@@ -68,7 +68,7 @@ MATRIX = [
         "V4.1主干编译入口尚未接入本次新增decorator；并非所有模型都不编译。",
         "DeepSeek V4.1主干接入torch.compile并补动态embedding维。",
         [18081, 18191],
-        "扩展GLM backbone/MTP，修复static range/hash、PCP custom-op boundary与FX多matcher注册。",
+        "扩展GLM backbone/MTP，补齐static shape范围和安装包编译兼容、PCP custom-op boundary与FX多matcher注册。",
         [19076, 20503, 20473, 19756],
     ),
     (

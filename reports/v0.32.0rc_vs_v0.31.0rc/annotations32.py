@@ -523,7 +523,8 @@ CAPABILITIES = [
         20503,
         "GLM / GDN / KDA",
         "GLM Flash static kernel 编译范围适配",
-        "将MTP rounded capture size纳入静态编译range/hash，PoolKeyIndexer保留dynamic binary。",
+        "按固定shape编译算子二进制；将MTP实际rounded capture size纳入编译范围，"
+        "PoolKeyIndexer保留dynamic binary，并兼容安装包头文件路径。",
         "enable_static_kernel开启，MRV2相关separate-routine条件。",
         "compile可用性修复；不是所有算子静态化，原PR正文有截断，以完整补丁为准。",
     ),
