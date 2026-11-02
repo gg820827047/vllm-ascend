@@ -1,0 +1,1028 @@
+commit 2164a24d1e509fe211b60c4635fa266e292bd8b4
+Author:     Li Hefei <107125352+rikakuhi@users.noreply.github.com>
+AuthorDate: Wed Oct 21 17:18:30 2026 +0800
+Commit:     GitHub <noreply@github.com>
+CommitDate: Wed Oct 21 17:18:30 2026 +0800
+
+    [Feature][DSA] Share O-projection buffers across DeepSeek layers (#19190)
+    
+    ## What this PR does / why we need it?
+    
+    This PR reduces resident OTP communication-buffer memory for DeepSeek V4
+    and V4.1 by sharing address-stable O-projection exchange scratch across
+    sequential DSA layers. It reserves the shared buffers before KV-cache
+    profiling and sizes them for the largest decode graph capacity, so
+    profiling accounts for their resident memory without sizing them to the
+    larger profiling-token budget. Empty DSA ranks now still enter OTP
+    O-projection collectives during ragged DP decoding. Buffer reservation
+    also initializes its pool defensively for standalone attention
+    instances.
+    
+    ## Does this PR introduce any user-facing change?
+    
+    No new user-facing option or API. The change affects internal OTP buffer
+    allocation and KV-cache memory accounting when O-projection tensor
+    parallelism is enabled.
+    
+    ## How was this patch tested?
+    
+    - Added or updated unit coverage in `tests/ut/attention/test_dsa_v1.py`,
+    `tests/ut/attention/test_dsa_v41.py`,
+    `tests/ut/models/test_deepseek_v41_dspark.py`, and
+    `tests/ut/models/test_deepseek_v4_dspark_context_wkv.py`.
+    - On the 108 `lhf_vllm` container, four focused OTP tests passed: 9
+    passed.
+    - The full `test_dsa_v1.py` run did not complete; it aborted during
+    Triton compilation of `dspark_swa_indices.py` after earlier test
+    failures. This is not counted as a passing run.
+    - `python -m py_compile` and `git diff --check` passed for the changed
+    files. `bash format.sh ci` could not run because `pre-commit` is not
+    installed in the container; Ruff is also unavailable.
+    - Multi-rank HCCL validation has not been run.
+    
+    - vLLM main:
+    https://github.com/vllm-project/vllm/commit/a98247ab4db686ee03c66d5feb3c761e52a2f8ab
+    
+    Signed-off-by: rikakuhi <942697235@qq.com>
+
+diff --git a/docs/source/user_guide/configuration/additional_config.md b/docs/source/user_guide/configuration/additional_config.md
+index f10492182..b7c970594 100644
+--- a/docs/source/user_guide/configuration/additional_config.md
++++ b/docs/source/user_guide/configuration/additional_config.md
+@@ -131,7 +131,7 @@ Design / ops (analysis branch): `docs/source/developer_guide/Design_Documents/ru
+ 
+ | Name | Type | Default | Description |
+ | ---- | ---- | ------- | ----------- |
+-| `oproj_tensor_parallel_size`     | int  | `0` | The custom tensor parallel size of `o_proj`.     |
++| `oproj_tensor_parallel_size`     | int  | `0` | The custom tensor parallel size of `o_proj`. Values `0` and `1` disable O-projection TP; values greater than `1` enable sharding.     |
+ | `mlp_tensor_parallel_size`       | int  | `0` | The custom tensor parallel size of `mlp`.       |
+ | `lmhead_tensor_parallel_size`    | int  | `0` | The custom tensor parallel size of `lm_head`.    |
+ | `embedding_tensor_parallel_size` | int  | `0` | The custom tensor parallel size of `embedding`. |
+diff --git a/tests/ut/attention/test_dsa_v1.py b/tests/ut/attention/test_dsa_v1.py
+index d9894fd72..2d2ca2048 100644
+--- a/tests/ut/attention/test_dsa_v1.py
++++ b/tests/ut/attention/test_dsa_v1.py
+@@ -44,6 +44,7 @@ from vllm_ascend.attention.dsa_v1 import (
+     AscendDSAMetadata,
+     AscendDSAMetadataBuilder,
+     AscendDSAReqMetadata,
++    OProjBufferPool,
+     build_compressor_metadata_out,
+     build_vision_bidirectional_swa_indices,
+ )
+@@ -2564,6 +2565,7 @@ def test_pcp_forward_updates_global_caches_before_local_attention(
+             return_value=caches,
+         ),
+         patch("vllm_ascend.attention.context_parallel.dsa_cp.get_pcp_group", return_value=pcp_group),
++        patch("vllm_ascend.attention.dsa_v1.oproj_tp_enable", return_value=False),
+         patch.object(impl, "_update_global_swa_cache", side_effect=lambda *args: events.append("cache")) as update_swa,
+         patch.object(impl, "_update_global_compressor_cache") as update_compressor,
+         patch.object(
+@@ -2777,8 +2779,8 @@ def test_pcp_local_o_projection_adds_static_quant_bias_once(tp_size, reduce_resu
+ 
+ 
+ @pytest.mark.parametrize("tp_size", [2, 8])
+-def test_o_proj_capacity_covers_decode_batch(tp_size):
+-    decode_capacity, scheduler_capacity = 4, 6
++@pytest.mark.parametrize("decode_capacity,scheduler_capacity", [(4, 6), (6, 4), (6, 6)])
++def test_o_proj_capacity_tracks_decode_graph_not_profile_budget(tp_size, decode_capacity, scheduler_capacity):
+     impl = AscendDSAImpl.__new__(AscendDSAImpl)
+     impl.n_local_groups = tp_size
+     impl.support_fp8_attention = False
+@@ -2788,6 +2790,7 @@ def test_o_proj_capacity_covers_decode_batch(tp_size):
+         scheduler_config=SimpleNamespace(max_num_batched_tokens=scheduler_capacity, max_num_seqs=4)
+     )
+     group = SimpleNamespace(world_size=tp_size, device_group=object())
++    capacity = decode_capacity
+ 
+     def exchange(recv, send, *, group):
+         recv.copy_(send)
+@@ -2807,9 +2810,9 @@ def test_o_proj_capacity_covers_decode_batch(tp_size):
+         patch("vllm_ascend.attention.dsa_v1.torch_npu.npu_transpose_batchmatmul", side_effect=matmul),
+     ):
+         buffers = None
+-        # A full decode batch, a smaller batch and an idle rank must reuse the
+-        # same buffers so every collective keeps its shape.
+-        for num_tokens in (decode_capacity, 1, 0):
++        # Decode steps and an idle rank reuse the decode-capacity buffers even
++        # when the profiling scheduler budget is larger.
++        for num_tokens in (capacity, 1, 0):
+             x = torch.arange(num_tokens * tp_size * 2, dtype=torch.float32).reshape(num_tokens, tp_size, 2)
+             output = torch.empty(num_tokens, 2)
+             impl._forward_o_proj(x, output)
+@@ -2823,14 +2826,205 @@ def test_o_proj_capacity_covers_decode_batch(tp_size):
+ 
+         assert impl._oproj_send_buf.shape[1] == decode_capacity
+ 
+-        # A batch sized by the larger scheduler budget must fail fast instead
+-        # of inflating the static exchange buffers.
+-        with pytest.raises(ValueError, match=r"capacity \(4\) must cover local tokens \(6\)"):
+-            impl._forward_o_proj(torch.zeros(scheduler_capacity, tp_size, 2), torch.empty(scheduler_capacity, 2))
++        # A batch exceeding decode capacity must fail fast instead of inflating
++        # the static exchange buffers to the scheduler budget.
++        oversized_tokens = max(scheduler_capacity, decode_capacity + 1)
++        with pytest.raises(
++            ValueError,
++            match=rf"capacity \({decode_capacity}\) must cover local tokens \({oversized_tokens}\)",
++        ):
++            impl._forward_o_proj(torch.zeros(oversized_tokens, tp_size, 2), torch.empty(oversized_tokens, 2))
+ 
+     assert a2a.call_count == rs.call_count == 3
+ 
+ 
++def test_forward_empty_rank_still_participates_in_otp_collectives():
++    impl = AscendDSAImpl.__new__(AscendDSAImpl)
++    impl.turboquant = None
++    impl._get_o_proj_input_shape = lambda metadata: (4, 1, 2)
++    layer_metadata = SimpleNamespace(attention=SimpleNamespace(num_actual_tokens=0), swa=None)
++    impl._get_layer_metadata = lambda layer_name, metadata: layer_metadata
++    impl._prepare_caches_before_attention = lambda *args: False
++    impl._forward_o_proj = MagicMock()
++    output = torch.ones((4, 2))
++
++    with (
++        patch("vllm_ascend.attention.dsa_v1.oproj_tp_enable", return_value=True),
++        patch("vllm_ascend.attention.dsa_v1.wait_for_kv_layer_from_connector"),
++        patch("vllm_ascend.attention.dsa_v1.notify_kv_cache_written"),
++        patch("vllm_ascend.attention.dsa_v1.maybe_save_kv_layer_to_connector"),
++        patch("vllm_ascend.attention.dsa_v1.attention_transfer_window", return_value=MagicMock()),
++    ):
++        result = impl.forward("layer", torch.zeros((4, 2)), (), {"layer": object()}, output)
++
++    assert result is output
++    assert torch.count_nonzero(output) == 0
++    impl._forward_o_proj.assert_called_once()
++
++
++def test_reserve_oproj_buffers_initializes_missing_pool():
++    impl = AscendDSAImpl.__new__(AscendDSAImpl)
++    impl.n_local_groups = 2
++    impl.n_local_heads = 2
++    impl.head_dim = 2
++    impl.wo_b = SimpleNamespace(output_size=2)
++    group = SimpleNamespace(world_size=2)
++
++    with (
++        patch("vllm_ascend.attention.dsa_v1.oproj_tp_enable", return_value=True),
++        patch("vllm_ascend.attention.dsa_v1.get_otp_group", return_value=group),
++        patch("vllm_ascend.attention.dsa_v1.get_potential_max_tokens", return_value=4),
++    ):
++        impl.reserve_oproj_buffers(torch.device("cpu"), torch.float32)
++
++    assert isinstance(impl._oproj_buffer_pool, OProjBufferPool)
++    assert impl._oproj_send_buf.shape == (2, 4, 1, 2)
++    assert impl._oproj_recv_buf.shape == (2, 4, 1, 2)
++    assert impl._oproj_rs_out_buf.shape == (4, 2)
++
++
++def test_o_proj_buffers_shared_across_layers_in_one_model():
++    capacity = 4
++    shared_pool = OProjBufferPool()
++    group = SimpleNamespace(world_size=2, device_group=object())
++
++    def make_impl(pool):
++        impl = AscendDSAImpl.__new__(AscendDSAImpl)
++        impl.n_local_groups = 2
++        impl.n_local_heads = 2
++        impl.head_dim = 2
++        impl.support_fp8_attention = False
++        impl.wo_a = SimpleNamespace(weight=torch.ones(1, 2, 2))
++        impl.wo_b = MagicMock(side_effect=lambda x: x)
++        impl.wo_b.output_size = 2
++        impl.vllm_config = SimpleNamespace(
++            scheduler_config=SimpleNamespace(max_num_batched_tokens=capacity, max_num_seqs=4)
++        )
++        impl._oproj_buffer_pool = pool
++        return impl
++
++    first, second, other_model = (
++        make_impl(shared_pool),
++        make_impl(shared_pool),
++        make_impl(OProjBufferPool()),
++    )
++
++    def exchange(recv, send, *, group):
++        recv.copy_(send)
++
++    def matmul(x, weight, **kwargs):
++        return torch.bmm(x.transpose(0, 1), weight).transpose(0, 1)
++
++    def reduce_scatter(out, partial, *, group):
++        out.copy_(partial.reshape(2, capacity, 2).sum(0))
++
++    with (
++        patch("vllm_ascend.attention.dsa_v1.oproj_tp_enable", return_value=True),
++        patch("vllm_ascend.attention.dsa_v1.get_otp_group", return_value=group),
++        patch("vllm_ascend.attention.dsa_v1.get_potential_max_tokens", return_value=capacity),
++        patch("vllm_ascend.attention.dsa_v1.dist.all_to_all_single", side_effect=exchange),
++        patch("vllm_ascend.attention.dsa_v1.dist.reduce_scatter_tensor", side_effect=reduce_scatter),
++        patch("vllm_ascend.attention.dsa_v1.torch_npu.npu_transpose_batchmatmul", side_effect=matmul),
++    ):
++        for impl in (first, second, other_model):
++            impl.reserve_oproj_buffers(torch.device("cpu"), torch.float32)
++            reserved_buffers = (impl._oproj_send_buf, impl._oproj_recv_buf, impl._oproj_rs_out_buf)
++            x = torch.ones(2, 2, 2)
++            output = torch.empty(2, 2)
++            impl._forward_o_proj(x, output)
++            torch.testing.assert_close(output, torch.full_like(output, 4))
++            assert all(
++                current is reserved
++                for current, reserved in zip(
++                    (impl._oproj_send_buf, impl._oproj_recv_buf, impl._oproj_rs_out_buf), reserved_buffers
++                )
++            )
++
++    for name in ("_oproj_send_buf", "_oproj_recv_buf", "_oproj_rs_out_buf"):
++        assert getattr(first, name) is getattr(second, name)
++        assert getattr(first, name) is not getattr(other_model, name)
++    assert len(shared_pool.exchange) == len(shared_pool.reduce_scatter) == 1
++
++
++def test_o_proj_pool_separates_incompatible_buffer_layouts():
++    pool = OProjBufferPool()
++    device = torch.device("cpu")
++    first = pool.get_exchange((2, 4, 1, 2), torch.float16, device)
++    assert pool.get_exchange((2, 4, 1, 2), torch.float16, device) is first
++    assert pool.get_exchange((2, 5, 1, 2), torch.float16, device)[0] is not first[0]
++    assert pool.get_exchange((2, 4, 1, 2), torch.float32, device)[0] is not first[0]
++    rs = pool.get_reduce_scatter((4, 2), torch.float16, device)
++    assert pool.get_reduce_scatter((4, 2), torch.float16, device) is rs
++    assert pool.get_reduce_scatter((4, 3), torch.float16, device) is not rs
++
++
++def test_o_proj_buffers_reserved_before_profile_and_shared_across_layers():
++    pool = OProjBufferPool()
++    config = SimpleNamespace(scheduler_config=SimpleNamespace(max_num_batched_tokens=4))
++    group = SimpleNamespace(world_size=2)
++    device = torch.device("cpu")
++
++    def make_impl():
++        impl = AscendDSAImpl.__new__(AscendDSAImpl)
++        impl._oproj_buffer_pool = pool
++        impl.vllm_config = config
++        impl.n_local_groups = 4
++        impl.n_local_heads = 4
++        impl.head_dim = 2
++        impl.wo_b = SimpleNamespace(output_size=3)
++        return impl
++
++    first, second = make_impl(), make_impl()
++    with (
++        patch("vllm_ascend.attention.dsa_v1.oproj_tp_enable", return_value=True),
++        patch("vllm_ascend.attention.dsa_v1.get_otp_group", return_value=group),
++        patch("vllm_ascend.attention.dsa_v1.get_potential_max_tokens", return_value=3),
++    ):
++        first.reserve_oproj_buffers(device, torch.float16)
++        second.reserve_oproj_buffers(device, torch.float16)
++
++    assert first._oproj_send_buf.shape == (2, 3, 2, 2)
++    assert first._oproj_recv_buf.shape == (2, 3, 2, 2)
++    assert first._oproj_rs_out_buf.shape == (3, 3)
++    for name in ("_oproj_send_buf", "_oproj_recv_buf", "_oproj_rs_out_buf"):
++        assert getattr(first, name) is getattr(second, name)
++    assert len(pool.exchange) == len(pool.reduce_scatter) == 1
++
++
++def test_o_proj_reservation_disabled_without_otp():
++    impl = AscendDSAImpl.__new__(AscendDSAImpl)
++    impl._oproj_buffer_pool = OProjBufferPool()
++    with patch("vllm_ascend.attention.dsa_v1.oproj_tp_enable", return_value=False):
++        impl.reserve_oproj_buffers(torch.device("cpu"), torch.float16)
++    assert not impl._oproj_buffer_pool.exchange
++    assert not impl._oproj_buffer_pool.reduce_scatter
++
++
++@pytest.mark.parametrize("profile_tokens,capacity", [(6, 3), (2, 3)])
++def test_o_proj_profile_runs_only_decode_capacity(profile_tokens, capacity):
++    impl = AscendDSAImpl.__new__(AscendDSAImpl)
++    impl.turboquant = None
++    impl.enable_pcp_o_proj_weight_sharding = False
++    impl._oproj_send_buf = torch.empty((2, capacity, 1, 2))
++    impl._get_o_proj_input_shape = lambda metadata: (profile_tokens, 2, 2)
++    seen = []
++
++    def project(inputs, outputs):
++        seen.append((inputs.shape, outputs.shape, torch.count_nonzero(inputs).item()))
++        outputs.fill_(1)
++
++    impl._forward_o_proj = project
++    output = torch.full((profile_tokens, 2), -1.0)
++    with patch("vllm_ascend.attention.dsa_v1.oproj_tp_enable", return_value=True):
++        result = impl.forward("layer", torch.empty(profile_tokens, 2), None, None, output)
++
++    active = min(profile_tokens, capacity)
++    assert result is output
++    assert seen == [((active, 2, 2), (active, 2), 0)]
++    torch.testing.assert_close(output[:active], torch.ones_like(output[:active]))
++    torch.testing.assert_close(output[active:], torch.zeros_like(output[active:]))
++
++
+ @pytest.mark.parametrize("tp_size", [2, 8])
+ @pytest.mark.parametrize("num_tokens", [0, 1, 3, 6])
+ def test_a5_fp8_o_proj_keeps_otp_collectives(tp_size, num_tokens):
+@@ -2951,3 +3145,31 @@ def test_dspark_compressed_tq_metadata_keeps_full_context(use_tq, ratio, deferre
+     assert metadata_op.call_args.kwargs["seqused_kv"].tolist() == [261 if compressed_tq else 133]
+     assert (metadata.dspark_swa_indices is None) == compressed_tq
+     assert metadata.ori_win_left == (127 if compressed_tq else 132)
++
++
++@pytest.mark.parametrize("otp_size", [0, 1])
++def test_o_proj_without_sharding_skips_buffers_and_collectives(otp_size):
++    impl = AscendDSAImpl.__new__(AscendDSAImpl)
++    impl.n_local_groups = 2
++    impl._oproj_buffer_pool = OProjBufferPool()
++    impl._wo_a_bmm = lambda x: x + 1
++    impl.wo_b = lambda x: x * 2
++    config = SimpleNamespace(finegrained_tp_config=SimpleNamespace(oproj_tensor_parallel_size=otp_size))
++    inputs = torch.arange(24, dtype=torch.float32).reshape(6, 2, 2)
++    output = torch.empty(6, 4)
++    with (
++        patch("vllm_ascend.utils.get_ascend_config", return_value=config),
++        patch("vllm_ascend.attention.dsa_v1.get_otp_group") as get_group,
++        patch("vllm_ascend.attention.dsa_v1.get_potential_max_tokens", return_value=3) as get_capacity,
++        patch("vllm_ascend.attention.dsa_v1.dist.all_to_all_single") as all_to_all,
++        patch("vllm_ascend.attention.dsa_v1.dist.reduce_scatter_tensor") as reduce_scatter,
++    ):
++        impl.reserve_oproj_buffers(inputs.device, inputs.dtype)
++        impl._forward_o_proj(inputs, output)
++    torch.testing.assert_close(output, (inputs.reshape(6, 4) + 1) * 2)
++    assert not impl._oproj_buffer_pool.exchange
++    assert not impl._oproj_buffer_pool.reduce_scatter
++    get_group.assert_not_called()
++    get_capacity.assert_not_called()
++    all_to_all.assert_not_called()
++    reduce_scatter.assert_not_called()
+diff --git a/tests/ut/attention/test_dsa_v41.py b/tests/ut/attention/test_dsa_v41.py
+index 01fa59ae2..6c07b5796 100644
+--- a/tests/ut/attention/test_dsa_v41.py
++++ b/tests/ut/attention/test_dsa_v41.py
+@@ -15,6 +15,80 @@ from vllm_ascend.models.deepseek_v41 import mixed_quant_attention as a5_indexer
+ TOKENS, TOPK = 4, 512
+ 
+ 
++@pytest.mark.parametrize("otp_enabled,pcp_sharding", [(False, None), (False, False), (True, False), (False, True)])
++@pytest.mark.parametrize("num_tokens", [0, 1, 7])
++@pytest.mark.parametrize("provide_output", [False, True])
++def test_profile_initializes_sharded_o_proj(monkeypatch, otp_enabled, pcp_sharding, num_tokens, provide_output):
++    impl = AscendDSAV41Impl.__new__(AscendDSAV41Impl)
++    hidden_states = torch.ones(num_tokens, 8, dtype=torch.bfloat16)
++    output = torch.full_like(hidden_states, float("nan")) if provide_output else None
++    calls = []
++
++    def project_o_proj(inputs, projected):
++        assert inputs.shape == (num_tokens, 4, 2)
++        assert inputs.dtype == hidden_states.dtype
++        assert inputs.device == hidden_states.device
++        assert torch.count_nonzero(inputs) == 0
++        assert projected.shape == hidden_states.shape
++        calls.append(projected)
++        projected.zero_()
++        return projected
++
++    projector = SimpleNamespace(_forward_o_proj=project_o_proj)
++    if pcp_sharding is not None:
++        projector.enable_pcp_o_proj_weight_sharding = pcp_sharding
++    attn = SimpleNamespace(
++        n_local_heads=4,
++        head_dim=2,
++        dsa_attn=SimpleNamespace(dsa_attn=SimpleNamespace(impl=projector)),
++    )
++    monkeypatch.setattr(dsa_v41, "get_forward_context", lambda: SimpleNamespace(attn_metadata=None))
++    monkeypatch.setattr(dsa_v41, "oproj_tp_enable", lambda: otp_enabled)
++    monkeypatch.setattr(dsa_v41, "get_potential_max_tokens", lambda: num_tokens)
++
++    result = impl.forward(attn, None, hidden_states, output)
++
++    should_project = otp_enabled or bool(pcp_sharding)
++    assert len(calls) == int(should_project)
++    if should_project:
++        assert calls[0].untyped_storage().data_ptr() == result.untyped_storage().data_ptr()
++        assert calls[0].storage_offset() == result.storage_offset()
++    if provide_output:
++        assert result is output
++    assert result.shape == hidden_states.shape
++    assert result.dtype == hidden_states.dtype
++    assert torch.equal(result, torch.zeros_like(hidden_states))
++
++
++def test_v41_otp_profile_exercises_only_decode_capacity(monkeypatch):
++    impl = AscendDSAV41Impl.__new__(AscendDSAV41Impl)
++    capacity = 3
++    seen = []
++
++    def project(inputs, outputs):
++        seen.append((inputs.shape, outputs.shape, torch.count_nonzero(inputs).item()))
++        outputs.fill_(1)
++
++    projector = SimpleNamespace(
++        _oproj_send_buf=torch.empty((2, capacity, 1, 2)),
++        _forward_o_proj=project,
++        enable_pcp_o_proj_weight_sharding=False,
++    )
++    attn = SimpleNamespace(
++        n_local_heads=2,
++        head_dim=2,
++        dsa_attn=SimpleNamespace(dsa_attn=SimpleNamespace(impl=projector)),
++    )
++    monkeypatch.setattr(dsa_v41, "get_forward_context", lambda: SimpleNamespace(attn_metadata=None))
++    monkeypatch.setattr(dsa_v41, "oproj_tp_enable", lambda: True)
++    output = torch.full((5, 2), -1.0)
++
++    assert impl.forward(attn, None, torch.empty(5, 2), output) is output
++    assert seen == [((capacity, 2, 2), (capacity, 2), 0)]
++    torch.testing.assert_close(output[:capacity], torch.ones_like(output[:capacity]))
++    torch.testing.assert_close(output[capacity:], torch.zeros_like(output[capacity:]))
++
++
+ @pytest.mark.parametrize("in_graph", [False, True])
+ def test_cp_defer_scope_forwards_graph_mode_and_restores_both_builders(monkeypatch, in_graph):
+     base = dsa_v41.AscendDSAV41MetadataBuilder
+diff --git a/tests/ut/attention/test_dsa_v41_cp.py b/tests/ut/attention/test_dsa_v41_cp.py
+index 30a8b907f..437633323 100644
+--- a/tests/ut/attention/test_dsa_v41_cp.py
++++ b/tests/ut/attention/test_dsa_v41_cp.py
+@@ -696,6 +696,7 @@ def runtime(builders, monkeypatch):
+         )
+         projector.cv_wq_a, projector.cv_wq_b, projector.cv_wkv = map(CVLinearWrapper, (attn.wq_a, attn.wq_b, attn.wkv))
+         monkeypatch.setattr(dsa_v41, "get_ascend_config", lambda: SimpleNamespace(multistream_dsv4_dsa_overlap=overlap))
++        monkeypatch.setattr(dsa_v41, "oproj_tp_enable", lambda: False)
+         impl = dsa_v41_cp.AscendDSAV41PCPImpl(
+             "model.layers.0",
+             SimpleNamespace(is_kv_source=False, has_long_context=False, compress_ratio=0),
+@@ -765,9 +766,11 @@ class TestPCPBatchLifecycle:
+     ):
+         state = runtime(sharding=sharding, overlap=overlap, decode_sharded=decode_sharded)
+         profile_output = torch.empty(4, 4)
++        state.projector.reference_input = torch.zeros_like(profile_output)
++        state.projector.peer_inputs = list(state.projector.reference_input.chunk(2))
+         state.impl.forward(state.attn, None, torch.zeros_like(profile_output), profile_output)
+         assert torch.count_nonzero(profile_output) == 0
+-        assert not state.events
++        assert state.events == (["project", "reduce"] if sharding else [])
+         switches = state.projector._pcp_o_proj_weight_switches or ()
+         addresses = [
+             (layer.weight.data_ptr(), part.gather_output.data_ptr())
+diff --git a/tests/ut/distributed/test_parallel_state.py b/tests/ut/distributed/test_parallel_state.py
+index 3ea270772..a2cda3ae4 100644
+--- a/tests/ut/distributed/test_parallel_state.py
++++ b/tests/ut/distributed/test_parallel_state.py
+@@ -41,11 +41,12 @@ def mock_distributed():
+         yield
+ 
+ 
+-def test_init_ascend_model_parallel(mock_distributed, parallel_config):
++@pytest.mark.parametrize("otp_size", [0, 1, 2])
++def test_init_ascend_model_parallel(mock_distributed, parallel_config, otp_size):
+     mock_ascend_config = MagicMock()
+     mock_ascend_config.kvpp_config.size = 1
+     mock_ascend_config.finegrained_tp_config.lmhead_tensor_parallel_size = 2
+-    mock_ascend_config.finegrained_tp_config.oproj_tensor_parallel_size = 2
++    mock_ascend_config.finegrained_tp_config.oproj_tensor_parallel_size = otp_size
+     mock_ascend_config.finegrained_tp_config.embedding_tensor_parallel_size = 2
+     mock_ascend_config.finegrained_tp_config.mlp_tensor_parallel_size = 2
+     mock_ascend_config.pd_tp_ratio = 2
+@@ -65,10 +66,13 @@ def test_init_ascend_model_parallel(mock_distributed, parallel_config):
+ 
+         mc2_group = get_mc2_group()
+         lmheadtp_group = get_lmhead_tp_group()
+-        otp_group = get_otp_group()
++        if otp_size > 1:
++            assert get_otp_group() is not None
++        else:
++            with pytest.raises(AssertionError, match="output tensor parallel group is not initialized"):
++                get_otp_group()
+         p_tp_group = get_p_tp_group()
+         assert mc2_group is not None
+-        assert otp_group is not None
+         assert lmheadtp_group is not None
+         assert p_tp_group is not None
+ 
+diff --git a/tests/ut/models/test_deepseek_v41_dspark.py b/tests/ut/models/test_deepseek_v41_dspark.py
+index c95738064..d789c3181 100644
+--- a/tests/ut/models/test_deepseek_v41_dspark.py
++++ b/tests/ut/models/test_deepseek_v41_dspark.py
+@@ -251,13 +251,18 @@ def test_draft_constructor_uses_upstream_head_contracts(monkeypatch, draft_vocab
+             )
+         ),
+         parallel_config=SimpleNamespace(use_sequence_parallel_moe=False),
++        model_config=SimpleNamespace(dtype=torch.float16),
+         quant_config=quant_config,
+     )
+     module = deepseek_v41_dspark_module
++    draft_impls = []
+ 
+     def layer(*args, **kwargs):
+         result = torch.nn.Module()
+         result.mlp = SimpleNamespace(gate=SimpleNamespace(tid2eid=None, bias_vl=None))
++        impl = MagicMock(spec=module.AscendDSAImpl)
++        draft_impls.append(impl)
++        result.self_attn = SimpleNamespace(dsa_attn=SimpleNamespace(dsa_attn=SimpleNamespace(impl=impl)))
+         return result
+ 
+     monkeypatch.setattr(module, "DeepseekV41DSparkDecoderLayer", layer)
+@@ -279,3 +284,9 @@ def test_draft_constructor_uses_upstream_head_contracts(monkeypatch, draft_vocab
+     confidence.assert_called_once_with(input_dim=12, prefix="model.confidence_head", bias=False, with_markov=True)
+     assert linear.call_args.kwargs["quant_config"] is quant_config
+     assert model.layers["42"].markov_head is model.markov_head
++    assert len(draft_impls) == 3
++    for impl in draft_impls:
++        assert impl._oproj_buffer_pool is model._oproj_buffer_pool
++        impl.reserve_oproj_buffers.assert_called_once_with(
++            torch.device(module.current_platform.device_type), torch.float16
++        )
+diff --git a/tests/ut/models/test_deepseek_v41_hyper_connection.py b/tests/ut/models/test_deepseek_v41_hyper_connection.py
+index 060e807e0..9892a4c2d 100644
+--- a/tests/ut/models/test_deepseek_v41_hyper_connection.py
++++ b/tests/ut/models/test_deepseek_v41_hyper_connection.py
+@@ -349,6 +349,7 @@ def test_v41_dspark_decoder_uses_draft_experts_instead_of_target_config():
+     def make_layer(*args, **kwargs):
+         layer = torch.nn.Module()
+         layer.mlp = SimpleNamespace(gate=SimpleNamespace(tid2eid=None, bias_vl=None))
++        layer.self_attn = SimpleNamespace(dsa_attn=SimpleNamespace(dsa_attn=SimpleNamespace(impl=object())))
+         return layer
+ 
+     factory = MagicMock(side_effect=make_layer)
+diff --git a/tests/ut/models/test_deepseek_v4_dspark_context_wkv.py b/tests/ut/models/test_deepseek_v4_dspark_context_wkv.py
+index 46b026759..18128cc32 100644
+--- a/tests/ut/models/test_deepseek_v4_dspark_context_wkv.py
++++ b/tests/ut/models/test_deepseek_v4_dspark_context_wkv.py
+@@ -1,6 +1,7 @@
+ # SPDX-License-Identifier: Apache-2.0
+ 
+ from types import SimpleNamespace
++from unittest.mock import MagicMock, patch
+ 
+ import torch
+ 
+@@ -8,6 +9,59 @@ from vllm_ascend.models.deepseek_v4 import dspark as dspark_module
+ from vllm_ascend.models.deepseek_v4.dspark import DeepseekV4DSparkModel
+ 
+ 
++def test_draft_constructor_shares_and_reserves_oproj_buffers(monkeypatch):
++    config = SimpleNamespace(
++        hc_mult=4,
++        hidden_size=8,
++        vocab_size=32,
++        draft_vocab_size=None,
++        dspark_block_size=6,
++        dspark_target_layer_ids=[37, 38, 39],
++        dspark_markov_rank=4,
++        num_hidden_layers=40,
++        n_mtp_layers=3,
++        head_dim=4,
++        rms_norm_eps=1e-6,
++        hc_eps=1e-5,
++        quantization_config={"quant_method": "fp8"},
++    )
++    quant_config = object()
++    vllm_config = SimpleNamespace(
++        speculative_config=SimpleNamespace(
++            draft_model_config=SimpleNamespace(hf_config=config),
++        ),
++        model_config=SimpleNamespace(dtype=torch.float16),
++        quant_config=quant_config,
++    )
++    draft_impls = []
++
++    def layer(*args, **kwargs):
++        result = torch.nn.Module()
++        result.use_sequence_parallel_moe = False
++        impl = MagicMock(spec=dspark_module.AscendDSAImpl)
++        draft_impls.append(impl)
++        result.self_attn = SimpleNamespace(dsa_attn=SimpleNamespace(dsa_attn=SimpleNamespace(impl=impl)))
++        return result
++
++    monkeypatch.setattr(dspark_module, "DeepseekV4DecoderLayer", layer)
++    monkeypatch.setattr(dspark_module, "VocabParallelEmbedding", lambda *a, **kw: torch.nn.Identity())
++    monkeypatch.setattr(dspark_module, "MergedColumnParallelLinear", lambda *a, **kw: torch.nn.Identity())
++    monkeypatch.setattr(dspark_module, "ColumnParallelLinear", lambda *a, **kw: torch.nn.Identity())
++    monkeypatch.setattr(dspark_module, "RMSNorm", lambda *a, **kw: torch.nn.Identity())
++    with (
++        patch.object(dspark_module, "DSparkMarkovHead", autospec=True, return_value=torch.nn.Identity()),
++        patch.object(dspark_module, "DSparkConfidenceHead", autospec=True, return_value=torch.nn.Identity()),
++    ):
++        model = DeepseekV4DSparkModel(vllm_config=vllm_config, prefix="model")
++
++    assert len(draft_impls) == 3
++    for impl in draft_impls:
++        assert impl._oproj_buffer_pool is model._oproj_buffer_pool
++        impl.reserve_oproj_buffers.assert_called_once_with(
++            torch.device(dspark_module.current_platform.device_type), torch.float16
++        )
++
++
+ def test_context_wkv_weights_are_duplicated_by_layer():
+     weights = [
+         ("mtp.0.attn.wkv.weight", torch.arange(4)),
+diff --git a/tests/ut/test_ascend_config.py b/tests/ut/test_ascend_config.py
+index 9b4439118..ece242dd7 100644
+--- a/tests/ut/test_ascend_config.py
++++ b/tests/ut/test_ascend_config.py
+@@ -158,6 +158,29 @@ class TestAscendConfig(TestBase):
+         config._sparse_li_layer_filter_enabled = AscendConfig._has_sparse_li_layer_config(quant_config)
+         return config
+ 
++    @_clean_up_ascend_config
++    @patch("vllm_ascend.platform.NPUPlatform.check_and_update_config")
++    def test_oproj_recompute_scheduler_required_only_for_sharding(self, mock_fix_incompatible_config):
++        for otp_size, mlp_size in ((0, 0), (1, 0), (2, 0), (8, 0), (1, 1)):
++            with self.subTest(otp_size=otp_size, mlp_size=mlp_size):
++                clear_ascend_config()
++                config = VllmConfig()
++                config.model_config.is_moe = True
++                config.additional_config = {
++                    "finegrained_tp_config": {
++                        "oproj_tensor_parallel_size": otp_size,
++                        "mlp_tensor_parallel_size": mlp_size,
++                    },
++                    "scheduler_config": {"recompute_scheduler_enable": False},
++                }
++                if otp_size > 1 or mlp_size > 0:
++                    with self.assertRaisesRegex((AssertionError, ValueError), "recompute_scheduler_enable=true"):
++                        init_ascend_config(config)
++                else:
++                    result = init_ascend_config(config)
++                    self.assertFalse(result.scheduler_config.recompute_scheduler_enable)
++                    self.assertEqual(result.finegrained_tp_config.oproj_tensor_parallel_size, otp_size)
++
+     def test_sparse_li_c8_layer_filter_uses_indexer_quant_type(self):
+         config = self._make_sparse_li_c8_config(
+             {
+diff --git a/tests/ut/test_utils.py b/tests/ut/test_utils.py
+index f786027e1..a9fb4da3c 100644
+--- a/tests/ut/test_utils.py
++++ b/tests/ut/test_utils.py
+@@ -962,3 +962,10 @@ def test_endpoint_mapping_failure_does_not_fall_back(tmp_path, monkeypatch, phys
+ def test_no_endpoint_path_does_not_resolve_device(config, physical_device_lookup):
+     utils.setup_ascend_local_comm_res(0, config)
+     physical_device_lookup.assert_not_called()
++
++
++@pytest.mark.parametrize("size,enabled", [(0, False), (1, False), (2, True), (8, True)])
++def test_oproj_tp_enable_requires_weight_sharding(size, enabled):
++    config = SimpleNamespace(finegrained_tp_config=SimpleNamespace(oproj_tensor_parallel_size=size))
++    with mock.patch("vllm_ascend.utils.get_ascend_config", return_value=config):
++        assert utils.oproj_tp_enable() is enabled
+diff --git a/vllm_ascend/ascend_config.py b/vllm_ascend/ascend_config.py
+index 55a0e9971..878c5259c 100644
+--- a/vllm_ascend/ascend_config.py
++++ b/vllm_ascend/ascend_config.py
+@@ -828,7 +828,7 @@ class AscendConfig:
+                 )
+ 
+         finegrained_tp_enabled = (
+-            self.finegrained_tp_config.oproj_tensor_parallel_size > 0
++            self.finegrained_tp_config.oproj_tensor_parallel_size > 1
+             or self.finegrained_tp_config.mlp_tensor_parallel_size > 0
+         )
+         if finegrained_tp_enabled and not self.scheduler_config.recompute_scheduler_enable:
+diff --git a/vllm_ascend/attention/dsa_v1.py b/vllm_ascend/attention/dsa_v1.py
+index e0718979a..a0707a345 100644
+--- a/vllm_ascend/attention/dsa_v1.py
++++ b/vllm_ascend/attention/dsa_v1.py
+@@ -89,6 +89,31 @@ else:
+ 
+ # The SAS and QLI metadata operators use a fixed 1024-element int32 layout.
+ DSA_METADATA_BUFFER_SIZE = 1024
++
++
++class OProjBufferPool:
++    """Model-owned, address-stable OTP scratch storage shared by sequential layers."""
++
++    def __init__(self) -> None:
++        self.exchange: dict[tuple[tuple[int, ...], torch.dtype, torch.device], tuple[torch.Tensor, torch.Tensor]] = {}
++        self.reduce_scatter: dict[tuple[tuple[int, ...], torch.dtype, torch.device], torch.Tensor] = {}
++
++    def get_exchange(
++        self, shape: tuple[int, ...], dtype: torch.dtype, device: torch.device
++    ) -> tuple[torch.Tensor, torch.Tensor]:
++        key = (shape, dtype, device)
++        if key not in self.exchange:
++            send = torch.zeros(shape, dtype=dtype, device=device)
++            self.exchange[key] = (send, torch.empty_like(send))
++        return self.exchange[key]
++
++    def get_reduce_scatter(self, shape: tuple[int, ...], dtype: torch.dtype, device: torch.device) -> torch.Tensor:
++        key = (shape, dtype, device)
++        if key not in self.reduce_scatter:
++            self.reduce_scatter[key] = torch.empty(shape, dtype=dtype, device=device)
++        return self.reduce_scatter[key]
++
++
+ CompressorMetadataOutput: TypeAlias = tuple[torch.Tensor, torch.Tensor, torch.Tensor]
+ 
+ _DSV4_DSA_OVERLAP_STREAM = None
+@@ -1837,6 +1862,7 @@ class AscendDSAImpl(AttentionImplBase[Any]):
+         **kwargs,
+     ):
+         self.vllm_config = kwargs["vllm_config"]
++        self._oproj_buffer_pool = OProjBufferPool()
+         self.num_heads = n_heads
+         self.n_local_heads = n_local_heads
+         self.scale = scale
+@@ -1953,9 +1979,8 @@ class AscendDSAImpl(AttentionImplBase[Any]):
+ 
+     def process_weights_after_loading(self, act_dtype: torch.dtype):
+         # Attention impls are not walked by vllm's process_weights_after_loading
+-        # dispatcher (only LinearMethodBase subclasses are). OTP buffers are
+-        # allocated lazily on the first _forward_o_proj call, which always runs
+-        # before ACL graph capture (profiling run triggers it).
++        # dispatcher (only LinearMethodBase subclasses are). The owning model
++        # reserves OTP storage during construction, before KV memory profiling.
+         pass
+ 
+     def _wo_a_bmm(self, o_proj_input: torch.Tensor) -> torch.Tensor:
+@@ -1985,6 +2010,32 @@ class AscendDSAImpl(AttentionImplBase[Any]):
+             batch_split_factor=1,
+         )
+ 
++    def reserve_oproj_buffers(self, device: torch.device, dtype: torch.dtype) -> None:
++        """Reserve graph-stable OTP storage before KV cache capacity is measured."""
++        if not oproj_tp_enable():
++            return
++        if not hasattr(self, "_oproj_buffer_pool"):
++            self._oproj_buffer_pool = OProjBufferPool()
++        oproj_tp_size = get_otp_group().world_size
++        if self.n_local_groups % oproj_tp_size != 0:
++            raise ValueError(
++                f"n_local_groups={self.n_local_groups} must be divisible by oproj_tensor_parallel_size={oproj_tp_size}"
++            )
++        # Decode is graph-bound when OTP is enabled. Profiling may use a larger
++        # scheduler budget, but it only needs to exercise this decode capacity.
++        exchange_num_tokens = get_potential_max_tokens()
++        group_hidden_dim = self.n_local_heads * self.head_dim // self.n_local_groups
++        buf_shape = (
++            oproj_tp_size,
++            exchange_num_tokens,
++            self.n_local_groups // oproj_tp_size,
++            group_hidden_dim,
++        )
++        self._oproj_send_buf, self._oproj_recv_buf = self._oproj_buffer_pool.get_exchange(buf_shape, dtype, device)
++        self._oproj_rs_out_buf = self._oproj_buffer_pool.get_reduce_scatter(
++            (exchange_num_tokens, self.wo_b.output_size), dtype, device
++        )
++
+     def _forward_o_proj(self, o_proj_input: torch.Tensor, output: torch.Tensor) -> torch.Tensor:
+         num_tokens = o_proj_input.shape[0]
+         group_hidden_dim = o_proj_input.shape[1] * o_proj_input.shape[2] // self.n_local_groups
+@@ -2012,21 +2063,21 @@ class AscendDSAImpl(AttentionImplBase[Any]):
+                 raise ValueError(
+                     f"oproj static exchange capacity ({exchange_num_tokens}) must cover "
+                     f"local tokens ({num_tokens}). Fine-grained oproj TP requires "
+-                    "capacity >= max_num_batched_tokens. Please set --max-num-batched-"
+-                    "tokens to max_num_seqs * decode_query_len "
+-                    f"(currently max_num_seqs={scheduler_config.max_num_seqs}), or "
+-                    "raise the largest cudagraph_capture_sizes entry."
++                    "capacity >= the largest decode graph bucket. Please raise "
++                    "max_cudagraph_capture_size or the largest "
++                    "cudagraph_capture_sizes entry "
++                    f"(currently max_num_seqs={scheduler_config.max_num_seqs})."
+                 )
+-            # Lazily allocate static send/recv buffers on first call. The
+-            # profiling run hits this path before ACL graph capture, so the
+-            # buffers exist and keep a stable device address across all later
+-            # capture/replay cycles (graph replay requires the same address
+-            # that was recorded at capture; new_zeros per call would desync
+-            # the HCCL operator).
++            # Model construction reserves these buffers before KV profiling.
++            # Keep the lazy fallback for standalone attention implementations.
+             if not hasattr(self, "_oproj_send_buf"):
+                 buf_shape = (oproj_tp_size, exchange_num_tokens, groups_per_rank, group_hidden_dim)
+-                self._oproj_send_buf = torch.zeros(buf_shape, dtype=o_proj_input.dtype, device=o_proj_input.device)
+-                self._oproj_recv_buf = torch.empty_like(self._oproj_send_buf)
++                pool = getattr(self, "_oproj_buffer_pool", None)
++                if pool is None:
++                    pool = self._oproj_buffer_pool = OProjBufferPool()
++                self._oproj_send_buf, self._oproj_recv_buf = pool.get_exchange(
++                    buf_shape, o_proj_input.dtype, o_proj_input.device
++                )
+             send = self._oproj_send_buf
+             recv = self._oproj_recv_buf
+             # In-place fill into the address-stable buffer: zero the padding
+@@ -2045,10 +2096,8 @@ class AscendDSAImpl(AttentionImplBase[Any]):
+             # at capture during ACL graph replay — the same reason all_to_all
+             # and the embedding TP path use raw dist + static buffers.
+             if not hasattr(self, "_oproj_rs_out_buf"):
+-                self._oproj_rs_out_buf = torch.empty(
+-                    (exchange_num_tokens, o_proj_output.shape[-1]),
+-                    dtype=o_proj_output.dtype,
+-                    device=o_proj_output.device,
++                self._oproj_rs_out_buf = self._oproj_buffer_pool.get_reduce_scatter(
++                    (exchange_num_tokens, o_proj_output.shape[-1]), o_proj_output.dtype, o_proj_output.device
+                 )
+             dist.reduce_scatter_tensor(self._oproj_rs_out_buf, o_proj_output, group=oproj_group.device_group)
+             output[...] = self._oproj_rs_out_buf[:num_tokens]
+@@ -2092,9 +2141,18 @@ class AscendDSAImpl(AttentionImplBase[Any]):
+             self.turboquant._initialize(hidden_states.device)
+         o_proj_input_shape = self._get_o_proj_input_shape(attn_metadata)
+         if attn_metadata is None:
+-            # Profiling run: run o_proj on zero input so HCCL collectives are
+-            # captured by the ACL graph.  Non-OTP just zeros the output.
+-            if oproj_tp_enable() or self.enable_pcp_o_proj_weight_sharding:
++            # Profiling uses the full scheduler batch for other operators, but
++            # OTP only runs on decode graphs. Exercise its largest decode shape
++            # so the collective and projection scratch are accounted for.
++            if oproj_tp_enable():
++                capacity = (
++                    self._oproj_send_buf.shape[1] if hasattr(self, "_oproj_send_buf") else get_potential_max_tokens()
++                )
++                profile_tokens = min(o_proj_input_shape[0], capacity)
++                output.zero_()
++                o_proj_input = hidden_states.new_zeros((profile_tokens, *o_proj_input_shape[1:]))
++                self._forward_o_proj(o_proj_input, output[:profile_tokens])
++            elif self.enable_pcp_o_proj_weight_sharding:
+                 o_proj_input = hidden_states.new_zeros(o_proj_input_shape)
+                 self._forward_o_proj(o_proj_input, output)
+             else:
+@@ -2117,6 +2175,11 @@ class AscendDSAImpl(AttentionImplBase[Any]):
+         )
+         if actual_tokens == 0:
+             output.zero_()
++            if oproj_tp_enable():
++                # Other OTP ranks may have active tokens and enter these
++                # collectives. Keep the empty rank in the same communication
++                # sequence using its already-zeroed projection input.
++                self._forward_o_proj(o_proj_input, output)
+             notify_kv_cache_written(layer_name)
+             with attention_transfer_window():
+                 pass
+diff --git a/vllm_ascend/attention/dsa_v41.py b/vllm_ascend/attention/dsa_v41.py
+index 844958d3e..8dc2a49c4 100644
+--- a/vllm_ascend/attention/dsa_v41.py
++++ b/vllm_ascend/attention/dsa_v41.py
+@@ -42,7 +42,12 @@ from vllm_ascend.ops.rope_dsv4 import (
+     get_full_cos_and_sin_dsa_for_layer,
+ )
+ from vllm_ascend.ops.triton.c2_ring_metadata import build_c2_ring_metadata
+-from vllm_ascend.utils import npu_stream_switch, vllm_version_is
++from vllm_ascend.utils import (
++    get_potential_max_tokens,
++    npu_stream_switch,
++    oproj_tp_enable,
++    vllm_version_is,
++)
+ from vllm_ascend.worker.device_metadata import (
+     DeviceMetadataStage,
+     DeviceMetadataTask,
+@@ -751,7 +756,22 @@ class AscendDSAV41Impl:
+             output = torch.empty_like(hidden_states)
+         forward_context = get_forward_context()
+         if forward_context.attn_metadata is None:
++            projector = attn.dsa_attn.dsa_attn.impl
+             output.zero_()
++            if oproj_tp_enable():
++                capacity = (
++                    projector._oproj_send_buf.shape[1]
++                    if hasattr(projector, "_oproj_send_buf")
++                    else get_potential_max_tokens()
++                )
++                profile_tokens = min(hidden_states.shape[0], capacity)
++                o_proj_input = hidden_states.new_zeros((profile_tokens, attn.n_local_heads, attn.head_dim))
++                projector._forward_o_proj(o_proj_input, output[:profile_tokens])
++            elif getattr(projector, "enable_pcp_o_proj_weight_sharding", False):
++                # Match V4 profiling: exercise OTP communication buffers or
++                # PCP resident weight shards before graph capture.
++                o_proj_input = hidden_states.new_zeros((hidden_states.shape[0], attn.n_local_heads, attn.head_dim))
++                projector._forward_o_proj(o_proj_input, output)
+             return output
+         metadata = self._get_layer_metadata(forward_context.attn_metadata)
+         q, qr, prepared_indexer = self._prepare_inputs_and_caches(
+diff --git a/vllm_ascend/distributed/parallel_state.py b/vllm_ascend/distributed/parallel_state.py
+index fc383f2ef..433d7e46d 100644
+--- a/vllm_ascend/distributed/parallel_state.py
++++ b/vllm_ascend/distributed/parallel_state.py
+@@ -202,7 +202,7 @@ def init_ascend_model_parallel(
+ 
+     global _OTP, _LMTP, _EMBED_TP, _MLP_TP
+ 
+-    if otp_size > 0:
++    if otp_size > 1:
+         _OTP = _create_or_get_group(otp_size, "otp")
+     if lmhead_tp_size > 0:
+         _LMTP = _create_or_get_group(lmhead_tp_size, "lmheadtp")
+diff --git a/vllm_ascend/models/deepseek_v4/dspark.py b/vllm_ascend/models/deepseek_v4/dspark.py
+index 446084797..bf2ea9d26 100644
+--- a/vllm_ascend/models/deepseek_v4/dspark.py
++++ b/vllm_ascend/models/deepseek_v4/dspark.py
+@@ -40,7 +40,9 @@ from vllm.model_executor.model_loader.weight_utils import default_weight_loader
+ from vllm.model_executor.models.interfaces import SupportsEagle3
+ from vllm.model_executor.models.qwen3_dspark import DSparkConfidenceHead, DSparkMarkovHead
+ from vllm.model_executor.models.utils import PPMissingLayer, maybe_prefix, process_eagle_weight
++from vllm.platforms import current_platform
+ 
++from vllm_ascend.attention.dsa_v1 import AscendDSAImpl, OProjBufferPool
+ from vllm_ascend.models.common.ops.sequence_parallel import sp_padding_mask, sp_shard
+ from vllm_ascend.models.deepseek_v4.model import (
+     DeepseekV2MixtureOfExperts,
+@@ -134,6 +136,13 @@ class DeepseekV4DSparkModel(nn.Module):
+                 for idx in range(self.num_dspark_layers)
+             }
+         )
++        self._oproj_buffer_pool = OProjBufferPool()
++        for layer in self.layers.values():
++            impl = layer.self_attn.dsa_attn.dsa_attn.impl
++            if not isinstance(impl, AscendDSAImpl):
++                continue
++            impl._oproj_buffer_pool = self._oproj_buffer_pool
++            impl.reserve_oproj_buffers(torch.device(current_platform.device_type), vllm_config.model_config.dtype)
+ 
+         first_layer = self.layers[str(self.mtp_start_layer_idx)]
+         self.use_sequence_parallel_moe = first_layer.use_sequence_parallel_moe
+diff --git a/vllm_ascend/models/deepseek_v4/model.py b/vllm_ascend/models/deepseek_v4/model.py
+index f65af8f3c..96df4a0e9 100644
+--- a/vllm_ascend/models/deepseek_v4/model.py
++++ b/vllm_ascend/models/deepseek_v4/model.py
+@@ -78,6 +78,7 @@ from vllm.v1.attention.backends.mla.sparse_swa import DeepseekV4SWACache as Vllm
+ from vllm.v1.kv_cache_interface import KVCacheSpec
+ 
+ from vllm_ascend.ascend_config import get_ascend_config
++from vllm_ascend.attention.dsa_v1 import AscendDSAImpl, OProjBufferPool
+ from vllm_ascend.core.kv_cache_interface import AscendSlidingWindowMLASpec
+ from vllm_ascend.models.common.ops.sequence_parallel import (
+     sp_all_gather,
+@@ -838,6 +839,16 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
+             lambda prefix: DeepseekV4DecoderLayer(vllm_config, prefix, topk_indices_buffer=topk_indices_buffer),
+             prefix=f"{prefix}.layers",
+         )
++        # Decoder layers run in order, so their OTP collectives can reuse the
++        # same address-stable scratch storage during profiling and graph replay.
++        self._oproj_buffer_pool = OProjBufferPool()
++        for layer in self.layers:
++            if isinstance(layer, DeepseekV4DecoderLayer):
++                impl = layer.self_attn.dsa_attn.dsa_attn.impl
++                if not isinstance(impl, AscendDSAImpl):
++                    continue
++                impl._oproj_buffer_pool = self._oproj_buffer_pool
++                impl.reserve_oproj_buffers(torch.device(self.device), vllm_config.model_config.dtype)
+ 
+         if get_pp_group().is_last_rank:
+             self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+diff --git a/vllm_ascend/models/deepseek_v41/dspark.py b/vllm_ascend/models/deepseek_v41/dspark.py
+index de96627f5..3349a92ee 100644
+--- a/vllm_ascend/models/deepseek_v41/dspark.py
++++ b/vllm_ascend/models/deepseek_v41/dspark.py
+@@ -29,8 +29,10 @@ from vllm.model_executor.model_loader.weight_utils import default_weight_loader
+ from vllm.model_executor.models.interfaces import SupportsEagle3
+ from vllm.model_executor.models.qwen3_dspark import DSparkConfidenceHead, DSparkMarkovHead
+ from vllm.model_executor.models.utils import PPMissingLayer, maybe_prefix, process_eagle_weight
++from vllm.platforms import current_platform
+ 
+ from vllm_ascend.attention.context_parallel.dsa_v41_cp import get_v41_cp_classes
++from vllm_ascend.attention.dsa_v1 import AscendDSAImpl, OProjBufferPool
+ from vllm_ascend.attention.dsa_v41 import DeepseekV41CacheBackend, scatter_cache_sk
+ from vllm_ascend.core.kv_cache_interface import AscendSlidingWindowMLASpec
+ from vllm_ascend.device.device_op import DeviceOperator
+@@ -174,6 +176,13 @@ class DeepseekV41DSparkModel(torch.nn.Module):
+                 for idx in range(self.num_dspark_layers)
+             }
+         )
++        self._oproj_buffer_pool = OProjBufferPool()
++        for layer in self.layers.values():
++            impl = layer.self_attn.dsa_attn.dsa_attn.impl
++            if not isinstance(impl, AscendDSAImpl):
++                continue
++            impl._oproj_buffer_pool = self._oproj_buffer_pool
++            impl.reserve_oproj_buffers(torch.device(current_platform.device_type), vllm_config.model_config.dtype)
+ 
+         first_layer = self.layers[str(self.mtp_start_layer_idx)]
+         self.use_sequence_parallel_moe = vllm_config.parallel_config.use_sequence_parallel_moe
+diff --git a/vllm_ascend/models/deepseek_v41/model.py b/vllm_ascend/models/deepseek_v41/model.py
+index 8e7e9bcdb..7b8b2609b 100644
+--- a/vllm_ascend/models/deepseek_v41/model.py
++++ b/vllm_ascend/models/deepseek_v41/model.py
+@@ -55,6 +55,7 @@ from vllm.sequence import IntermediateTensors
+ from vllm.utils.torch_utils import kv_cache_dtype_str_to_dtype
+ 
+ from vllm_ascend.ascend_config import get_ascend_config
++from vllm_ascend.attention.dsa_v1 import AscendDSAImpl, OProjBufferPool
+ from vllm_ascend.attention.dsa_v41 import (
+     DeepseekV41CacheLayer,
+ )
+@@ -975,6 +976,14 @@ class DeepseekV41Model(nn.Module, EagleModelMixin):
+             lambda prefix: self.decoder_layer_cls(vllm_config, prefix, topk_indices_buffer=topk_indices_buffer),
+             prefix=f"{prefix}.layers",
+         )
++        self._oproj_buffer_pool = OProjBufferPool()
++        for layer in self.layers:
++            if isinstance(layer, DeepseekV41DecoderLayer):
++                impl = layer.self_attn.dsa_attn.dsa_attn.impl
++                if not isinstance(impl, AscendDSAImpl):
++                    continue
++                impl._oproj_buffer_pool = self._oproj_buffer_pool
++                impl.reserve_oproj_buffers(torch.device(self.device), vllm_config.model_config.dtype)
+ 
+         if get_pp_group().is_last_rank:
+             self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+diff --git a/vllm_ascend/utils.py b/vllm_ascend/utils.py
+index de1fd0ddc..7548a7b8e 100644
+--- a/vllm_ascend/utils.py
++++ b/vllm_ascend/utils.py
+@@ -1002,7 +1002,7 @@ def embedding_tp_enable() -> bool:
+ 
+ 
+ def oproj_tp_enable() -> bool:
+-    return get_ascend_config().finegrained_tp_config.oproj_tensor_parallel_size > 0
++    return get_ascend_config().finegrained_tp_config.oproj_tensor_parallel_size > 1
+ 
+ 
+ def mlp_tp_enable() -> bool:

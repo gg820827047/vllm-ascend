@@ -1,0 +1,158 @@
+commit be0b61da22778b043eb2369b5f922b2a39ddc46d
+Author:     wzx0726 <zhexuanwu12@gmail.com>
+AuthorDate: Fri Oct 9 09:41:42 2026 +0800
+Commit:     GitHub <noreply@github.com>
+CommitDate: Fri Oct 9 09:41:42 2026 +0800
+
+    [BugFix][MLA] Handle empty PCP prefill ranks (#17972)
+    
+    ### What this PR does / why we need it?
+    
+    PCP can assign zero real prefill tokens to a rank while retaining padded
+    KV inputs for collective processing. MLA preprocessing then attempts
+    `prefill_k_pe.view(0, num_kv_heads, -1)` and raises an ambiguous
+    zero-element reshape error before prefill attention runs.
+    
+    Use the existing `self.qk_rope_head_dim` for the last dimension instead
+    of inferring it. This preserves padded KV processing, collectives,
+    cropping, and the existing attention path. Add a regression test to the
+    existing MLA test class for 0, 1, and 3 local tokens, checking that
+    padded KV input is retained and the returned Q/K/V shapes are correct.
+    No new flags, state, helpers, or empty-rank early return are introduced.
+    
+    ### Does this PR introduce _any_ user-facing change?
+    
+    Yes. MLA PCP requests with a locally empty prefill rank can complete
+    generation instead of failing during preprocessing. No API or
+    configuration changes.
+    
+    ### How was this patch tested?
+    
+    Runtime validation used real BF16 DeepSeek-V2-Lite weights on
+    Ascend950DT with torch 2.10.0, torch_npu 2.10.0.post4, and CANN 9.1.0.
+    Configuration: MRV2, TP1/DCP1, PCP1 or PCP2, `enable_mlapo=false`, no
+    MTP/prefix cache/async scheduling/EP/EPLB, batch token budget 512,
+    temperature 0, seed 17, and 4 generated tokens.
+    
+    - **End-to-end empty-rank inference:** with PCP2 and prompt token IDs
+    `[99297]`, rank0 received 1 real prefill token and rank1 received 0 real
+    tokens plus 1 padding token. `LLM.generate()` completed and returned
+    `[254, 4334, 1439, 245]` (`" the difference between a"`) in both
+    repetitions, matching PCP1. An independent worker trace confirmed the
+    empty rank in the same inference run; the job exited 0.
+    - **Negative control:** restoring only the original `-1` reproduced the
+    first worker exception at `mla_preprocess_prefill`: `cannot reshape
+    tensor of 0 elements into shape [0, 1, -1] ... ambiguous`. The old-code
+    job subsequently waited and its own process family was cleaned up; it
+    did not produce a completed harness result or finish the second planned
+    repetition.
+    - **Boundaries and output comparison:** PCP1 and PCP2 eager each
+    completed lengths 1, 2, 3, 4, 5, 32, 513, 514, and 515 twice, with
+    identical output tokens. Same-PCP2 before/after comparison for lengths
+    2, 3, 4, 5, and 32 matched exactly. Independent trace runs also
+    completed a locally empty tail chunk with 512 tokens of prior context
+    and matched untraced outputs.
+    - **Graph:** PCP2 `FULL_DECODE_ONLY` completed all nine inputs twice and
+    matched eager tokens exactly. Both ranks captured token counts `[1, 2]`;
+    logs confirmed graph replay and 54 FULL executions. This covers eager
+    prefill plus graph decode. PCP prefill graph (`FULL_AND_PIECEWISE`) is
+    explicitly unsupported by the current MRV2 PCP implementation.
+    - **Unit tests:** `pytest -q tests/ut/attention/test_mla_v1.py -k
+    'prefill or preprocess'` passed all 35 selected tests and exited 0. The
+    new regression test fails with exit 1 when only the original production
+    line is restored.
+    - **Whole-file limitation:** the full MLA test file reported 133
+    passed/8 failed after the fix versus 132 passed/9 failed with the
+    original line. The same eight decode/graph-parameter failures were
+    present in both states; both whole-file jobs timed out during shutdown
+    after printing their summaries. The whole file is not claimed green.
+    - **Static checks on this PR branch:** Ruff check, Ruff format check,
+    AST/source comparison, and `git diff --check` passed. `bash format.sh
+    ci` could not run its hooks because local `pre-commit` is unavailable.
+    
+    Runtime evidence was collected on the local MRV2 PCP checkout at
+    `eb0e37db18cdc3958bdc46113d13f8fabcd25608` with this patch, paired with
+    vLLM `ced6857afa0ea7b2e3f0846a62e1394e90f15607`. This isolated PR is
+    based on upstream `0e181fc85fff24db10e5f92f10319c1913e6e9c5`. The
+    complete unit-test file and the relevant `mla_preprocess_prefill`,
+    `_get_num_prefill_kv_tokens`, `exec_kv_prefill`, `rope_single`, and
+    `_forward_prefill` methods are identical to the runtime-tested versions.
+    A complete E2E rerun of the newer upstream base has not been performed;
+    other context-handling code changed upstream. This PR remains draft
+    pending CI/review.
+    
+    Not covered by the real-model matrix: fused MLA prolog
+    (`enable_mlapo=true`), prefill graph, MTP, prefix caching, async
+    scheduling, quantized MLA, other PCP/DCP topologies, GQA E2E, or
+    performance.
+    
+    - vLLM main:
+    https://github.com/vllm-project/vllm/commit/ced6857afa0ea7b2e3f0846a62e1394e90f15607
+    
+    Signed-off-by: wzx0726 <278573478+wzx0726@users.noreply.github.com>
+    Co-authored-by: wzx0726 <278573478+wzx0726@users.noreply.github.com>
+
+diff --git a/tests/ut/attention/test_mla_v1.py b/tests/ut/attention/test_mla_v1.py
+index 21cfd1771..5dedb54a2 100644
+--- a/tests/ut/attention/test_mla_v1.py
++++ b/tests/ut/attention/test_mla_v1.py
+@@ -2894,6 +2894,46 @@ class TestAscendMLAImpl(TestBase):
+         self.assertIsNotNone(decode_res)
+         self.assertIsNotNone(prefill_res)
+ 
++    def test_mla_preprocess_prefill_pcp_empty_rank(self):
++        self.impl.pcp_enabled = True
++        self.impl.num_heads = 2
++        self.impl.num_kv_heads = 1
++        self.impl.rope_single = MagicMock(side_effect=lambda x, cos, sin: x)
++        self.impl.exec_kv_prefill = MagicMock()
++
++        for num_tokens in (0, 1, 3):
++            with self.subTest(num_tokens=num_tokens):
++                padded_tokens = max(1, num_tokens)
++                q_c = torch.zeros(padded_tokens, self.impl.q_lora_rank)
++                kv = torch.zeros(padded_tokens, self.impl.kv_lora_rank + self.impl.qk_rope_head_dim)
++                metadata = SimpleNamespace(
++                    num_decode_tokens=0,
++                    num_actual_tokens=num_tokens,
++                    slot_mapping=torch.arange(2 * padded_tokens),
++                    prefill=SimpleNamespace(
++                        cos=torch.zeros(padded_tokens, self.impl.qk_rope_head_dim),
++                        sin=torch.zeros(padded_tokens, self.impl.qk_rope_head_dim),
++                        pcp_local_num_input_tokens=padded_tokens,
++                    ),
++                )
++                self.impl.q_proj.return_value = (torch.zeros(num_tokens, 2 * self.impl.qk_head_dim),)
++                self.impl.kv_b_proj.return_value = (
++                    torch.zeros(num_tokens, 2 * (self.impl.qk_nope_head_dim + self.impl.v_head_dim)),
++                )
++                self.impl.exec_kv_prefill.return_value = (
++                    torch.ones(num_tokens, 1, 1, self.impl.qk_rope_head_dim),
++                    torch.zeros(num_tokens, 1, 1, self.impl.kv_lora_rank),
++                )
++
++                result = self.impl.mla_preprocess_prefill(q_c, kv, (), metadata)
++
++                self.assertEqual(self.impl.exec_kv_prefill.call_args.args[0].shape[0], padded_tokens)
++                self.assertEqual(result.q_nope.shape, (num_tokens, 2, self.impl.qk_nope_head_dim))
++                self.assertEqual(result.q_pe.shape, (num_tokens, 2, self.impl.qk_rope_head_dim))
++                self.assertEqual(result.k_nope.shape, (num_tokens, 2, self.impl.qk_nope_head_dim))
++                self.assertEqual(result.value.shape, (num_tokens, 2, self.impl.v_head_dim))
++                torch.testing.assert_close(result.k_pe, torch.ones(num_tokens, 2, self.impl.qk_rope_head_dim))
++
+     @patch("vllm_ascend.attention.mla_v1.DeviceOperator.reshape_and_cache")
+     @patch("torch_npu.npu_interleave_rope")
+     @patch("torch_npu.npu_kv_rmsnorm_rope_cache")
+diff --git a/vllm_ascend/attention/mla_v1.py b/vllm_ascend/attention/mla_v1.py
+index 7eb0baca7..59dc062f4 100644
+--- a/vllm_ascend/attention/mla_v1.py
++++ b/vllm_ascend/attention/mla_v1.py
+@@ -2120,7 +2120,7 @@ class AscendMLAImpl(MLAAttentionImpl):
+             .view(-1, self.num_heads, self.qk_nope_head_dim + self.v_head_dim)
+             .split([self.qk_nope_head_dim, self.v_head_dim], dim=-1)
+         )
+-        prefill_k_pe = prefill_k_pe.view(prefill_q_c.shape[0], self.num_kv_heads, -1)
++        prefill_k_pe = prefill_k_pe.view(prefill_q_c.shape[0], self.num_kv_heads, self.qk_rope_head_dim)
+         prefill_k_pe = prefill_k_pe.expand((*prefill_k_nope.shape[:-1], -1))
+         return PrefillMLAPreprocessResult(prefill_q_nope, prefill_q_pe, prefill_k_nope, prefill_k_pe, prefill_value)
+ 

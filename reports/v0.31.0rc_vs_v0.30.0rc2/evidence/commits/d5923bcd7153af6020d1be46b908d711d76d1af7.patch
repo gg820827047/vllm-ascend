@@ -1,0 +1,186 @@
+commit d5923bcd7153af6020d1be46b908d711d76d1af7
+Author:     Yunxiao Ning <73625538+foraxe@users.noreply.github.com>
+AuthorDate: Thu Oct 22 16:12:26 2026 +0800
+Commit:     GitHub <noreply@github.com>
+CommitDate: Thu Oct 22 16:12:26 2026 +0800
+
+    [BugFix][KVPool] Fix segmented bulk KV transfers (#19273)
+    
+    ### What this PR does / why we need it?
+    
+    Follow up #19070: `prepare_value_layer` intersects a requested token
+    interval with each physical cache segment, but bulk `prepare_value`
+    still scales every segment's length by the fraction of the logical block
+    requested and ignores the token offset.
+    
+    For a logical block containing seven 128-token kernel blocks, a
+    one-token request should copy one token from the first K/V segment pair.
+    The current bulk planner instead copies a fraction from all seven pairs,
+    including unrelated tokens. Nonzero offsets also start at the wrong
+    address.
+    
+    Use the existing `group_cache_entry_segments` metadata to intersect the
+    requested interval with each segment, skip empty intersections, and
+    calculate byte offsets within the selected segments. Extend the existing
+    strided roundtrip tests to cover bulk mode alongside the layerwise path.
+    Full-block descriptors retain their existing layout.
+    
+    ### Does this PR introduce _any_ user-facing change?
+    
+    Yes. Partial bulk KV transfers restore the selected token interval
+    correctly for segmented/interleaved cache layouts. No new configuration
+    or dependency requirement is introduced. Release note included in this
+    PR.
+    
+    ### How was this patch tested?
+    
+    **CPU recheck after narrowing the PR (2026-10-22):**
+    
+    - Six affected modules: 387 tests and 132 subtests passed. Two existing
+    MLA fixture methods were deselected because the optional-vLLM mock
+    cannot construct AscendMLAAttentionSpec. The unfiltered run reports six
+    failing subtests in those methods; the same failures reproduce with the
+    base metadata.
+    - Loading the base metadata with the updated tests reproduces 21
+    additional bulk byte-roundtrip failures. The retained partial-segment
+    fix removes all 21.
+    - These checks use the repository's external dependency mocks and real
+    CPU PyTorch tensors. No new NPU or inference run was performed.
+    - PRE_COMMIT_NO_CONCURRENCY=1 bash format.sh ci passed, as did git diff
+    --check and release-note YAML parsing.
+    
+    **Earlier validation of the retained physical-segment fix (not rerun
+    here):**
+    
+    - Based on Ascend main `bbbf28c32d2992dda5d7b8650daf469e57ba7fe1`,
+    including #19070. The newly enabled 26 bulk regression cases produce
+    **21 failures / 5 passes before this fix**. With this fix, **371
+    affected unit cases pass**, covering pool-worker metadata,
+    segmented/coalesced layouts, hybrid caches, and layerwise/bulk byte
+    roundtrips.
+    
+      ```bash
+    pytest -q
+    tests/ut/distributed/ascend_store/{test_pool_worker,test_metadata,test_segmented_cache_transfer,test_coalesced_cache_transfer,test_layerwise_strided_roundtrip,test_mooncake_hybrid}.py
+      ```
+    
+    - **Actual A3 NPU / Mooncake 0.3.12 client and master:** compare the
+    original and fixed planners with real registered device buffers and
+    `batch_put_from_multi_buffers` / `batch_get_into_multi_buffers`. Seven
+    physical blocks per logical block, 128 tokens per physical block,
+    interleaved K/V with padding, BF16 and FP32, eight intervals including
+    one token, kernel boundaries, nonzero offsets, and the full 896-token
+    block. Check the entire destination backing allocation, including guards
+    and unselected tokens. Original: all 14 partial cases fail byte
+    equality; both full-block controls pass. Fixed: **16/16 pass**.
+    Unregister, close, and process exit also succeed.
+    - **Inference smoke on A3:** Qwen3.5-family quantized 27B checkpoint,
+    TP1, eager, MRV2, hybrid attention/Mamba, 896-token logical attention
+    blocks over 128-token kernel blocks, max length 8192, greedy seed 0.
+    Using a fresh matched Mooncake 0.3.12 master/client and only #19070 plus
+    this follow-up applied to Ascend release `7672a5b50` (vLLM `ced6857af`,
+    CANN 9.2.0, torch_npu 2.10.0.post7): **4/4 requests exactly match
+    standalone baseline output token IDs**. Local prefix cache is reset
+    before each request: local hit deltas are all zero, and three external
+    restores each hit 1792 tokens (5376 total). External cache remains
+    available. Two independent cold-salt requests also exactly match
+    baseline. This validates the selected runtime overlay, not a complete
+    latest-main model deployment.
+    - `PRE_COMMIT_NO_CONCURRENCY=1 bash format.sh ci` **passed**. No
+    throughput improvement is claimed; this is a correctness fix. Cross-node
+    transport and a complete model accuracy benchmark are outside this
+    validation.
+    
+    This patch and its tests were developed with AI assistance and validated
+    with the executions above.
+    
+    ---
+    
+    ### Checklist
+    
+    - [x] **Boundary / edge-case coverage:** empty, partial, complete,
+    offset and cross-segment intervals; padded and unpadded storage; BF16
+    and FP32.
+    - [x] **Regression test:** the new bulk parametrizations fail on the
+    base revision.
+    - [ ] **Error / failure path coverage:** no new exception or
+    transport-failure behavior is introduced.
+    - [x] **Meaningful & reliable tests:** assertions check actual restored
+    bytes and untouched storage.
+    - [ ] **Performance impact:** no performance claim or hardware
+    throughput benchmark.
+    
+    - vLLM main:
+    https://github.com/vllm-project/vllm/commit/a98247ab4db686ee03c66d5feb3c761e52a2f8ab
+    
+    ---------
+    
+    Signed-off-by: yunzhi <ningyunxiao.nyx@antgroup.com>
+
+diff --git a/release_notes/fragments/19273.yaml b/release_notes/fragments/19273.yaml
+new file mode 100644
+index 000000000..875a57bdb
+--- /dev/null
++++ b/release_notes/fragments/19273.yaml
+@@ -0,0 +1,4 @@
++pr: 19273
++entries:
++  - category: bugfix
++    text: Fixed partial bulk KV transfers restoring incorrect token ranges for segmented AscendStore cache layouts.
+diff --git a/tests/ut/distributed/ascend_store/test_layerwise_strided_roundtrip.py b/tests/ut/distributed/ascend_store/test_layerwise_strided_roundtrip.py
+index 1dcb0a909..a57302e1b 100644
+--- a/tests/ut/distributed/ascend_store/test_layerwise_strided_roundtrip.py
++++ b/tests/ut/distributed/ascend_store/test_layerwise_strided_roundtrip.py
+@@ -102,13 +102,15 @@ def test_5760_token_block_128_token_kernel_bf16(mode):
+ @pytest.mark.parametrize("count", [1, 2, 3, 5, 6])
+ @pytest.mark.parametrize("padding", [0, 3])
+ @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32])
+-def test_legacy_partial_block(count, padding, dtype):
+-    roundtrip("legacy", 3, padding, dtype, token_count=count)
++@pytest.mark.parametrize("mode", ["bulk", "legacy"])
++def test_partial_block(mode, count, padding, dtype):
++    roundtrip(mode, 3, padding, dtype, token_count=count)
+ 
+ 
+ @pytest.mark.parametrize("offset,count", [(1, 1), (1, 3), (2, 3), (3, 3), (5, 1), (0, 0)])
+-def test_legacy_token_interval(offset, count):
+-    roundtrip("legacy", 3, 3, torch.bfloat16, token_count=count, token_offset=offset)
++@pytest.mark.parametrize("mode", ["bulk", "legacy"])
++def test_token_interval(mode, offset, count):
++    roundtrip(mode, 3, 3, torch.bfloat16, token_count=count, token_offset=offset)
+ 
+ 
+ @pytest.mark.parametrize("mode", ["gva", "block_key", "legacy"])
+diff --git a/vllm_ascend/distributed/kv_transfer/kv_pool/ascend_store/metadata.py b/vllm_ascend/distributed/kv_transfer/kv_pool/ascend_store/metadata.py
+index b738b951b..0518d8432 100644
+--- a/vllm_ascend/distributed/kv_transfer/kv_pool/ascend_store/metadata.py
++++ b/vllm_ascend/distributed/kv_transfer/kv_pool/ascend_store/metadata.py
+@@ -506,13 +506,25 @@ class ChunkedTokenDatabase:
+         length = len(group_block_len)
+         if length == 0:
+             return addr_list, size_list, block_id
++        segments = self.group_cache_entry_segments.get(kv_cache_group_id)
++        block_start = start // group_block_size * group_block_size
++        start_in_block = start - block_start
++        end_in_block = end - block_start
+         for index, base_addr in enumerate(group_addrs):
++            segment_index, segment_count = segments[index] if segments else (0, 1)
++            segment_tokens = group_block_size // segment_count
++            segment_start = segment_index * segment_tokens
++            copy_start = max(start_in_block, segment_start)
++            copy_end = min(end_in_block, segment_start + segment_tokens)
++            if copy_start >= copy_end:
++                continue
+             block_len = group_block_len[index % length]
+             block_stride = group_block_stride[index % length] if group_block_stride else block_len
+-            addr = base_addr + block_id * block_stride
+-            size = int(block_len / group_block_size * (end - start))
++            byte_start = block_len * (copy_start - segment_start) // segment_tokens
++            byte_end = block_len * (copy_end - segment_start) // segment_tokens
++            addr = base_addr + block_id * block_stride + byte_start
+             addr_list.append(addr)
+-            size_list.append(size)
++            size_list.append(byte_end - byte_start)
+         return addr_list, size_list, block_id
+ 
+     def prepare_value_layer(self, start: int, end: int, block_ids: list[int], layer_id: int):

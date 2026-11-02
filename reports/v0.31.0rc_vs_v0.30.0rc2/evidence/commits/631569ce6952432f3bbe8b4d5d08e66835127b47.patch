@@ -1,0 +1,231 @@
+commit 631569ce6952432f3bbe8b4d5d08e66835127b47
+Author:     Karryking3 <38461630+Karryking3@users.noreply.github.com>
+AuthorDate: Thu Oct 15 23:44:59 2026 +0800
+Commit:     GitHub <noreply@github.com>
+CommitDate: Thu Oct 15 23:44:59 2026 +0800
+
+    [BugFix][MoE] Preserve quantized shared expert output gate (#18894)
+    
+    ### What this PR does / why we need it?
+    
+    Fused W4A8MXFP and W8A8/W4A8 shared-expert paths returned the Down
+    projection without applying the optional output gate. For models with an
+    `expert_gate`, this omitted `sigmoid(expert_gate(hidden_states))` and
+    changed the model output.
+    
+    Route the MXFP result through `part2` and share its output-gate
+    postprocessing with the fused INT path. Preserve the INT quantized
+    matmul and the existing multistream waits.
+    
+    ### Does this PR introduce _any_ user-facing change?
+    
+    Yes. Restores the shared-expert output gate for affected quantized
+    models. Shared experts without an output gate keep their existing
+    output.
+    
+    ### How was this patch tested?
+    
+    - Added `test_mxfp_shared_expert_preserves_output_gate` for gated and
+    ungated MXFP execution and quantized tuple forwarding.
+    - Added `test_int_shared_expert_preserves_output_gate` with 24
+    combinations covering W8A8/W4A8, absent/None/present gates, SwiGLU/SiTU,
+    and multistream enabled/disabled. Checks BF16 output values, gate calls,
+    quantized matmul arguments, and stage waits.
+    - Python syntax checks, `git diff --check`, `ruff-check`, and
+    `ruff-format` passed.
+    - `bash format.sh ci` was run: all checks except Gitleaks and shellcheck
+    passed. Those checks are blocked by missing local `gitleaks`/`wget` and
+    `shellcheck`.
+    - Repository pytest and NPU tests have not been run locally; CI/NPU
+    validation is still required.
+    
+    - vLLM main:
+    https://github.com/vllm-project/vllm/commit/c4df37dfcc7f72ca41cd43801a468526ecf99a2b
+    
+    ---------
+    
+    Signed-off-by: Erkong <Erkong@noreply.gitcode.com>
+    Co-authored-by: Erkong <Erkong@noreply.gitcode.com>
+
+diff --git a/tests/ut/ops/test_fused_moe.py b/tests/ut/ops/test_fused_moe.py
+index 772a7eacb..27995a0db 100644
+--- a/tests/ut/ops/test_fused_moe.py
++++ b/tests/ut/ops/test_fused_moe.py
+@@ -1195,6 +1195,125 @@ def test_shared_expert_mlp_path_preserves_quant_and_lora_semantics(
+     assert shared_experts._select_mlp_path() is expected_path
+ 
+ 
++@pytest.mark.parametrize("has_expert_gate", [False, True])
++def test_mxfp_shared_expert_preserves_output_gate(monkeypatch, has_expert_gate):
++    shared_experts = AscendSharedExperts.__new__(AscendSharedExperts)
++    shared_experts.multistream_overlap = False
++    shared_experts.situ_activation = None
++    shared_experts.swiglu_limit = None
++    hidden_states = torch.tensor([[1.0, -1.0], [2.0, 1.0]])
++    down_output = torch.tensor([[2.0, 4.0], [6.0, 8.0]])
++    gate_weight = torch.tensor([[1.0, 2.0]])
++    expert_gate = MagicMock(side_effect=lambda x: (F.linear(x, gate_weight), None))
++    shared_experts.layer = SimpleNamespace(down_proj=MagicMock(return_value=(down_output, None)))
++    if has_expert_gate:
++        shared_experts.layer.expert_gate = expert_gate
++    quantized_x = torch.ones(2, 2)
++    scale = torch.ones(2, 1)
++    monkeypatch.setattr(
++        shared_experts_module.torch.ops._C_ascend,
++        "npu_swiglu_group_quant",
++        MagicMock(return_value=(quantized_x, scale, None)),
++        raising=False,
++    )
++    submitted = SubmittedSharedExpertGateUp(
++        hidden_states=hidden_states,
++        gate_up=torch.ones(2, 4),
++        gate_up_input_scale=None,
++        local_dp_metadata=None,
++        path=SharedExpertMLPPath.A8_MXFP_FUSED,
++    )
++
++    result = shared_experts._run_a8_mxfp_mlp(submitted, RoutedMoEMilestones())
++
++    expected = down_output
++    if has_expert_gate:
++        expected = down_output * torch.sigmoid(F.linear(hidden_states, gate_weight))
++        expert_gate.assert_called_once_with(hidden_states)
++    else:
++        expert_gate.assert_not_called()
++    torch.testing.assert_close(result, expected)
++    shared_experts.layer.down_proj.assert_called_once_with((quantized_x, scale))
++
++
++@pytest.mark.parametrize("quant_type", [QuantType.W8A8, QuantType.W4A8])
++@pytest.mark.parametrize("gate_mode", ["absent", "none", "present"])
++@pytest.mark.parametrize("use_situ", [False, True])
++@pytest.mark.parametrize("multistream_overlap", [False, True])
++def test_int_shared_expert_preserves_output_gate(monkeypatch, quant_type, gate_mode, use_situ, multistream_overlap):
++    shared_experts = AscendSharedExperts.__new__(AscendSharedExperts)
++    shared_experts.multistream_overlap = multistream_overlap
++    shared_experts.situ_activation = SimpleNamespace(beta=4.0, linear_beta=25.0) if use_situ else None
++    shared_experts.swiglu_limit = 0.0
++    shared_experts.quant_type = quant_type
++    shared_experts.lora_context = None
++    hidden_states = torch.tensor([[1.0, -1.0], [2.0, 1.0]], dtype=torch.bfloat16)
++    down_output = torch.tensor([[2.0, 4.0], [6.0, 8.0]], dtype=hidden_states.dtype)
++    gate_weight = torch.tensor([[1.0, 2.0]], dtype=hidden_states.dtype)
++    expert_gate = MagicMock(side_effect=lambda x: (F.linear(x, gate_weight), None))
++    shared_experts.layer = SimpleNamespace(
++        gate_up_proj=SimpleNamespace(weight_scale=torch.ones(4), weight_scale_fp32=torch.ones(4)),
++        down_proj=SimpleNamespace(weight=torch.ones(2, 2, dtype=torch.int8), weight_scale=torch.ones(2)),
++    )
++    if gate_mode != "absent":
++        shared_experts.layer.expert_gate = expert_gate if gate_mode == "present" else None
++    quantized_x = torch.ones(2, 2, dtype=torch.int8)
++    scale = torch.ones(2)
++    activation = MagicMock(return_value=(quantized_x, scale))
++    down_matmul = MagicMock(return_value=down_output)
++    current_stream = MagicMock()
++    monkeypatch.setattr(shared_experts_module, "has_lora", lambda _: False)
++    monkeypatch.setattr(
++        shared_experts_module, "get_current_hardware_profile", lambda: SimpleNamespace(supports=lambda _: False)
++    )
++    monkeypatch.setattr(shared_experts_module.torch_npu, "npu_quant_matmul", down_matmul, raising=False)
++    monkeypatch.setattr(shared_experts_module.torch.npu, "current_stream", lambda: current_stream)
++    monkeypatch.setattr(
++        shared_experts_module.torch.ops,
++        "_C_ascend",
++        SimpleNamespace(dequant_situ_quant=activation, npu_dequant_swiglu_quant=activation),
++    )
++    path = shared_experts._select_mlp_path()
++    assert path is SharedExpertMLPPath.A8_INT_FUSED
++    submitted = SubmittedSharedExpertGateUp(
++        hidden_states=hidden_states,
++        gate_up=torch.ones(2, 4, dtype=torch.int32),
++        gate_up_input_scale=torch.ones(2),
++        local_dp_metadata=None,
++        path=path,
++    )
++    milestones = RoutedMoEMilestones(
++        shared_activation_overlap_start=MagicMock(),
++        routed_combine_start=MagicMock(),
++    )
++
++    result = shared_experts._finish_shared_mlp(submitted, milestones)
++
++    expected = down_output
++    if gate_mode == "present":
++        expected = down_output * torch.sigmoid(F.linear(hidden_states, gate_weight))
++        expert_gate.assert_called_once_with(hidden_states)
++    else:
++        expert_gate.assert_not_called()
++        assert result is down_output
++    torch.testing.assert_close(result, expected)
++    activation.assert_called_once()
++    down_matmul.assert_called_once_with(
++        quantized_x,
++        shared_experts.layer.down_proj.weight,
++        shared_experts.layer.down_proj.weight_scale,
++        pertoken_scale=scale,
++        bias=None,
++        output_dtype=hidden_states.dtype,
++    )
++    expected_waits = (
++        [call(milestones.shared_activation_overlap_start), call(milestones.routed_combine_start)]
++        if multistream_overlap
++        else []
++    )
++    assert current_stream.wait_event.call_args_list == expected_waits
++
++
+ def test_multistream_missing_required_milestone_fails_fast():
+     shared_experts = AscendSharedExperts.__new__(AscendSharedExperts)
+     shared_experts.multistream_overlap = True
+diff --git a/tests/ut/ops/test_shared_mxfp_activation.py b/tests/ut/ops/test_shared_mxfp_activation.py
+index d28b02bf2..6f2711339 100644
+--- a/tests/ut/ops/test_shared_mxfp_activation.py
++++ b/tests/ut/ops/test_shared_mxfp_activation.py
+@@ -27,6 +27,7 @@ class TestSharedMXFPActivation(unittest.TestCase):
+         paths = next(n for n in tree.body if isinstance(n, ast.ClassDef) and n.name == "SharedExpertMLPPath")
+         cls = next(n for n in tree.body if isinstance(n, ast.ClassDef) and n.name == "AscendSharedExperts")
+         names = {
++            "_apply_output_gate",
+             "_can_fuse_w8a8_mxfp_activation",
+             "_prepare_w8a8_mxfp_down_input",
+             "_prepare_gate_up_input",
+diff --git a/vllm_ascend/ops/fused_moe/shared_experts.py b/vllm_ascend/ops/fused_moe/shared_experts.py
+index 11309e8c0..28b114259 100644
+--- a/vllm_ascend/ops/fused_moe/shared_experts.py
++++ b/vllm_ascend/ops/fused_moe/shared_experts.py
+@@ -207,7 +207,9 @@ class AscendSharedExperts:
+         down_input: LinearInput,
+     ):
+         shared_out, _ = self.layer.down_proj(down_input)  # type: ignore
++        return self._apply_output_gate(hidden_states, shared_out)
+ 
++    def _apply_output_gate(self, hidden_states: torch.Tensor, shared_out: torch.Tensor) -> torch.Tensor:
+         # Qwen3-Next specific gating mechanism
+         if hasattr(self.layer, "expert_gate") and self.layer.expert_gate is not None:
+             gate_out, _ = self.layer.expert_gate(hidden_states)  # type: ignore
+@@ -566,7 +568,7 @@ class AscendSharedExperts:
+             milestones.routed_combine_start,
+             "routed_combine_start",
+         )
+-        return torch_npu.npu_quant_matmul(
++        shared_out = torch_npu.npu_quant_matmul(
+             quantized_x,
+             self.layer.down_proj.weight,
+             self.layer.down_proj.weight_scale,
+@@ -574,6 +576,7 @@ class AscendSharedExperts:
+             bias=None,
+             output_dtype=submitted_gate_up.hidden_states.dtype,
+         )
++        return self._apply_output_gate(submitted_gate_up.hidden_states, shared_out)
+ 
+     def _run_a8_mxfp_mlp(
+         self,
+@@ -614,7 +617,7 @@ class AscendSharedExperts:
+             milestones.routed_combine_start,
+             "routed_combine_start",
+         )
+-        return self.layer.down_proj((quantized_x, swiglu_out_scale))[0]
++        return self.part2(submitted_gate_up.hidden_states, (quantized_x, swiglu_out_scale))
+ 
+     def _can_fuse_w8a8_mxfp_activation(self, gate_up: torch.Tensor) -> bool:
+         if self.quant_type != QuantType.W8A8MXFP or has_lora(self.lora_context):

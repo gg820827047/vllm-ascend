@@ -1,0 +1,1039 @@
+commit 4a736054fa2260d0a28df3bacc081a82cae532fc
+Author:     meng <92282390+czydyy@users.noreply.github.com>
+AuthorDate: Wed Oct 14 16:48:41 2026 +0800
+Commit:     GitHub <noreply@github.com>
+CommitDate: Wed Oct 14 16:48:41 2026 +0800
+
+    [CI] Add requested file and directory downloads to nightly runs (#18368)
+    
+    ### What this PR does / why we need it?
+    
+    Add `--download` to PR-triggered and manually dispatched nightly runs so
+    a requested file or directory can be downloaded as a GitHub Actions
+    artifact. Accept absolute paths, paths relative to the test repository,
+    and per-node mappings such as
+    `[{"node0":"/path/a"},{"node1":"/path/b"}]`.
+    
+    Single-node jobs archive the requested path after the test. For
+    multi-node jobs, CI archives requested paths once after the test
+    finishes and before deleting the Pods. An exit trap and Kubernetes
+    preStop hook cover Pods that exit earlier. Normal Pod deletion keeps the
+    original grace period, so downloading small files does not add a fixed
+    10-minute wait. Collection and upload errors do not change the test
+    result. Common credential paths and files are excluded.
+    
+    ### Does this PR introduce _any_ user-facing change?
+    
+    Yes. `/nightly` and nightly workflow dispatch accept an optional
+    `--download` request, and successful collections appear as downloadable
+    workflow artifacts.
+    
+    ### How was this patch tested?
+    
+    - Parsed the modified workflow YAML.
+    - Ran `bash -n` on `run.sh` and `download_archive.sh`.
+    - Verified that archiving a directory does not include the output
+    archive itself.
+    - Ran `git diff --check`.
+    - The Kubernetes Pod lifecycle and artifact upload still require CI
+    validation; no NPU or Kubernetes environment was available locally.
+    
+    - vLLM main:
+    https://github.com/vllm-project/vllm/commit/c4df37dfcc7f72ca41cd43801a468526ecf99a2b
+    
+    ---------
+    
+    Signed-off-by: chenzeyu <2978509328@qq.com>
+
+diff --git a/.github/workflows/_e2e_nightly_multi_node.yaml b/.github/workflows/_e2e_nightly_multi_node.yaml
+index 3c3defbad..739c5bc5f 100644
+--- a/.github/workflows/_e2e_nightly_multi_node.yaml
++++ b/.github/workflows/_e2e_nightly_multi_node.yaml
+@@ -73,6 +73,11 @@ on:
+         type: string
+         default: ''
+         description: non-empty when triggered by PR /nightly command
++      download_path:
++        required: false
++        type: string
++        default: ''
++        description: test container file or directory to upload as a GitHub artifact
+       testcase_timeout:
+         required: false
+         default: 120
+@@ -210,7 +215,9 @@ jobs:
+       - name: Prepare scripts
+         run: |
+           install -D tests/e2e/common/multi_node/run.sh /root/.cache/tests/run.sh
++          install -D tests/e2e/common/multi_node/download_archive.sh /root/.cache/tests/download_archive.sh
+           install -D tests/e2e/nightly/scripts/bisect_args.sh /root/.cache/tests/bisect_args.sh
++          install -D .github/workflows/scripts/collect_download.py /root/.cache/tests/collect_download.py
+ 
+       - name: Clear resources
+         run: |
+@@ -254,10 +261,14 @@ jobs:
+           BISECT_FORCE_INITIAL_BUILD: ${{ inputs.bisect_force_initial_build }}
+           BISECT_CONFIG_BASE_PATH: ${{ inputs.bisect_config_base_path }}
+           OPENLIBING_SECRET: ${{ secrets.OPENLIBING_SECRET }}
++          DOWNLOAD_SPEC: ${{ inputs.download_path }}
+         run: |
+           set -euo pipefail
+ 
+           size="${{ inputs.size }}"
++          if [ -n "$DOWNLOAD_SPEC" ]; then
++            python3 .github/workflows/scripts/collect_download.py "$DOWNLOAD_SPEC" --list --node-count "$size" > /dev/null
++          fi
+           replicas="${{ inputs.replicas }}"
+           image="${{ inputs.image }}"
+           config_file_path="${{ inputs.config_file_path }}"
+@@ -286,6 +297,7 @@ jobs:
+           jinja2 tests/e2e/common/multi_node/lws.yaml.jinja2 \
+             -D lws_name="$LWS_NAME" \
+             -D log_prefix="$LOG_PREFIX" \
++            -D download_spec="$DOWNLOAD_SPEC" \
+             -D size="$size" \
+             -D replicas="$replicas" \
+             -D image="$image" \
+@@ -593,12 +605,35 @@ jobs:
+ 
+       - name: Post process
+         if: always()
++        env:
++          DOWNLOAD_PATH: ${{ inputs.download_path }}
+         run: |
++          # Archive once after the test finishes, before deleting running pods.
++          # The exit trap covers pods that exit earlier.
++          if [ -n "$DOWNLOAD_PATH" ]; then
++            while IFS=$'\t' read -r node requested_path; do
++              index="${node#node}"
++              if [ "$index" -eq 0 ]; then
++                pod="${LWS_NAME}-0"
++                container=vllm-leader
++              else
++                pod="${LWS_NAME}-0-${index}"
++                container=vllm-worker
++              fi
++              echo "Archiving requested path from $pod: $requested_path"
++              if ! kubectl exec "$pod" -c "$container" -n "$NAMESPACE" -- \
++                  /bin/bash /root/.cache/tests/download_archive.sh --strict; then
++                echo "::warning::Could not archive $requested_path from $pod before deletion"
++              fi
++            done < <(python3 .github/workflows/scripts/collect_download.py \
++              "$DOWNLOAD_PATH" --list --node-count ${{ inputs.size }})
++          fi
++
+           echo "Current pod status:"
+           kubectl get pods -n "$NAMESPACE" --ignore-not-found=true
+ 
+           echo "Deleting resources for [$LWS_NAME]..."
+-          kubectl delete -f ./lws.yaml --ignore-not-found=true || true
++          kubectl delete -f ./lws.yaml --ignore-not-found=true --wait=false || true
+ 
+           echo "Waiting for pods of [$LWS_NAME] to fully terminate..."
+           TIMEOUT=300
+@@ -621,6 +656,70 @@ jobs:
+             sleep $SLEEP_INTERVAL
+           done
+ 
++      - name: Collect requested paths from test pods
++        if: ${{ always() && inputs.download_path != '' }}
++        id: collect_download
++        continue-on-error: true
++        env:
++          DOWNLOAD_PATH: ${{ inputs.download_path }}
++          ARTIFACT_LABEL: ${{ inputs.vllm_ascend_branch }}-${{ inputs.name || inputs.config_file_path }}
++        run: |
++          python3 .github/workflows/scripts/collect_download.py "$DOWNLOAD_PATH" --list --node-count ${{ inputs.size }} > /tmp/download-paths.tsv
++          mkdir -p /tmp/download-artifact
++          for attempt in $(seq 1 12); do
++            pending=0
++            while IFS=$'\t' read -r NODE REQUESTED_PATH; do
++              [ -f "${LOG_PREFIX}/${NODE}_download.tar.gz" ] && continue
++              index="${NODE#node}"
++              if [ "$index" -eq 0 ]; then
++                pod="${LWS_NAME}-0"
++              else
++                pod="${LWS_NAME}-0-${index}"
++              fi
++              phase=$(kubectl get pod "$pod" -n "$NAMESPACE" -o jsonpath='{.status.phase}' 2>/dev/null || true)
++              if [ "$phase" = "Running" ] || [ "$phase" = "Pending" ]; then
++                pending=1
++              fi
++            done < /tmp/download-paths.tsv
++            [ "$pending" -eq 0 ] && break
++            echo "Waiting for requested archives (attempt $attempt/12)"
++            sleep 5
++          done
++          copied=0
++          while IFS=$'\t' read -r NODE REQUESTED_PATH; do
++            source_archive="${LOG_PREFIX}/${NODE}_download.tar.gz"
++            if [ -f "$source_archive" ]; then
++              cp "$source_archive" "/tmp/download-artifact/${NODE}.tar.gz"
++              echo "Collected ${NODE}: ${REQUESTED_PATH} -> ${NODE}.tar.gz ($(wc -c < "$source_archive") bytes)"
++              copied=$((copied + 1))
++            else
++              echo "::warning::No archive from ${NODE} for ${REQUESTED_PATH}"
++            fi
++          done < /tmp/download-paths.tsv
++          if [ "$copied" -eq 0 ]; then
++            echo "::warning::No requested paths were archived by test pods"
++            exit 1
++          fi
++          safe_label=$(printf '%s' "$ARTIFACT_LABEL" | tr -c 'A-Za-z0-9_.-' '-' | cut -c1-100)
++          echo "name=nightly-download-${safe_label}" >> "$GITHUB_OUTPUT"
++
++      - name: Upload requested paths
++        if: ${{ always() && steps.collect_download.outcome == 'success' }}
++        id: upload_download
++        continue-on-error: true
++        uses: actions/upload-artifact@v7
++        with:
++          name: ${{ steps.collect_download.outputs.name }}
++          path: /tmp/download-artifact/
++          if-no-files-found: error
++          retention-days: 7
++          compression-level: 0
++
++      - name: Remove uploaded archives from shared storage
++        if: ${{ always() && steps.upload_download.outcome == 'success' }}
++        continue-on-error: true
++        run: rm -f "${LOG_PREFIX}"/node*_download.tar.gz
++
+       - name: Collect Ascend logs
+         if: always()
+         run: |
+diff --git a/.github/workflows/_e2e_nightly_single_node.yaml b/.github/workflows/_e2e_nightly_single_node.yaml
+index e5a1a21e4..1586608cc 100644
+--- a/.github/workflows/_e2e_nightly_single_node.yaml
++++ b/.github/workflows/_e2e_nightly_single_node.yaml
+@@ -63,6 +63,11 @@ on:
+         type: string
+         default: ''
+         description: non-empty when triggered by PR /nightly command
++      download_path:
++        required: false
++        type: string
++        default: ''
++        description: test container file or directory to upload as a GitHub artifact
+       vllm_ascend_ref:
+         required: false
+         type: string
+@@ -506,3 +511,26 @@ jobs:
+           if-no-files-found: warn
+           retention-days: 90
+           compression-level: 0
++
++      - name: Collect requested path
++        if: ${{ always() && inputs.download_path != '' }}
++        id: collect_download
++        continue-on-error: true
++        env:
++          DOWNLOAD_PATH: ${{ inputs.download_path }}
++          ARTIFACT_LABEL: ${{ inputs.vllm_ascend_branch || '' }}-${{ inputs.name || inputs.config_file_path || inputs.tests }}
++        run: |
++          python3 /vllm-workspace/vllm-ascend/.github/workflows/scripts/collect_download.py "$DOWNLOAD_PATH" /tmp/download-artifact.tar.gz
++          safe_label=$(printf '%s' "$ARTIFACT_LABEL" | tr -c 'A-Za-z0-9_.-' '-' | cut -c1-100)
++          echo "name=nightly-download-${safe_label}" >> "$GITHUB_OUTPUT"
++
++      - name: Upload requested path
++        if: ${{ always() && steps.collect_download.outcome == 'success' }}
++        continue-on-error: true
++        uses: actions/upload-artifact@v7
++        with:
++          name: ${{ steps.collect_download.outputs.name }}
++          path: /tmp/download-artifact.tar.gz
++          if-no-files-found: error
++          retention-days: 7
++          compression-level: 0
+diff --git a/.github/workflows/_e2e_nightly_single_node_560t.yaml b/.github/workflows/_e2e_nightly_single_node_560t.yaml
+index 800cf66e6..dc17ef833 100644
+--- a/.github/workflows/_e2e_nightly_single_node_560t.yaml
++++ b/.github/workflows/_e2e_nightly_single_node_560t.yaml
+@@ -63,6 +63,11 @@ on:
+         type: string
+         default: ''
+         description: non-empty when triggered by PR /nightly command
++      download_path:
++        required: false
++        type: string
++        default: ''
++        description: test container file or directory to upload as a GitHub artifact
+       vllm_ascend_ref:
+         required: false
+         type: string
+@@ -487,3 +492,26 @@ jobs:
+           if-no-files-found: warn
+           retention-days: 90
+           compression-level: 0
++
++      - name: Collect requested path
++        if: ${{ always() && inputs.download_path != '' }}
++        id: collect_download
++        continue-on-error: true
++        env:
++          DOWNLOAD_PATH: ${{ inputs.download_path }}
++          ARTIFACT_LABEL: ${{ inputs.vllm_ascend_branch || '' }}-${{ inputs.name || inputs.config_file_path || inputs.tests }}
++        run: |
++          python3 /vllm-workspace/vllm-ascend/.github/workflows/scripts/collect_download.py "$DOWNLOAD_PATH" /tmp/download-artifact.tar.gz
++          safe_label=$(printf '%s' "$ARTIFACT_LABEL" | tr -c 'A-Za-z0-9_.-' '-' | cut -c1-100)
++          echo "name=nightly-download-${safe_label}" >> "$GITHUB_OUTPUT"
++
++      - name: Upload requested path
++        if: ${{ always() && steps.collect_download.outcome == 'success' }}
++        continue-on-error: true
++        uses: actions/upload-artifact@v7
++        with:
++          name: ${{ steps.collect_download.outputs.name }}
++          path: /tmp/download-artifact.tar.gz
++          if-no-files-found: error
++          retention-days: 7
++          compression-level: 0
+diff --git a/.github/workflows/_e2e_nightly_single_node_models.yaml b/.github/workflows/_e2e_nightly_single_node_models.yaml
+index 8090e6597..eb0444f71 100644
+--- a/.github/workflows/_e2e_nightly_single_node_models.yaml
++++ b/.github/workflows/_e2e_nightly_single_node_models.yaml
+@@ -48,6 +48,11 @@ on:
+         type: string
+         default: ''
+         description: non-empty when triggered by PR /nightly command
++      download_path:
++        required: false
++        type: string
++        default: ''
++        description: test container file or directory to upload as a GitHub artifact
+       vllm_ascend_ref:
+         required: false
+         type: string
+@@ -308,3 +313,28 @@ jobs:
+           if-no-files-found: warn
+           retention-days: 90
+           overwrite: true
++
++      - name: Collect requested path
++        if: ${{ always() && inputs.download_path != '' }}
++        id: collect_download
++        continue-on-error: true
++        env:
++          DOWNLOAD_PATH: ${{ inputs.download_path }}
++          ARTIFACT_LABEL: ${{ inputs.model_list }}
++          IMAGE_LABEL: ${{ inputs.image }}
++        run: |
++          python3 /vllm-workspace/vllm-ascend/.github/workflows/scripts/collect_download.py "$DOWNLOAD_PATH" /tmp/download-artifact.tar.gz
++          safe_label=$(printf '%s' "$ARTIFACT_LABEL" | tr -c 'A-Za-z0-9_.-' '-' | cut -c1-60)
++          label_hash=$(printf '%s\n%s' "$ARTIFACT_LABEL" "$IMAGE_LABEL" | sha256sum | cut -c1-12)
++          echo "name=nightly-download-${safe_label}-${label_hash}" >> "$GITHUB_OUTPUT"
++
++      - name: Upload requested path
++        if: ${{ always() && steps.collect_download.outcome == 'success' }}
++        continue-on-error: true
++        uses: actions/upload-artifact@v7
++        with:
++          name: ${{ steps.collect_download.outputs.name }}
++          path: /tmp/download-artifact.tar.gz
++          if-no-files-found: error
++          retention-days: 7
++          compression-level: 0
+diff --git a/.github/workflows/pr_nightly_command.yml b/.github/workflows/pr_nightly_command.yml
+index d7792dcd0..9cbb9a027 100644
+--- a/.github/workflows/pr_nightly_command.yml
++++ b/.github/workflows/pr_nightly_command.yml
+@@ -51,6 +51,7 @@ jobs:
+       bisect_args_json: ${{ steps.resolve.outputs.bisect_args_json }}
+       command: ${{ steps.resolve.outputs.command }}
+       pr_number: ${{ steps.resolve.outputs.pr_number }}
++      download_path: ${{ steps.resolve.outputs.download_path }}
+       blocked: ${{ steps.block_window.outputs.blocked }}
+     steps:
+       - name: Install system dependencies
+@@ -68,6 +69,7 @@ jobs:
+           token: ${{ secrets.PAT_TOKEN }}
+           sparse-checkout: |
+             .github/workflows/scripts/resolve_nightly_tests.py
++            .github/workflows/scripts/collect_download.py
+             .github/workflows/configs/nightly_config.yaml
+             .github/workflows/configs/weekly_config.yaml
+           sparse-checkout-cone-mode: false
+@@ -225,6 +227,8 @@ jobs:
+           AOP_ENABLED="false"
+           IS_A3_560T="false"
+           NEXT_IS_BRANCH=0
++          NEXT_IS_DOWNLOAD=0
++          DOWNLOAD_PATH=""
+           NEXT_IS_GOOD_COMMIT=0
+           NEXT_IS_BAD_COMMIT=0
+           NEXT_IS_FAIL_CONFIRM_RETRIES=0
+@@ -261,6 +265,9 @@ jobs:
+             if [ "$NEXT_IS_BRANCH" = "1" ]; then
+               BRANCH="$WORD"
+               NEXT_IS_BRANCH=0
++            elif [ "$NEXT_IS_DOWNLOAD" = "1" ]; then
++              DOWNLOAD_PATH="$WORD"
++              NEXT_IS_DOWNLOAD=0
+             elif [ "$NEXT_IS_GOOD_COMMIT" = "1" ]; then
+               BISECT_GOOD_COMMIT="$WORD"
+               NEXT_IS_GOOD_COMMIT=0
+@@ -283,6 +290,8 @@ jobs:
+               PENDING_OPTION=""
+             elif [ "$WORD" = "--branch" ]; then
+               NEXT_IS_BRANCH=1
++            elif [ "$WORD" = "--log-path" ]; then
++              NEXT_IS_DOWNLOAD=1
+             elif [ "$WORD" = "--aop_enabled" ]; then
+               if [ -z "$TEST_CASES" ]; then
+                 echo "ERROR: --aop_enabled must appear after at least one test case"
+@@ -328,6 +337,13 @@ jobs:
+             echo "ERROR: $PENDING_OPTION requires a value"
+             exit 1
+           fi
++          if [ "$NEXT_IS_DOWNLOAD" = "1" ]; then
++            echo "ERROR: --log-path requires a value"
++            exit 1
++          fi
++          if [ -n "$DOWNLOAD_PATH" ]; then
++            python3 .github/workflows/scripts/collect_download.py "$DOWNLOAD_PATH" --list >/dev/null
++          fi
+ 
+           if [ -n "$BISECT_GOOD_COMMIT" ] &&
+              ! [[ "$BISECT_GOOD_COMMIT" =~ ^[0-9a-fA-F]{7,40}$ ]]; then
+@@ -371,10 +387,10 @@ jobs:
+             "$BISECT_NO_VERIFY_GOOD" \
+             "$BISECT_NO_VERIFY_BAD" \
+             "$BISECT_FORCE_INITIAL_BUILD"
+-
+           {
+             echo "test_cases=$TEST_CASES"
+             echo "branch=$BRANCH"
++            echo "download_path=$DOWNLOAD_PATH"
+             echo "aop_enabled=$AOP_ENABLED"
+             echo "bisect_good_commit=$BISECT_GOOD_COMMIT"
+             echo "bisect_bad_commit=$BISECT_BAD_COMMIT"
+@@ -452,6 +468,7 @@ jobs:
+         env:
+           GH_TOKEN: ${{ secrets.PAT_TOKEN }}
+           BISECT_ARGS_JSON: ${{ needs.authorize.outputs.bisect_args_json }}
++          DOWNLOAD_PATH: ${{ needs.authorize.outputs.download_path }}
+         run: |
+           REPO='${{ github.event.client_payload.github.payload.repository.full_name }}'
+           gh workflow run schedule_nightly_test_a2.yaml \
+@@ -463,6 +480,7 @@ jobs:
+             -f skip_build_image=true \
+             -f vllm_ascend_ref='${{ needs.authorize.outputs.vllm_ascend_ref }}' \
+             -f aop_enabled='${{ needs.authorize.outputs.aop_enabled }}' \
++            -f download_path="$DOWNLOAD_PATH" \
+             -f bisect_args_json="$BISECT_ARGS_JSON"
+           sleep 8
+           A2_RUN_ID=$(gh api "repos/$REPO/actions/workflows/schedule_nightly_test_a2.yaml/runs?per_page=1" \
+@@ -494,6 +512,7 @@ jobs:
+         env:
+           GH_TOKEN: ${{ secrets.PAT_TOKEN }}
+           BISECT_ARGS_JSON: ${{ needs.authorize.outputs.bisect_args_json }}
++          DOWNLOAD_PATH: ${{ needs.authorize.outputs.download_path }}
+         run: |
+           REPO='${{ github.event.client_payload.github.payload.repository.full_name }}'
+           gh workflow run schedule_nightly_test_a3.yaml \
+@@ -505,6 +524,7 @@ jobs:
+             -f skip_build_image=true \
+             -f vllm_ascend_ref='${{ needs.authorize.outputs.vllm_ascend_ref }}' \
+             -f aop_enabled='${{ needs.authorize.outputs.aop_enabled }}' \
++            -f download_path="$DOWNLOAD_PATH" \
+             -f bisect_args_json="$BISECT_ARGS_JSON"
+           sleep 8
+           A3_RUN_ID=$(gh api "repos/$REPO/actions/workflows/schedule_nightly_test_a3.yaml/runs?per_page=1" \
+@@ -536,6 +556,7 @@ jobs:
+         env:
+           GH_TOKEN: ${{ secrets.PAT_TOKEN }}
+           BISECT_ARGS_JSON: ${{ needs.authorize.outputs.bisect_args_json }}
++          DOWNLOAD_PATH: ${{ needs.authorize.outputs.download_path }}
+         run: |
+           REPO='${{ github.event.client_payload.github.payload.repository.full_name }}'
+           gh workflow run schedule_nightly_test_a3_560t.yaml \
+@@ -547,6 +568,7 @@ jobs:
+             -f skip_build_image=true \
+             -f vllm_ascend_ref='${{ needs.authorize.outputs.vllm_ascend_ref }}' \
+             -f aop_enabled='${{ needs.authorize.outputs.aop_enabled }}' \
++            -f download_path="$DOWNLOAD_PATH" \
+             -f bisect_args_json="$BISECT_ARGS_JSON"
+           sleep 8
+           A3_560T_RUN_ID=$(gh api "repos/$REPO/actions/workflows/schedule_nightly_test_a3_560t.yaml/runs?per_page=1" \
+@@ -577,6 +599,8 @@ jobs:
+         id: dispatch_a5
+         env:
+           GH_TOKEN: ${{ secrets.PAT_TOKEN }}
++          BISECT_ARGS_JSON: ${{ needs.authorize.outputs.bisect_args_json }}
++          DOWNLOAD_PATH: ${{ needs.authorize.outputs.download_path }}
+         run: |
+           REPO='${{ github.event.client_payload.github.payload.repository.full_name }}'
+           gh workflow run schedule_nightly_test_a5.yaml \
+@@ -587,7 +611,9 @@ jobs:
+             -f request_id='${{ needs.authorize.outputs.pr_number }}' \
+             -f skip_build_image=true \
+             -f vllm_ascend_ref='${{ needs.authorize.outputs.vllm_ascend_ref }}' \
+-            -f aop_enabled='${{ needs.authorize.outputs.aop_enabled }}'
++            -f aop_enabled='${{ needs.authorize.outputs.aop_enabled }}' \
++            -f download_path="$DOWNLOAD_PATH" \
++            -f bisect_args_json="$BISECT_ARGS_JSON"
+           sleep 8
+           A5_RUN_ID=$(gh api "repos/$REPO/actions/workflows/schedule_nightly_test_a5.yaml/runs?per_page=1" \
+             --jq '.workflow_runs[0].id')
+@@ -617,6 +643,7 @@ jobs:
+         id: dispatch_310p
+         env:
+           GH_TOKEN: ${{ secrets.PAT_TOKEN }}
++          DOWNLOAD_PATH: ${{ needs.authorize.outputs.download_path }}
+         run: |
+           REPO='${{ github.event.client_payload.github.payload.repository.full_name }}'
+           gh workflow run schedule_nightly_test_310p.yaml \
+@@ -625,6 +652,7 @@ jobs:
+             -f test_cases='${{ needs.authorize.outputs.test_cases }}' \
+             -f vllm_ascend_branch='${{ needs.authorize.outputs.branch }}' \
+             -f request_id='${{ needs.authorize.outputs.pr_number }}' \
++            -f download_path="$DOWNLOAD_PATH" \
+             -f skip_build_image=true \
+             -f vllm_ascend_ref='${{ needs.authorize.outputs.vllm_ascend_ref }}' \
+             -f aop_enabled='${{ needs.authorize.outputs.aop_enabled }}'
+diff --git a/.github/workflows/schedule_nightly_test_310p.yaml b/.github/workflows/schedule_nightly_test_310p.yaml
+index 58c3723cc..2e798f24c 100644
+--- a/.github/workflows/schedule_nightly_test_310p.yaml
++++ b/.github/workflows/schedule_nightly_test_310p.yaml
+@@ -38,6 +38,11 @@ on:
+         required: false
+         default: ''
+         type: string
++      download_path:
++        description: 'File or directory in the test container to upload as a GitHub artifact'
++        required: false
++        default: ''
++        type: string
+       skip_build_image:
+         description: 'Skip build-image job (used when triggered by /nightly command)'
+         required: false
+@@ -223,6 +228,7 @@ jobs:
+           )
+         }}
+       request_id: ${{ inputs.request_id || '' }}
++      download_path: ${{ inputs.download_path }}
+       vllm_ascend_ref: ${{ inputs.vllm_ascend_ref || '' }}
+       aop_single_enabled: ${{ inputs.aop_enabled }}
+       bisect_config_base_path: ${{ matrix.test_config.config_base_path }}
+diff --git a/.github/workflows/schedule_nightly_test_a2.yaml b/.github/workflows/schedule_nightly_test_a2.yaml
+index 0cc2af518..3663fd71b 100644
+--- a/.github/workflows/schedule_nightly_test_a2.yaml
++++ b/.github/workflows/schedule_nightly_test_a2.yaml
+@@ -79,6 +79,11 @@ on:
+         required: false
+         default: '{}'
+         type: string
++      download_path:
++        description: 'File or directory in the test container to upload as a GitHub artifact'
++        required: false
++        default: ''
++        type: string
+ permissions:
+   contents: read
+   pull-requests: read
+@@ -228,6 +233,7 @@ jobs:
+       ascend_log_prefix: ${{ needs.setup-vars.outputs.ascend_log_prefix }}/${{ matrix.vllm_ascend_branch }}
+       vllm_ascend_branch: ${{ matrix.vllm_ascend_branch }}
+       request_id: ${{ inputs.request_id || '' }}
++      download_path: ${{ inputs.download_path }}
+       replicas: 1
+       size: ${{ matrix.test_config.size }}
+       config_file_path: ${{ matrix.test_config.config_file_path }}
+@@ -300,6 +306,7 @@ jobs:
+       name: ${{ matrix.test_config.name }}
+       vllm_ascend_branch: ${{ matrix.vllm_ascend_branch }}
+       request_id: ${{ inputs.request_id || '' }}
++      download_path: ${{ inputs.download_path }}
+       vllm_ascend_ref: ${{ inputs.vllm_ascend_ref || needs.parse-trigger.outputs.ref }}
+       aop_single_enabled: ${{ inputs.aop_enabled }}
+       bisect_good_commit: ${{ fromJSON(inputs.bisect_args_json || '{}').good_commit || '' }}
+@@ -390,6 +397,7 @@ jobs:
+           )
+         }}
+       request_id: ${{ inputs.request_id || '' }}
++      download_path: ${{ inputs.download_path }}
+       vllm_ascend_ref: ${{ inputs.vllm_ascend_ref || needs.parse-trigger.outputs.ref }}
+       upload: false
+ 
+@@ -420,6 +428,7 @@ jobs:
+           contains(needs.parse-trigger.outputs.filter, format(',{0},', matrix.test_config.name))
+         }}
+       request_id: ${{ inputs.request_id || '' }}
++      download_path: ${{ inputs.download_path }}
+       vllm_ascend_ref: ${{ inputs.vllm_ascend_ref || needs.parse-trigger.outputs.ref }}
+       upload: false
+ 
+diff --git a/.github/workflows/schedule_nightly_test_a3.yaml b/.github/workflows/schedule_nightly_test_a3.yaml
+index 122a58e50..26c781987 100644
+--- a/.github/workflows/schedule_nightly_test_a3.yaml
++++ b/.github/workflows/schedule_nightly_test_a3.yaml
+@@ -80,6 +80,11 @@ on:
+         required: false
+         default: '{}'
+         type: string
++      download_path:
++        description: 'File or directory in the test container to upload as a GitHub artifact'
++        required: false
++        default: ''
++        type: string
+ permissions:
+   contents: read
+   pull-requests: read
+@@ -243,6 +248,7 @@ jobs:
+       bisect_force_initial_build: ${{ fromJSON(inputs.bisect_args_json || '{}').force_initial_build || false }}
+       bisect_config_base_path: ''
+       request_id: ${{ inputs.request_id || '' }}
++      download_path: ${{ inputs.download_path }}
+       should_run: >-
+         ${{
+           needs.parse-trigger.outputs.run == 'true' && (
+@@ -293,6 +299,7 @@ jobs:
+       bisect_force_initial_build: ${{ fromJSON(inputs.bisect_args_json || '{}').force_initial_build || false }}
+       bisect_config_base_path: ''
+       request_id: ${{ inputs.request_id || '' }}
++      download_path: ${{ inputs.download_path }}
+       should_run: >-
+         ${{
+           needs.parse-trigger.outputs.run == 'true' && (
+@@ -338,6 +345,7 @@ jobs:
+           )
+         }}
+       request_id: ${{ inputs.request_id || '' }}
++      download_path: ${{ inputs.download_path }}
+       vllm_ascend_ref: ${{ inputs.vllm_ascend_ref || '' }}
+       aop_single_enabled: ${{ inputs.aop_enabled }}
+       bisect_good_commit: ${{ fromJSON(inputs.bisect_args_json || '{}').good_commit || '' }}
+@@ -385,6 +393,7 @@ jobs:
+           )
+         }}
+       request_id: ${{ inputs.request_id || '' }}
++      download_path: ${{ inputs.download_path }}
+       vllm_ascend_ref: ${{ inputs.vllm_ascend_ref || '' }}
+       aop_single_enabled: ${{ inputs.aop_enabled }}
+       bisect_good_commit: ${{ fromJSON(inputs.bisect_args_json || '{}').good_commit || '' }}
+diff --git a/.github/workflows/schedule_nightly_test_a3_560t.yaml b/.github/workflows/schedule_nightly_test_a3_560t.yaml
+index 1c6ce6035..0a51c5502 100644
+--- a/.github/workflows/schedule_nightly_test_a3_560t.yaml
++++ b/.github/workflows/schedule_nightly_test_a3_560t.yaml
+@@ -79,6 +79,11 @@ on:
+         required: false
+         default: '{}'
+         type: string
++      download_path:
++        description: 'File or directory in the test container to upload as a GitHub artifact'
++        required: false
++        default: ''
++        type: string
+ permissions:
+   contents: read
+   pull-requests: read
+@@ -220,6 +225,7 @@ jobs:
+           )
+         }}
+       request_id: ${{ inputs.request_id || '' }}
++      download_path: ${{ inputs.download_path }}
+       vllm_ascend_ref: ${{ inputs.vllm_ascend_ref || '' }}
+       aop_single_enabled: ${{ inputs.aop_enabled }}
+       bisect_good_commit: ${{ fromJSON(inputs.bisect_args_json || '{}').good_commit || '' }}
+@@ -265,6 +271,7 @@ jobs:
+           )
+         }}
+       request_id: ${{ inputs.request_id || '' }}
++      download_path: ${{ inputs.download_path }}
+       vllm_ascend_ref: ${{ inputs.vllm_ascend_ref || '' }}
+       aop_single_enabled: ${{ inputs.aop_enabled }}
+       bisect_good_commit: ${{ fromJSON(inputs.bisect_args_json || '{}').good_commit || '' }}
+diff --git a/.github/workflows/schedule_nightly_test_a5.yaml b/.github/workflows/schedule_nightly_test_a5.yaml
+index 7a97ae2a4..806a0591e 100644
+--- a/.github/workflows/schedule_nightly_test_a5.yaml
++++ b/.github/workflows/schedule_nightly_test_a5.yaml
+@@ -77,6 +77,12 @@ on:
+         description: 'JSON object containing optional bisect parameters'
+         required: false
+         default: '{}'
++        type: string
++      download_path:
++        description: 'File or directory in the test container to upload as a GitHub artifact'
++        required: false
++        default: ''
++        type: string
+         
+ permissions:
+   contents: read
+@@ -240,6 +246,7 @@ jobs:
+       bisect_force_initial_build: ${{ fromJSON(inputs.bisect_args_json || '{}').force_initial_build || false }}
+       bisect_config_base_path: ''
+       request_id: ${{ inputs.request_id || '' }}
++      download_path: ${{ inputs.download_path }}
+       should_run: >-
+         ${{
+           needs.parse-trigger.outputs.run == 'true' && (
+@@ -286,6 +293,7 @@ jobs:
+           )
+         }}
+       request_id: ${{ inputs.request_id || '' }}
++      download_path: ${{ inputs.download_path }}
+       vllm_ascend_ref: ${{ inputs.vllm_ascend_ref || '' }}
+       aop_single_enabled: ${{ inputs.aop_enabled }}
+       bisect_good_commit: ${{ fromJSON(inputs.bisect_args_json || '{}').good_commit || '' }}
+diff --git a/.github/workflows/scripts/collect_download.py b/.github/workflows/scripts/collect_download.py
+new file mode 100644
+index 000000000..c4b6ec156
+--- /dev/null
++++ b/.github/workflows/scripts/collect_download.py
+@@ -0,0 +1,158 @@
++"""Validate and stage requested CI files or directories for GitHub artifacts."""
++
++import argparse
++import json
++import os
++import tarfile
++from pathlib import Path
++
++# Artifacts are visible to PR readers, so exclude system and credential roots.
++PROTECTED_ROOTS = (
++    Path("/proc"),
++    Path("/sys"),
++    Path("/dev"),
++    Path("/run"),
++    Path("/etc"),
++    Path("/root/.ssh"),
++    Path("/root/.config"),
++    Path("/root/.aws"),
++    Path("/root/.kube"),
++    Path("/tmp/kubeconfig"),
++)
++TEST_REPOSITORY = Path("/vllm-workspace/vllm-ascend")
++
++
++def validate_path(raw_path: str, *, require_exists: bool = True) -> Path:
++    if not raw_path or any(ord(char) < 32 for char in raw_path):
++        raise ValueError("--download path contains a control character")
++    path = Path(raw_path)
++    if ".." in path.parts:
++        raise ValueError("--download path must not contain '..'")
++    if not path.is_absolute():
++        path = TEST_REPOSITORY / path
++    path = Path(os.path.normpath(path))
++    if path == Path("/"):
++        raise ValueError("--download cannot select the filesystem root")
++    if any(part in {".git", ".ssh", ".aws", ".kube"} for part in path.parts):
++        raise ValueError("--download cannot select a credential directory")
++    if path.name == ".env" or path.name.endswith((".pem", ".key")):
++        raise ValueError("--download cannot select a credential file")
++    for protected in PROTECTED_ROOTS:
++        if path == protected or protected in path.parents or path in protected.parents:
++            raise ValueError(f"--download cannot include protected path: {protected}")
++    if require_exists and not (path.is_dir() or path.is_file()):
++        raise ValueError(f"--download file or directory does not exist: {path}")
++    if require_exists and (path.is_symlink() or any(parent.is_symlink() for parent in path.parents)):
++        raise ValueError("--download path must not contain symlinks")
++    return path
++
++
++class _DownloadObject(list[tuple[str, object]]):
++    """Keep every JSON object entry, including repeated node keys."""
++
++
++def parse_request(raw: str) -> dict[str, list[str]]:
++    """Parse paths into a node-to-paths mapping."""
++    if raw.startswith("'") and raw.endswith("'"):
++        raw = raw[1:-1]
++    if raw.startswith(("{", "[", '"')):
++        parsed = json.loads(raw, object_pairs_hook=_DownloadObject)
++        if isinstance(parsed, str):
++            paths = {"node0": [parsed]}
++        elif isinstance(parsed, _DownloadObject):
++            paths = {}
++            for node, value in parsed:
++                paths.setdefault(node, []).append(value)
++        elif isinstance(parsed, list):
++            paths = {}
++            for item in parsed:
++                if not isinstance(item, _DownloadObject) or len(item) != 1:
++                    raise ValueError("each download list entry must map one node to one path")
++                node, value = item[0]
++                paths.setdefault(node, []).append(value)
++        else:
++            raise ValueError("--download must be a path or node mapping")
++    else:
++        paths = {"node0": [raw]}
++    if not paths:
++        raise ValueError("--download node mapping must not be empty")
++    for node, node_paths in paths.items():
++        if not isinstance(node, str) or not node.startswith("node") or not node[4:].isdigit():
++            raise ValueError("--download node keys must be node0, node1, ...")
++        if node != f"node{int(node[4:])}":
++            raise ValueError("--download node numbers must not have leading zeros")
++        if not node_paths:
++            raise ValueError("--download node path lists must not be empty")
++        for path in node_paths:
++            if not isinstance(path, str):
++                raise ValueError("--download node paths must be strings")
++            validate_path(path, require_exists=False)
++    return paths
++
++
++def archive_path(sources: list[Path], destination: Path) -> None:
++    """Compress files without following links or including common credentials."""
++    destination.parent.mkdir(parents=True, exist_ok=True)
++    with tarfile.open(destination, "w:gz") as archive:
++        for index, source in enumerate(sources, start=1):
++            # Keep the existing layout for one path; separate multiple paths
++            # so files from different directories cannot overwrite each other.
++            prefix = Path(f"path-{index}") if len(sources) > 1 else Path()
++            if source.is_file():
++                archive.add(source, arcname=prefix / source.name, recursive=False)
++                continue
++            for root, dirs, files in os.walk(source, followlinks=False):
++                root_path = Path(root)
++                dirs[:] = [
++                    name
++                    for name in dirs
++                    if name not in {".git", ".ssh", ".aws", ".kube"} and not (root_path / name).is_symlink()
++                ]
++                for name in files:
++                    item = root_path / name
++                    if (
++                        item == destination
++                        or name == ".env"
++                        or name.endswith((".pem", ".key"))
++                        or item.is_symlink()
++                        or not item.is_file()
++                    ):
++                        continue
++                    archive.add(item, arcname=prefix / item.relative_to(source), recursive=False)
++
++
++def main() -> None:
++    parser = argparse.ArgumentParser(description=__doc__)
++    parser.add_argument("request")
++    parser.add_argument("destination", nargs="?")
++    parser.add_argument("--node", default="node0")
++    parser.add_argument("--node-count", type=int)
++    parser.add_argument("--list", action="store_true")
++    parser.add_argument("--path-for-node", action="store_true")
++    parser.add_argument("--check-only", action="store_true")
++    args = parser.parse_args()
++    paths = parse_request(args.request)
++    if args.node_count is not None:
++        if args.node_count < 1 or any(int(node[4:]) >= args.node_count for node in paths):
++            parser.error("--download references a node outside this job")
++    if args.list:
++        for node, node_paths in sorted(paths.items(), key=lambda item: int(item[0][4:])):
++            resolved = [str(validate_path(path, require_exists=False)) for path in node_paths]
++            print(f"{node}\t{json.dumps(resolved, separators=(',', ':'))}")
++        return
++    if args.path_for_node:
++        if args.node in paths:
++            resolved = [str(validate_path(path)) for path in paths[args.node]]
++            print(json.dumps(resolved, separators=(",", ":")))
++        return
++    if args.node not in paths:
++        parser.error(f"--download does not specify {args.node}")
++    sources = [validate_path(path, require_exists=not args.check_only) for path in paths[args.node]]
++    if not args.check_only:
++        if args.destination is None:
++            parser.error("destination is required unless --check-only is used")
++        archive_path(sources, Path(args.destination))
++
++
++if __name__ == "__main__":
++    main()
+diff --git a/.pre-commit-config.yaml b/.pre-commit-config.yaml
+index 223ee9caf..77fc41b9b 100644
+--- a/.pre-commit-config.yaml
++++ b/.pre-commit-config.yaml
+@@ -53,7 +53,7 @@ repos:
+     stages: [manual] # Only run in CI
+ 
+ - repo: https://github.com/rhysd/actionlint
+-  rev: v1.7.7
++  rev: v1.7.11
+   hooks:
+   # This hook runs actionlint directly, without tools/actionlint.sh. When
+   # ShellCheck is on PATH, export SHELLCHECK_OPTS=--exclude=SC2046,SC2006,SC2086
+diff --git a/docs/source/community/slash-commands.md b/docs/source/community/slash-commands.md
+index 63a239581..77235b17f 100644
+--- a/docs/source/community/slash-commands.md
++++ b/docs/source/community/slash-commands.md
+@@ -49,6 +49,7 @@ Trigger specific nightly test cases on A2 and A3. Supports only PR comments. Tes
+ | `/nightly <test_cases>` | Runs on `main` branch |
+ | `/nightly <test_cases> --branch <branch>` | Runs on the specified branch |
+ | `/nightly <test_cases> --aop_enabled` | Enable AOP hooks (bisect / classify) on failure |
++| `/nightly <test_cases> --log-path <path>` | Upload a test file or directory as a downloadable artifact |
+ 
+ Use `--branch <name>` to specify a target branch. Without `--branch`, all arguments are treated as test cases (separated by commas or spaces) and the branch defaults to `main`.
+ 
+@@ -56,6 +57,23 @@ Use `--aop_enabled` to enable the AOP (Aspect-Oriented Programming) pipeline, wh
+ automatically captures test results, classifies failures (env vs. code), and triggers
+ binary bisect for genuine failures. By default, AOP hooks are disabled.
+ 
++Use `--log-path <path>` to collect a file or directory from `node0` after
++the test, including when the test fails. Absolute paths refer to the test
++container; relative paths start at `/vllm-workspace/vllm-ascend`. For
++multi-node tests, pass a compact JSON map to select paths on each node:
++`--log-path '{"node0":"logs/leader.txt","node1":"/tmp/test-logs"}'`.
++To collect multiple paths from one node, repeat that node in a single
++mapping, for example
++`--log-path '{"node1":"logs/worker.txt","node1":"/tmp/test-logs"}'`.
++The equivalent list of single-path entries is also supported:
++`--log-path '[{"node1":"logs/worker.txt"},{"node1":"/tmp/test-logs"}]'`.
++Multiple paths from one node are placed under `path-1/`, `path-2/`, etc.
++inside that node's archive. The JSON must not contain spaces. Each selected
++node produces a `nodeN.tar.gz` file in the workflow run's **Artifacts** section.
++Single-node tests upload the selected paths as `download-artifact.tar.gz`. Missing
++paths are reported in the workflow log. System and credential directories
++cannot be selected.
++
+ > **Note**: When commenting on a PR, the tests run on the PR branch automatically in the triggered workflow; the `--branch` flag is primarily used in issue comments.
+ 
+ **Common test case names (A2):**
+@@ -92,6 +110,18 @@ binary bisect for genuine failures. By default, AOP hooks are disabled.
+ 
+ # Run specific test with AOP on a release branch
+ /nightly test_custom_op --branch releases/v0.24.0 --aop_enabled
++
++# Download a directory from a single-node test
++/nightly test_custom_op --log-path /tmp/test-logs
++
++# Download a file relative to the test repository
++/nightly test_custom_op --log-path logs/output.txt
++
++# Download logs from the leader and a worker pod
++/nightly multi-node-deepseek-v3.2-W8A8-EP --log-path '{"node0":"/tmp/test-logs","node1":"/tmp/test-logs"}'
++
++# Download two files from the same worker pod
++/nightly multi-node-deepseek-v3.2-W8A8-EP --log-path '[{"node1":"logs/worker.txt"},{"node1":"logs/metrics.txt"}]'
+ ```
+ 
+ This triggers `workflow_dispatch` on both `schedule_nightly_test_a2.yaml` and `schedule_nightly_test_a3.yaml`.
+diff --git a/tests/e2e/common/multi_node/download_archive.sh b/tests/e2e/common/multi_node/download_archive.sh
+new file mode 100644
+index 000000000..0a32be4b1
+--- /dev/null
++++ b/tests/e2e/common/multi_node/download_archive.sh
+@@ -0,0 +1,63 @@
++#!/bin/bash
++set -euo pipefail
++
++# Called from run.sh on exit and by CI before deleting running pods.
++backup_requested_directory() {
++    [ -n "${DOWNLOAD_SPEC:-}" ] || return 0
++    local node="node${LWS_WORKER_INDEX:-0}"
++    local requested archive temporary_archive shared_archive
++    local marker="/tmp/${node}_download.archived"
++    archive="$LOG_PREFIX/${node}_download.tar.gz"
++    # EXIT and CI finalization run in the same container. Reuse only
++    # an archive produced successfully by this container; retry failed attempts.
++    if [ -f "$marker" ] && [ -f "$archive" ]; then
++        echo "Requested path already archived on $node"
++        return 0
++    fi
++    if ! requested=$(python3 /root/.cache/tests/collect_download.py "$DOWNLOAD_SPEC" \
++        --path-for-node --node "$node"); then
++        echo "WARNING: Invalid download request for $node" >&2
++        return 1
++    fi
++    [ -n "$requested" ] || return 0
++    if ! mkdir -p "$LOG_PREFIX"; then
++        echo "WARNING: Could not create shared log directory on $node" >&2
++        return 1
++    fi
++    if ! temporary_archive=$(mktemp "/tmp/${node}-download.XXXXXX.tar.gz"); then
++        echo "WARNING: Could not create temporary archive on $node" >&2
++        return 1
++    fi
++    if ! python3 /root/.cache/tests/collect_download.py "$DOWNLOAD_SPEC" \
++        "$temporary_archive" --node "$node"; then
++        rm -f "$temporary_archive"
++        echo "WARNING: Could not archive requested path on $node" >&2
++        return 1
++    fi
++    if ! shared_archive=$(mktemp "$LOG_PREFIX/.${node}_download.XXXXXX.tar.gz"); then
++        rm -f "$temporary_archive"
++        echo "WARNING: Could not stage requested archive on shared storage for $node" >&2
++        return 1
++    fi
++    if ! cp "$temporary_archive" "$shared_archive"; then
++        rm -f "$temporary_archive" "$shared_archive"
++        echo "WARNING: Could not copy requested archive to shared storage for $node" >&2
++        return 1
++    fi
++    rm -f "$temporary_archive"
++    if ! mv "$shared_archive" "$archive"; then
++        rm -f "$shared_archive"
++        echo "WARNING: Could not publish requested archive on shared storage for $node" >&2
++        return 1
++    fi
++    touch "$marker"
++    echo "Archived requested path on $node: $requested -> $archive"
++}
++
++if [ "${BASH_SOURCE[0]}" = "$0" ]; then
++    if [ "${1:-}" = "--strict" ]; then
++        backup_requested_directory
++    else
++        backup_requested_directory || true
++    fi
++fi
+diff --git a/tests/e2e/common/multi_node/lws.yaml.jinja2 b/tests/e2e/common/multi_node/lws.yaml.jinja2
+index 93e269b73..4a3c35a1a 100644
+--- a/tests/e2e/common/multi_node/lws.yaml.jinja2
++++ b/tests/e2e/common/multi_node/lws.yaml.jinja2
+@@ -29,6 +29,8 @@ spec:
+                 value: "{{ config_base_path | default("") }}"
+               - name: LOG_PREFIX
+                 value: {{ log_prefix | default("/root/.cache/ascend-logs") }}
++              - name: DOWNLOAD_SPEC
++                value: {{ download_spec | default("") | tojson }}
+               - name: WORKSPACE
+                 value: "/vllm-workspace"
+               - name: FAIL_TAG
+@@ -149,6 +151,8 @@ spec:
+                 value: "{{ test_frequency | default("nightly") }}"
+               - name: LOG_PREFIX
+                 value: {{ log_prefix | default("/root/.cache/ascend-logs") }}
++              - name: DOWNLOAD_SPEC
++                value: {{ download_spec | default("") | tojson }}
+               - name: WORKSPACE
+                 value: "/vllm-workspace"
+               - name: FAIL_TAG
+diff --git a/tests/e2e/common/multi_node/run.sh b/tests/e2e/common/multi_node/run.sh
+index 0914ec028..cca32a579 100644
+--- a/tests/e2e/common/multi_node/run.sh
++++ b/tests/e2e/common/multi_node/run.sh
+@@ -28,6 +28,9 @@ if [ ! -f "$BISECT_ARGS_HELPER" ]; then
+ fi
+ # shellcheck source=../../nightly/scripts/bisect_args.sh
+ source "$BISECT_ARGS_HELPER"
++DOWNLOAD_ARCHIVE_HELPER="${SCRIPT_DIR}/download_archive.sh"
++# shellcheck source=download_archive.sh
++source "$DOWNLOAD_ARCHIVE_HELPER"
+ 
+ # The CANN install directory varies between release (cann-9.1.0) and daily
+ # (e.g. cann-2026.08.03) images, so discover it dynamically instead of
+@@ -528,6 +531,14 @@ finish_run() {
+     if [ "${AOP_MULTI_ENABLED:-}" = "true" ] && [ "${LWS_WORKER_INDEX:-}" = "0" ]; then
+         echo "AOP_RUN_FINISHED:${LOG_PREFIX}:${rc}"
+     fi
++    backup_requested_directory || true
++    return "$rc"
++}
++
++finish_without_aop() {
++    local rc=$?
++    backup_ascend_logs || true
++    backup_requested_directory || true
+     return "$rc"
+ }
+ 
+@@ -535,7 +546,7 @@ main() {
+     if [ "${AOP_MULTI_ENABLED:-}" = "true" ]; then
+         trap finish_run EXIT
+     else
+-        trap backup_ascend_logs EXIT
++        trap finish_without_aop EXIT
+     fi
+     check_npu_info
+     clear_logs

@@ -1,0 +1,2428 @@
+commit 1847b4eafefaa5c5aa2cafea1922689eabdb893f
+Author:     lijiahang226 <216526138+lijiahang226@users.noreply.github.com>
+AuthorDate: Thu Oct 15 20:02:18 2026 +0800
+Commit:     GitHub <noreply@github.com>
+CommitDate: Thu Oct 15 20:02:18 2026 +0800
+
+    [Feature][Model] Use CANN operators for GLM-5.3-Flash pooled indexing (#16730)
+    
+    ### What this PR does / why we need it?
+    
+    Connects BF16 GLM-5.3-Flash pooled indexing to CANN
+    KeyPool/PoolKeyIndexer, including DSA-CP. Reuses layer/draft metadata
+    and removes redundant SFA input preparation. Depends on #18295.
+    
+    PD/MTP fixes keep per-group block tables stable across FULL graph
+    replay, preserve circular-tail cache addressing, cover graph capture
+    buckets, and reject incompatible Mooncake circular-cache layouts.
+    
+    Includes the empty-query guard from #18771: eager/piecewise DSA-CP
+    shards with no actual queries still update the replicated caches, then
+    return `-1` indices without calling PoolKeyIndexer. FULL capture retains
+    selection so replay can process live queries.
+    
+    Refs #15665
+    
+    ### Does this PR introduce _any_ user-facing change?
+    
+    BF16 KPool uses CANN operators for ordinary TP and DSA-CP.
+    
+    ### How was this patch tested?
+    
+    245 CPU/mock regression tests passed for this head in the official
+    v0.30.0rc2 A5 image, without NPU devices. Tests cover metadata reuse,
+    FULL graph padding, MTP circular-cache addressing, Mooncake layout
+    rejection and empty DSA-CP query shards. The original implementation
+    fails four new empty-shard cases; the fix passes them, including shared
+    strided output buffers and NONE/PIECEWISE/FULL runtime modes.
+    
+    Historical joint full-model performance with #16730 + #18295 on A5/CANN
+    9.2.0, TP8/EP/MTP3, BF16 indexer and FP8 SFA cache, using `vllm bench
+    serve` (vLLM `0.30.0+empty`), 256 output tokens, seed 1024 and
+    temperature 0. Reference: frozen main
+    [`05fa3be5`](https://github.com/vllm-project/vllm-ascend/commit/05fa3be5f50306a151d4863735d3d84ce63dc0a2).
+    Each case/arm ran once without active profiling; all requests succeeded
+    with exact lengths and no KV preemption.
+    
+    | Input / concurrency / requests | Output tokens/s (main → combined) |
+    Throughput Δ | Mean TTFT Δ | Mean TPOT Δ |
+    | --- | --- | --- | --- | --- |
+    | 4096 / C8 / 64 | 340.033 → 443.616 | +30.46% | −7.46% | −25.58% |
+    | 4096 / C64 / 128 | 676.309 → 737.094 | +8.99% | −6.74% | −4.29% |
+    | 4096 / C90 / 180 | 712.100 → 724.663 | +1.76% | +0.22% | −2.39% |
+    | 65536 / C8 / 16 | 40.798 → 49.467 | +21.25% | −17.65% | −15.10% |
+    | 1048576 / C4 / 8 | 0.873 → 1.998 | +128.80% | −55.44% | −57.64% |
+    
+    Output throughput includes prefill and queueing. The candidate also
+    contains newer upstream changes, so these results do not isolate CANN or
+    Triton gains. At 1M, mean TTFT was 647.24 → 288.41 s and mean TPOT
+    1897.44 → 803.83 ms; client C4 reached peak running 3 on both arms. Both
+    arms extended the native total-token limit by 256 to allow output
+    (`max_model_len`/`max_position_embeddings=1048832`, unchanged RoPE).
+    This is not 1M semantic accuracy validation; the separate C1 rank-0
+    profile is excluded from these measurements.
+    
+    The historical combined main CANN/Triton implementation also completed
+    two full GSM8K runs per arm (1319 questions, C64, temperature 0, seed
+    1024, max_tokens 4096): raw scores were 1267/1272 for the candidate and
+    1264/1269 for frozen main 05fa, with no request errors or truncated
+    outputs. Each paired difference was +0.227 percentage points; repeat
+    variation was 0.379 points, so this does not establish an accuracy
+    improvement. The candidate also includes existing upstream changes; this
+    is not an isolated CANN effect. Current-head full-model PD/DSA-CP
+    accuracy and prefill regression validation remain pending.
+    
+    
+    - vLLM main:
+    https://github.com/vllm-project/vllm/commit/c4df37dfcc7f72ca41cd43801a468526ecf99a2b
+    
+    Signed-off-by: Li Jiahang <216526138+lijiahang226@users.noreply.github.com>
+    Signed-off-by: YanpengDing <dingyanpeng18@163.com>
+    Co-authored-by: YanpengDing <dingyanpeng18@163.com>
+
+diff --git a/tests/ut/attention/test_sfa_nope_metadata.py b/tests/ut/attention/test_sfa_nope_metadata.py
+index 182a9be37..bd7e57652 100644
+--- a/tests/ut/attention/test_sfa_nope_metadata.py
++++ b/tests/ut/attention/test_sfa_nope_metadata.py
+@@ -16,7 +16,9 @@ from vllm_ascend.attention.context_parallel.sfa_cp import AscendSFADSACPMetadata
+ from vllm_ascend.device.hardware_profile import DeviceAdaptorFamily
+ 
+ 
+-def _builder(block_size, a5, monkeypatch, rope_dim=0, builder_cls=sfa.AscendSFAMetadataBuilder, tp_size=1):
++def _builder(
++    block_size, a5, monkeypatch, rope_dim=0, builder_cls=sfa.AscendSFAMetadataBuilder, tp_size=1, speculative=False
++):
+     config = SimpleNamespace(
+         cache_config=SimpleNamespace(block_size=block_size),
+         model_config=SimpleNamespace(
+@@ -25,10 +27,11 @@ def _builder(block_size, a5, monkeypatch, rope_dim=0, builder_cls=sfa.AscendSFAM
+             hf_text_config=SimpleNamespace(num_attention_heads=4, kv_lora_rank=512),
+         ),
+         parallel_config=SimpleNamespace(tensor_parallel_size=tp_size, prefill_context_parallel_size=1),
+-        scheduler_config=SimpleNamespace(max_num_seqs=2, max_num_batched_tokens=4),
+-        speculative_config=None,
++        scheduler_config=SimpleNamespace(max_num_seqs=2, max_num_batched_tokens=32 if speculative else 4),
++        speculative_config=SimpleNamespace(num_speculative_tokens=5) if speculative else None,
+         compilation_config=SimpleNamespace(
+-            static_forward_context={"layer": SimpleNamespace(qk_rope_head_dim=rope_dim)}
++            cudagraph_capture_sizes=[32] if speculative else [],
++            static_forward_context={"layer": SimpleNamespace(qk_rope_head_dim=rope_dim)},
+         ),
+     )
+     monkeypatch.setattr(
+@@ -37,6 +40,8 @@ def _builder(block_size, a5, monkeypatch, rope_dim=0, builder_cls=sfa.AscendSFAM
+         lambda: SimpleNamespace(device_adaptor_family=DeviceAdaptorFamily.FP8_OPTIMIZED if a5 else None),
+     )
+     monkeypatch.setattr(sfa, "select_common_block_size", lambda *args: 128)
++    config_flags = SimpleNamespace(enable_sparse_sfa_c8=False, enable_sparse_sfa_turboquant=False)
++    monkeypatch.setattr(sfa, "get_ascend_config", lambda: config_flags)
+     monkeypatch.setattr(
+         sfa, "AttentionMaskBuilder", lambda device: SimpleNamespace(get_attention_mask=lambda *args: None)
+     )
+@@ -102,6 +107,7 @@ def test_dsacp_nope_plan_uses_local_queries_and_full_heads(monkeypatch, dummy_re
+     local = metadata.nope_metadata
+     assert local is not None
+     assert metadata.num_actual_tokens == 3 and local.num_actual_tokens == 1
++    assert local.positions.data_ptr() == common.positions[2:].data_ptr()
+     assert metadata.query_start_loc.data_ptr() == common.query_start_loc.data_ptr()
+     torch.testing.assert_close(
+         local.query_start_loc, torch.tensor([0, 0, 1, 2] if dummy_request else [0, 0, 1], dtype=torch.int32)
+@@ -120,6 +126,33 @@ def test_dsacp_nope_plan_uses_local_queries_and_full_heads(monkeypatch, dummy_re
+     assert second.smla_valid_mask.data_ptr() == local.smla_valid_mask.data_ptr()
+ 
+ 
++@pytest.mark.parametrize("flag", [None, "enable_sparse_sfa_c8", "enable_sparse_sfa_turboquant"])
++def test_dsacp_draft_buffers_cover_full_graph_bucket(monkeypatch, flag):
++    group = SimpleNamespace(world_size=2, rank_in_group=0)
++    monkeypatch.setattr("vllm_ascend.attention.context_parallel.sfa_cp.get_tp_group", lambda: group)
++    builder = _builder(128, True, monkeypatch, builder_cls=AscendSFADSACPMetadataBuilder, tp_size=2, speculative=True)
++    if flag:
++        setattr(sfa.get_ascend_config(), flag, True)
++    common = _common(128)
++    common.num_reqs = common.num_input_tokens = 32
++    common.num_actual_tokens = 2
++    common.max_query_len = 1
++    common.query_start_loc = torch.arange(33, dtype=torch.int32)
++    common.query_start_loc_cpu = common.query_start_loc.clone()
++    common.seq_lens = torch.cat((common.seq_lens, torch.zeros(30, dtype=torch.int32)))
++    common.slot_mapping = torch.cat((common.slot_mapping[:2], torch.full((30,), -1)))
++    common.positions = torch.zeros(32, dtype=torch.int64)
++    common.block_table_tensor = torch.cat((common.block_table_tensor, torch.zeros(30, 2, dtype=torch.int32)))
++    metadata = builder.build_for_drafting(common, 4)
++    assert (metadata.nope_metadata.smla_metadata is None) is bool(flag)
++    assert builder.nope_states[4].block_table_buffer.shape[0] == 32
++    assert builder.dsa_cp_spec_actual_seq_lengths_query[3].numel() == 33
++    assert builder.dsa_cp_spec_actual_seq_lengths_key[3].numel() == 33
++    again = builder.build_for_drafting(_common(128), 4)
++    assert again.dsa_cp_context.query_start_loc.data_ptr() == metadata.dsa_cp_context.query_start_loc.data_ptr()
++    assert again.nope_metadata.block_table.data_ptr() == metadata.nope_metadata.block_table.data_ptr()
++
++
+ @pytest.mark.parametrize("block_size", [128, 384, 640, 2304, 4352])
+ @pytest.mark.parametrize("a5", [False, True])
+ def test_shared_sfa_nope_metadata_pages_and_draft_buffers(monkeypatch, block_size, a5):
+diff --git a/tests/ut/kv_offload/mooncake_v2/test_pull_worker.py b/tests/ut/kv_offload/mooncake_v2/test_pull_worker.py
+index 803e77a76..4b9586437 100644
+--- a/tests/ut/kv_offload/mooncake_v2/test_pull_worker.py
++++ b/tests/ut/kv_offload/mooncake_v2/test_pull_worker.py
+@@ -1281,6 +1281,29 @@ def test_circular_address_generation_transfers_whole_page_with_independent_strid
+     assert lengths == [128]
+ 
+ 
++@pytest.mark.parametrize("local_shape,remote_shape", [((9, 256), (2, 9, 128)), ((2, 9, 128), (9, 256))])
++def test_circular_transfer_rejects_equal_size_different_layout(local_shape, remote_shape) -> None:
++    thread = make_thread(
++        kv_cache_specs=[make_kpool_tail_spec()],
++        kv_caches_base_addr=[[1000]],
++        block_shapes=[[local_shape]],
++        block_strides=[[9216]],
++        block_lens=[[9216]],
++    )
++    remote = make_pp_metadata(
++        block_shapes=[[remote_shape]],
++        block_strides=[[9216]],
++        block_lens=[[9216]],
++        tp_base_addrs={0: [[5000]]},
++    )
++    src, dst, lengths = list[int](), list[int](), list[int]()
++    with pytest.raises(ValueError, match="circular cache layout mismatch"):
++        thread._append_spec_transfer_addresses(
++            0, 0, 0, 1, 1, 4, {(0, 0): [("request", [1], [3])]}, remote, src, dst, lengths
++        )
++    assert not src and not dst and not lengths
++
++
+ def test_whole_block_coalescing_is_prepared_per_request_and_reused_across_layers() -> None:
+     spec = MLAAttentionSpec(block_size=16, num_kv_heads=1, head_size=64, dtype=torch.float16)
+     thread = make_thread(
+diff --git a/tests/ut/models/test_glm5next_kpool_model_backend.py b/tests/ut/models/test_glm5next_kpool_model_backend.py
+index c8f2e1275..330ac7931 100644
+--- a/tests/ut/models/test_glm5next_kpool_model_backend.py
++++ b/tests/ut/models/test_glm5next_kpool_model_backend.py
+@@ -18,8 +18,6 @@ from vllm_ascend.attention.indexer_kpool import (
+     Glm5NextKPoolIndexerBackend,
+ )
+ 
+-# The operator PR owns these kernels. Each orchestration test below replaces
+-# the kernel call with an asserting CPU implementation.
+ with patch.dict(
+     "sys.modules",
+     {
+@@ -226,6 +224,7 @@ def test_backend_uses_normalized_q_c_and_separate_tail_metadata(
+     graph_mode,
+     dsa_cp,
+ ) -> None:
++    monkeypatch.setattr(backend_module, "enable_dsa_cp", lambda: dsa_cp)
+     backend = Glm5NextKPoolIndexerBackend.__new__(Glm5NextKPoolIndexerBackend)
+     nn.Module.__init__(backend)
+     backend.n_head = 2
+@@ -243,12 +242,13 @@ def test_backend_uses_normalized_q_c_and_separate_tail_metadata(
+     )
+     backend.tail_cache = SimpleNamespace(
+         prefix="indexer.tail",
+-        kv_cache=torch.zeros(2, 2, 4, 2, dtype=torch.float32),
++        kv_cache=torch.zeros(2, 4, 4, dtype=torch.float32),
+     )
+     backend.topk_indices_buffer = torch.empty(64, 16, dtype=torch.int32)
+     backend.softmax_scale = 0.5
+-    backend._wk_weight_f32 = None
+-    backend.indexer_op = _RecordingKPool()
++    backend._key_weight = None
++    recorder = _RecordingKPool()
++    backend._forward_cann = recorder.forward
+     tail_metadata = _tail_metadata()
+     monkeypatch.setattr(
+         backend_module,
+@@ -267,19 +267,22 @@ def test_backend_uses_normalized_q_c_and_separate_tail_metadata(
+     metadata.cum_query_lens = torch.arange(1, 9, dtype=torch.int32)
+     metadata.raw_seq_lens = torch.ones(8, dtype=torch.int32)
+     metadata.seq_lens = torch.zeros(8, dtype=torch.int32)
+-    metadata.seq_lens_cpu = metadata.seq_lens.clone()
+     metadata.block_table = torch.zeros(8, 1, dtype=torch.int32)
+     metadata.positions = torch.zeros(64, dtype=torch.int64)
+     metadata.slot_mapping = torch.full((64,), -1, dtype=torch.int64)
++
+     if dsa_cp:
+-        metadata.query_metadata = AscendIndexerKPoolQueryMetadata(
++        metadata.query_metadata = backend_module.AscendIndexerKPoolQueryMetadata(
+             positions=metadata.positions,
+             cum_query_lens=metadata.cum_query_lens,
+             num_actual_tokens=metadata.num_actual_tokens,
++            seq_lens=metadata.seq_lens,
++            pool_tail=torch.zeros(8, dtype=torch.int64),
+         )
+         metadata.positions = torch.zeros(128, dtype=torch.int64)
+-        group = SimpleNamespace(all_gather=lambda x, dim: torch.cat((x, x)))
+-        monkeypatch.setattr(backend_module, "get_tp_group", lambda: group)
++        monkeypatch.setattr(
++            backend_module, "get_tp_group", lambda: SimpleNamespace(all_gather=lambda x, dim: torch.cat((x, x)))
++        )
+ 
+     result = backend.forward(
+         hidden,
+@@ -290,40 +293,34 @@ def test_backend_uses_normalized_q_c_and_separate_tail_metadata(
+     )
+ 
+     assert result is not None
+-    assert backend.indexer_op.args is not None
++    assert recorder.args is not None
++    assert recorder.kwargs is not None
+     expected_rows = 64 if dsa_cp or graph_mode == CUDAGraphMode.FULL else 8
+     assert result.shape[0] == expected_rows
+-    torch.testing.assert_close(
+-        backend.indexer_op.args[1], normalized_q_c[:expected_rows].repeat(1, 2).view(expected_rows, 2, 2)
+-    )
+-    expected_k = torch.nn.functional.layer_norm(
+-        torch.nn.functional.linear(hidden[:expected_rows] + 3, backend.wk_weights_proj.weight)[:, :2],
+-        (2,),
+-        backend.k_norm.weight,
+-        backend.k_norm.bias,
+-        backend.k_norm.eps,
+-    )
+-    torch.testing.assert_close(
+-        backend.indexer_op.args[0], torch.cat((expected_k, expected_k)) if dsa_cp else expected_k
+-    )
+-    assert backend.indexer_op.args[0].dtype == torch.float32
++    torch.testing.assert_close(recorder.args[1], normalized_q_c[:expected_rows].repeat(1, 2).view(expected_rows, 2, 2))
++    if dsa_cp:
++        torch.testing.assert_close(recorder.args[0], torch.cat((hidden + 3, hidden + 3)))
++    else:
++        torch.testing.assert_close(recorder.args[0], hidden[:expected_rows] + 3)
++    torch.testing.assert_close(backend._key_weight, backend.wk_weights_proj.weight[:2])
++    torch.testing.assert_close(backend._norm_weight_f32, backend.k_norm.weight.float())
+     expected_weights = torch.nn.functional.linear(hidden[:expected_rows], backend.wk_weights_proj.weight[2:]) * (
+         0.5 * 2**-0.5
+     )
+-    torch.testing.assert_close(backend.indexer_op.args[2], expected_weights)
+-    assert backend.indexer_op.args[7] is tail_metadata
+-    assert backend.indexer_op.kwargs is not None
+-    assert backend.indexer_op.kwargs["compute_topk"] is True
+-    assert backend.indexer_op.kwargs["output_buffer"] is backend.topk_indices_buffer
+-    assert backend.indexer_op.kwargs["allow_cache_packing"] is (graph_mode != CUDAGraphMode.FULL)
+-    assert backend.indexer_op.kwargs["query_metadata"] is metadata.query_metadata
++    torch.testing.assert_close(recorder.args[2], expected_weights)
++    assert recorder.args[-1] is tail_metadata
++    assert recorder.kwargs["compute_topk"] is True
+ 
+ 
+ def test_dsacp_kpool_compresses_global_tokens_and_selects_local_queries(monkeypatch):
+     metadata = _indexer_metadata()
+     local_positions = metadata.positions[4:]
+     query_metadata = AscendIndexerKPoolQueryMetadata(
+-        positions=local_positions, cum_query_lens=torch.tensor([0, 4], dtype=torch.int32), num_actual_tokens=3
++        positions=local_positions,
++        cum_query_lens=torch.tensor([0, 4], dtype=torch.int32),
++        num_actual_tokens=3,
++        seq_lens=metadata.seq_lens,
++        pool_tail=torch.zeros(2, dtype=torch.int64),
+     )
+     compress = MagicMock()
+     select = MagicMock(return_value=torch.zeros((4, 1, 7), dtype=torch.int32))
+@@ -352,3 +349,127 @@ def test_dsacp_kpool_compresses_global_tokens_and_selects_local_queries(monkeypa
+     assert result.shape[0] == 4
+     assert torch.all(result[3] == -1)
+     torch.testing.assert_close(result[:3, 0, 0], torch.tensor([0, 0, 0], dtype=torch.int32))
++
++
++@pytest.mark.parametrize("missing", ["cann_ops_transformer", "vllm_ascend.ops.triton.glm5_next_cann_keypool"])
++def test_cann_backend_reports_missing_operator_dependencies(monkeypatch, missing):
++    def load(name):
++        if name == missing:
++            raise ImportError(name)
++        return MagicMock()
++
++    loader = MagicMock(side_effect=load)
++    monkeypatch.setattr(backend_module, "import_module", loader)
++    with pytest.raises(RuntimeError, match="CANN ops-transformer operator package and Triton cache/index adapters"):
++        Glm5NextKPoolIndexerBackend.__new__(Glm5NextKPoolIndexerBackend)._init_cann_ops()
++    assert missing in [call.args[0] for call in loader.call_args_list]
++
++
++@pytest.mark.parametrize("compute_topk", [False, True])
++@pytest.mark.parametrize(
++    "dsa_cp,actual_query_tokens,runtime_mode",
++    [
++        (False, 8, CUDAGraphMode.NONE),
++        (True, 4, CUDAGraphMode.NONE),
++        (True, 3, CUDAGraphMode.NONE),
++        (True, 0, CUDAGraphMode.NONE),
++        (True, 0, CUDAGraphMode.PIECEWISE),
++        (True, 0, CUDAGraphMode.FULL),
++    ],
++)
++@pytest.mark.parametrize("reuse_output", [False, True])
++def test_cann_indexer_writes_caches_before_optional_selection(
++    monkeypatch, compute_topk, dsa_cp, actual_query_tokens, runtime_mode, reuse_output
++):
++    monkeypatch.setattr(
++        backend_module, "get_forward_context", lambda: SimpleNamespace(cudagraph_runtime_mode=runtime_mode)
++    )
++    op = Glm5NextKPoolIndexerBackend.__new__(Glm5NextKPoolIndexerBackend)
++    nn.Module.__init__(op)
++    op.topk_tokens, op.head_dim, op.index_kpool = 4, 2, 4
++    op._key_weight = torch.empty(2, 3, dtype=torch.bfloat16)
++    op._gate_weight = torch.empty(2, 3, dtype=torch.bfloat16)
++    op._norm_weight_f32 = op._norm_bias_f32 = None
++    op.k_norm = SimpleNamespace(eps=1e-6)
++    op.index_kpool_compress_ape = torch.empty(4, 2)
++    storage = torch.full((20, 22), 77, dtype=torch.int32)
++    op.topk_indices_buffer = storage[::2, :11] if reuse_output else None
++    pooled = torch.empty(2, 2, dtype=torch.bfloat16)
++    state = torch.empty(5, 4, 4)
++    query_rows = 4 if dsa_cp else 8
++    packed = torch.empty(query_rows, 1, 7, dtype=torch.int32)
++    calls = MagicMock()
++    for name, result in (
++        ("prepare_keypool_state", state),
++        ("key_pool", pooled),
++        ("write_keypool_caches", None),
++        ("pool_key_indexer", (torch.empty(query_rows, 7, dtype=torch.int32), None)),
++        ("pack_keypool_indices", packed),
++    ):
++        mock = MagicMock(return_value=result)
++        setattr(op, "_" + name, mock)
++        calls.attach_mock(mock, name)
++    metadata = _indexer_metadata()
++    metadata.query_start_loc = torch.tensor([0, 4, 8], dtype=torch.int32)
++    metadata.start_pos = torch.zeros(2, dtype=torch.int32)
++    metadata.pool_tail = torch.zeros(2, dtype=torch.int64)
++    metadata.pooled_slot_mapping = torch.tensor([0, 2], dtype=torch.int64)
++    metadata.keypool_state_table = torch.empty(2, 2, dtype=torch.int32)
++    metadata.keypool_start_offsets = torch.empty(2, dtype=torch.int32)
++    if dsa_cp:
++        metadata.query_metadata = AscendIndexerKPoolQueryMetadata(
++            positions=metadata.positions[4:],
++            cum_query_lens=torch.tensor([0, actual_query_tokens], dtype=torch.int64),
++            num_actual_tokens=actual_query_tokens,
++            seq_lens=torch.tensor([0, int(actual_query_tokens > 0)], dtype=torch.int64),
++            pool_tail=torch.zeros(2, dtype=torch.int64),
++        )
++    query_metadata = metadata.query_metadata or metadata
++    tail_metadata = _tail_metadata()
++    tail_metadata.cann_inputs = SimpleNamespace(retained_indices=None)
++    cache = torch.empty(2, 2, 1, 2, dtype=torch.bfloat16)
++    tail = torch.empty(2, 4, 4)
++    with patch.object(torch.Tensor, "item", side_effect=AssertionError("unexpected device synchronization")):
++        result = op._forward_cann(
++            torch.empty(8, 3, dtype=torch.bfloat16),
++            torch.empty(query_rows, 1, 2, dtype=torch.bfloat16),
++            torch.empty(query_rows, 1, dtype=torch.bfloat16),
++            cache,
++            tail,
++            metadata,
++            tail_metadata,
++            compute_topk=compute_topk,
++        )
++    names = [call[0] for call in calls.mock_calls]
++    assert names[:3] == ["prepare_keypool_state", "key_pool", "write_keypool_caches"]
++    assert op._key_pool.call_args.args[1:3] == (op._key_weight, op._gate_weight)
++    assert op._key_pool.call_args.kwargs["cu_seqlens"] is metadata.query_start_loc
++    assert op._write_keypool_caches.call_args.args[:2] == (tail, cache)
++    assert op._write_keypool_caches.call_args.args[4] is pooled
++    skip_empty_query = actual_query_tokens == 0 and runtime_mode != CUDAGraphMode.FULL
++    if compute_topk and skip_empty_query:
++        assert result.shape == (query_rows, 1, 7)
++        assert result.dtype == torch.int32
++        assert torch.all(result == -1)
++        assert names[3:] == []
++        op._pool_key_indexer.assert_not_called()
++        op._pack_keypool_indices.assert_not_called()
++        if reuse_output:
++            assert result.data_ptr() == storage.data_ptr()
++            assert torch.all(op.topk_indices_buffer[:query_rows] == -1)
++            assert torch.all(op.topk_indices_buffer[query_rows:] == 77)
++            assert torch.all(storage[1::2] == 77)
++            assert torch.all(storage[:, 11:] == 77)
++    elif compute_topk:
++        assert result is packed
++        assert names[3:] == ["pool_key_indexer", "pack_keypool_indices"]
++        assert op._pool_key_indexer.call_args.args[1] is cache
++        assert op._pool_key_indexer.call_args.kwargs["block_table"] is metadata.block_table
++        assert op._pool_key_indexer.call_args.kwargs["actual_seq_q"] is query_metadata.cum_query_lens
++        assert op._pool_key_indexer.call_args.kwargs["actual_seq_k"] is query_metadata.seq_lens
++        assert op._pool_key_indexer.call_args.args[3] is query_metadata.pool_tail
++        assert op._pack_keypool_indices.call_args.args[1] is query_metadata
++    else:
++        assert result is None
++        op._pool_key_indexer.assert_not_called()
++        op._pack_keypool_indices.assert_not_called()
+diff --git a/tests/ut/models/test_glm5next_kv_cache.py b/tests/ut/models/test_glm5next_kv_cache.py
+index bebd2d323..6e0b97170 100644
+--- a/tests/ut/models/test_glm5next_kv_cache.py
++++ b/tests/ut/models/test_glm5next_kv_cache.py
+@@ -2,22 +2,23 @@
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+ """GLM-Next cache specs and compressed-cache addressing."""
+ 
++import sys
+ from dataclasses import replace
+ from types import SimpleNamespace
+-from unittest.mock import patch
++from unittest.mock import MagicMock, patch
+ 
+ import pytest
+ import torch
+ from vllm.v1.core.block_pool import BlockPool
+ from vllm.v1.kv_cache_spec_registry import KVCacheSpecRegistry
+ 
++import vllm_ascend.attention.indexer_kpool as backend_module
+ from vllm_ascend.attention.indexer_kpool import (
+     AscendIndexerKPoolBackend,
+     AscendIndexerKPoolMetadataBuilder,
+     AscendIndexerKPoolTailBackend,
+     AscendIndexerKPoolTailMetadataBuilder,
+ )
+-from vllm_ascend.attention.utils import AscendCommonAttentionMetadata
+ from vllm_ascend.core.kv_cache_interface import (
+     AscendIndexerKPoolTailSpec,
+     AscendMLAAttentionSpec,
+@@ -33,6 +34,25 @@ from vllm_ascend.models.glm5next.kv_cache import (
+     format_indexer_kpool_slot_mapping,
+     get_kpool_tail_ring_capacity,
+ )
++from vllm_ascend.spec_decode.multi_kv_cache_group_proposer import AscendMultiKVCacheGroupMTPProposer
++
++pytestmark = pytest.mark.usefixtures("keypool_kernels")
++
++
++@pytest.fixture
++def keypool_kernels(monkeypatch):
++    def metadata(common, buffers, tokens, *_, **kwargs):
++        n = common.num_reqs
++        keys = "positions slot_mapping seq_lens raw_seq_lens query_start_loc cum_query_lens start_pos pool_tail"
++        sizes = (tokens, tokens, n, n, n + 1, n, n, n)
++        return tuple(getattr(buffers, key)[:size] for key, size in zip(keys.split(), sizes))
++
++    kernels = SimpleNamespace(
++        build_keypool_metadata=MagicMock(side_effect=metadata),
++        build_tail_inputs=MagicMock(),
++    )
++    monkeypatch.setitem(sys.modules, "vllm_ascend.ops.triton.glm5_next_cann_keypool", kernels)
++    return kernels
+ 
+ 
+ @pytest.fixture(autouse=True)
+@@ -225,8 +245,8 @@ def test_indexer_metadata_addresses_complete_storage_pages(storage_block_size):
+     # as a view, so both builders observe the same persistent buffer.
+     assert first.block_size == 128 // pool_size
+     torch.testing.assert_close(first.block_table, expanded)
+-    assert first.slot_mapping.tolist() == [8 * storage_block_size - 1, -1, 2 * storage_block_size, -1]
+-    assert first.seq_lens.tolist() == [storage_block_size + 1]
++    assert first.slot_mapping.shape == (4,)
++    assert first.seq_lens.shape == (1,)
+     address = first.block_table.data_ptr()
+     assert draft.block_table.data_ptr() == address
+     common.block_table_tensor[:, :split] = 3 * split + torch.arange(split)
+@@ -236,65 +256,6 @@ def test_indexer_metadata_addresses_complete_storage_pages(storage_block_size):
+     torch.testing.assert_close(draft.block_table, common.block_table_tensor[:1])
+ 
+ 
+-def test_dsacp_indexer_shards_queries_and_keeps_global_cache_metadata(monkeypatch):
+-    monkeypatch.setattr("vllm_ascend.attention.indexer_kpool.enable_dsa_cp", lambda: True)
+-    monkeypatch.setattr(
+-        "vllm_ascend.attention.indexer_kpool.get_tp_group",
+-        lambda: SimpleNamespace(world_size=2, rank_in_group=1),
+-    )
+-    config = SimpleNamespace(
+-        cache_config=SimpleNamespace(block_size=128),
+-        scheduler_config=SimpleNamespace(max_num_batched_tokens=5, max_num_seqs=2),
+-        model_config=SimpleNamespace(max_model_len=256),
+-    )
+-    spec = AscendMLAAttentionSpec(
+-        block_size=128,
+-        num_kv_heads=1,
+-        head_size=128,
+-        dtype=torch.bfloat16,
+-        tokens_per_state=4,
+-        model_version="glm5_next",
+-    )
+-    tail_spec = AscendIndexerKPoolTailSpec(
+-        block_size=4,
+-        sliding_window=4,
+-        compress_ratio=4,
+-        num_kv_heads=1,
+-        head_size=128,
+-        dtype=torch.float32,
+-    )
+-    builder = AscendIndexerKPoolMetadataBuilder(spec, ["layer.indexer.k_cache"], config, torch.device("cpu"))
+-    tail_builder = AscendIndexerKPoolTailMetadataBuilder(
+-        tail_spec, ["layer.indexer.tail_cache"], config, torch.device("cpu")
+-    )
+-    common = SimpleNamespace(
+-        num_reqs=2,
+-        num_input_tokens=5,
+-        num_actual_tokens=5,
+-        query_start_loc=torch.tensor([0, 4, 5], dtype=torch.int32),
+-        seq_lens=torch.tensor([4, 1], dtype=torch.int32),
+-        _seq_lens_cpu=None,
+-        seq_lens_cpu=None,
+-        positions=torch.tensor([0, 1, 2, 3, 0]),
+-        slot_mapping=torch.tensor([0, 1, 2, 3, 128]),
+-        block_table_tensor=torch.tensor([[0], [1]], dtype=torch.int32),
+-    )
+-    metadata = builder.build(0, common)
+-    tail = tail_builder.build(0, common)
+-    assert metadata.positions.tolist() == [0, 1, 2, 3, 0, 0]
+-    assert metadata.slot_mapping.tolist() == [-1, -1, -1, 0, -1, -1]
+-    assert metadata.cum_query_lens.tolist() == [4, 5]
+-    query = metadata.query_metadata
+-    assert query.num_actual_tokens == 2
+-    assert query.positions.tolist() == [3, 0, 0]
+-    assert query.cum_query_lens.tolist() == [1, 2]
+-    assert tail.slot_mapping.tolist() == [0, 1, 2, 3, 128, -1]
+-    refreshed = builder.build(0, common).query_metadata
+-    assert refreshed.cum_query_lens.data_ptr() == query.cum_query_lens.data_ptr()
+-    assert refreshed.positions.data_ptr() == query.positions.data_ptr()
+-    assert tail_builder.build(0, common).slot_mapping.data_ptr() == tail.slot_mapping.data_ptr()
+-
+-
+ def test_model_cache_layers_publish_source_compatible_specs():
+     current_config = SimpleNamespace(
+         parallel_config=SimpleNamespace(pipeline_parallel_size=2),
+@@ -342,51 +303,6 @@ def test_model_cache_layers_publish_source_compatible_specs():
+     }
+ 
+ 
+-def test_indexer_metadata_preserves_raw_request_boundaries():
+-    config = SimpleNamespace(
+-        cache_config=SimpleNamespace(block_size=256),
+-        scheduler_config=SimpleNamespace(
+-            max_num_batched_tokens=16,
+-            max_num_seqs=2,
+-        ),
+-        model_config=SimpleNamespace(max_model_len=512),
+-    )
+-    builder = AscendIndexerKPoolMetadataBuilder(
+-        AscendMLAAttentionSpec(
+-            block_size=256,
+-            num_kv_heads=1,
+-            head_size=128,
+-            dtype=torch.bfloat16,
+-            model_version="glm5_next",
+-            **_ratio_kwargs(16),
+-        ),
+-        ["model.layers.0.indexer.k_cache"],
+-        config,
+-        torch.device("cpu"),
+-    )
+-    common = AscendCommonAttentionMetadata(
+-        query_start_loc=torch.tensor([0, 2, 5], dtype=torch.int32),
+-        query_start_loc_cpu=torch.tensor([0, 2, 5], dtype=torch.int32),
+-        seq_lens=torch.tensor([18, 35], dtype=torch.int32),
+-        _seq_lens_cpu=torch.tensor([18, 35], dtype=torch.int32),
+-        num_reqs=2,
+-        num_actual_tokens=5,
+-        max_query_len=3,
+-        num_input_tokens=5,
+-        max_seq_len=35,
+-        block_table_tensor=torch.tensor([[0, -1], [1, 2]], dtype=torch.int32),
+-        slot_mapping=torch.tensor([16, 17, 32, 33, 34]),
+-        positions=torch.tensor([16, 17, 32, 33, 34]),
+-    )
+-
+-    metadata = builder.build(0, common)
+-
+-    assert metadata.cum_query_lens.tolist() == [2, 5]
+-    assert metadata.raw_seq_lens.tolist() == [18, 35]
+-    assert metadata.seq_lens.tolist() == [1, 2]
+-    assert metadata.num_actual_tokens == 5
+-
+-
+ def test_indexer_metadata_request_buffers_cover_graph_token_padding():
+     config = SimpleNamespace(
+         cache_config=SimpleNamespace(block_size=256),
+@@ -424,9 +340,9 @@ def test_indexer_metadata_request_buffers_cover_graph_token_padding():
+ 
+     metadata = builder.build_for_drafting(common, draft_index=1)
+ 
+-    assert metadata.seq_lens.tolist() == [1, 2, 0, 0]
+-    assert metadata.cum_query_lens.tolist() == [1, 2, 3, 4]
+-    assert metadata.raw_seq_lens.tolist() == [17, 33, 0, 0]
++    assert metadata.seq_lens.shape == (4,)
++    assert metadata.cum_query_lens.shape == (4,)
++    assert metadata.raw_seq_lens.shape == (4,)
+ 
+ 
+ def test_indexer_metadata_buffers_are_stable_per_draft_step():
+@@ -492,8 +408,6 @@ def test_indexer_metadata_buffers_are_stable_per_draft_step():
+         refreshed.positions.data_ptr(),
+     )
+     assert refreshed_ptrs == first_ptrs
+-    assert refreshed.positions.tolist() == [32, 33]
+-    assert refreshed.raw_seq_lens.tolist() == [34]
+ 
+     other_step = SimpleNamespace(**vars(common))
+     other_step.slot_mapping = common.slot_mapping.clone()
+@@ -506,3 +420,162 @@ def test_indexer_metadata_buffers_are_stable_per_draft_step():
+         second.positions.data_ptr(),
+     )
+     assert all(left != right for left, right in zip(first_ptrs, second_ptrs))
++    for field in ("query_start_loc", "start_pos", "pool_tail", "pooled_slot_mapping"):
++        pointer = getattr(first, field).data_ptr()
++        assert all(getattr(meta, field).data_ptr() == pointer for meta in (captured, drafted, refreshed))
++        assert getattr(second, field).data_ptr() != pointer
++
++
++def _config():
++    return SimpleNamespace(
++        cache_config=SimpleNamespace(block_size=128),
++        scheduler_config=SimpleNamespace(max_num_batched_tokens=16, max_num_seqs=2),
++        model_config=SimpleNamespace(max_model_len=8192),
++    )
++
++
++def _builder(config):
++    spec = AscendMLAAttentionSpec(
++        block_size=config.cache_config.block_size,
++        num_kv_heads=1,
++        head_size=128,
++        dtype=torch.bfloat16,
++        model_version="glm5_next",
++        **_ratio_kwargs(4),
++    )
++    return AscendIndexerKPoolMetadataBuilder(spec, ["layer.indexer.k_cache"], config, torch.device("cpu"))
++
++
++class _Common(SimpleNamespace):
++    @property
++    def _seq_lens_cpu(self):
++        raise AssertionError("CANN metadata must not read host lengths")
++
++
++def _common():
++    return _Common(
++        num_reqs=2,
++        num_input_tokens=10,
++        num_actual_tokens=8,
++        query_start_loc=torch.tensor([0, 6, 8], dtype=torch.int32),
++        seq_lens=torch.tensor([8, 9], dtype=torch.int32),
++        block_table_tensor=torch.tensor([[0, -1], [1, -1]], dtype=torch.int32),
++        slot_mapping=torch.tensor([2, -1, 4, 5, 6, 7, 135, 136, -1, -1]),
++        positions=torch.tensor([2, 3, 4, 5, 6, 7, 7, 8, 3, 7]),
++    )
++
++
++@pytest.mark.parametrize("input_tokens", [9, 10])
++@pytest.mark.parametrize("unpadded", [None, "positions", "slot_mapping"])
++@pytest.mark.parametrize("dsa_cp", [False, True])
++def test_metadata_delegates_to_kernel_and_keeps_capture_storage(
++    input_tokens, unpadded, dsa_cp, keypool_kernels, monkeypatch
++):
++    monkeypatch.setattr(backend_module, "enable_dsa_cp", lambda: dsa_cp)
++    monkeypatch.setattr(backend_module, "get_tp_group", lambda: SimpleNamespace(world_size=2, rank_in_group=1))
++    builder, common = _builder(_config()), _common()
++    common.num_input_tokens = input_tokens
++    if unpadded:
++        setattr(common, unpadded, getattr(common, unpadded)[: common.num_actual_tokens])
++    first = builder.build(0, common)
++    args = keypool_kernels.build_keypool_metadata.call_args.args
++    assert args[0] is common
++    cache_tokens = backend_module._round_up(input_tokens, 2 if dsa_cp else 1)
++    assert args[2:] == (cache_tokens, 8 if unpadded else input_tokens, 128, 4)
++    assert first.num_actual_tokens == common.num_actual_tokens
++    kwargs = keypool_kernels.build_keypool_metadata.call_args.kwargs
++    assert kwargs["query_metadata"] is first.query_metadata
++    assert kwargs["local_start"] == (5 if dsa_cp else 0)
++    if dsa_cp:
++        assert first.query_metadata.positions.data_ptr() == first.positions[5:].data_ptr()
++        assert first.query_metadata.positions.shape == (5,)
++        assert first.query_metadata.num_actual_tokens == 3
++        for field in ("cum_query_lens", "seq_lens", "pool_tail"):
++            assert getattr(first.query_metadata, field).dtype == torch.int64
++    assert first.keypool_state_table.tolist() == [[1, 3, 3, 3], [2, 4, 4, 4]]
++    fields = ("start_pos", "query_start_loc", "pool_tail", "pooled_slot_mapping", "keypool_state_table")
++    pointers = [getattr(first, f).data_ptr() for f in fields]
++    common.seq_lens.add_(1)
++    common.positions.add_(1)
++    second = builder.build(0, common)
++    assert pointers == [getattr(second, f).data_ptr() for f in fields]
++    if dsa_cp:
++        for field in ("positions", "cum_query_lens", "seq_lens", "pool_tail"):
++            assert getattr(first.query_metadata, field).data_ptr() == getattr(second.query_metadata, field).data_ptr()
++
++
++@pytest.mark.parametrize("width", [1, 4])
++@pytest.mark.parametrize("dsa_cp", [False, True])
++def test_tail_inputs_pass_page_stride_and_isolate_step_buffers(width, dsa_cp, keypool_kernels, monkeypatch):
++    monkeypatch.setattr(backend_module, "enable_dsa_cp", lambda: dsa_cp)
++    config, common = _config(), _common()
++    spec = AscendIndexerKPoolTailSpec(
++        block_size=7,
++        num_kv_heads=1,
++        head_size=128,
++        dtype=torch.float32,
++        sliding_window=4,
++        compress_ratio=4,
++        page_size_padded=81920,
++    )
++    builder = AscendIndexerKPoolTailMetadataBuilder(spec, ["layer.indexer.tail_cache"], config, torch.device("cpu"))
++    common.max_query_len = width
++    common.num_actual_tokens = common.num_input_tokens = 2 * width
++    common.query_start_loc = torch.tensor([0, width, 2 * width], dtype=torch.int32)
++    common.seq_lens = torch.tensor([16 + width, 27 + width], dtype=torch.int32)
++    common.slot_mapping = torch.arange(2 * width)
++    first = builder.build(0, common)
++    args = keypool_kernels.build_tail_inputs.call_args.args
++    assert args[0] is common
++    assert args[1:5] == (4, 7, 80, width)
++    assert first.cann_inputs is keypool_kernels.build_tail_inputs.return_value
++    assert first.slot_mapping.data_ptr() == common.slot_mapping.data_ptr()
++    first_buffers = args[5]
++    other = _Common(**vars(common))
++    other.slot_mapping = common.slot_mapping.clone()
++    isolated = builder.build_for_drafting(other, 1)
++    other_buffers = keypool_kernels.build_tail_inputs.call_args.args[5]
++    assert other_buffers["writes"].data_ptr() != first_buffers["writes"].data_ptr()
++    common.query_start_loc[-1] = -1
++    common.num_actual_tokens = width
++    builder.build_for_graph_capture(common)
++    assert keypool_kernels.build_tail_inputs.call_args.args[5] is first_buffers
++    assert isolated.cann_inputs is keypool_kernels.build_tail_inputs.return_value
++
++
++@pytest.mark.parametrize("field", ["positions", "slot_mapping"])
++def test_incomplete_inputs_fail_before_kernel_launch(field, keypool_kernels):
++    common = _common()
++    setattr(common, field, getattr(common, field)[: common.num_actual_tokens - 1])
++    with pytest.raises(ValueError, match="must cover every actual token"):
++        _builder(_config()).build(0, common)
++    keypool_kernels.build_keypool_metadata.assert_not_called()
++
++
++@pytest.mark.parametrize("logical,primary", [(128, True), (256, False), (1152, False)])
++def test_mtp_preserves_expanded_kernel_pages(logical, primary):
++    config, common = _config(), _common()
++    config.cache_config.block_size = logical
++    config.parallel_config = SimpleNamespace(decode_context_parallel_size=1, prefill_context_parallel_size=1)
++    config.speculative_config = SimpleNamespace(num_speculative_tokens=3)
++    builder = _builder(config)
++    split, width = logical // 128, (8192 + logical - 1) // logical
++    physical = torch.arange(1, 2 * width + 1, dtype=torch.int32).view(2, width)
++    table = (physical[:, :, None] * split + torch.arange(split)).reshape(2, -1)
++    common.block_table_tensor = table
++    proposer = AscendMultiKVCacheGroupMTPProposer.__new__(AscendMultiKVCacheGroupMTPProposer)
++    proposer._uses_multi_group_kv_cache, proposer.kv_cache_gid, proposer.max_model_len = True, 0, 8192
++    proposer.vllm_config = config
++    gid = 0 if primary else 1
++    proposer._multi_group_slot_mapping_buffers = {(gid, 0): common.slot_mapping.clone()}
++    proposer._multi_group_block_table_buffers = {gid: torch.zeros_like(table)}
++    cache = SimpleNamespace(
++        is_circular_group=False,
++        compute_slot_mapping=lambda *_: None,
++        get_device_tensor=lambda: table,
++        slot_mapping=SimpleNamespace(gpu=common.slot_mapping),
++    )
++    proposer.runner = SimpleNamespace(input_batch=SimpleNamespace(block_table=[cache, cache]))
++    group = SimpleNamespace(kv_cache_group_id=gid, get_metadata_builder=lambda: builder)
++    draft = proposer._common_attn_metadata_for_draft_group(common, group, common.num_input_tokens)
++    torch.testing.assert_close(builder.build(0, draft).block_table, table)
+diff --git a/tests/ut/spec_decode/test_multi_kv_cache_group_proposer.py b/tests/ut/spec_decode/test_multi_kv_cache_group_proposer.py
+index 9fdb0870e..9cdbe64f7 100644
+--- a/tests/ut/spec_decode/test_multi_kv_cache_group_proposer.py
++++ b/tests/ut/spec_decode/test_multi_kv_cache_group_proposer.py
+@@ -10,6 +10,7 @@ from vllm.config.compilation import CUDAGraphMode
+ 
+ import vllm_ascend.spec_decode as spec_decode
+ import vllm_ascend.spec_decode.multi_kv_cache_group_proposer as multi_group_proposer
++from vllm_ascend.attention.indexer_kpool import AscendIndexerKPoolMetadata, AscendIndexerKPoolTailMetadata
+ from vllm_ascend.spec_decode.eagle_proposer import AscendEagleProposer
+ from vllm_ascend.spec_decode.multi_kv_cache_group_proposer import (
+     AscendMultiKVCacheGroupMTPProposer,
+@@ -74,7 +75,10 @@ def test_copy_cache_only_metadata_passes_through_classes_and_non_dataclasses():
+     class Metadata:
+         num_reqs: int
+ 
+-    for metadata in (Metadata, None, object(), SimpleNamespace(num_reqs=2)):
++    slots = torch.tensor([3, 7])
++    kpool = AscendIndexerKPoolMetadata(slots.view(-1, 1), slots, slots, slots, block_size=4, compress_ratio=4)
++    tail = AscendIndexerKPoolTailMetadata(slots.view(-1, 1), slots, block_size=4)
++    for metadata in (Metadata, None, object(), SimpleNamespace(num_reqs=2), kpool, tail):
+         assert AscendMultiKVCacheGroupMTPProposer._copy_cache_only_draft_metadata(metadata) is metadata
+ 
+ 
+@@ -112,14 +116,16 @@ def test_initialize_attn_backend_delegates_single_kv_cache_group():
+ 
+ def test_initialize_attn_backend_splits_glm_physical_cache_groups():
+     proposer = AscendMultiKVCacheGroupMTPProposer.__new__(AscendMultiKVCacheGroupMTPProposer)
+-    proposer._draft_attn_layer_names = {"draft.attn", "draft.indexer.k_cache"}
++    proposer._draft_attn_layer_names = {"draft.attn", "draft.indexer.k_cache", "draft.indexer.tail_cache"}
+     proposer.vllm_config = MagicMock()
+     proposer.device = torch.device("cpu")
+     proposer.num_speculative_tokens = 2
+     proposer.slot_mapping_group = [torch.zeros(4, dtype=torch.int32) for _ in range(2)]
+-    proposer.runner = SimpleNamespace(pin_memory=False)
++    proposer.runner = SimpleNamespace(pin_memory=False, max_num_reqs=2)
++    proposer.max_model_len = 128
+ 
+     main_backend = MagicMock()
++    proposer._draft_block_table_width = MagicMock(side_effect=lambda group: 1 if group.backend is main_backend else 2)
+     main_backend.full_cls_name.return_value = "main.backend"
+     main_backend.get_impl_cls.return_value = object
+     indexer_backend = MagicMock()
+@@ -131,8 +137,8 @@ def test_initialize_attn_backend_splits_glm_physical_cache_groups():
+     indexer_layer.get_attn_backend.return_value = indexer_backend
+     kv_cache_config = SimpleNamespace(
+         kv_cache_groups=[
+-            SimpleNamespace(layer_names=["draft.attn"], kv_cache_spec=MagicMock()),
+-            SimpleNamespace(layer_names=["draft.indexer.k_cache"], kv_cache_spec=MagicMock()),
++            SimpleNamespace(layer_names=["draft.attn", "draft.indexer.k_cache"], kv_cache_spec=MagicMock()),
++            SimpleNamespace(layer_names=["draft.indexer.tail_cache"], kv_cache_spec=MagicMock()),
+         ]
+     )
+ 
+@@ -141,7 +147,11 @@ def test_initialize_attn_backend_splits_glm_physical_cache_groups():
+         patch.object(
+             multi_group_proposer,
+             "get_layers_from_vllm_config",
+-            return_value={"draft.attn": main_layer, "draft.indexer.k_cache": indexer_layer},
++            return_value={
++                "draft.attn": main_layer,
++                "draft.indexer.k_cache": indexer_layer,
++                "draft.indexer.tail_cache": indexer_layer,
++            },
+         ),
+     ):
+         proposer.initialize_attn_backend(kv_cache_config, kernel_block_sizes=[128, 32])
+@@ -149,8 +159,10 @@ def test_initialize_attn_backend_splits_glm_physical_cache_groups():
+     assert proposer._uses_multi_group_kv_cache is True
+     assert proposer.kv_cache_gid == 0
+     assert proposer.block_size == 128
+-    assert [group.kv_cache_group_id for group in proposer.draft_attn_groups] == [0, 1]
+-    assert [call.kwargs["kernel_block_size"] for call in create_builders.call_args_list] == [128, None]
++    assert [group.kv_cache_group_id for group in proposer.draft_attn_groups] == [0, 0, 1]
++    assert [call.kwargs["kernel_block_size"] for call in create_builders.call_args_list] == [128, None, None]
++    tables = list(proposer._multi_group_block_table_buffers.values())
++    assert len({t.data_ptr() for t in tables}) == 2 and all(t.shape == (2, 2) for t in tables)
+ 
+ 
+ def test_secondary_group_recomputes_slot_mapping_from_its_block_table():
+@@ -160,8 +172,10 @@ def test_secondary_group_recomputes_slot_mapping_from_its_block_table():
+     proposer._draft_block_table_width = MagicMock(return_value=2)
+     # Pre-created in initialize_attn_backend; the hook no longer allocates.
+     proposer._multi_group_slot_mapping_buffers = {(1, 0): torch.zeros(4, dtype=torch.int32)}
++    proposer._multi_group_block_table_buffers = {1: torch.zeros(4, 2, dtype=torch.int32)}
+ 
+     secondary_block_table = MagicMock()
++    secondary_block_table.is_circular_group = False
+     secondary_block_table.get_device_tensor.return_value = torch.arange(8, dtype=torch.int32).reshape(2, 4)
+     secondary_block_table.slot_mapping.gpu = torch.zeros(4, dtype=torch.int32)
+     proposer.runner = SimpleNamespace(input_batch=SimpleNamespace(block_table=[MagicMock(), secondary_block_table]))
+@@ -198,26 +212,36 @@ def test_primary_group_crops_block_table_to_builder_width():
+     proposer._uses_multi_group_kv_cache = True
+     proposer.kv_cache_gid = 0
+     proposer._draft_block_table_width = MagicMock(return_value=2)
++    proposer._multi_group_block_table_buffers = {0: torch.full((4, 4), 77, dtype=torch.int32)}
+     proposer.runner = SimpleNamespace(input_batch=SimpleNamespace(block_table=[MagicMock()]))
+     attn_group = SimpleNamespace(kv_cache_group_id=0)
+     common_attn_metadata = SimpleNamespace(
+         _seq_lens_cpu=torch.tensor([5, 8], dtype=torch.int32),
+         seq_lens_cpu=None,
+-        num_reqs=2,
++        num_reqs=4,
+         num_actual_tokens=2,
+         block_table_tensor=torch.arange(8, dtype=torch.int32).reshape(2, 4),
+         slot_mapping=torch.arange(4, dtype=torch.int32),
+     )
+ 
++    refreshed_gids: set[int] = set()
+     group_metadata = proposer._common_attn_metadata_for_draft_group(
+         common_attn_metadata,
+         attn_group,
+         num_input_tokens=4,
++        refreshed_gids=refreshed_gids,
+     )
+ 
+     assert group_metadata is not common_attn_metadata
+-    assert group_metadata.block_table_tensor.shape == (2, 2)
++    assert group_metadata.block_table_tensor.shape == (4, 2)
++    assert not group_metadata.block_table_tensor[2:].any()
+     assert group_metadata.slot_mapping.data_ptr() == common_attn_metadata.slot_mapping.data_ptr()
++    common_attn_metadata.block_table_tensor.fill_(99)
++    reused = proposer._common_attn_metadata_for_draft_group(common_attn_metadata, attn_group, 4, 0, refreshed_gids)
++    assert reused.block_table_tensor.data_ptr() == group_metadata.block_table_tensor.data_ptr()
++    assert reused.block_table_tensor[0, 0] == 0
++    refreshed = proposer._common_attn_metadata_for_draft_group(common_attn_metadata, attn_group, 4, 0, set())
++    assert refreshed.block_table_tensor[0, 0] == 99
+ 
+ 
+ def test_cache_only_next_step_uses_group_metadata_without_advancing_state():
+@@ -228,7 +252,7 @@ def test_cache_only_next_step_uses_group_metadata_without_advancing_state():
+     group_common_attn_metadata = MagicMock()
+     primary_metadata = object()
+     cache_only_metadata = object()
+-    primary_group = SimpleNamespace(layer_names=["draft.attn"])
++    primary_group = SimpleNamespace(kv_cache_group_id=0, layer_names=["draft.attn"])
+     builder = MagicMock()
+     builder.build_for_drafting.return_value = cache_only_metadata
+     cache_only_group = SimpleNamespace(
+@@ -251,6 +275,7 @@ def test_cache_only_next_step_uses_group_metadata_without_advancing_state():
+         cache_only_group,
+         2,
+         1,
++        {0},
+     )
+     builder.build_for_drafting.assert_called_once_with(group_common_attn_metadata, 1)
+     assert per_layer_metadata == {
+@@ -259,41 +284,50 @@ def test_cache_only_next_step_uses_group_metadata_without_advancing_state():
+     }
+ 
+ 
+-@pytest.mark.parametrize("draft_index", [0, 1, 2])
++@pytest.mark.parametrize("draft_index", [0, 1, 4])
+ def test_multi_group_graph_capture_uses_per_group_views(draft_index):
+     proposer = AscendMultiKVCacheGroupMTPProposer.__new__(AscendMultiKVCacheGroupMTPProposer)
+     proposer.use_compress = False
+-    common = SimpleNamespace(num_input_tokens=8)
++    proposer.arange = torch.arange(25, dtype=torch.int32)
++    proposer.token_arange_np = np.arange(25, dtype=np.int32)
++    proposer.query_start_loc_group = [torch.zeros(25, dtype=torch.int32) for _ in range(5)]
++    proposer.seq_lens_group = [torch.tensor([6] + [0] * 23, dtype=torch.int32) for _ in range(5)]
++    common = SimpleNamespace(num_input_tokens=24, num_actual_tokens=24, num_reqs=4, max_query_len=6)
++    common.seq_lens_cpu = common.seq_lens = torch.tensor([6, 0, 0, 0])
++    common.query_start_loc_cpu = common.query_start_loc = torch.arange(0, 25, 6)
+     group_views = [object(), object()]
+     builders = [MagicMock(), MagicMock()]
+     groups = [
+         SimpleNamespace(
++            kv_cache_group_id=0,
+             layer_names=[f"draft.layer.{index}"],
+             get_metadata_builder=MagicMock(return_value=builder),
+         )
+         for index, builder in enumerate(builders)
+     ]
+     proposer.draft_attn_groups = groups
++    proposer._is_cache_only_draft_attn_group = MagicMock(side_effect=lambda group: group is groups[1])
+     proposer._common_attn_metadata_for_draft_group = MagicMock(side_effect=group_views)
+     expected = [object(), object()]
+     for builder, metadata in zip(builders, expected):
+         builder.build_for_graph_capture.return_value = metadata
++        builder.build_for_drafting.return_value = metadata
+ 
+     result = proposer._build_multi_group_graph_capture_metadata(common, draft_index)
+ 
+-    assert result == {
+-        "draft.layer.0": expected[0],
+-        "draft.layer.1": expected[1],
+-    }
+-    assert [invocation.args for invocation in proposer._common_attn_metadata_for_draft_group.call_args_list] == [
+-        (common, groups[0], 8, draft_index),
+-        (common, groups[1], 8, draft_index),
+-    ]
+-    for builder, group_view in zip(builders, group_views):
+-        builder.build_for_graph_capture.assert_called_once_with(
+-            group_view,
+-            multi_group_proposer.AscendAttentionState.DecodeOnly,
+-        )
++    assert result == dict(zip(("draft.layer.0", "draft.layer.1"), expected))
++    captured = proposer._common_attn_metadata_for_draft_group.call_args_list[0].args[0]
++    assert common.num_reqs == 4 and common.num_actual_tokens == 24 and common.max_query_len == 6
++    query = captured.query_start_loc.clamp(max=captured.num_actual_tokens)
++    assert (captured.seq_lens - query.diff() >= 0).all()
++    assert (captured.num_reqs, captured.num_actual_tokens) == ((24, 1) if draft_index else (4, 6))
++    if draft_index:
++        assert captured.max_query_len == captured.decode_token_per_req == 1
++    for index, (builder, group_view) in enumerate(zip(builders, group_views)):
++        drafting = draft_index and index == 0
++        method = builder.build_for_drafting if drafting else builder.build_for_graph_capture
++        mode = draft_index if drafting else multi_group_proposer.AscendAttentionState.DecodeOnly
++        method.assert_called_once_with(group_view, mode)
+ 
+ 
+ def test_multi_group_graph_capture_rejects_compressed_attention():
+@@ -306,54 +340,60 @@ def test_multi_group_graph_capture_rejects_compressed_attention():
+ def test_secondary_tail_slots_cover_prefill_and_keep_each_step():
+     proposer = AscendMultiKVCacheGroupMTPProposer.__new__(AscendMultiKVCacheGroupMTPProposer)
+     proposer._uses_multi_group_kv_cache = True
++    proposer.use_compress = False
+     proposer.kv_cache_gid = 0
+     proposer._draft_block_table_width = MagicMock(return_value=1)
+-    proposer._multi_group_slot_mapping_buffers = {
+-        (1, 0): torch.zeros(8, dtype=torch.int32),
+-        (1, 1): torch.zeros(8, dtype=torch.int32),
+-    }
++    proposer._multi_group_slot_mapping_buffers = {(1, step): torch.zeros(8, dtype=torch.int32) for step in range(5)}
++    proposer._multi_group_block_table_buffers = {1: torch.zeros(8, 1, dtype=torch.int32)}
+     slots = torch.full((8,), -1, dtype=torch.int32)
+-    table = torch.tensor([[2], [7]], dtype=torch.int32)
++    table = torch.tensor([[2], [7], [0], [0], [0], [0], [0], [9]], dtype=torch.int32)
+     block_table = MagicMock()
++    block_table.is_circular_group = True
+     block_table.get_device_tensor.return_value = table
+     block_table.slot_mapping.gpu = slots
+ 
+-    def compute(num_reqs, query_start_loc, positions):
+-        slots.fill_(-1)
+-        for req in range(num_reqs):
+-            start, end = query_start_loc[req : req + 2].tolist()
+-            slots[start:end] = table[req, 0] * 9 + positions[start:end] % 9
+-
+-    block_table.compute_slot_mapping.side_effect = compute
++    block_table.compute_slot_mapping.side_effect = lambda *args: slots.fill_(-1)
+     proposer.runner = SimpleNamespace(input_batch=SimpleNamespace(block_table=[None, block_table]))
+-    group = SimpleNamespace(kv_cache_group_id=1)
++    builder = SimpleNamespace(build_for_drafting=lambda metadata, step: metadata)
++    group = SimpleNamespace(kv_cache_group_id=1, layer_names=["tail"], get_metadata_builder=lambda: builder)
++    primary = SimpleNamespace(kv_cache_group_id=0, layer_names=["attn"])
++    build = proposer._build_cache_only_group_next_step_attn_metadata
+     common = SimpleNamespace(
+         num_reqs=2,
+         num_actual_tokens=5,
+         positions=torch.tensor([5, 6, 7, 10, 11, 0, 0, 0]),
++        slot_mapping=torch.tensor([1, 2, 3, 4, 5, -1, -1, -1], dtype=torch.int32),
+         query_start_loc=torch.tensor([0, 3, 5]),
+         _seq_lens_cpu=None,
+         seq_lens_cpu=None,
+     )
+     first = proposer._common_attn_metadata_for_draft_group(common, group, 8, 0)
+-    assert first.slot_mapping.tolist() == [23, 24, 25, 64, 65, -1, -1, -1]
++    assert first.slot_mapping is common.slot_mapping
++    assert first.block_table_tensor.tolist() == [[2], [7]]
+     common.positions = torch.tensor([8, 12, 0, 0, 0, 0, 0, 0])
+     common.query_start_loc = torch.tensor([0, 1, 2])
+     common.num_actual_tokens = 2
+-    second = proposer._common_attn_metadata_for_draft_group(common, group, 8, 1)
+-    assert second.slot_mapping.tolist() == [26, 66, -1, -1, -1, -1, -1, -1]
+-    assert first.slot_mapping.tolist() == [23, 24, 25, 64, 65, -1, -1, -1]
+-    assert first.slot_mapping.data_ptr() != second.slot_mapping.data_ptr()
+-
+-    common.positions = torch.tensor([9, 13, 0, 0, 0, 0, 0, 0])
+-    refreshed = proposer._common_attn_metadata_for_draft_group(common, group, 8, 1)
+-    assert refreshed.slot_mapping.data_ptr() == second.slot_mapping.data_ptr()
+-    assert refreshed.slot_mapping.tolist() == [18, 67, -1, -1, -1, -1, -1, -1]
++    common.num_reqs = 8
++    common.slot_mapping = torch.tensor([6, -1, -1, -1, -1, -1, -1, -1], dtype=torch.int32)
++    assert first.slot_mapping.data_ptr() != common.slot_mapping.data_ptr()
++    for step, circular in ((1, True), (2, True), (4, True), (1, True), (2, False)):
++        block_table.is_circular_group = circular
++        if step == 1 or not circular:
++            expected = table.clone()
++        current = build(common, step, 8, primary, None, [group])["tail"]
++        assert torch.equal(current.block_table_tensor, expected)
++        assert current.block_table_tensor.data_ptr() == first.block_table_tensor.data_ptr()
++        if circular:
++            assert current.positions is common.positions and current.slot_mapping is common.slot_mapping
++        common.positions = common.positions + 1
++        table.add_(10)
++    block_table.compute_slot_mapping.assert_called_once()
+ 
+ 
+ def test_later_draft_sequence_lengths_exclude_rejected_tokens():
+     proposer = AscendMultiKVCacheGroupMTPProposer.__new__(AscendMultiKVCacheGroupMTPProposer)
+     proposer._uses_multi_group_kv_cache = True
++    proposer._multi_group_block_table_buffers = {0: torch.zeros(12, 1, dtype=torch.int32)}
+     proposer.kv_cache_gid = 0
+     proposer.uses_mrope = False
+     proposer.method = "mtp"
+@@ -395,6 +435,7 @@ def test_later_draft_sequence_lengths_exclude_rejected_tokens():
+ def test_full_graph_later_draft_accepts_missing_cpu_sequence_lengths():
+     proposer = AscendMultiKVCacheGroupMTPProposer.__new__(AscendMultiKVCacheGroupMTPProposer)
+     proposer._uses_multi_group_kv_cache = True
++    proposer._multi_group_block_table_buffers = {0: torch.zeros(16, 1, dtype=torch.int32)}
+     proposer.kv_cache_gid = 0
+     proposer.uses_mrope = False
+     proposer.method = "mtp"
+diff --git a/tests/ut/worker/test_glm5next_pooled_cache.py b/tests/ut/worker/test_glm5next_pooled_cache.py
+index 7731719ac..a616603ee 100644
+--- a/tests/ut/worker/test_glm5next_pooled_cache.py
++++ b/tests/ut/worker/test_glm5next_pooled_cache.py
+@@ -2,6 +2,7 @@
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+ """CPU tests for GLM-Next model-runner pooled cache views."""
+ 
++from dataclasses import replace
+ from itertools import permutations
+ from types import SimpleNamespace
+ from unittest.mock import patch
+@@ -11,7 +12,7 @@ import torch
+ from vllm.v1.core.single_type_kv_cache_manager import (
+     register_all_kvcache_specs,
+ )
+-from vllm.v1.kv_cache_interface import MambaSpec
++from vllm.v1.kv_cache_interface import KVCacheGroupSpec, MambaSpec
+ 
+ from vllm_ascend.core.kv_cache_interface import (
+     AscendIndexerKPoolTailSpec,
+@@ -23,8 +24,10 @@ from vllm_ascend.models.glm5next.cache_config import (
+     get_glm5_next_kv_cache_groups,
+     get_glm5_next_pool_bytes_per_block,
+ )
++from vllm_ascend.models.glm5next.cache_views import view_kpool_tail_cache
+ from vllm_ascend.utils import get_kv_cache_tensor_layers
+ from vllm_ascend.worker.model_runner_v1 import NPUModelRunner
++from vllm_ascend.worker.v2 import attn_utils
+ 
+ MAIN = "model.layers.1.attn"
+ INDEXER = "model.layers.1.indexer.k_cache"
+@@ -57,7 +60,7 @@ class _StateBackend:
+         head_size,
+         **_kwargs,
+     ):
+-        return num_blocks, 2, block_size, head_size
++        return num_blocks, block_size, 2 * head_size
+ 
+ 
+ def _make_config():
+@@ -214,7 +217,7 @@ def test_glm5_next_runner_allocates_contiguous_slot_backings():
+     assert main_rope_cache.shape == (3, 8, 1, 0)
+     assert main_cache.is_contiguous()
+     assert indexer_cache.shape == (3, 4, 1, 4)
+-    assert tail_cache.shape == (3, 2, 2, 1)
++    assert tail_cache.shape == (3, 2, 2)
+     assert [cache.shape for cache in caches[MAMBA]] == [
+         (3, 2, 2),
+         (3, 1, 2, 2),
+@@ -360,3 +363,26 @@ def test_padded_page_layout_rejected_for_packed_hybrid_pool():
+         ),
+     ]
+     assert not requires_padded_page_layout(specs)
++
++
++def test_cann_tail_views_keep_interleaved_rows_and_shared_page_stride(monkeypatch):
++    config, _, plan = _make_plan()
++    runner = _make_runner(config)
++    raw_caches = runner._allocate_kv_cache_tensors(plan)
++    spec = replace(_make_specs()[STATE], head_size=2)
++    plan.kv_cache_groups = [KVCacheGroupSpec(layer_names=[STATE], kv_cache_spec=spec)]
++    raw = raw_caches[STATE]
++    expected = view_kpool_tail_cache(STATE, spec, raw, plan.num_blocks)[0]
++    group = SimpleNamespace(kv_cache_group_id=0, kv_cache_spec=spec, layer_names=[STATE], backend=_StateBackend)
++    monkeypatch.setattr(attn_utils, "get_current_vllm_config", lambda: config)
++    monkeypatch.setattr(attn_utils, "enable_sfa", lambda _config: False)
++    actual = attn_utils._reshape_kv_cache_v2([group], {STATE: raw}, "auto", [2], {}, plan)[STATE][0]
++    assert actual.shape == expected.shape == (plan.num_blocks, 2, 4)
++    assert actual.data_ptr() == expected.data_ptr() == raw.data_ptr()
++    page_bytes = raw.numel() // plan.num_blocks
++    assert actual.stride(0) * actual.element_size() == page_bytes
++    expected[1, :, :2] = 5
++    expected[1, :, 2:] = 7
++    torch.testing.assert_close(actual[1], torch.tensor([[5, 5, 7, 7], [5, 5, 7, 7]], dtype=torch.float32))
++    torch.testing.assert_close(actual[0], torch.zeros_like(actual[0]))
++    torch.testing.assert_close(actual[2], torch.zeros_like(actual[2]))
+diff --git a/vllm_ascend/attention/context_parallel/sfa_cp.py b/vllm_ascend/attention/context_parallel/sfa_cp.py
+index 1db610fe1..25ef9e9da 100644
+--- a/vllm_ascend/attention/context_parallel/sfa_cp.py
++++ b/vllm_ascend/attention/context_parallel/sfa_cp.py
+@@ -476,13 +476,13 @@ class AscendSFADSACPMetadataBuilder(AscendSFAMetadataBuilder):
+         self.dsa_cp_spec_actual_seq_lengths_key: list[torch.Tensor] | None = None
+         if self.speculative_config:
+             spec_token_num = self.speculative_config.num_speculative_tokens
++            capture_sizes = vllm_config.compilation_config.cudagraph_capture_sizes or []
++            spec_rows = max([max_num_reqs * (spec_token_num + 1), *capture_sizes]) + 1
+             self.dsa_cp_spec_actual_seq_lengths_query = [
+-                torch.zeros(max_num_reqs * (spec_token_num + 1) + 1, dtype=torch.int32, device=device)
+-                for _ in range(spec_token_num)
++                torch.zeros(spec_rows, dtype=torch.int32, device=device) for _ in range(spec_token_num)
+             ]
+             self.dsa_cp_spec_actual_seq_lengths_key = [
+-                torch.zeros(max_num_reqs * (spec_token_num + 1) + 1, dtype=torch.int32, device=device)
+-                for _ in range(spec_token_num)
++                torch.zeros(spec_rows, dtype=torch.int32, device=device) for _ in range(spec_token_num)
+             ]
+ 
+     def _prepare_parallel_metadata(
+@@ -570,7 +570,9 @@ class AscendSFADSACPMetadataBuilder(AscendSFAMetadataBuilder):
+         context = metadata.dsa_cp_context
+         assert context is not None
+         assert metadata.positions is not None
+-        positions = nn.functional.pad(metadata.positions, (0, context.num_tokens_pad - metadata.positions.shape[0]))
++        positions = metadata.positions
++        if context.num_tokens_pad != positions.shape[0]:
++            positions = nn.functional.pad(positions, (0, context.num_tokens_pad - positions.shape[0]))
+         # Preserve the global metadata for KV writes and output restoration.
+         # Only the NoPE operator consumes this token-local view.
+         local_metadata = replace(
+diff --git a/vllm_ascend/attention/indexer_kpool.py b/vllm_ascend/attention/indexer_kpool.py
+index 83f80a84c..c523468e6 100644
+--- a/vllm_ascend/attention/indexer_kpool.py
++++ b/vllm_ascend/attention/indexer_kpool.py
+@@ -3,6 +3,7 @@
+ """Cache metadata and execution backends for the GLM-Next pooled indexer."""
+ 
+ from dataclasses import dataclass
++from importlib import import_module
+ from typing import Any
+ 
+ import torch
+@@ -21,16 +22,12 @@ from vllm.v1.attention.backend import (
+ )
+ from vllm.v1.kv_cache_interface import MLAAttentionSpec
+ 
+-from vllm_ascend.attention.context_parallel.common_cp import get_cp_local_query_key_lens
+ from vllm_ascend.core.kv_cache_interface import (
+     AscendIndexerKPoolTailSpec,
+     get_kv_cache_compression_ratio,
+     get_storage_block_size,
+ )
+ from vllm_ascend.device.hardware_profile import AttentionBackendFamily, get_current_hardware_profile
+-from vllm_ascend.models.glm5next.kv_cache import (
+-    format_indexer_kpool_slot_mapping,
+-)
+ from vllm_ascend.utils import _round_up, enable_dsa_cp
+ 
+ GLM5_NEXT_SFA_KERNEL_BLOCK_SIZE = 128
+@@ -43,6 +40,8 @@ class AscendIndexerKPoolQueryMetadata:
+     positions: torch.Tensor
+     cum_query_lens: torch.Tensor
+     num_actual_tokens: int
++    seq_lens: torch.Tensor
++    pool_tail: torch.Tensor
+ 
+ 
+ @dataclass
+@@ -52,15 +51,36 @@ class AscendIndexerKPoolMetadata:
+     block_table: torch.Tensor
+     slot_mapping: torch.Tensor
+     seq_lens: torch.Tensor
+-    seq_lens_cpu: torch.Tensor | None
+     positions: torch.Tensor
+     block_size: int
+     compress_ratio: int
+     cache_role: str = "indexer"
+     cum_query_lens: torch.Tensor | None = None
+     raw_seq_lens: torch.Tensor | None = None
++    seq_lens_cpu: torch.Tensor | None = None
+     num_actual_tokens: int = 0
+     query_metadata: AscendIndexerKPoolQueryMetadata | None = None
++    query_start_loc: torch.Tensor | None = None
++    start_pos: torch.Tensor | None = None
++    pool_tail: torch.Tensor | None = None
++    keypool_state_table: torch.Tensor | None = None
++    keypool_start_offsets: torch.Tensor | None = None
++    pooled_slot_mapping: torch.Tensor | None = None
++
++
++@dataclass
++class _KPoolMetadataBuffers:
++    slot_mapping: torch.Tensor
++    seq_lens: torch.Tensor
++    cum_query_lens: torch.Tensor
++    raw_seq_lens: torch.Tensor
++    positions: torch.Tensor
++    query_start_loc: torch.Tensor
++    start_pos: torch.Tensor
++    pool_tail: torch.Tensor
++    start_offsets: torch.Tensor
++    token_indices: torch.Tensor
++    pooled_slot_mapping: torch.Tensor
+ 
+ 
+ class AscendIndexerKPoolMetadataBuilder(AttentionMetadataBuilder):
+@@ -106,28 +126,21 @@ class AscendIndexerKPoolMetadataBuilder(AttentionMetadataBuilder):
+                 f"kernel={GLM5_NEXT_SFA_KERNEL_BLOCK_SIZE}."
+             )
+         self.kernel_row_block_size = GLM5_NEXT_SFA_KERNEL_BLOCK_SIZE // self.compress_ratio
++        # MTP tables count expanded kernel pages.
++        self.kernel_blocks_per_logical_block = self.logical_block_size // GLM5_NEXT_SFA_KERNEL_BLOCK_SIZE
+         scheduler_config = vllm_config.scheduler_config
+-        self._max_num_batched_tokens = scheduler_config.max_num_batched_tokens
+         self.use_dsa_cp = enable_dsa_cp()
+         self.dsa_cp_size = get_tp_group().world_size if self.use_dsa_cp else 1
+-        self._max_num_batched_tokens = _round_up(self._max_num_batched_tokens, self.dsa_cp_size)
+-        self._max_num_seqs = scheduler_config.max_num_seqs
+-        # FULL draft graphs pad the request-shaped metadata to the selected
+-        # token bucket.  That padded length can exceed max_num_seqs (for
+-        # example, four requests with K=3 use a 16-token bucket), so request
+-        # buffers must cover the graph token capacity as well.
+-        self._max_num_metadata_reqs = max(
+-            self._max_num_seqs,
+-            self._max_num_batched_tokens,
+-        )
+-        # Each MTP draft step owns a persistent common slot-mapping tensor. Key
+-        # derived buffers by that address so capture and runtime rebuilds bind
+-        # the same storage without different draft steps overwriting each other.
+-        self._metadata_buffers: dict[
+-            int,
+-            tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor],
+-        ] = {}
++        self.dsa_cp_rank = get_tp_group().rank_in_group if self.use_dsa_cp else 0
++        self._max_num_batched_tokens = _round_up(scheduler_config.max_num_batched_tokens, self.dsa_cp_size)
++        # FULL draft graphs can pad requests beyond max_num_seqs.
++        self._max_num_metadata_reqs = max(scheduler_config.max_num_seqs, self._max_num_batched_tokens)
++        # Keep captured storage isolated between MTP draft steps.
++        self._metadata_buffers: dict[int, _KPoolMetadataBuffers] = {}
+         self._dsa_cp_query_buffers: dict[int, torch.Tensor] = {}
++        self._captured_state_tables: dict[tuple[int, int, int], torch.Tensor] = {}
++        self._state_table_scratch: dict[int, torch.Tensor] = {}
++        self._state_table_shapes: dict[int, tuple[int, int]] = {}
+ 
+     def _build_query_metadata(
+         self, common: CommonAttentionMetadata, positions: torch.Tensor
+@@ -135,64 +148,74 @@ class AscendIndexerKPoolMetadataBuilder(AttentionMetadataBuilder):
+         if not self.use_dsa_cp:
+             return None
+         local_tokens = positions.shape[0] // self.dsa_cp_size
+-        local_start = get_tp_group().rank_in_group * local_tokens
++        local_start = self.dsa_cp_rank * local_tokens
+         local_end = local_start + local_tokens
+         key = common.slot_mapping.data_ptr()
+         if key not in self._dsa_cp_query_buffers:
+             self._dsa_cp_query_buffers[key] = torch.empty(
+-                self._max_num_metadata_reqs, dtype=torch.int32, device=self.device
++                3, self._max_num_metadata_reqs, dtype=torch.int64, device=self.device
+             )
+-        query_lens = self._dsa_cp_query_buffers[key][: common.num_reqs]
+-        local_query_lens, _ = get_cp_local_query_key_lens(
+-            common.query_start_loc,
+-            common.query_start_loc[1 : common.num_reqs + 1],
+-            common.seq_lens[: common.num_reqs],
+-            local_start,
+-            local_end,
+-        )
+-        query_lens.copy_(local_query_lens)
++        query_lens, seq_lens, pool_tail = self._dsa_cp_query_buffers[key][:, : common.num_reqs]
+         return AscendIndexerKPoolQueryMetadata(
+             positions=positions[local_start:local_end],
+             cum_query_lens=query_lens,
+             num_actual_tokens=max(min(local_end, common.num_actual_tokens) - local_start, 0),
++            seq_lens=seq_lens,
++            pool_tail=pool_tail,
+         )
+ 
+-    def _get_metadata_buffers(
+-        self, common_attn_metadata: CommonAttentionMetadata
+-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
++    def _get_metadata_buffers(self, common_attn_metadata: CommonAttentionMetadata) -> _KPoolMetadataBuffers:
+         key = common_attn_metadata.slot_mapping.data_ptr()
+         buffers = self._metadata_buffers.get(key)
+         if buffers is None:
+-            buffers = (
+-                torch.empty(
+-                    self._max_num_batched_tokens,
+-                    dtype=torch.int64,
+-                    device=self.device,
+-                ),
+-                torch.empty(
+-                    self._max_num_metadata_reqs,
+-                    dtype=torch.int32,
+-                    device=self.device,
+-                ),
+-                torch.empty(
+-                    self._max_num_metadata_reqs,
+-                    dtype=torch.int32,
+-                    device=self.device,
+-                ),
+-                torch.empty(
+-                    self._max_num_metadata_reqs,
+-                    dtype=torch.int32,
+-                    device=self.device,
+-                ),
+-                torch.empty(
+-                    self._max_num_batched_tokens,
+-                    dtype=torch.int64,
+-                    device=self.device,
+-                ),
++            reqs, tokens = self._max_num_metadata_reqs, self._max_num_batched_tokens
++            buffers = _KPoolMetadataBuffers(
++                slot_mapping=torch.empty(tokens, dtype=torch.int64, device=self.device),
++                seq_lens=torch.empty(reqs, dtype=torch.int64, device=self.device),
++                cum_query_lens=torch.empty(reqs, dtype=torch.int64, device=self.device),
++                raw_seq_lens=torch.empty(reqs, dtype=torch.int32, device=self.device),
++                positions=torch.empty(tokens, dtype=torch.int64, device=self.device),
++                query_start_loc=torch.empty(reqs + 1, dtype=torch.int32, device=self.device),
++                start_pos=torch.empty(reqs, dtype=torch.int32, device=self.device),
++                pool_tail=torch.empty(reqs, dtype=torch.int64, device=self.device),
++                start_offsets=torch.empty(reqs, dtype=torch.int32, device=self.device),
++                token_indices=torch.arange(tokens, dtype=torch.int32, device=self.device),
++                pooled_slot_mapping=torch.empty(tokens + 1, dtype=torch.int64, device=self.device),
+             )
+             self._metadata_buffers[key] = buffers
+         return buffers
+ 
++    def _get_state_table(self, common: CommonAttentionMetadata, graph_capture: bool) -> torch.Tensor:
++        # Capture owns each table; eager shapes reuse one growing allocation.
++        step = common.slot_mapping.data_ptr()
++        width = getattr(common, "max_query_len", common.num_input_tokens)
++        cols = 1 + (width + self.compress_ratio - 1) // self.compress_ratio
++        shape = (common.num_reqs, cols)
++        key = (step, *shape)
++        table = self._captured_state_tables.get(key)
++        initialize = table is None
++        if table is None:
++            if graph_capture:
++                table = torch.empty(shape, dtype=torch.int32, device=self.device)
++                self._captured_state_tables[key] = table
++            else:
++                size = common.num_reqs * cols
++                scratch = self._state_table_scratch.get(step)
++                if scratch is None or scratch.numel() < size:
++                    scratch = torch.empty(size, dtype=torch.int32, device=self.device)
++                    self._state_table_scratch[step] = scratch
++                table = scratch[:size].view(shape)
++                initialize = self._state_table_shapes.get(step) != shape
++                self._state_table_shapes[step] = shape
++        if initialize:
++            # This table depends only on shape, so initialize it once.
++            host = torch.empty(shape, dtype=torch.int32, pin_memory=self.device.type != "cpu")
++            rows = torch.arange(1, common.num_reqs + 1, dtype=torch.int32)
++            host.copy_((rows + common.num_reqs)[:, None].expand(shape))
++            host[:, 0].copy_(rows)
++            table.copy_(host, non_blocking=True)
++        return table
++
+     def build(
+         self,
+         common_prefix_len: int,
+@@ -200,60 +223,65 @@ class AscendIndexerKPoolMetadataBuilder(AttentionMetadataBuilder):
+         fast_build: bool = False,
+         **kwargs,
+     ) -> AscendIndexerKPoolMetadata:
++        graph_capture = kwargs.pop("_graph_capture", False)
+         del common_prefix_len, fast_build, kwargs
+         num_reqs = common_attn_metadata.num_reqs
+         num_input_tokens = common_attn_metadata.num_input_tokens
++        buffers = self._get_metadata_buffers(common_attn_metadata)
+         num_cache_tokens = _round_up(num_input_tokens, self.dsa_cp_size)
+-        slot_buffer, seq_buffer, cum_buffer, raw_seq_buffer, positions_buffer = self._get_metadata_buffers(
+-            common_attn_metadata
+-        )
+-        positions = positions_buffer[:num_cache_tokens]
+-        positions[num_input_tokens:].zero_()
+-        positions[:num_input_tokens].copy_(common_attn_metadata.positions[:num_input_tokens])
+-        slot_mapping = slot_buffer[:num_cache_tokens]
+-        slot_mapping[num_input_tokens:].fill_(-1)
+-        slot_mapping[:num_input_tokens].copy_(
+-            format_indexer_kpool_slot_mapping(
+-                common_attn_metadata.slot_mapping[:num_input_tokens],
+-                positions[:num_input_tokens],
+-                self.logical_block_size,
+-                self.compress_ratio,
+-            )
++        num_source_tokens = min(
++            num_input_tokens, common_attn_metadata.positions.shape[0], common_attn_metadata.slot_mapping.shape[0]
+         )
+-        seq_lens = seq_buffer[:num_reqs]
+-        torch.div(
+-            common_attn_metadata.seq_lens[:num_reqs],
++        if num_source_tokens < common_attn_metadata.num_actual_tokens:
++            raise ValueError("KPool positions and slot mapping must cover every actual token.")
++        from vllm_ascend.ops.triton.glm5_next_cann_keypool import build_keypool_metadata  # type: ignore[import-untyped]
++
++        state_table = self._get_state_table(common_attn_metadata, graph_capture)
++        query_metadata = self._build_query_metadata(common_attn_metadata, buffers.positions[:num_cache_tokens])
++        (
++            positions,
++            slot_mapping,
++            seq_lens,
++            raw_seq_lens,
++            query_start_loc,
++            cum_query_lens,
++            start_pos,
++            pool_tail,
++        ) = build_keypool_metadata(
++            common_attn_metadata,
++            buffers,
++            num_cache_tokens,
++            num_source_tokens,
++            self.logical_block_size,
+             self.compress_ratio,
+-            rounding_mode="floor",
+-            out=seq_lens,
++            query_metadata=query_metadata,
++            local_start=self.dsa_cp_rank * (num_cache_tokens // self.dsa_cp_size),
+         )
+-        cum_query_lens = cum_buffer[:num_reqs]
+-        cum_query_lens.copy_(common_attn_metadata.query_start_loc[: num_reqs + 1][1:])
+-        raw_seq_lens = raw_seq_buffer[:num_reqs]
+-        raw_seq_lens.copy_(common_attn_metadata.seq_lens[:num_reqs])
+-        if common_attn_metadata._seq_lens_cpu is not None:
+-            seq_lens_cpu = common_attn_metadata._seq_lens_cpu[:num_reqs]
+-        elif common_attn_metadata.seq_lens_cpu is not None:
+-            seq_lens_cpu = common_attn_metadata.seq_lens_cpu[:num_reqs]
+-        else:
+-            seq_lens_cpu = None
+-        if seq_lens_cpu is not None:
+-            seq_lens_cpu = torch.div(seq_lens_cpu, self.compress_ratio, rounding_mode="floor")
+         block_table = common_attn_metadata.block_table_tensor[:num_reqs]
+         return AscendIndexerKPoolMetadata(
+             block_table=block_table,
+             slot_mapping=slot_mapping,
+             seq_lens=seq_lens,
+-            seq_lens_cpu=seq_lens_cpu,
+             positions=positions,
+             block_size=self.kernel_row_block_size,
+             compress_ratio=self.compress_ratio,
+             cum_query_lens=cum_query_lens,
+             raw_seq_lens=raw_seq_lens,
+             num_actual_tokens=common_attn_metadata.num_actual_tokens,
+-            query_metadata=self._build_query_metadata(common_attn_metadata, positions),
++            query_start_loc=query_start_loc,
++            start_pos=start_pos,
++            pool_tail=pool_tail,
++            pooled_slot_mapping=buffers.pooled_slot_mapping[
++                1 : 1 + min(num_cache_tokens, num_cache_tokens // self.compress_ratio + num_reqs)
++            ],
++            keypool_state_table=state_table,
++            keypool_start_offsets=buffers.start_offsets[:num_reqs],
++            query_metadata=query_metadata,
+         )
+ 
++    def build_for_cudagraph_capture(self, common_attn_metadata: CommonAttentionMetadata) -> AscendIndexerKPoolMetadata:
++        return self.build_for_graph_capture(common_attn_metadata)
++
+     def build_for_graph_capture(
+         self,
+         common_attn_metadata: CommonAttentionMetadata,
+@@ -261,7 +289,7 @@ class AscendIndexerKPoolMetadataBuilder(AttentionMetadataBuilder):
+         **kwargs,
+     ) -> AscendIndexerKPoolMetadata:
+         del attn_state
+-        return self.build(0, common_attn_metadata, **kwargs)
++        return self.build(0, common_attn_metadata, _graph_capture=True, **kwargs)
+ 
+     def build_for_drafting(
+         self,
+@@ -286,8 +314,6 @@ class AscendIndexerKPoolBackend(AttentionBackend):
+ 
+     @staticmethod
+     def get_supported_kernel_block_sizes(kv_cache_spec=None) -> list[int | MultipleOf]:
+-        # The scheduler manages logical token blocks. Triton consumes complete
+-        # compressed storage pages with their actual size and strides.
+         return [MultipleOf(1)]
+ 
+     @staticmethod
+@@ -316,6 +342,7 @@ class AscendIndexerKPoolTailMetadata:
+     block_table: torch.Tensor
+     slot_mapping: torch.Tensor
+     block_size: int
++    cann_inputs: Any = None
+ 
+ 
+ class AscendIndexerKPoolTailMetadataBuilder(AttentionMetadataBuilder):
+@@ -346,10 +373,14 @@ class AscendIndexerKPoolTailMetadataBuilder(AttentionMetadataBuilder):
+             )
+         super().__init__(kv_cache_spec, layer_names, vllm_config, device)
+         self.block_size = kv_cache_spec.block_size
+-        self.use_dsa_cp = enable_dsa_cp()
+-        self.dsa_cp_size = get_tp_group().world_size if self.use_dsa_cp else 1
+-        self._max_num_batched_tokens = _round_up(vllm_config.scheduler_config.max_num_batched_tokens, self.dsa_cp_size)
+-        self._slot_buffers: dict[int, torch.Tensor] = {}
++        # Persistent rings are separate from temporary CANN state pages.
++        self._max_num_metadata_reqs = max(
++            vllm_config.scheduler_config.max_num_seqs, vllm_config.scheduler_config.max_num_batched_tokens
++        )
++        self._tail_inputs: dict[int, dict[str, torch.Tensor]] = {}
++        self._pool_size = kv_cache_spec.compress_ratio
++        self._page_rows = kv_cache_spec.page_size_bytes // (2 * kv_cache_spec.head_size * 4)
++        self._lookahead = self.block_size > self._pool_size
+ 
+     def build(
+         self,
+@@ -361,23 +392,38 @@ class AscendIndexerKPoolTailMetadataBuilder(AttentionMetadataBuilder):
+         del common_prefix_len, fast_build, kwargs
+         num_reqs = common_attn_metadata.num_reqs
+         num_input_tokens = common_attn_metadata.num_input_tokens
++        key = common_attn_metadata.slot_mapping.data_ptr()
++        block_table = common_attn_metadata.block_table_tensor[:num_reqs, :1]
+         slot_mapping = common_attn_metadata.slot_mapping[:num_input_tokens]
+-        if self.use_dsa_cp:
+-            # Match the gathered K/gate rows, including TP alignment padding.
+-            key = common_attn_metadata.slot_mapping.data_ptr()
+-            if key not in self._slot_buffers:
+-                self._slot_buffers[key] = torch.empty(
+-                    self._max_num_batched_tokens, dtype=slot_mapping.dtype, device=self.device
+-                )
+-            padded_tokens = _round_up(num_input_tokens, self.dsa_cp_size)
+-            slots = self._slot_buffers[key][:padded_tokens]
+-            slots[:num_input_tokens].copy_(slot_mapping)
+-            slots[num_input_tokens:].fill_(-1)
+-            slot_mapping = slots
++        from vllm_ascend.ops.triton.glm5_next_cann_keypool import build_tail_inputs  # type: ignore[import-untyped]
++
++        if key not in self._tail_inputs:
++            n, width = self._max_num_metadata_reqs, self.block_size
++            self._tail_inputs[key] = {
++                "history": torch.empty(n, self._pool_size, dtype=torch.int64, device=self.device),
++                **{
++                    name: torch.empty(n, width, dtype=torch.int64, device=self.device)
++                    for name in ("writes", "state", "retained")
++                },
++            }
++        retained_width = (
++            min(self.block_size, getattr(common_attn_metadata, "max_query_len", self.block_size))
++            if self._lookahead
++            else 0
++        )
++        cann_inputs = build_tail_inputs(
++            common_attn_metadata,
++            self._pool_size,
++            self.block_size,
++            self._page_rows,
++            max(1, retained_width) if self._lookahead else 0,
++            self._tail_inputs[key],
++        )
+         return AscendIndexerKPoolTailMetadata(
+-            block_table=common_attn_metadata.block_table_tensor[:num_reqs],
++            block_table=block_table,
+             slot_mapping=slot_mapping,
+             block_size=self.block_size,
++            cann_inputs=cann_inputs,
+         )
+ 
+     def build_for_graph_capture(
+@@ -431,7 +477,7 @@ class AscendIndexerKPoolTailBackend(AttentionBackend):
+         del cache_type, cache_dtype_str
+         if num_kv_heads != 1:
+             raise ValueError(f"Indexer KPool tail cache requires one KV head, got {num_kv_heads}.")
+-        return (num_blocks, 2, block_size, head_size)
++        return (num_blocks, block_size, 2 * head_size)
+ 
+ 
+ class Glm5NextKPoolIndexerBackend(nn.Module):
+@@ -468,13 +514,14 @@ class Glm5NextKPoolIndexerBackend(nn.Module):
+         self.k_cache: Any = vllm_indexer.k_cache
+         self.tail_cache: Any = vllm_indexer.tail_cache
+         self.topk_indices_buffer: torch.Tensor | None = vllm_indexer.topk_indices_buffer
+-        # Load KPool operators only when constructing the model-side backend;
+-        # cache metadata is also imported during engine initialization.
+-        from vllm_ascend.models.glm5next.sparse_attn_indexer_kpool import SparseAttnIndexerKpool
+-
+-        self.indexer_op = SparseAttnIndexerKpool(self.topk_tokens, self.head_dim)
+-        self.enable_sparse_li_c8 = False
+-        for name in ("_wk_weight_f32", "_gate_weight_f32", "_norm_weight_f32", "_norm_bias_f32"):
++        self._init_cann_ops()
++        for name in (
++            "_key_weight",
++            "_gate_weight",
++            "_head_weight_f32",
++            "_norm_weight_f32",
++            "_norm_bias_f32",
++        ):
+             self.register_buffer(name, None, persistent=False)
+ 
+     @property
+@@ -491,8 +538,9 @@ class Glm5NextKPoolIndexerBackend(nn.Module):
+         return 1
+ 
+     def process_weights_after_loading(self) -> None:
+-        self._wk_weight_f32 = self.wk_weights_proj.weight.detach().float()
+-        self._gate_weight_f32 = self.index_kpool_compress_gate.detach().float()
++        self._key_weight = self.wk_weights_proj.weight[: self.head_dim].detach().contiguous()
++        self._gate_weight = self.index_kpool_compress_gate.detach().to(self._key_weight.dtype).contiguous()
++        self._head_weight_f32 = self.wk_weights_proj.weight[self.head_dim :].detach().float().contiguous()
+         self._norm_weight_f32 = self.k_norm.weight.detach().float() if self.k_norm.weight is not None else None
+         self._norm_bias_f32 = self.k_norm.bias.detach().float() if self.k_norm.bias is not None else None
+ 
+@@ -500,14 +548,14 @@ class Glm5NextKPoolIndexerBackend(nn.Module):
+     def _bound_cache(layer: Any) -> torch.Tensor:
+         context = get_forward_context()
+         cache = layer.kv_cache
+-        if isinstance(cache, (list, tuple)):
++        if isinstance(cache, list):
+             virtual_engine = getattr(context, "virtual_engine", 0) or 0
+             if virtual_engine >= len(cache):
+                 raise IndexError(f"Cache virtual engine {virtual_engine} is out of range.")
+             cache = cache[virtual_engine]
+         if isinstance(cache, (list, tuple)):
+             if len(cache) != 1:
+-                raise TypeError("GLM KPool cache must contain one tensor.")
++                raise TypeError("GLM KPool cache requires one key tensor.")
+             cache = cache[0]
+         if not isinstance(cache, torch.Tensor):
+             raise TypeError(f"GLM KPool cache {layer.prefix!r} is not bound to a tensor.")
+@@ -536,65 +584,177 @@ class Glm5NextKPoolIndexerBackend(nn.Module):
+             num_tokens = min(num_tokens, indexer_metadata.num_actual_tokens)
+         hidden = hidden_states[:num_tokens]
+         k_hidden = k_hidden_states[:num_tokens]
+-        if self._wk_weight_f32 is None:
++        if self._key_weight is None:
+             self.process_weights_after_loading()
+-        assert self._wk_weight_f32 is not None
+-        hidden_f32 = hidden.float()
+-        k_hidden_f32 = hidden_f32 if k_hidden_states is hidden_states else k_hidden.float()
+-        projected = F.linear(k_hidden_f32, self._wk_weight_f32)
+-        k = F.layer_norm(
+-            projected[:, : self.head_dim],
+-            (self.head_dim,),
+-            self._norm_weight_f32,
+-            self._norm_bias_f32,
+-            getattr(self.k_norm, "eps", getattr(self.k_norm, "variance_epsilon", 1e-6)),
+-        )
+-        gate_score = F.linear(k_hidden_f32, self._gate_weight_f32)
+-        if indexer_metadata.query_metadata is not None:
+-            # Pool compression can cross a TP token boundary. Gather raw K and
+-            # gates before updating the replicated pool/tail caches.
+-            gathered = get_tp_group().all_gather(torch.cat((k, gate_score), dim=-1), dim=0)
+-            k, gate_score = gathered.split(self.head_dim, dim=-1)
++        assert self._key_weight is not None
+         q_values = None
+         weights = None
+         if compute_topk:
+             if isinstance(q_c, tuple):
+                 raise TypeError("GLM KPool backend requires an unquantized q_c tensor.")
+             q_values = self.wq_b(q_c[:num_tokens])[0].view(num_tokens, self.n_head, self.head_dim)
+-            weights = (
+-                projected[:, self.head_dim :]
+-                if k_hidden_states is hidden_states
+-                else F.linear(hidden_f32, self._wk_weight_f32[self.head_dim :])
+-            ).to(q_values.dtype)
++            weights = F.linear(hidden.float(), self._head_weight_f32).to(q_values.dtype)
+             weights = weights * (self.softmax_scale * self.n_head**-0.5)
+ 
+         indexer_cache = self._bound_cache(self.k_cache)
+         tail_cache = self._bound_cache(self.tail_cache)
+-        positions = indexer_metadata.positions[: k.shape[0]]
+-        result = self.indexer_op(
+-            k,
++        if indexer_metadata.query_metadata is not None:
++            k_hidden = get_tp_group().all_gather(k_hidden, dim=0)
++        return self._forward_cann(
++            k_hidden,
+             q_values,
+             weights,
+-            positions,
+             indexer_cache,
+             tail_cache,
+             indexer_metadata,
+             tail_metadata,
+-            gate_score=gate_score,
+-            compress_ape=self.index_kpool_compress_ape,
+-            index_kpool=self.index_kpool,
+-            max_pool_seq_len=(
+-                indexer_metadata.block_table.shape[1] * indexer_cache.shape[1]
+-                if context.cudagraph_runtime_mode == CUDAGraphMode.FULL or indexer_metadata.seq_lens_cpu is None
+-                else int(indexer_metadata.seq_lens_cpu.max())
+-                if indexer_metadata.seq_lens_cpu.numel()
+-                else 0
+-            ),
+             compute_topk=compute_topk,
+-            output_buffer=self.topk_indices_buffer,
+-            # FULL graphs retain padded token rows and replay the captured
+-            # dispatch. Keep paged reads independent of the live query count.
+-            allow_cache_packing=context.cudagraph_runtime_mode != CUDAGraphMode.FULL,
+-            query_metadata=indexer_metadata.query_metadata,
+         )
+-        return result
++
++    def _init_cann_ops(self) -> None:
++        try:
++            import_module("cann_ops_transformer")
++            adapters = import_module("vllm_ascend.ops.cann_keypool")
++            fused = import_module("vllm_ascend.ops.triton.glm5_next_cann_keypool")
++            self._gather_retained_hidden = adapters.gather_retained_hidden
++            self._pack_keypool_indices = fused.pack_keypool_indices
++            self._prepare_keypool_state = adapters.prepare_keypool_state
++            self._write_keypool_caches = fused.write_keypool_caches
++            self._key_pool = torch.ops.cann_ops_transformer.key_pool
++            self._pool_key_indexer = torch.ops.cann_ops_transformer.pool_key_indexer
++        except (ImportError, AttributeError) as exc:
++            raise RuntimeError(
++                "GLM-5.3-Flash KPool requires cann_ops_transformer with key_pool and pool_key_indexer, "
++                "the matching CANN ops-transformer operator package and Triton cache/index adapters."
++            ) from exc
++
++    def _forward_cann(
++        self,
++        hidden_states: torch.Tensor,
++        q_values: torch.Tensor | None,
++        weights: torch.Tensor | None,
++        indexer_cache: torch.Tensor,
++        tail_cache: torch.Tensor,
++        indexer_metadata: AscendIndexerKPoolMetadata,
++        tail_metadata: AscendIndexerKPoolTailMetadata,
++        *,
++        compute_topk: bool,
++    ) -> torch.Tensor | None:
++        query_metadata = indexer_metadata.query_metadata or indexer_metadata
++        num_tokens = (
++            query_metadata.positions.shape[0] if indexer_metadata.query_metadata is not None else hidden_states.shape[0]
++        )
++        output_width = self.topk_tokens + self.index_kpool - 1
++        if compute_topk and self.topk_indices_buffer is not None:
++            if (
++                self.topk_indices_buffer.ndim != 2
++                or self.topk_indices_buffer.dtype != torch.int32
++                or self.topk_indices_buffer.device != hidden_states.device
++                or self.topk_indices_buffer.stride(1) != 1
++                or (num_tokens > 1 and self.topk_indices_buffer.stride(0) < self.topk_indices_buffer.shape[1])
++            ):
++                raise ValueError("GLM KPool output buffer requires int32 contiguous columns on the query device.")
++            if self.topk_indices_buffer.shape[0] < num_tokens or self.topk_indices_buffer.shape[1] < output_width:
++                raise ValueError("GLM KPool output buffer must cover the token rows and top-k width.")
++        if self.index_kpool <= 0 or self.topk_tokens <= 0 or self.topk_tokens % self.index_kpool:
++            raise ValueError("KPool top-k must be divisible by its positive pool size.")
++        if num_tokens == 0:
++            if not compute_topk:
++                return None
++            if self.topk_indices_buffer is not None:
++                return self.topk_indices_buffer[:0, :output_width].unsqueeze(1)
++            return torch.empty((0, 1, output_width), dtype=torch.int32, device=hidden_states.device)
++        if (
++            indexer_metadata.cum_query_lens is None
++            or indexer_metadata.query_start_loc is None
++            or indexer_metadata.start_pos is None
++            or indexer_metadata.pool_tail is None
++            or indexer_metadata.pooled_slot_mapping is None
++            or tail_metadata.cann_inputs is None
++        ):
++            raise ValueError("GLM KPool metadata requires CANN request boundaries and pooled-key row indices.")
++        if indexer_cache.dtype != torch.bfloat16:
++            raise TypeError("GLM KPool compressed cache must be bfloat16.")
++        if tail_cache.dtype != torch.float32:
++            raise TypeError("GLM KPool compressor tail must be float32.")
++        if tail_cache.ndim != 3 or tail_cache.shape[1] < self.index_kpool or tail_cache.shape[2] != 2 * self.head_dim:
++            raise ValueError("GLM KPool tail requires [blocks, capacity, 2 * head_dim] K/gate storage.")
++        if tail_metadata.block_size != tail_cache.shape[1]:
++            raise ValueError("GLM KPool tail metadata capacity must match the bound cache.")
++        if (
++            self.index_kpool_compress_ape.shape != (self.index_kpool, self.head_dim)
++            or self.index_kpool_compress_ape.dtype != torch.float32
++        ):
++            raise ValueError("GLM KPool APE must be FP32 with shape [pool_size, head_dim].")
++
++        if compute_topk and (q_values is None or weights is None):
++            raise ValueError("GLM KPool top-k requires query and head weights.")
++
++        # Keep history separate: CANN can save the tail before other cores
++        # finish reading history. Whole-pool shifts preserve the pooling result.
++        norm_eps = getattr(self.k_norm, "eps", getattr(self.k_norm, "variance_epsilon", 1e-6))
++        state = self._prepare_keypool_state(tail_cache, indexer_metadata.start_pos, tail_metadata, self.index_kpool)
++        pooled_key = self._key_pool(
++            hidden_states,
++            self._key_weight,
++            self._gate_weight,
++            self.index_kpool_compress_ape,
++            state,
++            indexer_metadata.keypool_state_table,
++            indexer_metadata.keypool_start_offsets,
++            norm_weight=self._norm_weight_f32,
++            norm_bias=self._norm_bias_f32,
++            cu_seqlens=indexer_metadata.query_start_loc,
++            cmp_ratio=self.index_kpool,
++            norm_eps=norm_eps,
++        )
++        tail_key = tail_gate = None
++        if tail_metadata.cann_inputs.retained_indices is not None:
++            # Re-project the live MTP rollback window missing from CANN state.
++            tail_hidden = self._gather_retained_hidden(hidden_states, tail_metadata.cann_inputs.retained_indices)
++            tail_key = F.linear(tail_hidden, self._key_weight).float()
++            if self._norm_weight_f32 is not None:
++                tail_key = F.layer_norm(
++                    tail_key, (self.head_dim,), self._norm_weight_f32, self._norm_bias_f32, norm_eps
++                )
++            tail_gate = F.linear(tail_hidden, self._gate_weight).float()
++        self._write_keypool_caches(
++            tail_cache,
++            indexer_cache,
++            tail_key,
++            tail_gate,
++            pooled_key,
++            indexer_metadata,
++            tail_metadata,
++            state,
++        )
++        # Sharing top-k still advances the compressed cache and raw tail.
++        if not compute_topk:
++            return None
++        # Empty DSA-CP shards must update caches but skip CANN's unsafe no-work path.
++        # FULL capture retains selection because replay may have live queries.
++        if query_metadata.num_actual_tokens == 0 and get_forward_context().cudagraph_runtime_mode != CUDAGraphMode.FULL:
++            if self.topk_indices_buffer is not None:
++                output = self.topk_indices_buffer[:num_tokens]
++                output.fill_(-1)
++                return output[:, :output_width].unsqueeze(1)
++            return torch.full((num_tokens, 1, output_width), -1, dtype=torch.int32, device=hidden_states.device)
++        assert q_values is not None and weights is not None
++        query = q_values.to(indexer_cache.dtype)
++        indices, _ = self._pool_key_indexer(
++            query,
++            indexer_cache,
++            weights.to(torch.bfloat16),
++            query_metadata.pool_tail,
++            actual_seq_q=query_metadata.cum_query_lens,
++            actual_seq_k=query_metadata.seq_lens,
++            block_table=indexer_metadata.block_table,
++            layout_q="TND",
++            layout_k="PA_BBND",
++            topk=self.topk_tokens,
++            pool_size=self.index_kpool,
++            mask_mode=3,
++        )
++        return self._pack_keypool_indices(
++            indices, query_metadata, self.topk_tokens, self.index_kpool, self.topk_indices_buffer
++        )
+diff --git a/vllm_ascend/attention/sfa_v1.py b/vllm_ascend/attention/sfa_v1.py
+index 36cc95cec..54d1859f5 100644
+--- a/vllm_ascend/attention/sfa_v1.py
++++ b/vllm_ascend/attention/sfa_v1.py
+@@ -255,18 +255,17 @@ class SparseMLAMetadataState:
+             raise ValueError("Sparse MLA block size must be a positive multiple of the SFA kernel block size.")
+         self.split = block_size // kernel_block_size
+         self.use_smla = get_current_hardware_profile().device_adaptor_family == DeviceAdaptorFamily.FP8_OPTIMIZED
++        if self.use_smla:
++            config = get_ascend_config()
++            self.use_smla = not (config.enable_sparse_sfa_c8 or config.enable_sparse_sfa_turboquant)
+         self.block_size = kernel_block_size
+         self.table_stride = 1
+         cache_block_size = vllm_config.cache_config.block_size
+         expand_factor = max(cache_block_size // kernel_block_size, 1)
+         table_width = cdiv(vllm_config.model_config.max_model_len, cache_block_size) * expand_factor
+-        self.block_table_buffer = torch.empty(
+-            # Mixed FULL graphs can append one padding request.
+-            vllm_config.scheduler_config.max_num_seqs + 1,
+-            table_width,
+-            dtype=torch.int32,
+-            device=device,
+-        )
++        capture_sizes = vllm_config.compilation_config.cudagraph_capture_sizes or []
++        table_rows = max([vllm_config.scheduler_config.max_num_seqs + 1, *capture_sizes])
++        self.block_table_buffer = torch.empty(table_rows, table_width, dtype=torch.int32, device=device)
+         if self.use_smla:
+             config = vllm_config.model_config.hf_text_config
+             self.num_heads = (
+@@ -301,16 +300,20 @@ class SparseMLAMetadataState:
+         if width > self.block_table_buffer.shape[1]:
+             raise ValueError("Sparse MLA block table exceeds its persistent buffer.")
+         table = self.block_table_buffer[: expanded.shape[0], :width]
+-        torch.div(expanded[:, :: self.table_stride], self.table_stride, rounding_mode="floor", out=table)
++        if self.table_stride == 1:
++            table.copy_(expanded)
++        else:
++            torch.div(expanded[:, :: self.table_stride], self.table_stride, rounding_mode="floor", out=table)
+         metadata.block_table = table
+         metadata.block_size = self.block_size
+         if self.use_smla:
+             positions = metadata.positions
+             if positions.numel() > self.length_buffer.shape[0]:
+                 raise ValueError("Sparse MLA token count exceeds its persistent top-k buffer.")
+-            valid = torch.arange(positions.numel(), device=positions.device) < metadata.num_actual_tokens
+             mask = self.valid_mask_buffer[: positions.numel()]
+-            mask[:, 0].copy_(valid)
++            mask.fill_(True)
++            if metadata.num_actual_tokens < positions.numel():
++                mask[metadata.num_actual_tokens :].zero_()
+             metadata.smla_valid_mask = mask
+             metadata.smla_topk_length = self.length_buffer[: positions.numel()]
+             metadata.smla_metadata = self.metadata_buffer
+diff --git a/vllm_ascend/core/kv_cache_interface.py b/vllm_ascend/core/kv_cache_interface.py
+index 5aec2b2ff..01d22b117 100644
+--- a/vllm_ascend/core/kv_cache_interface.py
++++ b/vllm_ascend/core/kv_cache_interface.py
+@@ -455,7 +455,7 @@ class AscendSlidingWindowMLASpec(SlidingWindowMLASpec):
+ 
+ @dataclass(frozen=True, kw_only=True)
+ class AscendIndexerKPoolTailSpec(SlidingWindowSpec):
+-    """One fixed FP32 ``[2, ring_capacity, head_size]`` page per request.
++    """One fixed FP32 ``[ring_capacity, 2 * head_size]`` page per request.
+ 
+     ``block_size`` is the physical ring capacity; ``compress_ratio`` defines
+     pool boundaries independently. The dedicated manager never slides or grows.
+diff --git a/vllm_ascend/distributed/kv_transfer/kv_p2p/mooncake/pull_worker.py b/vllm_ascend/distributed/kv_transfer/kv_p2p/mooncake/pull_worker.py
+index 9693200da..ddada547d 100644
+--- a/vllm_ascend/distributed/kv_transfer/kv_p2p/mooncake/pull_worker.py
++++ b/vllm_ascend/distributed/kv_transfer/kv_p2p/mooncake/pull_worker.py
+@@ -1196,6 +1196,15 @@ class MooncakePullRecvingThread(threading.Thread):
+                 for cache_index, (local_base_addr, remote_base_addr) in enumerate(
+                     zip(local_base_addrs, remote_base_addrs)
+                 ):
++                    if is_circular_kv_cache_spec(spec):
++                        local_shape = self.block_shapes[local_layer_index][cache_index]
++                        remote_shape = remote_metadata.block_shapes[remote_layer_index][cache_index]
++                        if local_shape != remote_shape:
++                            raise ValueError(
++                                f"Mooncake circular cache layout mismatch for layer "
++                                f"{self.layer_names[local_layer_index]!r}, cache {cache_index}: "
++                                f"local={local_shape}, remote={remote_shape}"
++                            )
+                     local_block_stride = self.block_strides[local_layer_index][cache_index]
+                     remote_block_stride = remote_metadata.block_strides[remote_layer_index][cache_index]
+                     local_block_len = self.block_lens[local_layer_index][cache_index]
+diff --git a/vllm_ascend/models/glm5next/cache_views.py b/vllm_ascend/models/glm5next/cache_views.py
+index 7182cfdce..b2716bfca 100644
+--- a/vllm_ascend/models/glm5next/cache_views.py
++++ b/vllm_ascend/models/glm5next/cache_views.py
+@@ -1,6 +1,6 @@
+ # SPDX-License-Identifier: Apache-2.0
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+-"""Pooled-cache physical views for GLM-Next on Model Runner V1."""
++"""Pooled-cache physical views for GLM-Next."""
+ 
+ from collections.abc import Callable
+ 
+@@ -24,10 +24,10 @@ def _row_major_strides(shape: tuple[int, ...]) -> list[int]:
+     return strides
+ 
+ 
+-def _view_kpool_tail_cache(
++def view_kpool_tail_cache(
+     layer_name: str,
+     kv_cache_spec: AscendIndexerKPoolTailSpec,
+-    raw_cache: torch.Tensor,
++    raw_cache: torch.Tensor | tuple[torch.Tensor, ...],
+     num_blocks: int,
+ ) -> list[torch.Tensor]:
+     if not isinstance(raw_cache, torch.Tensor):
+@@ -44,13 +44,13 @@ def _view_kpool_tail_cache(
+     return [
+         torch.as_strided(
+             typed_slot,
+-            size=(num_blocks, 2, kv_cache_spec.block_size, kv_cache_spec.head_size),
+-            stride=(page_el, kv_cache_spec.block_size * kv_cache_spec.head_size, kv_cache_spec.head_size, 1),
++            size=(num_blocks, kv_cache_spec.block_size, 2 * kv_cache_spec.head_size),
++            stride=(page_el, 2 * kv_cache_spec.head_size, 1),
+         )
+     ]
+ 
+ 
+-def _view_compressed_indexer_cache(
++def view_compressed_indexer_cache(
+     layer_name: str,
+     kv_cache_spec: AscendMLAAttentionSpec,
+     raw_cache: torch.Tensor | tuple[torch.Tensor, ...],
+@@ -129,12 +129,12 @@ def view_glm5_next_cache(
+     falls through to its generic reshape paths.
+     """
+     if isinstance(kv_cache_spec, AscendIndexerKPoolTailSpec):
+-        return _view_kpool_tail_cache(layer_name, kv_cache_spec, raw_cache, num_blocks)
++        return view_kpool_tail_cache(layer_name, kv_cache_spec, raw_cache, num_blocks)
+     if isinstance(kv_cache_spec, AscendMLAAttentionSpec) and getattr(
+         kv_cache_spec, "indexes_kv_by_block_stride", False
+     ):
+         if get_kv_cache_compression_ratio(kv_cache_spec) > 1:
+-            return _view_compressed_indexer_cache(layer_name, kv_cache_spec, raw_cache, attn_backend, kernel_block_size)
++            return view_compressed_indexer_cache(layer_name, kv_cache_spec, raw_cache, attn_backend, kernel_block_size)
+         _k_dim, v_dim = get_kv_cache_dims(layer_name, kv_cache_spec)
+         if v_dim == 0:
+             return _view_nope_main_mla_cache(kv_cache_spec, raw_cache, attn_backend, kernel_block_size)
+diff --git a/vllm_ascend/ops/cann_keypool.py b/vllm_ascend/ops/cann_keypool.py
+new file mode 100644
+index 000000000..a130c6f15
+--- /dev/null
++++ b/vllm_ascend/ops/cann_keypool.py
+@@ -0,0 +1,29 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""State gather for CANN KeyPool."""
++
++import torch
++
++
++def _cache_rows(cache):
++    width = cache.shape[-1]
++    if cache.stride(0) % width:
++        raise ValueError("KeyPool cache pages must align to complete rows.")
++    rows = (cache.shape[0] - 1) * (cache.stride(0) // width) + cache.shape[1]
++    return cache.as_strided((rows, width), (width, 1))
++
++
++def prepare_keypool_state(tail, starts, tail_metadata, pool):
++    n, width = starts.numel(), tail.shape[-1]
++    inputs = tail_metadata.cann_inputs
++    if inputs.page_rows * width != tail.stride(0):
++        raise ValueError("KeyPool tail metadata must preserve the physical cache page stride.")
++    state = tail.new_empty((1 + 2 * n, pool, width))
++    torch.index_select(
++        _cache_rows(tail), 0, inputs.history_indices.flatten(), out=state[1 : n + 1].view(n * pool, width)
++    )
++    return state
++
++
++def gather_retained_hidden(hidden, indices):
++    return torch.index_select(hidden, 0, indices.flatten())
+diff --git a/vllm_ascend/spec_decode/multi_kv_cache_group_proposer.py b/vllm_ascend/spec_decode/multi_kv_cache_group_proposer.py
+index 09323f305..c941ffda9 100644
+--- a/vllm_ascend/spec_decode/multi_kv_cache_group_proposer.py
++++ b/vllm_ascend/spec_decode/multi_kv_cache_group_proposer.py
+@@ -13,6 +13,7 @@ from vllm.v1.spec_decode.utils import PADDING_SLOT_ID
+ from vllm.v1.worker.utils import AttentionGroup
+ 
+ from vllm_ascend.attention.attention_v1 import AscendAttentionState
++from vllm_ascend.attention.indexer_kpool import AscendIndexerKPoolMetadata, AscendIndexerKPoolTailMetadata
+ from vllm_ascend.spec_decode.eagle_proposer import AscendEagleProposer
+ 
+ _MULTI_KV_CACHE_GROUP_MTP_MODEL_TYPES = {"glm5_next_mtp"}
+@@ -142,8 +143,15 @@ class AscendMultiKVCacheGroupMTPProposer(AscendEagleProposer):
+         # addresses).
+         slot_mapping_lens = self.slot_mapping_group[0].shape[0]
+         self._multi_group_slot_mapping_buffers: dict[tuple[int, int], torch.Tensor] = {}
++        capture_sizes = self.vllm_config.compilation_config.cudagraph_capture_sizes or []
++        table_rows = max([self.runner.max_num_reqs, *capture_sizes])
++        table_buffers = self._multi_group_block_table_buffers = dict[int, torch.Tensor]()
++        table_widths: dict[int, int] = {}
+         for attn_group in self.draft_attn_groups:
+             gid = attn_group.kv_cache_group_id
++            table_widths[gid] = max(table_widths.get(gid, 0), self._draft_block_table_width(attn_group))
++        for gid, width in table_widths.items():
++            table_buffers[gid] = torch.zeros(table_rows, width, dtype=torch.int32, device=self.device)
+             if gid == self.kv_cache_gid:
+                 # The primary group reuses the proposer's per-step buffers.
+                 continue
+@@ -162,12 +170,6 @@ class AscendMultiKVCacheGroupMTPProposer(AscendEagleProposer):
+         )
+ 
+     def _draft_block_table_width(self, attn_group: AttentionGroup) -> int:
+-        """Helper: return the block-table width consumed by one group.
+-
+-        This method is new in this subclass. It converts the maximum logical
+-        sequence length into the kernel block-table width when logical and
+-        physical block sizes differ, as they do for the indexer cache.
+-        """
+         builder = attn_group.get_metadata_builder()
+         logical_block_size = getattr(builder, "logical_block_size", None)
+         blocks_per_logical_block = getattr(builder, "kernel_blocks_per_logical_block", None)
+@@ -187,6 +189,7 @@ class AscendMultiKVCacheGroupMTPProposer(AscendEagleProposer):
+         attn_group,
+         num_input_tokens,
+         draft_index=0,
++        refreshed_gids: set[int] | None = None,
+     ):
+         """Override the runtime common-metadata view hook for one group.
+ 
+@@ -208,56 +211,74 @@ class AscendMultiKVCacheGroupMTPProposer(AscendEagleProposer):
+             block_table = self.runner.input_batch.block_table[gid]
+             num_reqs = group_metadata.num_reqs
+             num_actual_tokens = common_attn_metadata.num_actual_tokens
+-            block_table.compute_slot_mapping(
+-                num_reqs,
+-                common_attn_metadata.query_start_loc,
+-                common_attn_metadata.positions[:num_actual_tokens],
+-            )
+             block_table_tensor = block_table.get_device_tensor()[:num_reqs]
+-            # Pre-created in ``initialize_attn_backend``; never allocate here so
+-            # the address an ACL graph captured stays valid across replays.
+-            group_slot_mapping = self._multi_group_slot_mapping_buffers.get((gid, draft_index))
+-            assert group_slot_mapping is not None
+-            assert group_slot_mapping.shape[0] >= num_input_tokens
+-            source_slot_mapping = block_table.slot_mapping.gpu[:num_input_tokens]
+-            group_slot_mapping[:num_input_tokens].copy_(source_slot_mapping)
+-            group_slot_mapping[num_actual_tokens:].fill_(PADDING_SLOT_ID)
+-            group_metadata.slot_mapping = group_slot_mapping
+-
+-        group_metadata.block_table_tensor = block_table_tensor[
++            if not block_table.is_circular_group:
++                block_table.compute_slot_mapping(
++                    num_reqs,
++                    common_attn_metadata.query_start_loc,
++                    common_attn_metadata.positions[:num_actual_tokens],
++                )
++                group_slot_mapping = self._multi_group_slot_mapping_buffers[(gid, draft_index)]
++                source_slot_mapping = block_table.slot_mapping.gpu[:num_input_tokens]
++                group_slot_mapping[:num_input_tokens].copy_(source_slot_mapping)
++                group_slot_mapping[num_actual_tokens:].fill_(PADDING_SLOT_ID)
++                group_metadata.slot_mapping = group_slot_mapping
++        table = self._multi_group_block_table_buffers[gid]
++        if refreshed_gids is None or gid not in refreshed_gids:
++            rows = min(group_metadata.num_reqs, block_table_tensor.shape[0])
++            table[:rows].copy_(block_table_tensor[:rows, : table.shape[1]])
++            if rows < group_metadata.num_reqs:
++                table[rows : group_metadata.num_reqs].zero_()
++            if refreshed_gids is not None:
++                refreshed_gids.add(gid)
++        group_metadata.block_table_tensor = table[
+             : group_metadata.num_reqs, : self._draft_block_table_width(attn_group)
+         ]
+         return group_metadata
+ 
+     def _build_multi_group_graph_capture_metadata(self, common_attn_metadata, draft_index):
+-        # ``glm5_next_mtp`` is the only family routed here and it never uses
+-        # compressed attention, so every draft step takes the plain capture
+-        # entrypoint.
+         assert not self.use_compress
++        common_attn_metadata = copy.copy(common_attn_metadata)
++        # Dummy padding has query tokens but zero sequence lengths.
++        actual = common_attn_metadata.seq_lens_cpu[: common_attn_metadata.num_reqs].count_nonzero().item()
++        common_attn_metadata.num_actual_tokens = int(common_attn_metadata.query_start_loc_cpu[actual])
++        if draft_index > 0:
++            # Later drafts use one query per padded row, matching FULL replay.
++            tokens = common_attn_metadata.num_input_tokens
++            common_attn_metadata.num_reqs = tokens
++            common_attn_metadata.num_actual_tokens = actual
++            common_attn_metadata.max_query_len = common_attn_metadata.decode_token_per_req = 1
++            query = self.query_start_loc_group[draft_index][: tokens + 1]
++            query.copy_(self.arange[: tokens + 1])
++            common_attn_metadata.query_start_loc = query
++            common_attn_metadata.query_start_loc_cpu = torch.from_numpy(self.token_arange_np[: tokens + 1])
++            lengths = self.seq_lens_group[draft_index][:tokens]
++            lengths[actual:].zero_()
++            common_attn_metadata.seq_lens = lengths
++            common_attn_metadata.seq_lens_cpu = common_attn_metadata._seq_lens_cpu = None
+         per_layer_attn_metadata: dict[str, Any] = {}
++        refreshed_gids: set[int] = set()
+         for attn_group in self.draft_attn_groups:
+             group_common_metadata = self._common_attn_metadata_for_draft_group(
+                 common_attn_metadata,
+                 attn_group,
+                 common_attn_metadata.num_input_tokens,
+                 draft_index,
++                refreshed_gids,
+             )
+-            attn_metadata = attn_group.get_metadata_builder().build_for_graph_capture(
+-                group_common_metadata,
+-                AscendAttentionState.DecodeOnly,
+-            )
++            builder = attn_group.get_metadata_builder()
++            if draft_index > 0 and not self._is_cache_only_draft_attn_group(attn_group):
++                attn_metadata = builder.build_for_drafting(group_common_metadata, draft_index)
++            else:
++                attn_metadata = builder.build_for_graph_capture(group_common_metadata, AscendAttentionState.DecodeOnly)
+             for layer_name in attn_group.layer_names:
+                 per_layer_attn_metadata[layer_name] = attn_metadata
+         return per_layer_attn_metadata
+ 
+     @staticmethod
+     def _copy_cache_only_draft_metadata(attn_metadata):
+-        """Helper: preserve a step's tensors before a builder reuses its buffers.
+-
+-        KPool builders use persistent buffers for target graph replay. Draft
+-        metadata for every step must coexist until the merged draft finishes,
+-        including step 0's multi-token query layout and compressed cache slots.
+-        """
++        if isinstance(attn_metadata, (AscendIndexerKPoolMetadata, AscendIndexerKPoolTailMetadata)):
++            return attn_metadata
+         if not is_dataclass(attn_metadata) or isinstance(attn_metadata, type):
+             return attn_metadata
+         return replace(
+@@ -283,14 +304,6 @@ class AscendMultiKVCacheGroupMTPProposer(AscendEagleProposer):
+         mtp_slot_mapping=None,
+         attn_group=None,
+     ):
+-        """Override the transition from verification rows to one row per request.
+-
+-        The first pass may retain rejected tokens as padding. Later draft steps
+-        start at each request's selected token, so reset lengths to its actual
+-        device position before the inherited updater advances the step once.
+-        CPU lengths still describe the optimistic verification batch and must
+-        be invalidated without introducing a device-to-host synchronization.
+-        """
+         if self._uses_multi_group_kv_cache and draft_index == 1:
+             old_common_metadata = copy.copy(old_common_metadata)
+             old_common_metadata.seq_lens = old_common_metadata.seq_lens.clone()
+@@ -319,14 +332,6 @@ class AscendMultiKVCacheGroupMTPProposer(AscendEagleProposer):
+         num_input_tokens,
+         num_actual_tokens,
+     ):
+-        """Override step-0 draft attention metadata construction.
+-
+-        The base implementation builds every attention group from one common
+-        block table and slot mapping. This override supplies a physical-group
+-        view to each builder, then returns the executable primary group's
+-        metadata as the shared MTP state. Single-group models delegate to the
+-        inherited implementation.
+-        """
+         if not self._uses_multi_group_kv_cache:
+             return super().build_draft_attn_metadata(
+                 common_attn_metadata,
+@@ -336,6 +341,7 @@ class AscendMultiKVCacheGroupMTPProposer(AscendEagleProposer):
+ 
+         per_layer_attn_metadata: dict[str, Any] = {}
+         shared_draft_cache: dict[str, Any] = dict(common_ratio_to_sas_metadata=dict()) if self.use_compress else {}
++        refreshed_gids: set[int] = set()
+         for attn_group in self.draft_attn_groups:
+             extra_attn_metadata_args = dict(shared_draft_cache)
+             if self.use_compress:
+@@ -347,6 +353,7 @@ class AscendMultiKVCacheGroupMTPProposer(AscendEagleProposer):
+                     attn_group,
+                     num_input_tokens,
+                     0,
++                    refreshed_gids,
+                 ),
+                 self.runner.get_model(),
+                 **extra_attn_metadata_args,
+@@ -371,14 +378,6 @@ class AscendMultiKVCacheGroupMTPProposer(AscendEagleProposer):
+         primary_metadata,
+         cache_only_groups,
+     ):
+-        """Override cache-only metadata construction for later MTP steps.
+-
+-        ``attn_update_stack_num_spec_norm`` has already advanced shared state
+-        once for the primary group before this hook is called. This override
+-        rebinds that updated logical state to each cache-only group's physical
+-        cache without advancing sequence lengths, positions, or DCP metadata a
+-        second time. Single-group models use the base hook unchanged.
+-        """
+         if not self._uses_multi_group_kv_cache:
+             return super()._build_cache_only_group_next_step_attn_metadata(
+                 common_attn_metadata,
+@@ -392,12 +391,18 @@ class AscendMultiKVCacheGroupMTPProposer(AscendEagleProposer):
+         per_layer_attn_metadata: dict[str, Any] = {
+             layer_name: primary_metadata for layer_name in primary_group.layer_names
+         }
++        refreshed_gids = {primary_group.kv_cache_group_id}
+         for attn_group in cache_only_groups:
++            if draft_index > 1:
++                gid = attn_group.kv_cache_group_id
++                if gid not in refreshed_gids and self.runner.input_batch.block_table[gid].is_circular_group:
++                    refreshed_gids.add(gid)
+             group_common_attn_metadata = self._common_attn_metadata_for_draft_group(
+                 common_attn_metadata,
+                 attn_group,
+                 num_input_tokens,
+                 draft_index,
++                refreshed_gids,
+             )
+             extra_attn_metadata_args: dict[str, Any] = {}
+             if self.use_compress:
+@@ -407,10 +412,6 @@ class AscendMultiKVCacheGroupMTPProposer(AscendEagleProposer):
+                 draft_index,
+                 **extra_attn_metadata_args,
+             )
+-            # The cache-only builder reuses its persistent buffers across draft
+-            # steps in eager mode too — the same reuse ACL graph replay performs
+-            # — so a step's tensors must be cloned before the next build
+-            # overwrites them.
+             if not getattr(self, "use_cuda_graph", False):
+                 attn_metadata = self._copy_cache_only_draft_metadata(attn_metadata)
+             for layer_name in attn_group.layer_names:
+diff --git a/vllm_ascend/worker/v2/attn_utils.py b/vllm_ascend/worker/v2/attn_utils.py
+index b6469a1ca..3b89971f2 100644
+--- a/vllm_ascend/worker/v2/attn_utils.py
++++ b/vllm_ascend/worker/v2/attn_utils.py
+@@ -91,6 +91,7 @@ from vllm_ascend.distributed.kv_transfer.sparse_kv_offload.sparse_kv_offload_man
+     reshape_kv_cache_tensors_for_sparse_kv_offload,
+ )
+ from vllm_ascend.models.deepseek_v41.cache_config import is_deepseek_v41_cache
++from vllm_ascend.models.glm5next.cache_views import view_compressed_indexer_cache, view_kpool_tail_cache
+ from vllm_ascend.quantization.methods.kv_cache.turboquant import TURBOQUANT_CACHE_DTYPE
+ from vllm_ascend.quantization.methods.kv_cache.turboquant.cache import uses_turboquant_groups
+ from vllm_ascend.quantization.utils import enable_fa_quant
+@@ -1626,35 +1627,22 @@ def _reshape_kv_cache_v2(
+                 continue
+ 
+             if isinstance(kv_cache_spec, AscendIndexerKPoolTailSpec):
+-                if not isinstance(raw_cache, torch.Tensor):
+-                    raise ValueError(f"KPool tail cache for {layer_name} must use one raw tensor.")
+-                typed_slot = raw_cache.view(kv_cache_spec.dtype)
+-                dtype_size = get_dtype_size(kv_cache_spec.dtype)
+-                num_blocks = kv_cache_config.num_blocks
+-                page_el = typed_slot.numel() // num_blocks if num_blocks else 0
+-                tail_block_el = kv_cache_spec.unpadded_page_size_bytes // dtype_size
+-                if num_blocks and tail_block_el > page_el:
+-                    raise ValueError(
+-                        f"KPool tail cache for {layer_name} does not fit one small page: "
+-                        f"tail={tail_block_el} elements, page={page_el} elements."
+-                    )
+-                kv_caches[layer_name] = [
+-                    torch.as_strided(
+-                        typed_slot,
+-                        size=(
+-                            num_blocks,
+-                            2,
+-                            kv_cache_spec.block_size,
+-                            kv_cache_spec.head_size,
+-                        ),
+-                        stride=(
+-                            page_el,
+-                            kv_cache_spec.block_size * kv_cache_spec.head_size,
+-                            kv_cache_spec.head_size,
+-                            1,
+-                        ),
+-                    )
+-                ]
++                kv_caches[layer_name] = view_kpool_tail_cache(
++                    layer_name, kv_cache_spec, raw_cache, kv_cache_config.num_blocks
++                )
++                continue
++            if (
++                isinstance(kv_cache_spec, AscendMLAAttentionSpec)
++                and getattr(kv_cache_spec, "model_version", None) == "glm5_next"
++                and get_kv_cache_compression_ratio(kv_cache_spec) > 1
++            ):
++                kv_caches[layer_name] = view_compressed_indexer_cache(
++                    layer_name,
++                    kv_cache_spec,
++                    raw_cache,
++                    group.backend,
++                    kernel_block_size * get_kv_cache_compression_ratio(kv_cache_spec),
++                )
+                 continue
+             if is_dsv4_model and isinstance(kv_cache_spec, (AscendMLAAttentionSpec, AscendSlidingWindowMLASpec)):
+                 if not isinstance(raw_cache, torch.Tensor):

@@ -1,0 +1,155 @@
+commit 7b5ad8160e5f1eb6eda6954d0659d1a0e65b1122
+Author:     freyfwt <110148731+freyfwt@users.noreply.github.com>
+AuthorDate: Tue Oct 13 21:51:56 2026 +0800
+Commit:     GitHub <noreply@github.com>
+CommitDate: Tue Oct 13 21:51:56 2026 +0800
+
+    [BugFix][EPLB] Fix dynamic EPLB startup in headless workers (#18521)
+    
+    ### What this PR does / why we need it?
+    
+    Headless multi-node workers can fail with `AssertionError: daemonic
+    processes are not allowed to have children` when dynamic EPLB starts its
+    `Manager()`. `serve.py` can import `MultiprocExecutor` before the EPLB
+    platform patch, retaining the original executor even after the patch
+    replaces the class in its defining module.
+    
+    Update the cached CLI reference from the existing EPLB patch when the
+    CLI module is already loaded. This adds four production lines, preserves
+    dynamic EPLB and its existing non-daemonic workers, and avoids importing
+    the CLI into offline or spawned workers.
+    
+    ### Does this PR introduce _any_ user-facing change?
+    
+    Fixes headless worker startup with dynamic EPLB enabled using the
+    existing configuration.
+    
+    ### How was this patch tested?
+    
+    - `python -m pytest -q
+    tests/ut/patch/platform/test_patch_multiproc_executor.py`: **3 passed**
+    locally. The same tests on the unmodified base produce **1 failed, 2
+    passed**, reproducing the stale CLI reference.
+    - Real Ascend NPU tensor smoke: **passed**. Focused pytest in the real
+    NPU environment: **3 passed**, using
+    `--confcutdir=tests/ut/patch/platform` to exclude suite-wide
+    initialization that requires the unavailable, unrelated `fla_npu`
+    package. The tests cover the cached CLI reference, avoiding eager CLI
+    imports, and a spawned non-daemonic worker successfully starting a
+    `Manager()`.
+    - `bash format.sh ci`: **passed**.
+    - Full `tools/mypy.sh 1` for Python **3.10, 3.11, and 3.12**: **passed**
+    across `vllm_ascend`, `examples`, and `tests`, using the repository's
+    verified vLLM commit.
+    - Full multi-node model-serving reproduction was not run.
+    
+    - vLLM main:
+    https://github.com/vllm-project/vllm/commit/8cc9aa5ad350f6f80cf3bebb298d410803ff75a9
+    
+    Signed-off-by: freyfwt <freytian1996@gmail.com>
+
+diff --git a/tests/ut/patch/platform/test_patch_multiproc_executor.py b/tests/ut/patch/platform/test_patch_multiproc_executor.py
+new file mode 100644
+index 000000000..ce035bf4b
+--- /dev/null
++++ b/tests/ut/patch/platform/test_patch_multiproc_executor.py
+@@ -0,0 +1,81 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM Ascend project
++
++import runpy
++import sys
++from multiprocessing import Manager, current_process, get_context
++from pathlib import Path
++
++import pytest
++
++PATCH_PATH = Path(__file__).resolve().parents[4] / "vllm_ascend/patch/platform/patch_multiproc_executor.py"
++
++
++def _start_manager(ready_pipe, death_pipe, **kwargs):
++    with Manager() as manager:
++        shared_dict = manager.dict({"expert_map": None})
++        ready_pipe.send((current_process().daemon, dict(shared_dict)))
++    ready_pipe.close()
++    death_pipe.close()
++
++
++@pytest.fixture
++def executor_modules():
++    # Keep vLLM imports out of spawned workers that only exercise Manager().
++    import vllm.v1.executor.multiproc_executor as multiproc_executor
++    from vllm.entrypoints.cli import serve
++
++    return multiproc_executor, serve
++
++
++def test_patch_updates_cached_headless_executor(monkeypatch, executor_modules):
++    multiproc_executor, serve = executor_modules
++    # Reproduce serve.py importing the original class before the EPLB patch.
++    monkeypatch.setattr(serve, "MultiprocExecutor", multiproc_executor.MultiprocExecutor)
++    monkeypatch.setattr(multiproc_executor, "MultiprocExecutor", multiproc_executor.MultiprocExecutor)
++
++    patched = runpy.run_path(str(PATCH_PATH))
++
++    assert serve.MultiprocExecutor is patched["AscendMultiprocExecutor"]
++    assert multiproc_executor.MultiprocExecutor is serve.MultiprocExecutor
++
++
++def test_patch_does_not_import_cli(monkeypatch, executor_modules):
++    multiproc_executor, _ = executor_modules
++    monkeypatch.delitem(sys.modules, "vllm.entrypoints.cli.serve")
++    monkeypatch.setattr(multiproc_executor, "MultiprocExecutor", multiproc_executor.MultiprocExecutor)
++
++    runpy.run_path(str(PATCH_PATH))
++
++    assert "vllm.entrypoints.cli.serve" not in sys.modules
++
++
++def test_eplb_worker_can_start_manager(monkeypatch, executor_modules):
++    multiproc_executor, serve = executor_modules
++    monkeypatch.setattr(multiproc_executor, "MultiprocExecutor", multiproc_executor.MultiprocExecutor)
++    monkeypatch.setattr(serve, "MultiprocExecutor", serve.MultiprocExecutor)
++    patched = runpy.run_path(str(PATCH_PATH))
++    context = get_context("spawn")
++    monkeypatch.setitem(patched["AscendWorkerProc"].make_worker_process.__globals__, "get_mp_context", lambda: context)
++    monkeypatch.setattr(multiproc_executor.WorkerProc, "worker_main", _start_manager)
++    worker_lock = context.Lock()
++
++    handle = patched["AscendWorkerProc"].make_worker_process(
++        vllm_config=None,
++        local_rank=0,
++        rank=0,
++        distributed_init_method="",
++        input_shm_handle=None,
++        shared_worker_lock=worker_lock,
++    )
++    try:
++        assert handle.ready_pipe.poll(30), "Worker did not start its EPLB manager"
++        assert handle.ready_pipe.recv() == (False, {"expert_map": None})
++        handle.proc.join(timeout=30)
++        assert handle.proc.exitcode == 0
++    finally:
++        if handle.proc.is_alive():
++            handle.proc.terminate()
++            handle.proc.join(timeout=30)
++        handle.ready_pipe.close()
++        handle.death_writer.close()
+diff --git a/vllm_ascend/patch/platform/patch_multiproc_executor.py b/vllm_ascend/patch/platform/patch_multiproc_executor.py
+index 56e64040c..bb5baa2f5 100644
+--- a/vllm_ascend/patch/platform/patch_multiproc_executor.py
++++ b/vllm_ascend/patch/platform/patch_multiproc_executor.py
+@@ -1,5 +1,6 @@
+ from __future__ import annotations
+ 
++import sys
+ import weakref
+ from collections import deque
+ from collections.abc import Callable
+@@ -209,3 +210,6 @@ class AscendWorkerProc(WorkerProc):
+ 
+ 
+ vllm.v1.executor.multiproc_executor.MultiprocExecutor = AscendMultiprocExecutor
++# The headless CLI may have imported the original executor before this patch.
++if "vllm.entrypoints.cli.serve" in sys.modules:
++    sys.modules["vllm.entrypoints.cli.serve"].__dict__["MultiprocExecutor"] = AscendMultiprocExecutor

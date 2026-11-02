@@ -1,0 +1,414 @@
+commit a219257748820aa15a998bb86b0cacb57cb06a04
+Author:     MarinaMiao <46422913+MarinaMiao@users.noreply.github.com>
+AuthorDate: Mon Oct 19 10:27:19 2026 +0800
+Commit:     GitHub <noreply@github.com>
+CommitDate: Mon Oct 19 10:27:19 2026 +0800
+
+    [BugFix][KVPool] Copy Mamba state after synchronous KV loads (#18901)
+    
+    ### What this PR does / why we need it?
+    
+    Fixes #18898.
+    
+    With the V2 model runner, Mamba `align` state preprocessing can copy a
+    cached source state into the running state before a synchronous KVPool
+    load restores that source. The model then consumes stale recurrent state
+    even though prefix lookup and loading succeeded, producing corrupted
+    output on repeated long prompts.
+    
+    Keep state-index decisions before attention metadata construction, and
+    defer only the bulk state copy until the runner connector's
+    `pre_forward()` has completed. An instance-local connector adapter
+    provides this ordering for eager execution and FULL graph replay without
+    modifying upstream vLLM or its shared no-op connector.
+    
+    Enable the deferred path only when the model state exposes the copy
+    callback and the transfer connector declares synchronous, non-layerwise
+    loading. Preserve the existing layerwise path. Forward connector
+    lifecycle calls and arguments unchanged, including the newer positional
+    input batch and `post_forward()` interface.
+    
+    ### Does this PR introduce _any_ user-facing change?
+    
+    Repeated long prompts that restore Mamba state from KVPool should
+    generate valid output. No CLI flags, defaults, cache keys or transfer
+    protocols change. Other hybrid models using the same model state and
+    connector capabilities receive the same correction; this is not gated on
+    a model name.
+    
+    ### How was this patch tested?
+    
+    - Added regression tests for load-before-copy ordering, exactly-once
+    copying, load failure, lifecycle forwarding, runner isolation and
+    connector API argument forwarding.
+    - The unfixed state path fails the ordering regression in eager,
+    PIECEWISE and FULL execution branches. The previous adapter fails both
+    newer-interface regression tests.
+    - Focused CPU contract checks: 35 passed. The checks execute the saved
+    production methods and pinned upstream forward branches with device and
+    I/O boundaries replaced by test doubles.
+    - Ruff check, Ruff format check and Git diff whitespace checks passed
+    for all six changed files.
+    - A runtime-specific port of the same copy-ordering fix was tested on
+    eight Ascend A3 compute nodes with Prefill/Decode separation, prefix
+    caching enabled, eager prefill and FULL decode graphs. A smoke request
+    and two identical long requests succeeded. Each long request contained
+    20,965 input tokens; the second had no local-cache hit and actually
+    loaded 20,736 tokens from KVPool. Both returned the expected response
+    and stopped normally. No upstream vLLM runner files were modified.
+    
+    - vLLM main:
+    https://github.com/vllm-project/vllm/commit/c4df37dfcc7f72ca41cd43801a468526ecf99a2b
+    
+    ---------
+    
+    Signed-off-by: MarinaMiao <1320651167@qq.com>
+    Co-authored-by: Chao Lei <leichao139636@163.com>
+
+diff --git a/tests/ut/worker/test_mamba_kv_connector.py b/tests/ut/worker/test_mamba_kv_connector.py
+new file mode 100644
+index 000000000..8c3f5499f
+--- /dev/null
++++ b/tests/ut/worker/test_mamba_kv_connector.py
+@@ -0,0 +1,157 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Ascend project
++
++from types import SimpleNamespace
++from unittest.mock import Mock
++
++import pytest
++
++from vllm_ascend.worker.v2.kv_connector import MambaCopyKVConnector
++
++
++@pytest.mark.parametrize("sync_load", [True, False])
++def test_bulk_copy_reads_state_after_pre_forward(monkeypatch, sync_load):
++    """A remote load must update the source before it is copied for forward."""
++    from vllm_ascend.worker.v2.model_states import mamba_hybrid
++    from vllm_ascend.worker.v2.model_states.mamba_hybrid import AscendMambaHybridModelState
++
++    memory = {"source": 7, "running": 0}
++    events = []
++
++    class DecisionKernel:
++        def __getitem__(self, grid):
++            return lambda *args, **kwargs: events.append("decision")
++
++    def copy(*args):
++        events.append("copy")
++        memory["running"] = memory["source"]
++
++    state = AscendMambaHybridModelState.__new__(AscendMambaHybridModelState)
++    state.__dict__.update(
++        _align_mode=True,
++        _pending_bulk_copy=None,
++        _mamba_state_idx_gpu=None,
++        _mamba_src_col_gpu=None,
++        _mamba_src_off_gpu=None,
++        num_accepted_tokens_gpu=None,
++        _finish_previous_layerwise_mamba_copy=lambda: None,
++        _get_mamba_group_info=lambda cfg: (None, SimpleNamespace(block_size=384)),
++        _ensure_align_ctx=lambda *args: SimpleNamespace(run_fused_precopy=copy),
++        _prepare_layerwise_mamba_copy=lambda *args: False,
++    )
++    monkeypatch.setattr(mamba_hybrid, "preprocess_mamba_align_fused_kernel", DecisionKernel())
++    monkeypatch.setattr(mamba_hybrid, "has_kv_transfer_group", lambda: True)
++    monkeypatch.setattr(
++        mamba_hybrid,
++        "get_kv_transfer_group",
++        lambda: SimpleNamespace(requires_mamba_state_copy_after_load=True),
++    )
++    batch = SimpleNamespace(num_reqs=1, idx_mapping=None, query_start_loc=None)
++    AscendMambaHybridModelState.preprocess_state(state, batch, (), None, None)
++    assert events == ["decision"]
++
++    def load(scheduler_output, **kwargs):
++        events.append("pre_forward")
++        if sync_load:
++            memory["source"] = 42
++
++    inner = SimpleNamespace(pre_forward=load)
++    wrapped = MambaCopyKVConnector(inner, lambda: AscendMambaHybridModelState.copy_state_after_kv_load(state))
++    wrapped.pre_forward(object(), attn_metadata=object())
++    assert events == ["decision", "pre_forward", "copy"]
++    assert memory["running"] == (42 if sync_load else 7)
++    # The normal forward can now consume the state; a second hook is a no-op.
++    AscendMambaHybridModelState.copy_state_after_kv_load(state)
++    assert events.count("copy") == 1
++    assert state._pending_bulk_copy is None
++
++
++def test_load_failure_does_not_copy_state():
++    inner = SimpleNamespace(pre_forward=Mock(side_effect=ValueError("load failed")))
++    copy = Mock()
++    wrapped = MambaCopyKVConnector(inner, copy)
++    with pytest.raises(ValueError, match="load failed"):
++        wrapped.pre_forward(object())
++    copy.assert_not_called()
++
++
++def test_pre_forward_passes_input_batch_and_metadata():
++    inner = SimpleNamespace(pre_forward=Mock())
++    copy = Mock()
++    wrapped = MambaCopyKVConnector(inner, copy)
++    scheduler_output, input_batch = object(), object()
++    attn_metadata: dict[str, object] = {}
++    wrapped.pre_forward(scheduler_output, input_batch, attn_metadata=attn_metadata)
++    inner.pre_forward.assert_called_once_with(scheduler_output, input_batch, attn_metadata=attn_metadata)
++    copy.assert_called_once_with()
++
++
++def test_post_forward_does_not_inject_removed_arguments():
++    output = object()
++
++    class Inner:
++        def post_forward(self, finished_req_ids):
++            assert finished_req_ids == {"done"}
++            return output
++
++    wrapped = MambaCopyKVConnector(Inner(), Mock())
++    assert wrapped.post_forward({"done"}) is output
++
++
++def test_connector_lifecycle_is_forwarded():
++    output = object()
++    inner = SimpleNamespace(
++        pre_forward=Mock(),
++        finish_forward=Mock(),
++        post_forward=Mock(return_value=output),
++        no_forward=Mock(return_value=output),
++        set_disabled=Mock(),
++        reset_capture_state=Mock(),
++    )
++    copy = Mock()
++    wrapped = MambaCopyKVConnector(inner, copy)
++    wrapped.finish_forward()
++    assert wrapped.post_forward({"done"}, wait_for_save=False) is output
++    tokenless_step = object()
++    assert wrapped.no_forward(tokenless_step) is output
++    wrapped.set_disabled(True)
++    wrapped.reset_capture_state()
++    inner.finish_forward.assert_called_once_with()
++    inner.post_forward.assert_called_once_with({"done"}, wait_for_save=False)
++    inner.no_forward.assert_called_once_with(tokenless_step)
++    inner.set_disabled.assert_called_once_with(True)
++    inner.reset_capture_state.assert_called_once_with()
++    copy.assert_not_called()
++
++
++def test_wrappers_keep_runner_state_independent():
++    copy_a, copy_b = Mock(), Mock()
++    inner = SimpleNamespace(pre_forward=Mock())
++    first = MambaCopyKVConnector(inner, copy_a)
++    second = MambaCopyKVConnector(inner, copy_b)
++    first.pre_forward(None)
++    copy_a.assert_called_once_with()
++    copy_b.assert_not_called()
++    second.pre_forward(None)
++    assert copy_a.call_count == 1
++    copy_b.assert_called_once_with()
++
++
++@pytest.mark.parametrize("failed", [True, False])
++def test_finish_execution_cleans_failed_copy_and_finishes_metadata(failed):
++    from vllm_ascend.worker.v2.model_states.mamba_hybrid import AscendMambaHybridModelState
++
++    state = AscendMambaHybridModelState.__new__(AscendMambaHybridModelState)
++    ctx = Mock()
++    pending = (ctx, 1, Mock())
++    state._pending_bulk_copy = pending
++    state.device_metadata = Mock()
++
++    state.finish_execution(failed=failed)
++
++    assert state._pending_bulk_copy is (None if failed else pending)
++    state.device_metadata.finish.assert_called_once_with()
++    if failed:
++        # A failed load must not leave stale state to copy on a later hook.
++        state.copy_state_after_kv_load()
++        ctx.run_fused_precopy.assert_not_called()
+diff --git a/vllm_ascend/distributed/kv_transfer/ascend_multi_connector.py b/vllm_ascend/distributed/kv_transfer/ascend_multi_connector.py
+index 7e4a58336..fe5f1f9b2 100644
+--- a/vllm_ascend/distributed/kv_transfer/ascend_multi_connector.py
++++ b/vllm_ascend/distributed/kv_transfer/ascend_multi_connector.py
+@@ -52,6 +52,10 @@ class AscendMultiConnector(MultiConnector, SupportsHMA):
+             for connector in self._connectors
+         )
+ 
++        self.requires_mamba_state_copy_after_load = any(
++            getattr(connector, "requires_mamba_state_copy_after_load", False) for connector in self._connectors
++        )
++
+     def configure_dspark_prefix_cache(self, vllm_config: "VllmConfig") -> bool:
+         """Select a store that restores both target and persistent draft KV."""
+         providers = []
+diff --git a/vllm_ascend/distributed/kv_transfer/kv_pool/ascend_store/ascend_store_connector.py b/vllm_ascend/distributed/kv_transfer/kv_pool/ascend_store/ascend_store_connector.py
+index cd173d526..9c454dc81 100644
+--- a/vllm_ascend/distributed/kv_transfer/kv_pool/ascend_store/ascend_store_connector.py
++++ b/vllm_ascend/distributed/kv_transfer/kv_pool/ascend_store/ascend_store_connector.py
+@@ -147,6 +147,8 @@ class AscendStoreConnector(KVConnectorBase_V1, SupportsHMA):
+         # align pre-copy is deferred behind this connector's layerwise loads.
+         self._mamba_state: Any = None
+         self.requires_mamba_state_copy_after_layer_load = self.use_layerwise
++        # Opt in only for synchronous bulk loads, not background retrieval.
++        self.requires_mamba_state_copy_after_load = not self.use_layerwise and not extra_config.get("load_async", False)
+ 
+         self.connector_scheduler: KVPoolScheduler | None = None
+         self.connector_worker: KVPoolWorker | None = None
+diff --git a/vllm_ascend/worker/v2/kv_connector.py b/vllm_ascend/worker/v2/kv_connector.py
+new file mode 100644
+index 000000000..5c25fa39e
+--- /dev/null
++++ b/vllm_ascend/worker/v2/kv_connector.py
+@@ -0,0 +1,43 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Ascend project
++
++from collections.abc import Callable
++from typing import TYPE_CHECKING, Any
++
++from vllm.v1.worker.gpu.kv_connector import KVConnector
++
++if TYPE_CHECKING:
++    from vllm.v1.core.sched.output import SchedulerOutput
++    from vllm.v1.outputs import KVConnectorOutput, ModelRunnerOutput
++
++
++class MambaCopyKVConnector(KVConnector):
++    """Keep Mamba bulk copies between synchronous KV loads and forward.
++
++    Wrap only this runner's connector. In particular, do not mutate the
++    upstream class or the shared no-op connector used during profiling.
++    """
++
++    def __init__(self, connector: KVConnector, copy_mamba_state: Callable[[], None]) -> None:
++        self._connector = connector
++        self._copy_mamba_state = copy_mamba_state
++
++    def pre_forward(self, scheduler_output: "SchedulerOutput", *args: Any, **kwargs: Any) -> None:
++        self._connector.pre_forward(scheduler_output, *args, **kwargs)
++        self._copy_mamba_state()
++
++    def finish_forward(self) -> None:
++        self._connector.finish_forward()
++
++    def post_forward(self, finished_req_ids: set[str], *args: Any, **kwargs: Any) -> "KVConnectorOutput | None":
++        return self._connector.post_forward(finished_req_ids, *args, **kwargs)
++
++    def no_forward(self, scheduler_output: "SchedulerOutput") -> "ModelRunnerOutput":
++        # No state preprocessing or model execution on this path.
++        return self._connector.no_forward(scheduler_output)
++
++    def set_disabled(self, disabled: bool) -> None:
++        self._connector.set_disabled(disabled)
++
++    def reset_capture_state(self) -> None:
++        self._connector.reset_capture_state()
+diff --git a/vllm_ascend/worker/v2/model_runner.py b/vllm_ascend/worker/v2/model_runner.py
+index 869c9d4f9..120e5b390 100644
+--- a/vllm_ascend/worker/v2/model_runner.py
++++ b/vllm_ascend/worker/v2/model_runner.py
+@@ -44,6 +44,7 @@ from vllm.v1.worker.gpu.input_batch import (
+     prepare_pos_seq_lens,
+     prepare_prefill_inputs,
+ )
++from vllm.v1.worker.gpu.kv_connector import KVConnector
+ from vllm.v1.worker.gpu.model_runner import (
+     BatchReqState,
+     ExecuteModelState,
+@@ -116,6 +117,7 @@ from vllm_ascend.worker.v2.attn_utils import (
+ )
+ from vllm_ascend.worker.v2.eplb import AscendEPLBController
+ from vllm_ascend.worker.v2.input_batch import AscendInputBatch, AscendInputBuffers
++from vllm_ascend.worker.v2.kv_connector import MambaCopyKVConnector
+ from vllm_ascend.worker.v2.kvpp import KVPPRuntime
+ from vllm_ascend.worker.v2.pcp_manager import AscendPCPManager
+ from vllm_ascend.worker.v2.pp_transport import resolve_spec_pp_support
+@@ -141,6 +143,7 @@ class NPUModelRunner(GPUModelRunner):
+     supports_standardized_shared_kv_backing = True
+ 
+     execute_model_state: ExecuteModelState | None
++    kv_connector: KVConnector
+     max_num_reqs: int
+ 
+     def __init__(self, vllm_config: VllmConfig, device: torch.device):
+@@ -493,6 +496,14 @@ class NPUModelRunner(GPUModelRunner):
+             self.vllm_config.scheduler_config.max_num_seqs,
+         )
+ 
++        copy_mamba_state = getattr(self.model_state, "copy_state_after_kv_load", None)
++        if (
++            callable(copy_mamba_state)
++            and has_kv_transfer_group()
++            and getattr(get_kv_transfer_group(), "requires_mamba_state_copy_after_load", False)
++        ):
++            self.kv_connector = MambaCopyKVConnector(self.kv_connector, copy_mamba_state)
++
+         # Only target-model layers determine whether FIA is in use. This flag
+         # is used for adaptive verification handling.
+         draft_layer_names: set[str] = getattr(self.speculator, "draft_attn_layer_names", set())
+diff --git a/vllm_ascend/worker/v2/model_states/mamba_hybrid.py b/vllm_ascend/worker/v2/model_states/mamba_hybrid.py
+index cb72e4d36..e509a496c 100644
+--- a/vllm_ascend/worker/v2/model_states/mamba_hybrid.py
++++ b/vllm_ascend/worker/v2/model_states/mamba_hybrid.py
+@@ -81,6 +81,7 @@ class AscendMambaHybridModelState(MambaHybridModelState, AscendModelState):
+         super().__init__(*args, **kwargs)
+         self._layerwise_mamba_copy: _LayerwiseMambaCopyState | None = None
+         self._layer_state_ranges: dict[str, tuple[int, int]] | None = None
++        self._pending_bulk_copy: tuple[MambaSpecDecodeGPUContext, int, torch.Tensor] | None = None
+ 
+     def _get_layer_state_ranges(self, kv_cache_config: KVCacheConfig) -> dict[str, tuple[int, int]]:
+         """Map every mamba layer name to its (start, end) range in the
+@@ -209,7 +210,8 @@ class AscendMambaHybridModelState(MambaHybridModelState, AscendModelState):
+         layer from the connector's ``wait_for_layer_load`` hook so each copy
+         only reads state that has already been loaded remotely. Running the
+         bulk pre-copy here instead would race with the in-flight layerwise
+-        loads and read half-loaded state.
++        loads and read half-loaded state. Non-layerwise connectors can opt in
++        to a bulk copy after the runner connector completes pre_forward.
+         """
+         if not self._align_mode:
+             return
+@@ -240,6 +242,14 @@ class AscendMambaHybridModelState(MambaHybridModelState, AscendModelState):
+             # Per-layer copies are executed by the connector right after each
+             # layer's KV load finishes (do_mamba_copy_for_layer).
+             return
++        if has_kv_transfer_group() and getattr(get_kv_transfer_group(), "requires_mamba_state_copy_after_load", False):
++            # Sync KV loads run later in KVConnector.pre_forward. Keep the
++            # decision kernel above before attention metadata construction,
++            # but copy the loaded state only after pre_forward has completed.
++            if self._pending_bulk_copy is not None:
++                raise RuntimeError("Previous Mamba bulk copy was not consumed")
++            self._pending_bulk_copy = (ctx, num_reqs, input_batch.idx_mapping)
++            return
+         ctx.run_fused_precopy(
+             num_reqs,
+             self._mamba_state_idx_gpu,
+@@ -248,6 +258,26 @@ class AscendMambaHybridModelState(MambaHybridModelState, AscendModelState):
+             input_batch.idx_mapping,
+         )
+ 
++    def copy_state_after_kv_load(self) -> None:
++        """Run bulk pre-copy before eager execution or FULL graph replay."""
++        pending = self._pending_bulk_copy
++        if pending is None:
++            return
++        self._pending_bulk_copy = None
++        ctx, num_reqs, idx_mapping = pending
++        ctx.run_fused_precopy(
++            num_reqs,
++            self._mamba_state_idx_gpu,
++            self._mamba_src_col_gpu,
++            self._mamba_src_off_gpu,
++            idx_mapping,
++        )
++
++    def finish_execution(self, *, failed: bool) -> None:
++        if failed:
++            self._pending_bulk_copy = None
++        super().finish_execution(failed=failed)
++
+     def prepare_attn(
+         self,
+         input_batch: AscendInputBatch,

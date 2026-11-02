@@ -1,0 +1,409 @@
+commit c4622400eb45bc877f8eb050a84ed47b18b38ac4
+Author:     fangrongcan <60131170+Eric-dot@users.noreply.github.com>
+AuthorDate: Mon Oct 12 19:17:23 2026 +0800
+Commit:     GitHub <noreply@github.com>
+CommitDate: Mon Oct 12 19:17:23 2026 +0800
+
+    [Feature][KV Transfer] Support GLM-5.3-Flash Mooncake layerwise KV transfer (#17720)
+    
+    ### What this PR does / why we need it?
+    
+    GLM-5.3-Flash has prefix-cacheable MLA/indexer pages, TP-sharded KDA
+    state, and a request-owned K-pool tail. Mooncake layerwise
+    initialization rejects the private group even though that state should
+    never enter external prefix storage.
+    
+    Allow private groups with Mooncake block-key layerwise transfer, exclude
+    them from hashing and payloads, and load cacheable state at the aligned
+    resume boundary so the private tail can be reconstructed locally. Uses
+    upstream KDA connector hooks and TP-state ownership/key handling;
+    existing MemCache support is preserved.
+    
+    Only implementation and unit tests are included. No documentation or e2e
+    files are changed.
+    | Model | Cards | Data Type | Layerwise Enabled | Pooling Enabled |
+    Input | Output | External Prefix Cache | Prefix Cache | P Parallel
+    Config | D Parallel Config | Concurrency | Total Requests | TTFT (s) |
+    TPOT (ms) | Per-Card Output Throughput (tokens/s) |
+    | :--- | ---: | :---: | :---: | :---: | ---: | ---: | ---: | :---: |
+    :---: | :---: | ---: | ---: | ---: | ---: | ---: |
+    | glm5.3-flash | 8 | W8A8 | Yes | Yes | 16k | 1 | 90% | / | TP8EP8 | / |
+    32 | 256 | 3.67 | / | 16943 |
+    | glm5.3-flash | 8 | W8A8 | No | Yes | 16k | 1 | 90% | / | TP8EP8 | / |
+    32 | 256 | 4.05 | / | 15476 |
+    
+    ### Does this PR introduce _any_ user-facing change?
+    
+    Yes. GLM-5.3-Flash can initialize Mooncake block-key layerwise transfer
+    with aligned KDA state while keeping its private tail request-local.
+    
+    ### How was this patch tested?
+    
+    - CPU/mock targeted regression tests: 104 passed, 52 subtests passed;
+    two tests require unavailable local dependencies.
+    - Full remote CPU UT previously reported 9957 passed and one obsolete
+    GLM rejection assertion failed on both vLLM versions. That assertion is
+    now replaced by initialization and private-group exclusion checks.
+    Updated remote results pending.
+    - Changed tests pass mypy and Ruff checks locally.
+    - Documentation and e2e changes removed at the author's request. The
+    main branch contains an unrelated broken GLM5.3.md link to kv_pool.md
+    that fails strict RTD builds; fixing that link was verified to pass both
+    English and Chinese RTD, but is excluded from this PR.
+    - Real Ascend NPU/Mooncake execution remains unverified on this
+    development host.
+    
+    
+    - vLLM main:
+    https://github.com/vllm-project/vllm/commit/8cc9aa5ad350f6f80cf3bebb298d410803ff75a9
+    
+    Signed-off-by: fangrongcan <17343701736@163.com>
+
+diff --git a/tests/ut/distributed/ascend_store/_mock_deps.py b/tests/ut/distributed/ascend_store/_mock_deps.py
+index 90ef4232b..4fa72ed31 100644
+--- a/tests/ut/distributed/ascend_store/_mock_deps.py
++++ b/tests/ut/distributed/ascend_store/_mock_deps.py
+@@ -44,6 +44,8 @@ if "torch" not in sys.modules and importlib.util.find_spec("torch") is None:
+     _torch.bool = "bool"  # type: ignore[attr-defined]
+     _torch.float16 = "float16"  # type: ignore[attr-defined]
+     _torch.float32 = "float32"  # type: ignore[attr-defined]
++    _torch.int8 = "int8"  # type: ignore[attr-defined]
++    _torch.dtype = str  # type: ignore[attr-defined]
+     _torch.zeros = MagicMock(return_value=MagicMock())  # type: ignore[attr-defined]
+     _torch.sum = MagicMock(return_value=0)  # type: ignore[attr-defined]
+     _torch.device = MagicMock()  # type: ignore[attr-defined]
+@@ -92,6 +94,7 @@ _vllm_mock_modules = [
+     "vllm.utils",
+     "vllm.utils.hashing",
+     "vllm.utils.math_utils",
++    "vllm.utils.torch_utils",
+     "vllm.utils.network_utils",
+     "vllm.v1",
+     "vllm.v1.attention",
+@@ -343,7 +346,7 @@ class _FakeSingleTypeKVCacheManager:
+         if drop_eagle_block and computed and computed[0]:
+             for blocks in computed:
+                 blocks.pop()
+-        return computed
++        return computed, len(computed[0]) * kv_cache_spec.block_size
+ 
+ 
+ class _FakeSlidingWindowManager(_FakeSingleTypeKVCacheManager):
+@@ -381,6 +384,11 @@ _kv_interface_mod: Any = sys.modules["vllm.v1.kv_cache_interface"] if _MOCK_VLLM
+ _kv_interface_mod.KVCacheSpec = _FakeKVCacheSpec  # type: ignore[attr-defined]
+ _kv_interface_mod.AttentionSpec = _FakeAttentionSpec  # type: ignore[attr-defined]
+ _kv_interface_mod.FullAttentionSpec = _FakeFullAttentionSpec  # type: ignore[attr-defined]
++_kv_interface_mod.MLAAttentionSpec = _FakeFullAttentionSpec  # type: ignore[attr-defined]
++_kv_interface_mod.SlidingWindowMLASpec = _FakeSlidingWindowSpec  # type: ignore[attr-defined]
++_kv_interface_mod.CircularBufferSpec = type(  # type: ignore[attr-defined]
++    "CircularBufferSpec", (_FakeKVCacheSpec,), {"prefix_cacheable": False}
++)
+ _kv_interface_mod.SlidingWindowSpec = _FakeSlidingWindowSpec  # type: ignore[attr-defined]
+ _kv_interface_mod.MambaSpec = _FakeMambaSpec  # type: ignore[attr-defined]
+ _kv_interface_mod.UniformTypeKVCacheSpecs = _FakeUniformTypeKVCacheSpecs  # type: ignore[attr-defined]
+diff --git a/tests/ut/distributed/ascend_store/test_glm53_store.py b/tests/ut/distributed/ascend_store/test_glm53_store.py
+index b0f0e03a6..c9f4873da 100644
+--- a/tests/ut/distributed/ascend_store/test_glm53_store.py
++++ b/tests/ut/distributed/ascend_store/test_glm53_store.py
+@@ -342,9 +342,19 @@ class TestGLM53Store(unittest.TestCase):
+         hit_request.request_id = "missing"
+         self.assertEqual(scheduler.get_num_new_matched_tokens(hit_request, 0), (0, False))
+ 
+-    def test_mooncake_layerwise_still_rejects_hybrid(self):
+-        with self.assertRaisesRegex(ValueError, "AscendStore private KV state requires non-layerwise transfer"):
+-            make_worker(self, kv_cache_config=make_glm53_plan(), use_layerwise=True, use_mla=True)
++    def test_mooncake_layerwise_excludes_private_tail(self):
++        plan = make_glm53_plan()
++        worker = make_worker(self, kv_cache_config=plan, use_layerwise=True, use_mla=True, num_layers=4)
++        start_patch(self, "vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.pool_scheduler.importlib")
++        scheduler = KVPoolScheduler(worker.vllm_config, True, plan)
++        self.assertTrue(worker.use_block_key_layerwise)
++        self.assertTrue(scheduler.use_block_key_layerwise)
++        self.assertEqual(worker.cacheable_group_ids, [0, 2, 3, 4])
++        self.assertEqual(scheduler.cacheable_group_ids, worker.cacheable_group_ids)
++        worker.register_kv_caches(make_glm53_caches(plan))
++        for layer in range(worker.num_layers):
++            for group_id, _ in worker._groups_for_layerwise_transfer(layer):
++                self.assertIn(group_id, worker.cacheable_group_ids)
+ 
+     def test_empty_final_layer_waits_for_pending_save_before_reusing_events(self):
+         pending: queue.Queue[str] = queue.Queue()
+diff --git a/tests/ut/distributed/ascend_store/test_mooncake_hybrid.py b/tests/ut/distributed/ascend_store/test_mooncake_hybrid.py
+index b62722b03..cd9e4265f 100644
+--- a/tests/ut/distributed/ascend_store/test_mooncake_hybrid.py
++++ b/tests/ut/distributed/ascend_store/test_mooncake_hybrid.py
+@@ -16,6 +16,7 @@ import tests.ut.distributed.ascend_store._mock_deps  # noqa: F401
+ from vllm.v1.kv_cache_interface import (
+     FullAttentionSpec,
+     KVCacheGroupSpec,
++    MambaSpec,
+     SlidingWindowSpec,
+     UniformTypeKVCacheSpecs,
+ )
+@@ -110,7 +111,7 @@ def cpu_cache(array):
+ 
+ 
+ class TestMooncakeHybrid(unittest.TestCase):
+-    def make_hybrid(self, extra_entry=False):
++    def make_hybrid(self, extra_entry=False, private_tail=False, tp_rank=0, tp_size=1, use_mla=False):
+         groups = [
+             KVCacheGroupSpec(
+                 ["model.layers.0.kv", "model.layers.2.kv"],
+@@ -127,12 +128,40 @@ class TestMooncakeHybrid(unittest.TestCase):
+         ]
+         if extra_entry:
+             groups[1].layer_names.append("model.layers.2.c4_indexer")
++        if private_tail:
++            groups[2].kv_cache_spec = MambaSpec(
++                block_size=16,
++                shapes=((4,), (4,)),
++                dtypes=("uint8", "uint8"),
++                mamba_cache_mode="align",
++                num_speculative_blocks=3,
++            )
++
++            # A private ring's capacity is unrelated to token/hash pages.
++            # Wrap it like the per-layer specs supplied to real workers.
++            class PrivateTailSpec(FullAttentionSpec):
++                @property
++                def prefix_cacheable(self):
++                    return False
++
++            name = "model.layers.2.indexer.tail_cache"
++            tail = PrivateTailSpec(block_size=7, num_kv_heads=1, head_size=1, dtype="uint8")
++            groups.append(KVCacheGroupSpec([name], UniformTypeKVCacheSpecs.from_specs({name: tail})))
+         config = SimpleNamespace(num_blocks=8, kv_cache_groups=groups)
+         with patch(
+             "vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.pool_worker.KVPoolWorker._build_cache_coordinator",
+             return_value=None,
+         ):
+-            worker = make_worker(self, num_layers=4, num_hidden_layers=4, use_layerwise=True, kv_cache_config=config)
++            worker = make_worker(
++                self,
++                num_layers=4,
++                num_hidden_layers=4,
++                use_layerwise=True,
++                kv_cache_config=config,
++                tp_rank=tp_rank,
++                tp_size=tp_size,
++                use_mla=use_mla,
++            )
+         store = MemoryRangeStore()
+         worker.m_store = store
+         arrays: dict[str, NDArray[np.uint8]] = {}
+@@ -172,18 +201,107 @@ class TestMooncakeHybrid(unittest.TestCase):
+         )
+         worker.kv_recv_thread.add_request = lambda task: dispatch(worker.kv_recv_thread, task)
+         worker.cache_coordinator = object()
+-        masks = ([True] * 4, [True] * 2, [False, False, False, True])
++        masks: tuple[list[bool], ...] = ([True] * 4, [True] * 2, [False, False, False, True])
++        if private_tail:
++            masks += ([],)
+         worker.token_database.store_mask = MagicMock(return_value=masks)
+         worker.token_database.load_mask = MagicMock(return_value=masks)
+         return worker, store, arrays, jobs, errors
+ 
+     def test_multigroup_roundtrip_sparse_masks_and_group_commit_boundaries(self):
+-        worker, store, arrays, jobs, errors = self.make_hybrid()
++        self._roundtrip()
++
++    def test_private_tail_is_never_hashed_or_transferred(self):
++        self._roundtrip(private_tail=True)
++
++    def test_mla_dedup_preserves_every_tp_rank_kda_snapshot(self):
++        store = MemoryRangeStore()
++        workers = []
++        for rank in range(8):
++            worker, _, arrays, jobs, errors = self.make_hybrid(private_tail=True, tp_size=8, tp_rank=rank, use_mla=True)
++            worker.m_store = worker.kv_send_thread.m_store = worker.kv_recv_thread.m_store = store
++            for name, array in arrays.items():
++                if "state" in name:
++                    array.fill(80 + rank)
++            request = self.save_prefix(worker)
++            workers.append((worker, arrays, request, jobs, errors))
++        # MLA/indexer objects are replicated; recurrent state has eight shards.
++        self.assertEqual(len(store.complete), 4 + 2 + 8)
++        for rank, (worker, arrays, request, jobs, errors) in enumerate(workers):
++            for array in arrays.values():
++                array.fill(0)
++            request.load_spec = LoadSpec(0, 64, can_load=True)
++            request.can_save = False
++            worker.kv_role = "kv_consumer"
++            meta = AscendConnectorMetadata(set())
++            meta.add_request(request)
++            worker.prepare_layerwise_step(meta)
++            worker.start_load_kv(meta)
++            for _ in range(4):
++                worker.wait_for_layer_load()
++                with attention_transfer_window():
++                    pass
++            for name, array in arrays.items():
++                if "state" in name:
++                    np.testing.assert_array_equal(array[4], 80 + rank)
++                elif "tail_cache" in name:
++                    self.assertFalse(array.any())
++            for job in jobs:
++                job.join(timeout=2)
++                self.assertFalse(job.is_alive())
++            self.assertFalse(errors)
++        self.assertFalse(store.open_reads)
++
++    def test_private_layout_lookup_and_recompute_boundary(self):
++        worker, _, _, _, _ = self.make_hybrid(private_tail=True, tp_size=8, use_mla=True)
++        config = scheduler_tests.make_config(kv_role="kv_both", extra_config={"backend": "mooncake"})
++        config.parallel_config.tensor_parallel_size = 8
++        config.model_config.use_mla = True
++        config.scheduler_config.disable_hybrid_kv_cache_manager = False
++        with patch("vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.pool_scheduler.importlib"):
++            scheduler = KVPoolScheduler(config, use_layerwise=True, kv_cache_config=worker.kv_cache_config)
++        self.assertEqual(scheduler.cacheable_group_ids, [0, 1, 2])
++        self.assertEqual(scheduler.hash_block_size, 16)
++        self.assertEqual(scheduler.cache_transfer_granularity, 32)
++        self.assertEqual(len(scheduler._make_layerwise_hit_check_keys(0, "hash")), 1)
++        keys = scheduler._make_layerwise_hit_check_keys(2, "hash")
++        self.assertEqual(len(keys), 8)
++        self.assertEqual(keys[0], worker._make_layerwise_full_key(2, "hash"))
++        scheduler.store_scheduler.batch_is_readable.return_value = [True] * 7 + [False]
++        self.assertEqual(scheduler._query_layerwise_block_hits([keys]), [False])
++
++        scheduler.store_scheduler.batch_is_readable.side_effect = lambda keys: [True] * len(keys)
++        for eagle in (False, True):
++            scheduler.use_eagle = eagle
++            request = SimpleNamespace(
++                request_id="full-hit", num_tokens=64, prompt_token_ids=list(range(64)), block_hashes=[b"h"] * 4
++            )
++            self.assertEqual(scheduler.get_num_new_matched_tokens(request, 0), (32, False))
++            load = scheduler.load_specs[request.request_id]
++            self.assertEqual(load.kvpool_cached_tokens, 32)
++            self.assertEqual(load.kvpool_store_skip_tokens, 64)
++        # The full hit is a write-skip extent, not the recurrent resume point.
++        worker.use_eagle = False
++        request = ReqMeta(
++            "load",
++            token_len_chunk=64,
++            block_ids_by_group=[[1, 2, 3, 4], [1, 2], [1, 2, 3, 4], [7]],
++            block_hashes=[b"h0", b"h1", b"h2", b"h3"],
++            load_spec=LoadSpec(0, 32, True, 64),
++        )
++        with patch.object(worker, "_open_layerwise_get_sessions") as open_get:
++            views = mooncake_layerwise.prepare_group_sessions(worker, [request])
++        worker.token_database.load_mask.assert_called_with(request.block_hashes, 32)
++        self.assertFalse(views[3])
++        self.assertTrue(all(slot < 2 for _, _, _, slot in open_get.call_args.args[0]))
++
++    def _roundtrip(self, private_tail=False):
++        worker, store, arrays, jobs, errors = self.make_hybrid(private_tail=private_tail)
+         saved = {name: array.copy() for name, array in arrays.items()}
+         request = ReqMeta(
+             "save",
+             token_len_chunk=64,
+-            block_ids_by_group=[[1, 2, 3, 4], [1, 2], [1, 2, 3, 4]],
++            block_ids_by_group=[[1, 2, 3, 4], [1, 2], [1, 2, 3, 4]] + ([[7]] if private_tail else []),
+             block_hashes=[b"h0", b"h1", b"h2", b"h3"],
+             can_save=True,
+             is_last_chunk=True,
+@@ -234,6 +352,9 @@ class TestMooncakeHybrid(unittest.TestCase):
+             with attention_transfer_window():
+                 pass
+         for name, actual in arrays.items():
++            if "tail_cache" in name:
++                self.assertFalse(actual.any(), "Request-owned tail must never be loaded from another request")
++                continue
+             slots = [4] if "state" in name else [1, 2] if "c4" in name else [1, 2, 3, 4]
+             np.testing.assert_array_equal(actual[slots], saved[name][slots])
+             self.assertFalse(actual[0].any(), "Null block must stay untouched")
+@@ -319,6 +440,7 @@ class TestMooncakeHybrid(unittest.TestCase):
+         scheduler.tp_size = 2
+         scheduler.pp_size = 1
+         scheduler.put_step = 1
++        scheduler.num_speculative_blocks_by_group = {}
+         scheduler.grouped_block_size = [16, 32]
+         with patch.object(mooncake_layerwise, "hybrid_layout_id", return_value="layout"):
+             scheduler.layerwise_keys = mooncake_layerwise.bind_layerwise_keys(
+diff --git a/tests/ut/distributed/ascend_store/test_mooncake_layerwise.py b/tests/ut/distributed/ascend_store/test_mooncake_layerwise.py
+index 3fdc97903..083254b4a 100644
+--- a/tests/ut/distributed/ascend_store/test_mooncake_layerwise.py
++++ b/tests/ut/distributed/ascend_store/test_mooncake_layerwise.py
+@@ -172,6 +172,8 @@ class TestMooncakeWorkerSessionPreparation(unittest.TestCase):
+         worker.tp_rank = 0
+         worker.pp_rank = 0
+         worker.put_step = 1
++        worker.dcp_size = 1
++        worker.group_uses_align_state = [False]
+         worker.block_size = 16
+         worker.grouped_block_size = [16]
+         worker.num_layers = 1
+diff --git a/vllm_ascend/distributed/kv_transfer/kv_pool/ascend_store/backend/mooncake_layerwise.py b/vllm_ascend/distributed/kv_transfer/kv_pool/ascend_store/backend/mooncake_layerwise.py
+index 95eb3beef..0c907ce45 100644
+--- a/vllm_ascend/distributed/kv_transfer/kv_pool/ascend_store/backend/mooncake_layerwise.py
++++ b/vllm_ascend/distributed/kv_transfer/kv_pool/ascend_store/backend/mooncake_layerwise.py
+@@ -321,10 +321,17 @@ def _prepare_group_sessions(worker: KVPoolWorker, requests: list[ReqMeta]) -> di
+         cached_tokens = request.save_start_token
+         if request.load_spec is not None and request.load_spec.can_load:
+             cached_tokens = request.load_spec.kvpool_cached_tokens
+-            if not worker.use_eagle and request.load_spec.kvpool_store_skip_tokens is not None:
++            if (
++                not worker.use_eagle
++                and len(worker.cacheable_group_ids) == worker.num_kv_cache_groups
++                and request.load_spec.kvpool_store_skip_tokens is not None
++            ):
+                 cached_tokens = request.load_spec.kvpool_store_skip_tokens
+         load_masks = worker._compute_reachable_load_masks(request, cached_tokens)
+-        for group, block_size in enumerate(worker.grouped_block_size):
++        for group in worker.cacheable_group_ids:
++            # Skip private rings before deriving token hashes: their physical
++            # capacity need not even be divisible by the hash block size.
++            block_size = worker.grouped_block_size[group]
+             view = copy(request)
+             # Keep the complete group block table: LayerBatchBuilder indexes it
+             # using task.group_id. Only key/session metadata is group-local.
+@@ -374,7 +381,7 @@ def _prepare_group_sessions(worker: KVPoolWorker, requests: list[ReqMeta]) -> di
+             view.save_end_token = end * block_size
+             view.save_key_block_offset = start
+             view.save_block_keys = [None] * max(0, end - start)
+-            if not request.can_save or not worker._is_layerwise_save_owner():
++            if not request.can_save or not worker._is_layerwise_save_owner(group):
+                 continue
+             key_indices = [(key(index), index) for index in range(start, end) if selected(store_mask, index)]
+             names = [name for name, _ in key_indices]
+diff --git a/vllm_ascend/distributed/kv_transfer/kv_pool/ascend_store/pool_scheduler.py b/vllm_ascend/distributed/kv_transfer/kv_pool/ascend_store/pool_scheduler.py
+index fb6189d45..0c6c30e65 100644
+--- a/vllm_ascend/distributed/kv_transfer/kv_pool/ascend_store/pool_scheduler.py
++++ b/vllm_ascend/distributed/kv_transfer/kv_pool/ascend_store/pool_scheduler.py
+@@ -129,9 +129,10 @@ class KVPoolScheduler:
+         if (
+             self.use_layerwise
+             and self.backend_name != "memcache"
++            and not self.use_block_key_layerwise
+             and len(cacheable_block_sizes) != len(self.original_block_size)
+         ):
+-            raise ValueError("AscendStore private KV state requires non-layerwise transfer")
++            raise ValueError("AscendStore private KV state requires Mooncake block-key or non-layerwise transfer")
+         self.grouped_block_size = [block_size * self.dcp_size for block_size in self.original_block_size]
+         requested_hash_block_size = vllm_config.cache_config.prefix_match_unit
+         if not isinstance(requested_hash_block_size, int):
+diff --git a/vllm_ascend/distributed/kv_transfer/kv_pool/ascend_store/pool_worker.py b/vllm_ascend/distributed/kv_transfer/kv_pool/ascend_store/pool_worker.py
+index 1553f12e2..5a5c23444 100644
+--- a/vllm_ascend/distributed/kv_transfer/kv_pool/ascend_store/pool_worker.py
++++ b/vllm_ascend/distributed/kv_transfer/kv_pool/ascend_store/pool_worker.py
+@@ -249,9 +249,10 @@ class KVPoolWorker:
+         if (
+             self.use_layerwise
+             and self.backend_name != "memcache"
++            and not self.use_block_key_layerwise
+             and len(cacheable_block_sizes) != len(self.original_block_size)
+         ):
+-            raise ValueError("AscendStore private KV state requires non-layerwise transfer")
++            raise ValueError("AscendStore private KV state requires Mooncake block-key or non-layerwise transfer")
+         self.grouped_block_size = [block_size * self.dcp_size for block_size in self.original_block_size]
+         requested_hash_block_size = vllm_config.cache_config.prefix_match_unit
+         if not isinstance(requested_hash_block_size, int):
+@@ -2170,7 +2171,7 @@ class KVPoolWorker:
+             groups = self.physical_layer_to_group_layers.get(local_layer)
+             if groups is None:
+                 raise RuntimeError(f"Mooncake layerwise: no KV cache group for local layer {local_layer}")
+-            return groups
++            return [(group_id, layer_idx) for group_id, layer_idx in groups if group_id in self.cacheable_group_ids]
+         # GVA groups use stage-local indices too; PP offsets apply to pool keys and remote addresses.
+         return self.physical_layer_to_group_layers.get(local_layer, [(0, local_layer)])
+ 

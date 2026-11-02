@@ -1,0 +1,3087 @@
+commit 3a2e4a057cf9a84d62b84444d0a5f92298ab74fc
+Author:     weijinqian0 <1184188277@qq.com>
+AuthorDate: Sun Oct 11 15:49:47 2026 +0800
+Commit:     GitHub <noreply@github.com>
+CommitDate: Sun Oct 11 15:49:47 2026 +0800
+
+    [Feature][Model] Support DeepSeek V4.1 Endoder SWA bounded replay (#17742)
+    
+    ### What this PR does / why we need it?
+    
+    Support DeepSeek V4.1 SWA bounded replay on Ascend, integrating the
+    upstream replay mechanism from vllm-project/vllm#56227. After a
+    prefix-cache hit, rebuild the sliding-window KV while preserving the
+    shared cached KV of other cache groups. Supports both Ascend V1 and V2
+    model runners.
+    
+    - Carry replay configuration and retained-token fields through Ascend
+    cache construction and spec merging.
+    - Propagate replay starts for new and resumed requests, including
+    serialization across the scheduler/worker boundary.
+    - Pad replayed slot mappings for prefix-cacheable groups so replay does
+    not overwrite shared KV; V1 and V2 use their respective slot-mapping
+    layouts.
+    - Clamp SWA attention to the replay start through per-token visible
+    lengths in sparse flash MLA band mode, including arch22/arch35 kernels
+    and host-side validation.
+    - Disable replay for unsupported scheduler modes and PCP configurations;
+    retain compatibility with upstream versions without the replay fields.
+    - Add regression coverage for configuration fallback, cache specs,
+    resumed-request metadata, slot padding, and attention visibility.
+    
+    ### Does this PR introduce _any_ user-facing change?
+    
+    Yes. Supported DeepSeek V4.1 configurations can use upstream SWA bounded
+    replay on Ascend with either runner. Unsupported scheduler
+    configurations fall back to prefix-cacheable SWA behavior. No new
+    environment variable is introduced.
+    
+    ### How was this patch tested?
+    
+    - Existing PR validation: `git diff upstream/main...HEAD --check` and
+    `python -m py_compile` for the original 16 changed Python files passed.
+    - Existing PR formatting attempt: `bash format.sh ci` could not complete
+    because `pre-commit` is not installed.
+    - Existing targeted pytest attempt was blocked during conftest loading
+    because the local vLLM checkout lacks `FP32ReplicatedLinear` imported by
+    `patch_step3p5.py`. No unit-test pass is claimed.
+    - V2 follow-up: `git diff --check` and `python -m py_compile` passed for
+    all three changed Python files.
+    - Current `bash format.sh ci` attempt is blocked because `pre-commit` is
+    not installed.
+    - CANN/C++ kernel compilation, NPU execution, end-to-end accuracy, ACL
+    Graph replay, and performance benchmarks have not been run in this macOS
+    environment and still require validation.
+    
+    The verified vLLM pin above predates vLLM #56227, so it does not provide
+    scheduler replay-start metadata or the upstream bounded-replay switch.
+    The V2 integration is wired for the API from #56227 and requires that
+    API in the paired vLLM revision before runtime activation can be
+    validated.
+    
+    - vLLM main:
+    https://github.com/vllm-project/vllm/commit/ced6857afa0ea7b2e3f0846a62e1394e90f15607
+    
+    
+    Co-authored-by: dodatboii
+    
+    Signed-off-by: weijinqian0 <1184188277@qq.com>
+
+diff --git a/csrc/attention/sparse_flash_mla/op_host/sparse_flash_mla_tiling.cpp b/csrc/attention/sparse_flash_mla/op_host/sparse_flash_mla_tiling.cpp
+index 773d51c0c..fa3079211 100644
+--- a/csrc/attention/sparse_flash_mla/op_host/sparse_flash_mla_tiling.cpp
++++ b/csrc/attention/sparse_flash_mla/op_host/sparse_flash_mla_tiling.cpp
+@@ -1784,9 +1784,16 @@ ge::graphStatus SMLATilingCheck::CheckSingleParaTopkLength() const
+                     return ge::GRAPH_FAILED);
+         return ge::GRAPH_SUCCESS;
+     }
+-    OP_CHECK_IF(opParamInfo_.oriSparseIndices.tensor == nullptr,
+-                OP_LOGE_FOR_INVALID_ARGUMENT_WITH_REASON(opName_, "ori_sparse_indices",
+-                                                         "Ori_topk_length requires ori_sparse_indices"),
++    // SWA bounded replay (vLLM #56227): in band mode the caller uses this same
++    // tensor for what the window's scalar width cannot express -- how many ori
++    // KV entries each query token may see -- so it stands alone there. Outside
++    // band mode it stays tied to the index list it was written for.
++    const bool bandVisibleLen =
++        (opParamInfo_.oriMaskMode != nullptr && *opParamInfo_.oriMaskMode == SMLA_ORI_MASK_MODE_BAND);
++    OP_CHECK_IF(opParamInfo_.oriSparseIndices.tensor == nullptr && !bandVisibleLen,
++                OP_LOGE_FOR_INVALID_ARGUMENT_WITH_REASON(
++                    opName_, "ori_sparse_indices",
++                    "Ori_topk_length requires ori_sparse_indices unless ori_mask_mode is 4 (band)"),
+                 return ge::GRAPH_FAILED);
+     if (ge::GRAPH_SUCCESS != CheckDtypeSupport(opParamInfo_.oriTopkLength.desc, ORI_TOPK_LENGTH_NAME)) {
+         return ge::GRAPH_FAILED;
+@@ -1797,6 +1804,35 @@ ge::graphStatus SMLATilingCheck::CheckSingleParaTopkLength() const
+                     SMLADataTypeToSerialString(opParamInfo_.oriTopkLength.desc->GetDataType()).c_str(),
+                     "The dtype of ori_topk_length must be DT_INT32"),
+                 return ge::GRAPH_FAILED);
++    if (opParamInfo_.oriSparseIndices.tensor == nullptr) {
++        // Band mode: there is no index list to match, so the tensor is checked
++        // against the query it is addressed by. The kernel reads the row of the
++        // token it is masking (and reads it with GlobalTensor::GetValue, which
++        // does not bounds check), so a shape with fewer rows than the query has
++        // tokens leaves the rows past it reading past the tensor while the bound
++        // they were meant to carry is silently lost. The A5 checker states this
++        // same contract for this input; the index path below states it against
++        // the index list instead, because there the two are written together.
++        const gert::Shape &bandTopkShape = opParamInfo_.oriTopkLength.tensor->GetStorageShape();
++        const gert::Shape &bandQueryShape = opParamInfo_.q.shape->GetStorageShape();
++        if (qLayout_ == SMLALayout::BSND) {
++            OP_CHECK_IF(bandTopkShape.GetDimNum() != DIM_NUM_THREE ||
++                            bandTopkShape.GetDim(0) != bandQueryShape.GetDim(0) ||
++                            bandTopkShape.GetDim(1) != bandQueryShape.GetDim(1) || bandTopkShape.GetDim(2) != 1,
++                        OP_LOGE_FOR_INVALID_SHAPES_WITH_REASON(
++                            opName_, ORI_TOPK_LENGTH_NAME, Ops::Base::ToString(bandTopkShape),
++                            "BSND band ori_topk_length shape must be [B, S1, 1], matching the query's b and s1"),
++                        return ge::GRAPH_FAILED);
++        } else {
++            OP_CHECK_IF(bandTopkShape.GetDimNum() != DIM_NUM_TWO ||
++                            bandTopkShape.GetDim(0) != bandQueryShape.GetDim(0) || bandTopkShape.GetDim(1) != 1,
++                        OP_LOGE_FOR_INVALID_SHAPES_WITH_REASON(
++                            opName_, ORI_TOPK_LENGTH_NAME, Ops::Base::ToString(bandTopkShape),
++                            "TND band ori_topk_length shape must be [T, 1], matching the query's token count"),
++                        return ge::GRAPH_FAILED);
++        }
++        return ge::GRAPH_SUCCESS;
++    }
+     const gert::Shape &topkLenShape = opParamInfo_.oriTopkLength.tensor->GetStorageShape();
+     const gert::Shape &sparseShape = opParamInfo_.oriSparseIndices.tensor->GetStorageShape();
+     if (oriSparseIndicesLayout_ == SMLALayout::TND) {
+diff --git a/csrc/attention/sparse_flash_mla/op_host/sparse_flash_mla_tiling.h b/csrc/attention/sparse_flash_mla/op_host/sparse_flash_mla_tiling.h
+index fd35bdd21..684ec046f 100644
+--- a/csrc/attention/sparse_flash_mla/op_host/sparse_flash_mla_tiling.h
++++ b/csrc/attention/sparse_flash_mla/op_host/sparse_flash_mla_tiling.h
+@@ -89,6 +89,9 @@ constexpr uint32_t ATTR_SOFTMAX_SCALE_INDEX = 0;
+ constexpr uint32_t ATTR_CMP_RATIO_INDEX = 1;
+ constexpr uint32_t ATTR_ORI_MASK_MODE_INDEX = 2;
+ constexpr uint32_t ATTR_CMP_MASK_MODE_INDEX = 3;
++// The band mask mode. Its left edge is what the SWA bounded replay bound rides
++// (vLLM #56227), through ori_topk_length in band mode.
++constexpr uint32_t SMLA_ORI_MASK_MODE_BAND = 4U;
+ constexpr uint32_t ATTR_ORI_WIN_LEFT_INDEX = 4;
+ constexpr uint32_t ATTR_ORI_WIN_RIGHT_INDEX = 5;
+ constexpr uint32_t ATTR_LAYOUT_Q_INDEX = 6;
+diff --git a/csrc/attention/sparse_flash_mla/op_kernel/arch22/sparse_flash_mla_csa_kernel.h b/csrc/attention/sparse_flash_mla/op_kernel/arch22/sparse_flash_mla_csa_kernel.h
+index e0c85cca7..e32c9614b 100644
+--- a/csrc/attention/sparse_flash_mla/op_kernel/arch22/sparse_flash_mla_csa_kernel.h
++++ b/csrc/attention/sparse_flash_mla/op_kernel/arch22/sparse_flash_mla_csa_kernel.h
+@@ -147,6 +147,9 @@ private:
+     GlobalTensor<int32_t> oriBlockTableGm;
+     GlobalTensor<int32_t> cmpBlockTableGm;
+     GlobalTensor<int32_t> topKGm;
++    // SWA bounded replay: per-token visible ori KV length in band mode (the SWA
++    // template owns the sparse-index path that also feeds this tensor).
++    GlobalTensor<int32_t> oriTopkLengthGm;
+ 
+     GlobalTensor<int32_t> actualSeqLengthsQGm;
+     GlobalTensor<int32_t> actualSeqLengthsKVGm;
+@@ -535,6 +538,12 @@ __aicore__ inline void SparseFlashMlaCsa<SMLAT>::Init(
+         cmpBlockTableGm.SetGlobalBuffer((__gm__ int32_t *)cmpBlockTable);
+     }
+     topKGm.SetGlobalBuffer((__gm__ int32_t *)cmpSparseIndices);
++    // SWA bounded replay: the tensor is optional; its presence is what tells the
++    // band's left edge to follow the caller's per-token count (see below).
++    constInfo.hasOriTopkLength = (oriTopkLength != nullptr);
++    if (constInfo.hasOriTopkLength) {
++        oriTopkLengthGm.SetGlobalBuffer((__gm__ int32_t *)oriTopkLength);
++    }
+ 
+     // workspace 内存排布
+     // |Q--|mm1ResGm|vec1ResGm|mm2ResGm|vec2ResGm
+@@ -825,6 +834,20 @@ __aicore__ inline void SparseFlashMlaCsa<SMLAT>::ProcessBalance()
+             tempLoopInfo.oriMaskLeft = Max(tempLoopInfo.actOriS2Size - tempLoopInfo.actS1Size +
+                                                static_cast<int32_t>(tempLoopInfo.s1EndIdx) - constInfo.oriWinLeft,
+                                            0);
++            // SWA bounded replay: in band mode a supplied ori_topk_length is how
++            // many ori KV entries this query token may see. Keep that many ending
++            // at the same right edge; max() keeps ori_win_left as the upper
++            // bound, so this only ever narrows. The row is the token here, since
++            // this template runs one S1 row per tile (mBaseSize == gSize).
++            if (constInfo.hasOriTopkLength && constInfo.oriMaskMode == 4U) {
++                uint64_t qTokenOffset =
++                    tempLoopInfo.actualSeqQPrefixSum + static_cast<uint64_t>(tempLoopInfo.s1EndIdx);
++                int32_t rowLen =
++                    oriTopkLengthGm.GetValue(qTokenOffset * constInfo.kvHeadNum + tempLoopInfo.n2Idx);
++                if (rowLen > 0) {
++                    tempLoopInfo.oriMaskLeft = Max(tempLoopInfo.oriMaskLeft, tempLoopInfo.oriMaskRight - rowLen + 1);
++                }
++            }
+             int32_t cmpMaskS2Size =
+                 GetCmpMaskS2Size(tempLoopInfo.bIdx, tempLoopInfo.actOriS2Size, tempLoopInfo.actCmpS2Size);
+             tempLoopInfo.cmpMaskRight = cmpMaskS2Size - tempLoopInfo.actS1Size;
+diff --git a/csrc/attention/sparse_flash_mla/op_kernel/arch22/sparse_flash_mla_swa_block_vector.h b/csrc/attention/sparse_flash_mla/op_kernel/arch22/sparse_flash_mla_swa_block_vector.h
+index 301cc40fe..1f677a74c 100644
+--- a/csrc/attention/sparse_flash_mla/op_kernel/arch22/sparse_flash_mla_swa_block_vector.h
++++ b/csrc/attention/sparse_flash_mla/op_kernel/arch22/sparse_flash_mla_swa_block_vector.h
+@@ -645,6 +645,23 @@ __aicore__ inline void SWAVectorBlock<SMLAT>::ElewiseCompute(const RunInfo &info
+                 if (dealTempSize == 0) {
+                     continue;
+                 }
++                // SWA bounded replay: in band mode a supplied ori_topk_length is
++                // how many ori KV entries this query token may see -- per token,
++                // which the window's own scalar width cannot express. Keep that
++                // many ending at the same right edge. max() keeps ori_win_left as
++                // the upper bound, so this only ever narrows.
++                if (constInfo.hasOriTopkLength && constInfo.oriMaskMode == 4U) {
++                    uint64_t qTokenOffset = 0;
++                    if constexpr (LAYOUT_T == SMLA_LAYOUT::TND) {
++                        qTokenOffset = static_cast<uint64_t>(actualSeqLengthsQGm.GetValue(info.bIdx)) + i;
++                    } else {
++                        qTokenOffset = static_cast<uint64_t>(info.bIdx) * constInfo.qSeqSize + i;
++                    }
++                    int32_t rowLen = oriTopkLengthGm.GetValue(qTokenOffset * constInfo.kvHeadNum + info.n2IdxReal);
++                    if (rowLen > 0) {
++                        left = Max(left, right - rowLen + 1);
++                    }
++                }
+                 SetInfInBlk(mmResUb[ubOffset], dealTempSize, columnCount, 0, left - 1);
+                 SetInfInBlk(mmResUb[ubOffset], dealTempSize, columnCount, right + 1, columnCount - 1);
+                 right = Min(right + 1, columnCount - 1);
+diff --git a/csrc/attention/sparse_flash_mla/op_kernel/arch35/sparse_flash_mla_kvcache.h b/csrc/attention/sparse_flash_mla/op_kernel/arch35/sparse_flash_mla_kvcache.h
+index a95e12e69..a2e8637a3 100644
+--- a/csrc/attention/sparse_flash_mla/op_kernel/arch35/sparse_flash_mla_kvcache.h
++++ b/csrc/attention/sparse_flash_mla/op_kernel/arch35/sparse_flash_mla_kvcache.h
+@@ -360,6 +360,23 @@ __aicore__ inline bool ComputeS2LoopInfo(int64_t bnIndex, int64_t gS1Index, Glob
+         runParam.s2OriLineStartIdx = 0;
+         runParam.s2OriLineEndIdx = Min(oriSparseRangeLen, runParam.oriSparseBlockCount);
+         runParam.s2OriLineEndIdx = Min(runParam.s2OriLineEndIdx, runParam.actualS2OriSize);
++    } else if (constInfo.hasOriTopkLength && constInfo.oriMaskMode == 4) {
++        // SWA bounded replay (vLLM #56227): in band mode the same tensor reports
++        // how many ori KV entries this query token may see, counted back from the
++        // row's right edge. It only narrows (max() keeps the band as the upper
++        // bound), and the row is the token because qSNumInOneBlock is 1.
++        // Narrowing before oriKvLoopEndIdx rather than masking afterwards is what
++        // makes the Cube load the shortened range: on this path the loop count is
++        // the only mask there is.
++        int32_t rowLen = 0;
++        if constexpr (LAYOUT_T == SMLA_LAYOUT::TND) {
++            rowLen = oriTopkLengthGm.GetValue(cuSeqlensQGm.GetValue(runParam.boIdx) + runParam.s1oIdx);
++        } else {
++            rowLen = oriTopkLengthGm.GetValue(runParam.boIdx * constInfo.s1Size + runParam.s1oIdx);
++        }
++        if (rowLen > 0) {
++            runParam.s2OriLineStartIdx = Max(runParam.s2OriLineStartIdx, runParam.s2OriLineEndIdx - rowLen);
++        }
+     }
+     runParam.oriKvLoopEndIdx = (runParam.s2OriLineEndIdx - runParam.s2OriLineStartIdx + s2BaseSize - 1) / s2BaseSize;
+ 
+diff --git a/csrc/attention/sparse_flash_mla/op_kernel/arch35/sparse_flash_mla_swa_kernel_arch35.h b/csrc/attention/sparse_flash_mla/op_kernel/arch35/sparse_flash_mla_swa_kernel_arch35.h
+index 1c412057e..557f802b8 100644
+--- a/csrc/attention/sparse_flash_mla/op_kernel/arch35/sparse_flash_mla_swa_kernel_arch35.h
++++ b/csrc/attention/sparse_flash_mla/op_kernel/arch35/sparse_flash_mla_swa_kernel_arch35.h
+@@ -123,6 +123,13 @@ private:
+     GlobalTensor<int32_t> actualSeqCmpKvlenGm;
+     GlobalTensor<int32_t> cmpResidualKvGm;
+     GlobalTensor<int32_t> actualSeqQlenGm;
++    // SWA bounded replay: per-token visible ori KV length, read by
++    // ComputeS2LoopInfo in band mode.
++    GlobalTensor<int32_t> oriTopkLengthGm;
++    // The cmp side of the same channel. ComputeS2LoopInfo reads it whenever
++    // hasCmpTopkLength is set, so it needs a bound tensor rather than a
++    // placeholder when the caller supplies one.
++    GlobalTensor<int32_t> cmpTopkLengthGm;
+ 
+     bool hasCuSeqlensQ = false;
+     bool hasCuSeqlensOriKv = false;
+@@ -175,7 +182,16 @@ __aicore__ inline void SparseFlashMlaSwaKernel<CubeBlockType, VecBlockType>::Ini
+     constInfo.s1BaseSize = 64;
+     constInfo.s2BaseSize = 128;
+     constInfo.hasOriTopkLength = (oriTopkLength != nullptr);
++    if (constInfo.hasOriTopkLength) {
++        // Bound here rather than in InitGlobalBuffer, which does not receive it.
++        this->oriTopkLengthGm.SetGlobalBuffer((__gm__ int32_t *)oriTopkLength);
++    }
+     constInfo.hasCmpTopkLength = (cmpTopkLength != nullptr);
++    if (constInfo.hasCmpTopkLength) {
++        // Same reason as the ori side, and it is the flag above that decides
++        // whether ComputeS2LoopInfo reads at all.
++        this->cmpTopkLengthGm.SetGlobalBuffer((__gm__ int32_t *)cmpTopkLength);
++    }
+ 
+     this->ParseTilingData(cuSeqlensQ, sequsedQ, cuSeqlensOriKv, cuSeqlensCmpKv, seqUsedOriKv, seqUsedCmpKv,
+                           cmpResidualKV);
+@@ -517,9 +533,12 @@ __aicore__ inline void SparseFlashMlaSwaKernel<CubeBlockType, VecBlockType>::Pro
+                 this->ComputeAxisIdxByBnAndGs1(bnIdx, gS1Index, runParam);
+                 bool s1NoNeedCalc =
+                     ComputeParamS1<TEMPLATE_INTF_ARGS>(runParam, this->constInfo, gS1Index, this->cuSeqlensQGm);
+-                GlobalTensor<int32_t> tmpTensor;
++                // Both length tensors are real ones: the ori side carries the band
++                // bound (see ComputeS2LoopInfo), the cmp side is read whenever
++                // hasCmpTopkLength is set.
+                 bool s2NoNeedCalc = ComputeS2LoopInfo<TEMPLATE_INTF_ARGS>(
+-                    bnIdx, gS1Index, this->cuSeqlensQGm, tmpTensor, tmpTensor, runParam, this->constInfo);
++                    bnIdx, gS1Index, this->cuSeqlensQGm, this->oriTopkLengthGm, this->cmpTopkLengthGm, runParam,
++                    this->constInfo);
+                 if constexpr (IS_BATCH_CONSISTENCY) {
+                     int64_t oriLoad = runParam.s2OriLineEndIdx - runParam.s2OriLineStartIdx;
+                     int64_t cmpLoad = runParam.s2CmpLineEndIdx - runParam.s2CmpLineStartIdx;
+diff --git a/csrc/attention/sparse_flash_mla_metadata/op_host/sparse_flash_mla_metadata_check.h b/csrc/attention/sparse_flash_mla_metadata/op_host/sparse_flash_mla_metadata_check.h
+index 4a8241cc5..a996adaa8 100644
+--- a/csrc/attention/sparse_flash_mla_metadata/op_host/sparse_flash_mla_metadata_check.h
++++ b/csrc/attention/sparse_flash_mla_metadata/op_host/sparse_flash_mla_metadata_check.h
+@@ -218,6 +218,18 @@ aclnnStatus CheckSingleParamSmla(int64_t batchSize, int64_t maxSeqlenQ, int64_t
+                                                       "must be in [0, 3, 4]");
+                 return ACLNN_ERR_PARAM_INVALID;
+             }
++            // ori_topk is reserved on this side too: band carries its left bound
++            // through ori_topk_length, and the metadata kernel reads that tensor
++            // as a top-k count whenever ori_topk is non-zero -- it would size the
++            // schedule from a visible length. The non-Ascend950 branch states the
++            // same coupling; only this direction holds on both, since a -1 window
++            // is legal here.
++            if (oriMaskMode == static_cast<int64_t>(SparseModeSmla::BAND) && oriTopk != 0) {
++                OP_LOGE_FOR_INVALID_VALUE_WITH_REASON(
++                    SMLA_ACLNN_OP_NAME, "ori_topk", std::to_string(oriTopk),
++                    "When has_ori_kv is true and ori_mask_mode is 4 (band), the value of ori_topk must be 0");
++                return ACLNN_ERR_PARAM_INVALID;
++            }
+             // A5 treats -1 as unlimited window
+             if (oriWinLeft < -1 || oriWinRight < -1) {
+                 OP_LOGE_FOR_INVALID_VALUES_WITH_REASON(
+diff --git a/tests/e2e/nightly/single_node/ops/singlecard_ops/test_sparse_flash_mla_band.py b/tests/e2e/nightly/single_node/ops/singlecard_ops/test_sparse_flash_mla_band.py
+new file mode 100644
+index 000000000..910702b49
+--- /dev/null
++++ b/tests/e2e/nightly/single_node/ops/singlecard_ops/test_sparse_flash_mla_band.py
+@@ -0,0 +1,62 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++
++import pytest
++import torch
++import torch_npu  # noqa: F401
++
++from vllm_ascend.utils import enable_custom_op
++
++
++def test_band_visible_lengths_require_one_row_per_query():
++    enable_custom_op()
++    num_tokens, num_heads, head_dim, block_size = 2, 16, 512, 128
++    band_mask_mode = 4
++    query = torch.zeros((num_tokens, num_heads, head_dim), dtype=torch.bfloat16, device="npu")
++    kv = torch.ones((1, block_size, 1, head_dim), dtype=torch.bfloat16, device="npu")
++    starts = torch.tensor([0, num_tokens], dtype=torch.int32, device="npu")
++    lengths = torch.tensor([num_tokens], dtype=torch.int32, device="npu")
++    visible = torch.ones((num_tokens, 1), dtype=torch.int32, device="npu")
++    metadata = torch.ops._C_ascend.npu_sparse_flash_mla_metadata(
++        num_heads,
++        1,
++        head_dim,
++        cu_seqlens_q=starts,
++        seqused_ori_kv=lengths,
++        batch_size=1,
++        max_seqlen_q=num_tokens,
++        max_seqlen_ori_kv=num_tokens,
++        ori_mask_mode=band_mask_mode,
++        ori_win_left=block_size - 1,
++        ori_win_right=0,
++        layout_q="TND",
++        layout_kv="PA_BBND",
++        has_ori_kv=True,
++        has_cmp_kv=False,
++    )
++    kwargs = dict(
++        ori_kv=kv,
++        ori_block_table=torch.tensor([[0]], dtype=torch.int32, device="npu"),
++        cu_seqlens_q=starts,
++        seqused_ori_kv=lengths,
++        sinks=torch.zeros(num_heads, dtype=torch.float32, device="npu"),
++        metadata=metadata,
++        softmax_scale=head_dim**-0.5,
++        ori_mask_mode=band_mask_mode,
++        ori_win_left=block_size - 1,
++        ori_win_right=0,
++        layout_q="TND",
++        layout_kv="PA_BBND",
++    )
++    output, _ = torch.ops._C_ascend.npu_sparse_flash_mla(query, ori_topk_length=visible, **kwargs)
++    torch.npu.synchronize()
++    assert output.shape == query.shape
++    assert torch.isfinite(output).all()
++    # Zero queries give equal weight to each visible KV row and the zero
++    # attention sink. A one-row replay window must yield 1 / (1 + 1), even
++    # for the second query; ignoring visible lengths would yield 2 / 3 there.
++    torch.testing.assert_close(output, torch.full_like(output, 0.5))
++
++    with pytest.raises(RuntimeError, match="TND band ori_topk_length shape must be"):
++        torch.ops._C_ascend.npu_sparse_flash_mla(query, ori_topk_length=visible[:1], **kwargs)
++        torch.npu.synchronize()
+diff --git a/tests/ut/core/test_kv_cache_interface.py b/tests/ut/core/test_kv_cache_interface.py
+index 0e4c3e075..3ea307fa6 100644
+--- a/tests/ut/core/test_kv_cache_interface.py
++++ b/tests/ut/core/test_kv_cache_interface.py
+@@ -2,21 +2,25 @@
+ # Copyright (c) 2025 Huawei Technologies Co., Ltd. All Rights Reserved.
+ 
+ from types import SimpleNamespace
++from unittest.mock import patch
+ 
+ import pytest
+ import torch
+ from vllm.v1.core.block_pool import BlockPool
+ from vllm.v1.core.single_type_kv_cache_manager import CircularBufferManager, register_all_kvcache_specs
+-from vllm.v1.kv_cache_interface import CircularBufferSpec, UniformTypeKVCacheSpecs
++from vllm.v1.kv_cache_interface import CircularBufferSpec, SlidingWindowMLASpec, UniformTypeKVCacheSpecs
+ from vllm.v1.kv_cache_spec_registry import KVCacheSpecRegistry
+ 
+ from vllm_ascend.core.kv_cache_interface import (
+     AscendCircularBufferSpec,
+     AscendMLAAttentionSpec,
+     AscendSlidingWindowMLASpec,
++    declared_kwarg,
+     get_kv_cache_compression_ratio,
+     get_storage_block_size,
+     register_ascend_kv_cache_specs,
++    resolve_bounded_replay,
++    supports_bounded_replay,
+ )
+ 
+ 
+@@ -85,3 +89,195 @@ def test_circular_registry_preserves_spec_and_reports_recycled_pages(ascend, zer
+     assert not spec.prefix_cacheable and not spec.uses_slot_mapping
+     manager.free("request")
+     assert pool.get_num_free_blocks() == len(old_ids)
++
++
++# --- the fields a hand-rebuilt spec has to carry -----------------------------
++
++
++def _swa_spec(**overrides):
++    return AscendSlidingWindowMLASpec(
++        block_size=16,
++        num_kv_heads=1,
++        head_size=128,
++        dtype=torch.bfloat16,
++        sliding_window=64,
++        **overrides,
++    )
++
++
++@pytest.mark.skipif(
++    not hasattr(SlidingWindowMLASpec, "bounded_replay"),
++    reason="bounded_replay arrives with vLLM #56227. Until the Main2Main pin includes it "
++    "no spec can set the field, so there is nothing for merge to carry.",
++)
++def test_sliding_window_mla_merge_carries_bounded_replay():
++    """The Ascend override rebuilds the merged spec instead of calling the
++    parent's ``merge``, so upstream's field has to be carried across by hand:
++    dropping it would leave a multi-layer group replaying nothing while its
++    layers asked to, and nothing would report it -- ``prefix_cacheable`` and
++    ``prefix_replay_tokens`` are derived from the field, so the group would
++    simply look like an ordinary sliding-window one."""
++    merged = AscendSlidingWindowMLASpec.merge([_swa_spec(bounded_replay=True), _swa_spec(bounded_replay=True)])
++    assert merged.bounded_replay
++    assert not merged.prefix_cacheable
++
++    assert not AscendSlidingWindowMLASpec.merge([_swa_spec(), _swa_spec()]).bounded_replay
++
++    with pytest.raises(AssertionError, match="replay policy"):
++        AscendSlidingWindowMLASpec.merge([_swa_spec(bounded_replay=True), _swa_spec(bounded_replay=False)])
++
++
++def test_sliding_window_mla_merge_carries_the_retained_token_count():
++    """The same failure mode as the replay flag, one field over: this override
++    rebuilds the merged spec by hand, so anything it forgets is silently reset
++    to its default -- here the window would come out narrower than the layers
++    asked for, and the blocks of the extra trailing tokens would be dropped
++    even though they are what the next request's hit resumes from."""
++    if not declared_kwarg(AscendSlidingWindowMLASpec, "extra_retained_tokens", 8):
++        pytest.skip("extra_retained_tokens is absent from this baseline's SlidingWindowSpec.")
++
++    merged = AscendSlidingWindowMLASpec.merge([_swa_spec(extra_retained_tokens=8), _swa_spec(extra_retained_tokens=8)])
++
++    assert merged.extra_retained_tokens == 8
++
++    with pytest.raises(AssertionError, match="retained token count"):
++        AscendSlidingWindowMLASpec.merge([_swa_spec(extra_retained_tokens=8), _swa_spec(extra_retained_tokens=4)])
++
++
++# --- the field a pinned baseline may not have yet ----------------------------
++
++
++class _WithoutTheField:
++    def __init__(self, head_dim: int = 1):
++        self.head_dim = head_dim
++
++
++class _WithTheField:
++    def __init__(self, head_dim: int = 1, bounded_replay: bool = False):
++        self.head_dim = head_dim
++        self.bounded_replay = bounded_replay
++
++
++def test_the_kwarg_is_spelled_out_only_for_a_constructor_that_takes_it():
++    """Naming it unconditionally is a ``TypeError`` on a baseline pinned before
++    #56227, not a harmless extra, so the probe has to be the constructor's
++    parameters rather than the caller's intent."""
++    assert declared_kwarg(_WithoutTheField, "bounded_replay", True) == {}
++    assert declared_kwarg(_WithTheField, "bounded_replay", True) == {"bounded_replay": True}
++    assert declared_kwarg(_WithTheField, "bounded_replay", False) == {"bounded_replay": False}
++
++
++def test_the_swa_spec_accepts_whatever_the_probe_returns():
++    """Whatever the pinned vLLM takes, this is the call the merge path makes."""
++    replaying = _swa_spec(**declared_kwarg(AscendSlidingWindowMLASpec, "bounded_replay", True))
++    plain = _swa_spec(**declared_kwarg(AscendSlidingWindowMLASpec, "bounded_replay", False))
++
++    if hasattr(SlidingWindowMLASpec, "bounded_replay"):
++        assert replaying.bounded_replay
++        assert not plain.bounded_replay
++
++
++# --- which layers may declare a replay window --------------------------------
++
++
++def _vllm_config(*, v2_runner: bool = False, pcp_size: int = 1, architectures=("DeepseekV41ForCausalLM",)):
++    return SimpleNamespace(
++        use_v2_model_runner=v2_runner,
++        parallel_config=SimpleNamespace(prefill_context_parallel_size=pcp_size),
++        model_config=SimpleNamespace(architectures=list(architectures)),
++    )
++
++
++def _cache_config(**overrides) -> SimpleNamespace:
++    return SimpleNamespace(**{"swa_bounded_replay": True, **overrides})
++
++
++def test_only_the_v4_1_target_may_replay():
++    """The feature is a V4.1 one: upstream wires it into the V4.1 tree and that
++    tree alone, picking it by architecture name. A V4 model has to come out off
++    however the switch is set -- Ascend serves both from one model class."""
++    assert not supports_bounded_replay(SimpleNamespace(architectures=["DeepseekV4ForCausalLM"]))
++    assert supports_bounded_replay(SimpleNamespace(architectures=["DeepseekV41ForCausalLM"]))
++    assert supports_bounded_replay(SimpleNamespace(architectures=["DeepseekV41ForConditionalGeneration"]))
++
++
++def test_the_v4_1_draft_is_not_recognised():
++    """The DSpark draft is V4.1 too, but its SWA cache is a different class --
++    ``DeepseekV41DSparkSWACache`` -- and that class does not carry the field yet,
++    so a draft name here would open a gate onto nothing: the switch reads as on
++    and no block replays. Left out until that class is wired as well."""
++    assert not supports_bounded_replay(SimpleNamespace(architectures=["DeepseekV41DSparkModel"]))
++    assert not supports_bounded_replay(SimpleNamespace(architectures=["DSparkV41DraftModel"]))
++    assert not supports_bounded_replay(SimpleNamespace(architectures=["DeepseekV41DSparkModel", "DSparkV41DraftModel"]))
++
++
++def test_a_model_without_architectures_may_not_replay():
++    """Absent, empty or a non-list: none of them is the V4.1 name, and the
++    feature must not be inherited by accident."""
++    assert not supports_bounded_replay(SimpleNamespace())
++    assert not supports_bounded_replay(SimpleNamespace(architectures=None))
++    assert not supports_bounded_replay(SimpleNamespace(architectures=[]))
++    assert not supports_bounded_replay(None)
++
++
++def test_a_v4_layer_never_replays_however_the_switch_is_set():
++    with patch("vllm_ascend.core.kv_cache_interface.logger.warning_once") as warning:
++        assert not resolve_bounded_replay(_vllm_config(architectures=["DeepseekV4ForCausalLM"]), _cache_config())
++
++    # Silent, like upstream: the V4 tree does not read the switch at all, so
++    # there is nothing to explain to the user.
++    warning.assert_not_called()
++
++
++def test_a_baseline_without_the_switch_replays_nothing():
++    """The switch arrives with #56227. Where it does not exist the feature is
++    unreachable rather than off -- there is no flag to have turned on."""
++    assert not resolve_bounded_replay(_vllm_config(), SimpleNamespace())
++    assert not resolve_bounded_replay(_vllm_config(), None)
++    assert not resolve_bounded_replay(_vllm_config(), _cache_config(swa_bounded_replay=False))
++
++
++def test_the_upstream_switch_is_all_that_is_left():
++    """A V4.1 layer on the V1 runner replays without being asked twice: the
++    scheduler conditions above have already had their say, and there is no
++    capability left for this side to withhold."""
++    with patch("vllm_ascend.core.kv_cache_interface.logger.warning_once") as warning:
++        assert resolve_bounded_replay(_vllm_config(), _cache_config())
++
++    warning.assert_not_called()
++
++
++def test_the_v2_runner_keeps_supported_replay_enabled():
++    """Ascend V2 pads replayed writes in its model-state attention setup."""
++    assert resolve_bounded_replay(_vllm_config(v2_runner=True), _cache_config())
++
++
++def test_the_v2_runner_does_not_warn():
++    """V2 has its own slot-padding implementation for supported replay."""
++    with patch("vllm_ascend.core.kv_cache_interface.logger.warning_once") as warning:
++        resolve_bounded_replay(_vllm_config(v2_runner=True), _cache_config())
++
++    warning.assert_not_called()
++
++
++def test_prefill_context_parallelism_turns_the_switch_off():
++    assert not resolve_bounded_replay(_vllm_config(pcp_size=2), _cache_config())
++
++
++def test_the_pcp_message_is_upstreams():
++    with patch("vllm_ascend.core.kv_cache_interface.logger.warning_once") as warning:
++        resolve_bounded_replay(_vllm_config(pcp_size=4), _cache_config())
++
++    (message,), _ = warning.call_args
++    assert "prefill context parallelism" in message
++    assert "rank-local batch" in message
++
++
++def test_a_layer_that_may_replay_warns_about_nothing():
++    """A layer that is allowed to replay is the quiet case: whatever is said here
++    is said about a run that will not replay. Only the conditions that turn the
++    switch off speak."""
++    with patch("vllm_ascend.core.kv_cache_interface.logger.warning_once") as warning:
++        resolve_bounded_replay(_vllm_config(), _cache_config())
++
++    warning.assert_not_called()
+diff --git a/tests/ut/core/test_swa_replay_downgrade.py b/tests/ut/core/test_swa_replay_downgrade.py
+new file mode 100644
+index 000000000..0bb703e8d
+--- /dev/null
++++ b/tests/ut/core/test_swa_replay_downgrade.py
+@@ -0,0 +1,161 @@
++# Copyright (c) 2026 Huawei Technologies Co., Ltd. All Rights Reserved.
++#
++# Licensed under the Apache License, Version 2.0 (the "License");
++# you may not use this file except in compliance with the License.
++# You may obtain a copy of the License at
++#
++#     http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS,
++# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++# See the License for the specific language governing permissions and
++# limitations under the License.
++"""SWA bounded replay: where this backend has to turn the switch off.
++
++Upstream implements the rewind inside ``Scheduler.schedule()``. Four Ascend
++scheduling modes replace that method with a pinned copy of an older upstream
++body, so they neither rewind nor realize that the chunk they scheduled is a
++replay. Activating one of them therefore has to turn the switch off -- and only
++the switch, since the model wiring is what decides whether the sliding-window
++group declares a replay window at all.
++"""
++
++from types import SimpleNamespace
++from unittest.mock import patch
++
++import pytest
++
++from vllm_ascend.platform import (
++    _downgrade_swa_bounded_replay,
++    _swa_bounded_replay_unsupported_mode,
++)
++
++# The modes whose ``schedule()`` is a full copy of an older upstream body.
++UNSUPPORTED_MODES = [
++    ("recompute_scheduler_enable", {"recompute_scheduler_enable": True}),
++    ("dyntra_lb_config", {"dyntra_lb_config": SimpleNamespace(enabled=True)}),
++    ("profiling_chunk_config", {"profiling_chunk_config": SimpleNamespace(enabled=True)}),
++    ("enable_balance_scheduling", {"enable_balance_scheduling": True}),
++]
++
++V41 = ("DeepseekV41ForCausalLM",)
++
++
++def _ascend_config(**overrides) -> SimpleNamespace:
++    scheduler_config = SimpleNamespace(
++        recompute_scheduler_enable=False,
++        dyntra_lb_config=SimpleNamespace(enabled=False),
++        profiling_chunk_config=SimpleNamespace(enabled=False),
++        # Not a fork: reaches upstream through super().schedule().
++        batch_job_sched_config=SimpleNamespace(enabled=True),
++        # Not a fork either: does not override schedule() at all.
++        short_request_first_config=SimpleNamespace(enabled=True),
++        enable_balance_scheduling=False,
++    )
++    for name, value in overrides.items():
++        setattr(scheduler_config, name, value)
++    return SimpleNamespace(scheduler_config=scheduler_config, enable_dsa_cp=False)
++
++
++def _vllm_config(*, swa_bounded_replay: bool = True, architectures=V41) -> SimpleNamespace:
++    return SimpleNamespace(
++        cache_config=SimpleNamespace(swa_bounded_replay=swa_bounded_replay),
++        model_config=SimpleNamespace(architectures=list(architectures)),
++    )
++
++
++# --- which modes are unsupported ---------------------------------------------
++
++
++@pytest.mark.parametrize(("mode", "overrides"), UNSUPPORTED_MODES)
++def test_unsupported_modes_are_named(mode, overrides):
++    assert _swa_bounded_replay_unsupported_mode(_ascend_config(**overrides)) == mode
++
++
++def test_modes_that_reach_upstream_are_left_alone():
++    """BatchJobAware calls super().schedule(); ShortRequestFirst only installs a
++    request queue. Both inherit the rewind and must not be downgraded."""
++    assert _swa_bounded_replay_unsupported_mode(_ascend_config()) is None
++
++
++# --- the downgrade itself ----------------------------------------------------
++
++
++@pytest.mark.parametrize(("mode", "overrides"), UNSUPPORTED_MODES)
++def test_unsupported_mode_turns_the_switch_off(mode, overrides):
++    vllm_config = _vllm_config()
++
++    _downgrade_swa_bounded_replay(vllm_config, _ascend_config(**overrides))
++
++    assert not vllm_config.cache_config.swa_bounded_replay
++
++
++def test_switch_already_off_is_not_touched():
++    vllm_config = _vllm_config(swa_bounded_replay=False)
++
++    _downgrade_swa_bounded_replay(vllm_config, _ascend_config(profiling_chunk_config=SimpleNamespace(enabled=True)))
++
++    assert not vllm_config.cache_config.swa_bounded_replay
++
++
++def test_switch_is_kept_on_when_nothing_conflicts():
++    vllm_config = _vllm_config()
++
++    _downgrade_swa_bounded_replay(vllm_config, _ascend_config())
++
++    assert vllm_config.cache_config.swa_bounded_replay
++
++
++def test_missing_cache_config_is_not_an_error():
++    _downgrade_swa_bounded_replay(SimpleNamespace(cache_config=None), _ascend_config())
++
++
++def test_release_lane_without_the_switch_is_not_an_error():
++    """The release lane predates the switch; reading it must not raise, and the
++    absence already means "off"."""
++    cache_config = SimpleNamespace()
++
++    _downgrade_swa_bounded_replay(
++        SimpleNamespace(cache_config=cache_config, model_config=SimpleNamespace(architectures=list(V41))),
++        _ascend_config(profiling_chunk_config=SimpleNamespace(enabled=True)),
++    )
++
++    assert not hasattr(cache_config, "swa_bounded_replay")
++
++
++# --- the warning says which kind of conflict it was --------------------------
++
++
++def _warning_args(overrides, **config) -> tuple:
++    """The positional arguments the warning was called with.
++
++    ``vllm_ascend`` logs with %s and passes its values as arguments rather than
++    formatting eagerly, so the mode arrives here separately from the template.
++    """
++    with patch("vllm_ascend.platform.logger.warning_once") as warning:
++        _downgrade_swa_bounded_replay(_vllm_config(**config), _ascend_config(**overrides))
++    args, _ = warning.call_args
++    return args
++
++
++def test_the_warning_names_the_mode_that_conflicts():
++    """A user who reads only the mode has to know which knob to turn off."""
++    template, mode = _warning_args({"enable_balance_scheduling": True})
++
++    assert mode == "enable_balance_scheduling"
++    assert "%s schedules with a pinned copy of the scheduler" in template
++
++
++def test_a_model_that_cannot_replay_is_not_warned_about():
++    """The switch defaults to on for every model, but only a model the feature
++    was written for reads it. Telling a V4 user that replay is disabled names a
++    feature they never had -- and the switch is still cleared, so nothing can
++    reach the rewound path through some other caller."""
++    vllm_config = _vllm_config(architectures=("DeepseekV4ForCausalLM",))
++
++    with patch("vllm_ascend.platform.logger.warning_once") as warning:
++        _downgrade_swa_bounded_replay(vllm_config, _ascend_config(enable_balance_scheduling=True))
++
++    warning.assert_not_called()
++    assert not vllm_config.cache_config.swa_bounded_replay
+diff --git a/tests/ut/models/test_deepseek_v41_cache.py b/tests/ut/models/test_deepseek_v41_cache.py
+index bfdd33452..136699c63 100644
+--- a/tests/ut/models/test_deepseek_v41_cache.py
++++ b/tests/ut/models/test_deepseek_v41_cache.py
+@@ -43,6 +43,7 @@ from vllm_ascend.attention.dsa_v41 import (
+ from vllm_ascend.core.kv_cache_interface import (
+     AscendMLAAttentionSpec,
+     AscendSlidingWindowMLASpec,
++    declared_kwarg,
+     get_storage_block_size,
+ )
+ from vllm_ascend.models.deepseek_v41.cache_config import (
+@@ -55,7 +56,7 @@ from vllm_ascend.models.deepseek_v41.cache_config import (
+     make_folded_index_cache_spec,
+ )
+ from vllm_ascend.models.deepseek_v41.compressor import DeepseekV41Compressor
+-from vllm_ascend.models.deepseek_v41.model import build_layer_plan
++from vllm_ascend.models.deepseek_v41.model import AscendDeepseekV41SWACache, build_layer_plan
+ from vllm_ascend.worker.device_metadata import DeviceMetadataStage
+ 
+ 
+@@ -172,6 +173,35 @@ def test_owner_counts_nested_config_and_source_resolution(config, runtime):
+     assert type(specs["model.layers.2.self_attn.compressor.state_cache"]) is CircularBufferSpec
+ 
+ 
++@pytest.mark.parametrize("packed_groups", [False, True])
++def test_swa_only_reduced_backbone_uses_independent_cache_allocations(config, runtime, packed_groups):
++    config.num_hidden_layers = 2
++    config.compress_ratios = [0, 0]
++    config.kv_source_layer_ids = []
++    config.index_source_layer_ids = []
++    specs = collect_specs(runtime)
++    assert len(specs) == 2
++    assert all(isinstance(spec, AscendSlidingWindowMLASpec) for spec in specs.values())
++    assert is_deepseek_v41_cache(specs)
++
++    groups = (
++        make_cache_groups(group_cache_specs(specs))
++        if packed_groups
++        else kv_cache_utils.get_kv_cache_groups(runtime, specs)
++    )
++    assert is_deepseek_v41_cache(groups)
++    page_bytes = sum(spec.page_size_bytes for spec in specs.values())
++    assert kv_cache_utils._pool_bytes_per_block(groups) == page_bytes
++    cache_config = kv_cache_utils.get_kv_cache_config_from_groups(runtime, groups, 10 * page_bytes + 1)
++    assert cache_config.num_blocks == 10
++    assert len(cache_config.kv_cache_tensors) == 2
++    assert {tuple(tensor.layers) for tensor in cache_config.kv_cache_tensors} == {(name,) for name in specs}
++    assert sum(tensor.size for tensor in cache_config.kv_cache_tensors) == 10 * page_bytes
++    for tensor in cache_config.kv_cache_tensors:
++        assert tensor.block_stride == specs[tensor.layers[0]].page_size_bytes
++        assert tensor.offset == tensor.layer_stride == 0
++
++
+ def test_twelve_groups_share_four_layer_slots(config, runtime):
+     original = collect_specs(runtime)
+     uniform = group_cache_specs(original)
+@@ -1699,3 +1729,202 @@ def test_dspark_v41_noncausal_metadata_preserves_full_visible_block(runtime, mon
+     torch.testing.assert_close(local.ori_sparse_indices, full.ori_sparse_indices[rank : rank + 1])
+     assert local.seq_lens.tolist() == ([first_seq_len, 0] if rank < 3 else [0, 0])
+     assert local.ori_mask_mode == 0
++
++
++# --- SWA bounded replay: the read side's floor (vLLM #56227) ------------------
++#
++# A replayed request recomputes the hit's last window, so the sliding-window
++# group holds no KV of its own below ``replay_start``: those blocks were retired
++# and replaced by the null block, whose KV upstream documents as all-zero. The
++# window therefore has to be floored there, through ``ori_topk_length``, since
++# the operator bounds a window with one scalar for the whole call.
++
++
++REPLAY_WINDOW = 32  # upstream's own SWA geometry
++REPLAY_START = 64  # a 96-token hit, whose last window is recomputed
++REPLAY_SEQ_LEN = 100
++
++
++def _replay_common(replay_starts, *, query_lens, seq_lens):
++    """A prefill batch, whose requests replay whatever ``replay_starts`` says."""
++    query_start_loc = torch.tensor([0, *query_lens], dtype=torch.int32).cumsum(0).to(torch.int32)
++    return _cp_common().replace(
++        slot_mapping=torch.full((sum(query_lens),), -1, dtype=torch.int64),
++        block_table_tensor=torch.tensor([[0, 1, 2], [1, 2, 3]], dtype=torch.int32),
++        query_start_loc=query_start_loc,
++        query_start_loc_cpu=query_start_loc,
++        seq_lens=torch.tensor(seq_lens, dtype=torch.int32),
++        seq_lens_cpu=torch.tensor(seq_lens, dtype=torch.int32),
++        num_reqs=len(seq_lens),
++        num_actual_tokens=sum(query_lens),
++        num_input_tokens=sum(query_lens),
++        max_query_len=max(query_lens),
++        max_seq_len=max(seq_lens),
++        positions=torch.cat([torch.arange(seq - qlen, seq) for seq, qlen in zip(seq_lens, query_lens)]),
++        is_prefilling=torch.tensor([True] * len(seq_lens)),
++        causal=True,
++        replay_start=None if replay_starts is None else torch.tensor(replay_starts, dtype=torch.int32),
++    )
++
++
++def _swa_builder(runtime, window=REPLAY_WINDOW):
++    # The builder reads the window off the model config, which is the same value
++    # the operator's own band uses, so the two cannot drift; the spec is only
++    # there for the cache geometry. Set both to the geometry under test.
++    runtime.model_config.hf_text_config.sliding_window = window
++    spec = AscendSlidingWindowMLASpec(
++        block_size=128,
++        num_kv_heads=1,
++        head_size=8,
++        dtype=torch.bfloat16,
++        sliding_window=window,
++        cache_dtype_str="bfloat16",
++        model_version="deepseek_v41",
++    )
++    return AscendDSAV41MetadataBuilder(spec, [], runtime, torch.device("cpu"))
++
++
++def _expected_lens(window: int, replay_start: int, positions) -> list[int]:
++    """Upstream's row, as a count: ``position - max(position - window + 1, replay_start) + 1``."""
++    return [p - max(p - window + 1, replay_start, 0) + 1 for p in positions]
++
++
++def _built_lens(metadata) -> list[int]:
++    return metadata.ori_topk_length[:, 0].tolist()
++
++
++def test_a_replayed_window_is_floored_at_the_replay_start(runtime):
++    """The floor is the whole point: below ``replay_start`` the sliding-window
++    group holds nothing, so no count may cover it."""
++    builder = _swa_builder(runtime)
++    query_len = REPLAY_SEQ_LEN - REPLAY_START
++    common = _replay_common([REPLAY_START], query_lens=[query_len], seq_lens=[REPLAY_SEQ_LEN])
++
++    metadata = builder.build(0, common)
++
++    positions = range(REPLAY_START, REPLAY_SEQ_LEN)
++    assert _built_lens(metadata) == _expected_lens(REPLAY_WINDOW, REPLAY_START, positions)
++    # The first replayed token sees itself and nothing else: the rest of the
++    # window it would have asked for is below the replay start.
++    assert _built_lens(metadata)[0] == 1
++    # Rows stay floored while the query is inside the window it is rebuilding,
++    # and are the full window once it has run past it.
++    assert _built_lens(metadata)[REPLAY_WINDOW - 1] == REPLAY_WINDOW
++    assert _built_lens(metadata)[REPLAY_WINDOW] == REPLAY_WINDOW
++    # The band is still what bounds the window from above, and nothing else
++    # about the call changed.
++    assert metadata.ori_mask_mode == 4
++    assert metadata.ori_win_left == REPLAY_WINDOW - 1
++    assert metadata.ori_sparse_indices is None
++
++
++def test_a_window_that_drifts_between_the_spec_and_the_config_is_rejected(runtime):
++    """The write side pads out the spec's window and this mask floors on the text
++    config's. Both are read from the model today, so they agree -- but they are
++    two sources, and a drift would pad one window while bounding another, which
++    shows up as precision rather than as a failure. The builder refuses it."""
++    builder = _swa_builder(runtime)
++    runtime.model_config.hf_text_config.sliding_window = REPLAY_WINDOW + 1
++    common = _replay_common([REPLAY_START], query_lens=[REPLAY_SEQ_LEN - REPLAY_START], seq_lens=[REPLAY_SEQ_LEN])
++
++    with pytest.raises(AssertionError):
++        builder.build(0, common)
++
++
++def test_only_the_request_that_replays_is_floored(runtime):
++    """A replay step is one step of a batch: the requests that are not replaying
++    have a lower bound of zero, and their count is the one the operator's own
++    band would have produced."""
++    builder = _swa_builder(runtime)
++    common = _replay_common(
++        [REPLAY_START, 0],
++        query_lens=[REPLAY_SEQ_LEN - REPLAY_START, 5],
++        seq_lens=[REPLAY_SEQ_LEN, 20],
++    )
++
++    metadata = builder.build(0, common)
++
++    lens = _built_lens(metadata)
++    assert lens[: REPLAY_SEQ_LEN - REPLAY_START] == _expected_lens(
++        REPLAY_WINDOW, REPLAY_START, range(REPLAY_START, REPLAY_SEQ_LEN)
++    )
++    assert lens[REPLAY_SEQ_LEN - REPLAY_START :] == _expected_lens(REPLAY_WINDOW, 0, range(15, 20))
++
++
++@pytest.mark.parametrize("drop_field", [False, True])
++def test_a_step_that_does_not_replay_reports_no_length(runtime, drop_field):
++    """The runner reports "nothing replays" as ``None`` rather than as zeros, and
++    a lane without the field does not report at all. Both have to leave the
++    operator exactly as it was configured before this feature."""
++    builder = _swa_builder(runtime)
++    common = _replay_common(None, query_lens=[REPLAY_SEQ_LEN], seq_lens=[REPLAY_SEQ_LEN])
++    if drop_field:
++        del common.replay_start
++
++    metadata = builder.build(0, common)
++
++    assert metadata.ori_topk_length is None
++    assert metadata.ori_sparse_indices is None
++    assert metadata.ori_mask_mode == 4
++
++
++def test_an_all_zero_replay_start_reproduces_the_band(runtime):
++    """The builder cannot tell zeros from a real replay without reading a device
++    tensor, and must not: the runner's ``None`` is the only "does not replay".
++    So an all-zero vector has to be *equivalent* to the band rather than skipped
++    -- which is what makes this a floor and nothing else."""
++    builder = _swa_builder(runtime)
++    common = _replay_common([0], query_lens=[6], seq_lens=[REPLAY_SEQ_LEN])
++
++    metadata = builder.build(0, common)
++
++    assert _built_lens(metadata) == _expected_lens(REPLAY_WINDOW, 0, range(REPLAY_SEQ_LEN - 6, REPLAY_SEQ_LEN))
++
++
++def test_only_the_sliding_window_group_carries_the_length(runtime):
++    """The length is read off the sliding-window group's metadata whichever
++    group's loop ranges the layer is handed, so no other group has any use for
++    it -- and a long-KV group that reported one would be masking a window it
++    does not read."""
++    long_kv = AscendDSAV41MetadataBuilder(
++        AscendMLAAttentionSpec(
++            block_size=128,
++            num_kv_heads=1,
++            head_size=8,
++            dtype=torch.bfloat16,
++            tokens_per_state=2,
++            model_version="deepseek_v41",
++            storage_block_size=64,
++        ),
++        [],
++        runtime,
++        torch.device("cpu"),
++    )
++    common = _replay_common([REPLAY_START], query_lens=[4], seq_lens=[REPLAY_SEQ_LEN])
++
++    metadata = long_kv.build(0, common)
++
++    assert metadata.ori_topk_length is None
++    assert metadata.ori_mask_mode == 4
++
++
++def test_the_swa_cache_carries_the_replay_flag_into_its_spec():
++    """Where the switch becomes a spec field, and the field becomes the two
++    properties the scheduler and the worker read. On a lane pinned before
++    #56227 there is no field to carry, and then there is no flag either."""
++    if not declared_kwarg(AscendSlidingWindowMLASpec, "bounded_replay", True):
++        pytest.skip("bounded_replay is absent from this baseline's SlidingWindowMLASpec.")
++
++    cache = AscendDeepseekV41SWACache(
++        head_dim=8,
++        window_size=REPLAY_WINDOW,
++        dtype=torch.bfloat16,
++        prefix="model.layers.0.self_attn.swa_cache",
++        cache_config=SimpleNamespace(block_size=64, cache_dtype="bfloat16"),
++        bounded_replay=True,
++    )
++
++    spec = cache.get_kv_cache_spec(None)
++    assert spec.bounded_replay
++    assert not spec.prefix_cacheable
++    assert spec.prefix_replay_tokens == REPLAY_WINDOW
+diff --git a/tests/ut/patch/platform/test_patch_swa_bounded_replay.py b/tests/ut/patch/platform/test_patch_swa_bounded_replay.py
+new file mode 100644
+index 000000000..731f0c2d3
+--- /dev/null
++++ b/tests/ut/patch/platform/test_patch_swa_bounded_replay.py
+@@ -0,0 +1,160 @@
++# Copyright (c) 2026 Huawei Technologies Co., Ltd. All Rights Reserved.
++#
++# Licensed under the Apache License, Version 2.0 (the "License");
++# you may not use this file except in compliance with the License.
++# You may obtain a copy of the License at
++#
++#     http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS,
++# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++# See the License for the specific language governing permissions and
++# limitations under the License.
++"""SWA bounded replay: the V1 resume path.
++
++Upstream reports a rewind on ``NewRequestData`` only, because the V2 model
++runner folds resumed requests into the new-request list. The V1 runner resumes
++a preempted request through ``CachedRequestData``, and a resumed request is
++exactly the one that can rewind a second time, so the field has to be declared
++there and filled from the resumed requests.
++"""
++
++import inspect
++from types import SimpleNamespace
++
++import pytest
++from vllm.v1.core.sched.output import CachedRequestData
++from vllm.v1.core.sched.scheduler import Scheduler
++
++from vllm_ascend.patch.platform.patch_swa_bounded_replay import (
++    _EXPECTED_PARAMETERS,
++    _patch_cached_request_data_replay_start,
++    _patch_make_cached_request_data,
++    _upstream_carries_replay_start,
++)
++
++pytestmark = pytest.mark.skipif(
++    not _upstream_carries_replay_start(),
++    reason="The replay start arrives with vLLM #56227; on a pin that predates it the patch is "
++    "inert by design, so there is no field to carry and nothing to fill.",
++)
++
++REPLAY_START = 64
++
++
++def test_the_probe_finds_upstreams_rewind():
++    """The probe is the module's own switch, and it is what the skip above
++    rests on: it has to key on something that arrives with the feature."""
++    assert _upstream_carries_replay_start()
++
++
++def _scheduler() -> Scheduler:
++    """A Scheduler instance with only what the payload builder reads.
++
++    Deliberately minimal: if a pin bump makes the builder read more state, this
++    has to fail here rather than silently build a payload that never happens.
++    """
++    scheduler = Scheduler.__new__(Scheduler)
++    scheduler.use_pp = True
++    scheduler.use_v2_model_runner = False
++    scheduler.scheduler_config = SimpleNamespace(async_scheduling=False)
++    scheduler.prev_step_scheduled_req_ids = set()
++    return scheduler
++
++
++def _request(request_id: str, *, replay_start: int = 0) -> SimpleNamespace:
++    return SimpleNamespace(
++        request_id=request_id,
++        all_token_ids=[11, 12, 13],
++        num_computed_tokens=2,
++        num_output_tokens=1,
++        num_output_placeholders=0,
++        replay_start=replay_start,
++    )
++
++
++def _blocks():
++    return SimpleNamespace(get_block_ids=lambda allow_none: ([0],))
++
++
++def _build(resumed_reqs):
++    return Scheduler._make_cached_request_data(
++        _scheduler(),
++        running_reqs=[],
++        resumed_reqs=resumed_reqs,
++        num_scheduled_tokens={req.request_id: 1 for req in resumed_reqs},
++        spec_decode_tokens={},
++        req_to_new_blocks={req.request_id: _blocks() for req in resumed_reqs},
++    )
++
++
++# --- the field has to be declared to cross the process boundary --------------
++
++
++def test_replay_start_is_a_declared_field():
++    """msgpack encodes declared fields only, so an instance attribute set after
++    construction would never reach the worker."""
++    assert "replay_start" in CachedRequestData.__dataclass_fields__
++    assert "replay_start" in inspect.signature(CachedRequestData.__init__).parameters
++
++
++def test_declaring_the_field_is_idempotent():
++    fields_before = dict(CachedRequestData.__dataclass_fields__)
++
++    _patch_cached_request_data_replay_start()
++
++    assert CachedRequestData.__dataclass_fields__ == fields_before
++
++
++# --- a resumed request that rewinds has to say so ----------------------------
++
++
++def test_resumed_request_replay_start_reaches_the_payload():
++    cached_reqs = _build([_request("req-0", replay_start=REPLAY_START)])
++
++    assert set(cached_reqs.resumed_req_ids) == {"req-0"}
++    assert cached_reqs.replay_start == {"req-0": REPLAY_START}
++
++
++def test_resumed_request_that_does_not_rewind_contributes_nothing():
++    """A preempted request can come back without a fresh hit; naming it would
++    make the worker pad slots that were never replayed."""
++    cached_reqs = _build([_request("req-0"), _request("req-1", replay_start=REPLAY_START)])
++
++    assert cached_reqs.replay_start == {"req-1": REPLAY_START}
++
++
++def test_payload_without_resumed_requests_carries_an_empty_map():
++    """Absent has to mean "no replay" without depending on the payload's
++    length, which is why this is a dict and not a list parallel to req_ids."""
++    cached_reqs = _build([])
++
++    assert cached_reqs.replay_start == {}
++
++
++# --- a pin bump must fail loudly, not drop the field silently ----------------
++
++
++def test_patch_is_idempotent():
++    patched = Scheduler._make_cached_request_data
++
++    _patch_make_cached_request_data()
++
++    assert Scheduler._make_cached_request_data is patched
++
++
++def test_signature_drift_raises_instead_of_silently_stopping(monkeypatch):
++    def _renamed(self, running_reqs, resumed, num_scheduled_tokens, spec_decode_tokens, req_to_new_blocks):
++        raise AssertionError("the patch must not have been applied")
++
++    monkeypatch.setattr(Scheduler, "_make_cached_request_data", _renamed)
++
++    with pytest.raises(RuntimeError, match="unexpected Scheduler._make_cached_request_data signature"):
++        _patch_make_cached_request_data()
++
++
++def test_expected_parameters_match_the_patched_method():
++    """Guards the guard: the tuple above has to describe the method actually
++    installed, or the check would pass on a signature it no longer recognizes."""
++    assert tuple(inspect.signature(Scheduler._make_cached_request_data).parameters) == _EXPECTED_PARAMETERS
+diff --git a/tests/ut/patch/platform/test_prefix_cache_cp_patches.py b/tests/ut/patch/platform/test_prefix_cache_cp_patches.py
+index e1ac5f5a5..adc0edeff 100644
+--- a/tests/ut/patch/platform/test_prefix_cache_cp_patches.py
++++ b/tests/ut/patch/platform/test_prefix_cache_cp_patches.py
+@@ -99,6 +99,45 @@ def test_packed_cache_reuses_global_capacity_and_records_recycled_state_pages():
+     assert coordinator.single_type_managers[-1]._record_new_block_ids
+ 
+ 
++@pytest.mark.skipif(not hasattr(SlidingWindowMLASpec, "bounded_replay"), reason="vLLM lacks SWA bounded replay")
++@pytest.mark.parametrize("group_count", [1, 2])
++@pytest.mark.parametrize("wrapped", [False, True])
++def test_swa_only_replay_keeps_private_blocks_without_prefix_hits(group_count, wrapped):
++    register_all_kvcache_specs(None)
++    register_ascend_kv_cache_specs()
++    spec = AscendSlidingWindowMLASpec(
++        block_size=16,
++        num_kv_heads=1,
++        head_size=8,
++        dtype=torch.bfloat16,
++        sliding_window=32,
++        bounded_replay=True,
++        model_version="deepseek_v41",
++    )
++    groups = []
++    for index in range(group_count):
++        name = f"swa_{index}"
++        group_spec = UniformTypeKVCacheSpecs.from_specs({name: spec}) if wrapped else spec
++        groups.append(KVCacheGroupSpec([name], group_spec))
++    cfg = KVCacheConfig(num_blocks=32, kv_cache_tensors=[], kv_cache_groups=groups)
++    coordinator = get_kv_cache_coordinator(
++        cfg,
++        max_model_len=1024,
++        enable_caching=True,
++        scheduler_block_size=16,
++        hash_block_size=16,
++    )
++    free_blocks = coordinator.block_pool.get_num_free_blocks()
++    for manager in coordinator.single_type_managers:
++        assert not manager.enable_caching
++        manager.allocate_new_blocks("request", 16, 16)
++    assert coordinator.block_pool.get_num_free_blocks() == free_blocks - group_count
++    coordinator.free("request")
++    assert coordinator.block_pool.get_num_free_blocks() == free_blocks
++    assert coordinator.find_longest_cache_hit([b"a" * 32], 16) == (tuple([] for _ in groups), 0, 0)
++    assert all(isinstance(group.kv_cache_spec, UniformTypeKVCacheSpecs) == wrapped for group in cfg.kv_cache_groups)
++
++
+ @pytest.mark.parametrize("with_private_tail", [False, True])
+ def test_disabled_prefix_cache_preserves_private_tail_allocation(with_private_tail):
+     register_all_kvcache_specs(None)
+diff --git a/tests/ut/worker/test_pcp_manager_v2.py b/tests/ut/worker/test_pcp_manager_v2.py
+index 1dc8b0929..4ab534fd8 100644
+--- a/tests/ut/worker/test_pcp_manager_v2.py
++++ b/tests/ut/worker/test_pcp_manager_v2.py
+@@ -121,6 +121,7 @@ def test_decode_sharding_does_not_add_a_parallel_config_field():
+         parallel_config=parallel_config,
+         speculative_config=SimpleNamespace(method="mtp"),
+         compilation_config=SimpleNamespace(cudagraph_mode=CUDAGraphMode.NONE),
++        cache_config=None,
+     )
+     ascend_config = SimpleNamespace(
+         scheduler_config=SimpleNamespace(
+diff --git a/tests/ut/worker/test_replay_slot_padding.py b/tests/ut/worker/test_replay_slot_padding.py
+new file mode 100644
+index 000000000..ad473e646
+--- /dev/null
++++ b/tests/ut/worker/test_replay_slot_padding.py
+@@ -0,0 +1,485 @@
++# Copyright (c) 2026 Huawei Technologies Co., Ltd. All Rights Reserved.
++#
++# Licensed under the Apache License, Version 2.0 (the "License");
++# you may not use this file except in compliance with the License.
++# You may obtain a copy of the License at
++#
++#     http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS,
++# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++# See the License for the specific language governing permissions and
++# limitations under the License.
++"""The worker side of SWA bounded replay: padding replayed slots.
++
++A replayed request keeps its prefix hit's blocks, which stay shared with every
++other request that hit the same prefix. The cacheable groups must therefore not
++write the replayed positions: their KV already exists, and rewriting it would
++put a different value in a block other requests read. The group that owns the
++replay (``prefix_cacheable=False``) does write them, and that write is what
++rebuilds its sliding window.
++
++What runs on CPU is the bookkeeping around the kernel -- which group is padded,
++which pointers and window reach the launch, and how the per-request replay start
++is built. The kernel itself needs an NPU and is covered by the e2e tests.
++"""
++
++from dataclasses import replace
++from types import SimpleNamespace
++from unittest.mock import patch
++
++import numpy as np
++import pytest
++import torch
++from vllm.v1.attention.backends.utils import PAD_SLOT_ID
++from vllm.v1.kv_cache_interface import FullAttentionSpec, KVCacheGroupSpec, MambaSpec, UniformTypeKVCacheSpecs
++
++from tests.ut.attention.utils import BatchSpec, create_common_attn_metadata
++from vllm_ascend.core.kv_cache_interface import (
++    AscendIndexerKPoolTailSpec,
++    register_ascend_kv_cache_specs,
++)
++from vllm_ascend.worker.model_runner_v1 import NPUModelRunner
++
++# The prefix-replay geometry upstream's own test uses: a 100-token prompt with a
++# 96-token hit and a 32-token window recomputes [64, 96).
++WINDOW = 32
++REPLAY_START = 64
++BLOCK_SIZE = 16
++COMPRESS_RATIO = 4
++
++
++def _cacheable_spec() -> FullAttentionSpec:
++    return FullAttentionSpec(block_size=BLOCK_SIZE, num_kv_heads=1, head_size=1, dtype=torch.float32)
++
++
++def _non_cacheable_spec() -> AscendIndexerKPoolTailSpec:
++    """A real group that opts out of prefix caching.
++
++    The other one is the bounded-replay sliding-window group, which upstream
++    #56227 makes non-cacheable; this stands in for it so these cases do not
++    depend on that spec gaining a replay window.
++    """
++    register_ascend_kv_cache_specs()
++    return AscendIndexerKPoolTailSpec(
++        block_size=BLOCK_SIZE,
++        sliding_window=COMPRESS_RATIO,
++        compress_ratio=COMPRESS_RATIO,
++        num_kv_heads=1,
++        head_size=128,
++        dtype=torch.float32,
++    )
++
++
++def _cacheable_group(name: str = "kv") -> KVCacheGroupSpec:
++    return KVCacheGroupSpec([name], _cacheable_spec())
++
++
++def _replaying_group(name: str = "swa") -> KVCacheGroupSpec:
++    return KVCacheGroupSpec([name], _non_cacheable_spec())
++
++
++def _dcp_group_patch(dcp_world_size: int = 1, dcp_rank: int = 0):
++    mock_group = SimpleNamespace(world_size=dcp_world_size, rank_in_group=dcp_rank)
++    return patch("vllm_ascend.worker.block_table.get_dcp_group", return_value=mock_group)
++
++
++def _block_table(groups, *, max_num_reqs: int = 4, max_num_batched_tokens: int = 512, dcp_world_size: int = 1):
++    with _dcp_group_patch(dcp_world_size=dcp_world_size):
++        from vllm_ascend.worker.block_table import MultiGroupBlockTable
++
++        return MultiGroupBlockTable(
++            max_num_reqs=max_num_reqs,
++            max_model_len=1024,
++            max_num_batched_tokens=max_num_batched_tokens,
++            pin_memory=False,
++            device=torch.device("cpu"),
++            block_sizes=[BLOCK_SIZE] * len(groups),
++            kernel_sizes=[BLOCK_SIZE] * len(groups),
++            max_num_blocks=[64] * len(groups),
++            kv_cache_groups=groups,
++        )
++
++
++# --- which group is padded, which group writes -------------------------------
++
++
++@pytest.mark.parametrize("cacheable", [True, False])
++def test_block_table_reads_cacheability_off_the_spec(cacheable):
++    group = _cacheable_group("g") if cacheable else _replaying_group("g")
++    with _dcp_group_patch():
++        from vllm_ascend.worker.block_table import BlockTable
++
++        table = BlockTable(
++            block_size=BLOCK_SIZE,
++            max_num_reqs=4,
++            max_num_blocks_per_req=64,
++            max_num_batched_tokens=512,
++            pin_memory=False,
++            device=torch.device("cpu"),
++            kernel_sizes=[BLOCK_SIZE],
++            kv_cache_group=group,
++        )
++
++    assert table.is_prefix_cacheable is cacheable
++
++
++def test_group_without_a_spec_counts_as_cacheable():
++    """The tables built for the pre-grouping call sites pass no group at all."""
++    with _dcp_group_patch():
++        from vllm_ascend.worker.block_table import BlockTable
++
++        table = BlockTable(
++            block_size=BLOCK_SIZE,
++            max_num_reqs=4,
++            max_num_blocks_per_req=64,
++            max_num_batched_tokens=512,
++            pin_memory=False,
++            device=torch.device("cpu"),
++            kernel_sizes=[BLOCK_SIZE],
++        )
++
++    assert table.is_prefix_cacheable
++
++
++def test_cacheability_resolves_through_a_uniform_wrapper():
++    """A sliding-window group can be wrapped in a uniform collection, so the
++    opt-out only shows up if every spec inside agrees."""
++    replaying = _non_cacheable_spec()
++    wrapped = UniformTypeKVCacheSpecs.from_specs({"a": replaying, "b": replace(replaying)})
++
++    table = _block_table([KVCacheGroupSpec(["swa"], wrapped)])
++
++    assert not table.block_tables[0].is_prefix_cacheable
++    assert table._replay_cacheable_groups.tolist() == []
++
++
++# --- the indices and pointers handed to the PAD pass -------------------------
++
++
++def test_only_cacheable_groups_are_padded():
++    table = _block_table([_cacheable_group("kv"), _replaying_group("swa"), _cacheable_group("idx")])
++
++    assert table._replay_cacheable_groups.tolist() == [0, 2]
++
++
++def test_addresses_are_each_groups_own_slot_mapping():
++    """A group's slot mapping is patched in place through its own pointer, so
++    the array has to be per group and not the packed one the fused kernel uses."""
++    table = _block_table([_cacheable_group("kv"), _replaying_group("swa")])
++
++    assert table._replay_slot_mapping_addrs.dtype == torch.uint64
++    assert table._replay_slot_mapping_addrs.tolist() == [
++        block_table.slot_mapping.gpu.data_ptr() for block_table in table.block_tables
++    ]
++
++
++def test_addresses_exist_even_when_the_groups_cannot_fuse():
++    """The fused kernel is skipped whenever DCP is on; the PAD pass must not be."""
++    groups = [_cacheable_group("kv"), _cacheable_group("idx")]
++    table = _block_table(groups, dcp_world_size=2)
++
++    assert not table._can_fuse_slot_mapping
++    assert table._replay_cacheable_groups.tolist() == [0, 1]
++    assert len(table._replay_slot_mapping_addrs) == len(groups)
++
++
++def test_mamba_groups_are_not_addressed():
++    """A mamba group advances state, not paged KV, so there is no slot mapping
++    of its own to pad -- the fused path skips it for the same reason."""
++    mamba_spec = MambaSpec(
++        block_size=BLOCK_SIZE,
++        shapes=((4, 8),),
++        dtypes=(torch.float32,),
++        mamba_cache_mode="align",
++    )
++    groups = [_cacheable_group("kv"), KVCacheGroupSpec(["mamba"], mamba_spec)]
++    table = _block_table(groups)
++
++    assert table.block_tables[1].is_mamba_group
++    assert len(table._replay_slot_mapping_addrs) == 1
++    assert table._replay_slot_mapping_addrs.tolist() == [table.block_tables[0].slot_mapping.gpu.data_ptr()]
++
++
++def test_pad_pass_forwards_its_own_arrays():
++    table = _block_table([_cacheable_group("kv"), _replaying_group("swa")])
++    positions = torch.arange(REPLAY_START, REPLAY_START + 4, dtype=torch.int64)
++    query_start_loc = torch.tensor([0, 4], dtype=torch.int32)
++    replay_start = torch.tensor([REPLAY_START, 0], dtype=torch.int32)
++
++    with patch("vllm_ascend.worker.block_table.pad_replayed_slot_mapping") as pad:
++        table.pad_replayed_slots(2, query_start_loc, positions, replay_start, WINDOW)
++
++    (num_reqs, qsl, pos, starts, addrs, cacheable, window), kwargs = pad.call_args
++    assert num_reqs == 2
++    assert qsl is query_start_loc
++    assert pos is positions
++    assert starts is replay_start
++    assert addrs is table._replay_slot_mapping_addrs
++    assert cacheable is table._replay_cacheable_groups
++    assert window == WINDOW
++    assert kwargs == {"pad_id": PAD_SLOT_ID}
++
++
++# --- the host function's guards ---------------------------------------------
++
++
++def test_host_function_returns_before_launching_when_nothing_replays():
++    from vllm_ascend.ops.triton.compute_slot_mapping import pad_replayed_slot_mapping
++
++    empty = torch.tensor([], dtype=torch.int32)
++    # No cacheable group, and no request: both have to be non-launches rather
++    # than a kernel over an empty grid.
++    pad_replayed_slot_mapping(4, empty, empty, empty, empty, empty, WINDOW, pad_id=-1)
++    pad_replayed_slot_mapping(0, empty, empty, empty, empty, torch.tensor([0], dtype=torch.int32), WINDOW, pad_id=-1)
++
++
++# --- the per-request replay start the runner builds --------------------------
++
++
++def _runner(prefix_replay_tokens: int, max_num_reqs: int = 4) -> NPUModelRunner:
++    """A runner with only what the replay-start builder touches. The buffer
++    copies for real, so a value the device would still be holding is visible."""
++    runner = NPUModelRunner.__new__(NPUModelRunner)
++    runner.prefix_replay_tokens = prefix_replay_tokens
++    runner._replay_starts = {}
++    buffer = SimpleNamespace(
++        np=np.zeros(max_num_reqs, dtype=np.int32),
++        gpu=torch.zeros(max_num_reqs, dtype=torch.int32),
++    )
++    buffer.copy_to_gpu = lambda num=None: buffer.gpu.copy_(torch.from_numpy(buffer.np))
++    runner.replay_start = buffer
++    runner.input_batch = SimpleNamespace(
++        req_id_to_index={"req-0": 0, "req-1": 1},
++        num_computed_tokens_cpu=np.full(max_num_reqs, REPLAY_START, dtype=np.int32),
++    )
++    # Set by __init__ in production; _fill_replay_start owns it afterwards.
++    runner._replay_active = False
++    return runner
++
++
++def _scheduler_output(new_reqs=(), cached_replay_start=None, resumed_req_ids=None, finished_req_ids=()):
++    return SimpleNamespace(
++        scheduled_new_reqs=list(new_reqs),
++        scheduled_cached_reqs=SimpleNamespace(
++            replay_start=cached_replay_start or {},
++            resumed_req_ids=list(cached_replay_start or {}) if resumed_req_ids is None else resumed_req_ids,
++        ),
++        finished_req_ids=finished_req_ids,
++    )
++
++
++def _prepare_replay(runner, scheduler_output, num_reqs):
++    runner._update_replay_requests(scheduler_output)
++    return runner._fill_replay_start(num_reqs)
++
++
++def test_no_replay_window_means_no_work_at_all():
++    """A run where no group declares a replay window pays nothing here, which is
++    every run except DeepSeek-V4.1 with the switch on."""
++    runner = _runner(prefix_replay_tokens=0)
++
++    assert _prepare_replay(runner, _scheduler_output(), num_reqs=2) is None
++
++
++def test_newly_admitted_request_carries_its_replay_start():
++    runner = _runner(prefix_replay_tokens=WINDOW)
++    new_req = SimpleNamespace(req_id="req-1", replay_start=REPLAY_START)
++
++    replay_start = _prepare_replay(runner, _scheduler_output(new_reqs=[new_req]), num_reqs=2)
++
++    assert replay_start.tolist() == [0, REPLAY_START]
++
++
++def test_resumed_request_carries_its_replay_start():
++    """The V1 path: a preempted request comes back through CachedRequestData."""
++    runner = _runner(prefix_replay_tokens=WINDOW)
++
++    replay_start = _prepare_replay(runner, _scheduler_output(cached_replay_start={"req-0": REPLAY_START}), num_reqs=2)
++
++    assert replay_start.tolist() == [REPLAY_START, 0]
++
++
++def test_a_step_with_no_replay_reports_none():
++    runner = _runner(prefix_replay_tokens=WINDOW)
++
++    assert _prepare_replay(runner, _scheduler_output(), num_reqs=2) is None
++
++
++def test_decode_step_never_inherits_an_earlier_replay_start():
++    """Decode and padded rows must not retain a completed replay boundary."""
++    runner = _runner(prefix_replay_tokens=WINDOW, max_num_reqs=4)
++    new_req = SimpleNamespace(req_id="req-0", replay_start=REPLAY_START)
++    _prepare_replay(runner, _scheduler_output(new_reqs=[new_req]), num_reqs=2)
++    assert runner.replay_start.gpu.tolist() == [REPLAY_START, 0, 0, 0]
++
++    runner.input_batch.num_computed_tokens_cpu[0] = REPLAY_START + WINDOW
++    # The next step starts beyond the replay window.
++    assert _prepare_replay(runner, _scheduler_output(), num_reqs=2) is None
++    assert runner.replay_start.np.tolist() == [0, 0, 0, 0]
++    assert runner.replay_start.gpu.tolist() == [0, 0, 0, 0]
++
++
++def test_requests_outside_the_batch_are_ignored():
++    """A request can leave the batch between the scheduler's decision and this
++    step; it must not land its value on another request's row."""
++    runner = _runner(prefix_replay_tokens=WINDOW, max_num_reqs=2)
++    gone = SimpleNamespace(req_id="req-gone", replay_start=REPLAY_START)
++    admitted = SimpleNamespace(req_id="req-1", replay_start=WINDOW)
++    runner.input_batch.num_computed_tokens_cpu[1] = WINDOW
++
++    replay_start = _prepare_replay(runner, _scheduler_output(new_reqs=[gone, admitted]), num_reqs=2)
++
++    assert replay_start.tolist() == [0, WINDOW]
++
++
++@pytest.mark.parametrize("reorder", [False, True])
++def test_replay_boundary_survives_chunking_and_batch_reordering(reorder):
++    runner = _runner(prefix_replay_tokens=WINDOW)
++    new_req = SimpleNamespace(req_id="req-0", replay_start=REPLAY_START)
++    _prepare_replay(runner, _scheduler_output(new_reqs=[new_req]), num_reqs=2)
++
++    if reorder:
++        runner.input_batch.req_id_to_index = {"req-1": 0, "req-0": 1}
++    index = runner.input_batch.req_id_to_index["req-0"]
++    runner.input_batch.num_computed_tokens_cpu[index] = REPLAY_START + WINDOW // 2
++    replay_start = _prepare_replay(runner, _scheduler_output(), num_reqs=2)
++
++    expected = [0, 0]
++    expected[index] = REPLAY_START
++    assert replay_start.tolist() == expected
++    assert runner._attn_replay_start(2).tolist() == expected
++    # The second chunk still needs both slot padding and the SWA lower bound.
++    assert runner._replay_active
++
++
++@pytest.mark.parametrize("new_start", [0, REPLAY_START + WINDOW])
++def test_resume_replaces_saved_replay_boundary(new_start):
++    runner = _runner(prefix_replay_tokens=WINDOW)
++    new_req = SimpleNamespace(req_id="req-0", replay_start=REPLAY_START)
++    _prepare_replay(runner, _scheduler_output(new_reqs=[new_req]), num_reqs=2)
++    runner.input_batch.num_computed_tokens_cpu[0] = new_start
++
++    starts = {"req-0": new_start} if new_start else {}
++    replay_start = _prepare_replay(
++        runner,
++        _scheduler_output(cached_replay_start=starts, resumed_req_ids=["req-0"]),
++        num_reqs=2,
++    )
++    if new_start:
++        assert replay_start.tolist() == [new_start, 0]
++    else:
++        assert replay_start is None
++        assert "req-0" not in runner._replay_starts
++
++
++def test_finished_request_is_cleared_without_another_model_step():
++    runner = _runner(prefix_replay_tokens=WINDOW)
++    new_req = SimpleNamespace(req_id="req-0", replay_start=REPLAY_START)
++    _prepare_replay(runner, _scheduler_output(new_reqs=[new_req]), num_reqs=2)
++
++    runner._update_replay_requests(_scheduler_output(finished_req_ids={"req-0"}))
++
++    assert runner._replay_starts == {}
++
++
++def test_reused_request_id_without_hit_drops_saved_boundary():
++    runner = _runner(prefix_replay_tokens=WINDOW)
++    new_req = SimpleNamespace(req_id="req-0", replay_start=REPLAY_START)
++    _prepare_replay(runner, _scheduler_output(new_reqs=[new_req]), num_reqs=2)
++
++    new_req = SimpleNamespace(req_id="req-0", replay_start=0)
++    assert _prepare_replay(runner, _scheduler_output(new_reqs=[new_req]), num_reqs=2) is None
++    assert "req-0" not in runner._replay_starts
++
++
++def test_recompute_below_replay_start_discards_saved_boundary():
++    runner = _runner(prefix_replay_tokens=WINDOW)
++    new_req = SimpleNamespace(req_id="req-0", replay_start=REPLAY_START)
++    _prepare_replay(runner, _scheduler_output(new_reqs=[new_req]), num_reqs=2)
++    runner.input_batch.num_computed_tokens_cpu[0] = 0
++
++    assert _prepare_replay(runner, _scheduler_output(), num_reqs=2) is None
++    assert runner._replay_starts == {}
++    assert runner.replay_start.gpu.tolist() == [0, 0, 0, 0]
++
++
++# --- what the attention metadata carries -------------------------------------
++
++
++@pytest.mark.parametrize(
++    ("new_reqs", "cached_replay_start", "expected"),
++    [
++        ((), None, (False, None)),
++        ((SimpleNamespace(req_id="req-0", replay_start=REPLAY_START),), None, (True, [REPLAY_START, 0])),
++        ((), {"req-1": REPLAY_START}, (True, [0, REPLAY_START])),
++        # A request that leaves the batch leaves nothing behind: no row was
++        # written, so the step is not a replay step at all.
++        ((SimpleNamespace(req_id="req-gone", replay_start=REPLAY_START),), None, (False, None)),
++    ],
++)
++def test_attention_metadata_reports_a_replay_only_when_the_step_replays(
++    new_reqs,
++    cached_replay_start,
++    expected,
++):
++    runner = _runner(prefix_replay_tokens=WINDOW)
++    _prepare_replay(
++        runner,
++        _scheduler_output(new_reqs=new_reqs, cached_replay_start=cached_replay_start),
++        num_reqs=2,
++    )
++
++    active, values = expected
++    replay_start = runner._attn_replay_start(num_reqs_padded=2)
++
++    assert runner._replay_active is active
++    if values is None:
++        assert replay_start is None
++    else:
++        assert replay_start.tolist() == values
++
++
++def test_no_replay_window_never_reports_a_replay():
++    """A run where no group declares a window cannot replay, whatever the
++    scheduler payload happens to hold."""
++    runner = _runner(prefix_replay_tokens=0)
++
++    _prepare_replay(
++        runner,
++        _scheduler_output(new_reqs=[SimpleNamespace(req_id="req-0", replay_start=REPLAY_START)]),
++        num_reqs=2,
++    )
++
++    assert runner._attn_replay_start(num_reqs_padded=2) is None
++
++
++# --- the metadata field the attention backends consume -----------------------
++
++
++def _metadata(*, replay_start):
++    batch = BatchSpec(seq_lens=[1, 2, 3], query_lens=[1, 1, 1], name="replay")
++    return replace(
++        create_common_attn_metadata(batch, BLOCK_SIZE, torch.device("cpu")),
++        replay_start=replay_start,
++    )
++
++
++def test_unpadded_slices_the_replay_start_with_the_batch():
++    """The unpadded view is what speculative decoding builds from, so a per-req
++    tensor that is not sliced there would be read against the wrong request."""
++    metadata = _metadata(replay_start=torch.tensor([REPLAY_START, 0, 0], dtype=torch.int32))
++
++    unpadded = metadata.unpadded(num_actual_tokens=2, num_actual_reqs=2)
++
++    assert unpadded.replay_start.tolist() == [REPLAY_START, 0]
++
++
++def test_replay_start_defaults_to_none():
++    """Dummy/profiling/capture batches never fill it; a consumer has to read
++    None as "nothing replays", the same as all zeros."""
++    metadata = _metadata(replay_start=None)
++
++    assert metadata.replay_start is None
++    assert metadata.unpadded(num_actual_tokens=1, num_actual_reqs=1).replay_start is None
+diff --git a/vllm_ascend/attention/dsa_v41.py b/vllm_ascend/attention/dsa_v41.py
+index 8cd11c8c1..660c096bf 100644
+--- a/vllm_ascend/attention/dsa_v41.py
++++ b/vllm_ascend/attention/dsa_v41.py
+@@ -88,6 +88,50 @@ def _config_value(config: Any, name: str, default: Any = None) -> Any:
+     return getattr(config, name, default)
+ 
+ 
++def build_replay_swa_visible_lens(
++    window_size: int,
++    query_start_loc: torch.Tensor,
++    seq_lens: torch.Tensor,
++    replay_start: torch.Tensor,
++    num_tokens: int,
++) -> torch.Tensor:
++    """How many ori KV entries each query token may actually see.
++
++    Upstream's SWA kernels clamp the window per request (``start_pos =
++    max(start_pos, replay_start)``), and the clamp is a correctness requirement
++    rather than a refinement: a replayed request recomputes the hit's last
++    window, so the sliding-window group holds no KV of its own below
++    ``replay_start``. Those blocks were retired and replaced by the null block,
++    whose KV upstream documents as all-zero -- the window would not read another
++    request's data, it would read phantom keys that score zero and take weight
++    in the replayed token's softmax.
++
++    This operator bounds a window with one scalar for the whole call
++    (``ori_win_left``), which cannot express a per-token floor, so the floor
++    travels through ``ori_topk_length`` in band mode: "the number of ori KV
++    entries this query token may see". Entries are counted back from the token's
++    own right edge, so a count of ``position - floor + 1`` is exactly "keep the
++    window ending here, but not past the floor".
++
++    Positions are derived the way the operator derives its own, from
++    ``seqused_ori_kv - actS1Size + s1``, so the two coordinate systems cannot
++    drift. Device-side only: no ``.item()``, no host round trip. The caller
++    guarantees ``num_tokens`` is the sum of the query lengths, as
++    :func:`build_dspark_swa_indices` does for the other user of this channel.
++    """
++    query_lens = query_start_loc[1:] - query_start_loc[:-1]
++    req_ids = torch.repeat_interleave(
++        torch.arange(query_lens.shape[0], device=query_start_loc.device, dtype=torch.long),
++        query_lens,
++        output_size=num_tokens,
++    )
++    token_offsets = torch.arange(num_tokens, device=query_start_loc.device) - query_start_loc[req_ids]
++    positions = seq_lens[req_ids] - query_lens[req_ids] + token_offsets
++    lower = replay_start[: query_lens.shape[0]].to(positions.dtype)[req_ids]
++    start_positions = torch.maximum(positions - int(window_size) + 1, lower).clamp_min(0)
++    return (positions - start_positions + 1).to(torch.int32).unsqueeze(1)
++
++
+ @dataclass
+ class AscendDSAV41Metadata(AttentionMetadata):
+     """Scheduler and cache-plane contract for one V4.1 cache resource.
+@@ -1059,6 +1103,19 @@ class AscendDSAV41MetadataBuilder(AttentionMetadataBuilder[AscendDSAV41Metadata]
+             cos, sin = rope
+         text_config = self.vllm_config.model_config.hf_text_config
+         window_size = int(_config_value(text_config, "sliding_window", 0))
++        if cache_kind == "swa":
++            # The window the mask floors on (this one) and the window the replay
++            # padding writes out (the spec's, through ``prefix_replay_tokens``)
++            # have to be the same number: the padding decides which slots the
++            # replayed tokens skip, and the floor decides which positions they can
++            # see. A drift between the two sources -- the text config here, the
++            # cache spec there -- pads one window and bounds another, which is a
++            # silent precision loss rather than a failure, so it is checked.
++            spec_window = int(getattr(spec, "sliding_window", window_size))
++            assert spec_window == window_size, (
++                "SWA bounded replay pads the spec's sliding_window "
++                f"({spec_window}) while the mask floors on the text config's ({window_size})."
++            )
+         n_local_heads = (
+             int(_config_value(text_config, "num_attention_heads"))
+             // self.vllm_config.parallel_config.tensor_parallel_size
+@@ -1114,6 +1171,36 @@ class AscendDSAV41MetadataBuilder(AttentionMetadataBuilder[AscendDSAV41Metadata]
+             ori_sparse_indices, ori_topk_length = cached_window
+         if ori_topk_length is None and ori_sparse_indices is not None and noncausal:
+             ori_topk_length = (ori_sparse_indices >= 0).sum(dim=-1, dtype=torch.int32)
++
++        # SWA bounded replay (vLLM #56227): a prefill admission that hit the
++        # prefix cache recomputes the hit's last window, and only the
++        # sliding-window group is rebuilt by it. That group's window is the one
++        # that can reach below ``replay_start`` into the region it does not hold,
++        # so the floor rides ``ori_topk_length``, the operator's per-token
++        # channel for "how many ori KV entries this query may see". The window's
++        # width stays a scalar (``ori_win_left``) and still bounds it from above,
++        # so this only ever narrows the mask, and only for the requests that are
++        # replaying.
++        #
++        # Only the sliding-window group carries it, because
++        # ``_forward_attention`` reads the mask and this length from
++        # ``metadata.swa`` whichever group's loop ranges it was handed, and those
++        # ranges come from the same band -- so they stay a superset of the window.
++        replay_start = getattr(common, "replay_start", None)
++        replay_visible_lens = None
++        if replay_start is not None and cache_kind == "swa":
++            replay_visible_lens = build_replay_swa_visible_lens(
++                window_size,
++                common.query_start_loc[: num_reqs + 1],
++                seq_lens,
++                replay_start,
++                num_actual_tokens,
++            )
++        # In band mode this tensor is the per-token visible length; the sparse
++        # path above is its other producer, and that one pairs it with an index
++        # list. The operator's mask mode is therefore the band in both cases.
++        if replay_visible_lens is not None:
++            ori_topk_length = replay_visible_lens
+         ori_mask_mode = 0 if noncausal else 4
+         ori_win_left = max(0, window_size - 1)
+         ori_win_right = 0
+diff --git a/vllm_ascend/attention/utils.py b/vllm_ascend/attention/utils.py
+index e20f67d93..563e5ce2c 100644
+--- a/vllm_ascend/attention/utils.py
++++ b/vllm_ascend/attention/utils.py
+@@ -313,6 +313,14 @@ class AscendCommonAttentionMetadata(CommonAttentionMetadata):
+     _num_computed_tokens_cpu: torch.Tensor | None = None
+     dcp_local_seq_lens_cpu: torch.Tensor | None = None
+ 
++    # Per-request replay start: 0 for every request that is not replaying, else
++    # where that request's replayed run begins. A backend clamps a replaying
++    # request's sliding-window lower bound to it: below that point the window's
++    # KV is not being rebuilt -- the replayed positions are padded on the
++    # cacheable groups -- and only the shared prefix is there. ``None`` means
++    # the same as all zeros; dummy/profiling/capture batches do not fill it.
++    replay_start: torch.Tensor | None = None
++
+     # TODO: Remove it when vLLM no longer uses this function.
+     def unpadded(self, num_actual_tokens: int, num_actual_reqs: int) -> "AscendCommonAttentionMetadata":
+         # This only use to eagle now. It will be use to enforce_eager in future.
+@@ -368,6 +376,7 @@ class AscendCommonAttentionMetadata(CommonAttentionMetadata):
+             req_topk_buffer_active=_slice_reqs(self.req_topk_buffer_active),
+             copy_sfa_draft_index=self.copy_sfa_draft_index,
+             offload_dummy=self.offload_dummy,
++            replay_start=_slice_reqs(self.replay_start),
+             req_ids_tensor=_slice_reqs(self.req_ids_tensor),
+             token_to_req=(self.token_to_req[:num_actual_tokens] if self.token_to_req is not None else None),
+         )
+diff --git a/vllm_ascend/core/kv_cache_interface.py b/vllm_ascend/core/kv_cache_interface.py
+index afa2c354c..a98cbc162 100644
+--- a/vllm_ascend/core/kv_cache_interface.py
++++ b/vllm_ascend/core/kv_cache_interface.py
+@@ -1,12 +1,15 @@
+ # SPDX-License-Identifier: Apache-2.0
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+ 
++import inspect
+ from collections.abc import Iterable
+ from dataclasses import dataclass, replace
++from typing import Any
+ 
+ import torch
+ from typing_extensions import Self
+-from vllm.config import VllmConfig
++from vllm.config import CacheConfig, VllmConfig
++from vllm.logger import logger
+ from vllm.utils.math_utils import cdiv
+ from vllm.utils.torch_utils import get_dtype_size
+ from vllm.v1.core.single_type_kv_cache_manager import FullAttentionManager, SlidingWindowManager
+@@ -65,6 +68,87 @@ def is_prefix_cacheable(kv_cache_spec: KVCacheSpec) -> bool:
+     )
+ 
+ 
++def declared_kwarg(owner: type, name: str, value: Any) -> dict[str, Any]:
++    """Spell one optional field out for a constructor that declares it.
++
++    Used for the fields upstream adds to the sliding-window specs and their
++    caches over time -- ``extra_retained_tokens`` on the spec, ``bounded_replay``
++    on both the spec and the SWA cache (vLLM #56227). Naming such a keyword
++    unconditionally is a ``TypeError`` on a lane that does not have it, and this
++    repository supports two: main, which grows the fields, and the release tag,
++    which never does. Probing the owner keeps that decision in one place.
++    """
++    return {name: value} if name in inspect.signature(owner).parameters else {}
++
++
++# The architectures bounded replay was written for. Upstream wires the feature
++# into ``vllm/models/deepseek_v41/`` alone -- the DeepSeek-V4 tree never reads
++# the switch -- so the architecture name is the honest test for "this model may
++# replay". Both of this project's spellings for the target are listed: missing
++# the one a checkpoint declares is a switch that can never be turned on.
++#
++# The DSpark draft is deliberately left out. Its SWA cache is a different class
++# (``DeepseekV41DSparkSWACache``) that does not carry the field, so a draft
++# checkpoint would pass a gate that then replays nothing.
++BOUNDED_REPLAY_ARCHITECTURES = frozenset(
++    {
++        "DeepseekV41ForCausalLM",  # this repository's registry key
++        "DeepseekV41ForConditionalGeneration",  # the VL spelling
++    }
++)
++
++
++def supports_bounded_replay(model_config: Any) -> bool:
++    """Whether this model is one the feature was written for."""
++    architectures = getattr(model_config, "architectures", None) or ()
++    return any(architecture in BOUNDED_REPLAY_ARCHITECTURES for architecture in architectures)
++
++
++def resolve_bounded_replay(vllm_config: VllmConfig, cache_config: CacheConfig | None) -> bool:
++    """Whether a sliding-window layer may declare a replay window.
++
++    The switch and both guards are upstream's (vLLM #56227), re-decided here
++    because the layer upstream applies them in -- its own SWA attention layer --
++    is the one Ascend replaces. The Ascend scheduler conditions, the ones that
++    cannot rewind a prefix hit at all, are decided in ``platform.py`` before any
++    layer exists: they turn the switch itself off, so this reads the result.
++
++    It reads that switch and nothing else, deliberately: a V4.1 model that does
++    not turn it off in its cache config replays.
++
++    There is no capability guard beside them. Keeping a replayed window off the
++    blocks below ``replay_start`` -- whose KV the sliding-window group does not
++    hold, those positions having been retired to the null block -- is the
++    operator's job now: band mode reads ``ori_topk_length`` as the per-token
++    visible length and floors the window's left edge with it. See
++    ``build_replay_swa_visible_lens`` in ``attention/dsa_v41.py`` for the read
++    side and ``npu_sparse_flash_mla``'s band path for the clamp.
++    """
++    if not supports_bounded_replay(getattr(vllm_config, "model_config", None)):
++        # Upstream wires the feature into the DeepSeek-V4.1 tree only -- the V4
++        # tree's attention layer never reads the switch -- so a V4 model is
++        # silent here too: the feature is not part of this model, and no user
++        # can have turned it on for it.
++        return False
++    if not getattr(cache_config, "swa_bounded_replay", False):
++        # Absent from the release lane, where the feature does not exist at all:
++        # no switch to turn on, no spec field for the flag to reach, so there is
++        # nothing to warn about. Probed rather than read, so the lane does not
++        # have to be named here.
++        return False
++    if vllm_config.parallel_config.prefill_context_parallel_size > 1:
++        # The PAD pass walks the batch the rank was handed, which under PCP is
++        # not the batch the scheduler rewound. Keep replay disabled until the
++        # per-rank replay boundaries can be mapped correctly.
++        logger.warning_once(
++            "SWA bounded replay is off under prefill context parallelism (the replayed tokens' slot "
++            "padding knows the rank-local batch only); the sliding-window cache takes part in prefix "
++            "caching instead."
++        )
++        return False
++    return True
++
++
+ def requires_padded_page_layout(kv_cache_specs: Iterable[KVCacheSpec]) -> bool:
+     """Whether state caches advance by a padded page size shared with attention.
+ 
+@@ -275,16 +359,32 @@ class AscendSlidingWindowMLASpec(SlidingWindowMLASpec):
+         compress_ratio_set = set(spec.compress_ratio for spec in specs)
+         model_version_set = set(spec.model_version for spec in specs)
+         sliding_window_set = set(spec.sliding_window for spec in specs)
++        # ``extra_retained_tokens`` belongs to ``SlidingWindowSpec`` and
++        # ``bounded_replay`` arrives with vLLM #56227. This override builds the
++        # merged spec from scratch rather than through the parent's ``merge``,
++        # so it has to carry both across itself, and dropping either is silent:
++        # the first leaves a multi-layer group with a narrower window than its
++        # layers asked for, the second leaves it replaying nothing. ``None`` is
++        # what a lane without the field reads back, and is not carried.
++        extra_retained_set = set(getattr(spec, "extra_retained_tokens", None) for spec in specs)
++        bounded_replay_set = set(getattr(spec, "bounded_replay", None) for spec in specs)
+         assert (
+             len(cache_dtype_str_set) == 1
+             and len(compress_ratio_set) == 1
+             and len(model_version_set) == 1
+             and len(sliding_window_set) == 1
++            and len(extra_retained_set) == 1
++            and len(bounded_replay_set) == 1
+         ), (
+             "All attention layers in the same KV cache group must use the same "
+-            "quantization method, compress ratio, model version and sliding "
+-            "window size."
++            "quantization method, compress ratio, model version, sliding "
++            "window size, retained token count and replay policy."
+         )
++        carried_kwargs: dict[str, Any] = {}
++        if None not in bounded_replay_set:
++            carried_kwargs.update(declared_kwarg(cls, "bounded_replay", bounded_replay_set.pop()))
++        if None not in extra_retained_set:
++            carried_kwargs.update(declared_kwarg(cls, "extra_retained_tokens", extra_retained_set.pop()))
+         return cls(
+             block_size=specs[0].block_size,
+             num_kv_heads=specs[0].num_kv_heads,
+@@ -295,6 +395,7 @@ class AscendSlidingWindowMLASpec(SlidingWindowMLASpec):
+             cache_dtype_str=cache_dtype_str_set.pop(),
+             compress_ratio=compress_ratio_set.pop(),
+             model_version=model_version_set.pop(),
++            **carried_kwargs,
+         )
+ 
+ 
+diff --git a/vllm_ascend/models/deepseek_v41/cache_config.py b/vllm_ascend/models/deepseek_v41/cache_config.py
+index c00d098e7..19d16b666 100644
+--- a/vllm_ascend/models/deepseek_v41/cache_config.py
++++ b/vllm_ascend/models/deepseek_v41/cache_config.py
+@@ -18,6 +18,7 @@ from vllm.v1.kv_cache_interface import (
+ from vllm_ascend.core.kv_cache_interface import (
+     AscendMLAAttentionSpec,
+     AscendSlidingWindowMLASpec,
++    declared_kwarg,
+ )
+ from vllm_ascend.device.hardware_profile import (
+     HardwareCapability,
+@@ -39,7 +40,7 @@ def uses_a5_packed_cache() -> bool:
+     return get_current_hardware_profile().supports(HardwareCapability.DSV41_PACKED_CACHE)
+ 
+ 
+-def make_swa_cache_spec(*, block_size, window_size, head_size, dtype, cache_dtype):
++def make_swa_cache_spec(*, block_size, window_size, head_size, dtype, cache_dtype, bounded_replay=False):
+     if uses_a5_packed_cache():
+         if head_size != MLA_HEAD_DIM:
+             raise ValueError(f"A5 DeepSeek V4.1 requires head size {MLA_HEAD_DIM}, got {head_size}")
+@@ -56,6 +57,7 @@ def make_swa_cache_spec(*, block_size, window_size, head_size, dtype, cache_dtyp
+         cache_dtype_str=cache_dtype,
+         model_version="deepseek_v41",
+         alignment=None,
++        **declared_kwarg(AscendSlidingWindowMLASpec, "bounded_replay", bounded_replay),
+     )
+ 
+ 
+@@ -154,6 +156,12 @@ def get_layer_tuples(specs):
+     target_swa = sorted((name for name in swa if ".mtp." not in f".{name}"), key=_layer_number)
+     draft_swa = sorted((name for name in swa if ".mtp." in f".{name}"), key=_draft_layer_number)
+ 
++    # A reduced backbone may contain only the initial SWA layers. Without
++    # full-context source slots, each SWA layer needs its own physical slot.
++    if not full and len(swa) == len(specs):
++        names = target_swa + draft_swa
++        return [specs[name].unpadded_page_size_bytes for name in names], [(name,) for name in names]
++
+     layer_tuples: list[tuple[str, ...]] = []
+     page_sizes: list[int] = []
+     for slot_idx, kv_name in enumerate(full):
+@@ -180,6 +188,8 @@ def get_layer_tuples(specs):
+ 
+ def group_cache_specs(specs):
+     """Merge full-context resources and pad layer tuples without mutating inputs."""
++    if specs and all(isinstance(spec, AscendSlidingWindowMLASpec) for spec in specs.values()):
++        return [UniformTypeKVCacheSpecs.from_specs({name: spec}) for name, spec in specs.items()]
+     page_sizes, layer_tuples = get_layer_tuples(specs)
+     padded = {}
+     for page_size, layer_tuple in zip(page_sizes, layer_tuples):
+@@ -236,7 +246,10 @@ def _specs_from_groups(groups):
+     specs = {}
+     for group in groups:
+         for name in group.layer_names:
+-            specs[name] = group.kv_cache_spec.kv_cache_specs[name]
++            group_spec = group.kv_cache_spec
++            specs[name] = (
++                group_spec.kv_cache_specs[name] if isinstance(group_spec, UniformTypeKVCacheSpecs) else group_spec
++            )
+     return specs
+ 
+ 
+@@ -250,7 +263,7 @@ def get_deepseek_v41_kv_cache_config(
+     groups: list[KVCacheGroupSpec],
+     available_memory: int,
+ ) -> KVCacheConfig:
+-    """Allocate four independent layer slots backed by one global block-ID pool."""
++    """Allocate independent layer slots backed by one global block-ID pool."""
+     page_sizes, layer_tuples = get_layer_tuples(_specs_from_groups(groups))
+     capacity = max(available_memory // sum(page_sizes), 0)
+     num_blocks = may_override_num_blocks(vllm_config, capacity)
+diff --git a/vllm_ascend/models/deepseek_v41/engram/model_state.py b/vllm_ascend/models/deepseek_v41/engram/model_state.py
+index 901a5ac36..b45012f97 100644
+--- a/vllm_ascend/models/deepseek_v41/engram/model_state.py
++++ b/vllm_ascend/models/deepseek_v41/engram/model_state.py
+@@ -19,15 +19,50 @@
+ 
+ from typing import Any
+ 
++import numpy as np
+ import torch
+ from vllm.config.compilation import CUDAGraphMode
+-from vllm.triton_utils import triton
++from vllm.triton_utils import tl, triton
++from vllm.v1.attention.backends.utils import PAD_SLOT_ID
+ from vllm.v1.kv_cache_interface import KVCacheConfig
++from vllm.v1.utils import CpuGpuBuffer
+ from vllm.v1.worker.utils import AttentionGroup
+ 
+ from vllm_ascend.worker.v2.attn_utils import ring_state_update_skipped
+ from vllm_ascend.worker.v2.input_batch import AscendInputBatch
+-from vllm_ascend.worker.v2.model_states.default import AscendModelState
++from vllm_ascend.worker.v2.model_states.default import AscendModelState, ReplayAttnMetadata
++
++
++@triton.jit
++def _pad_v2_replayed_slots_kernel(
++    slot_mappings_ptr,
++    group_stride,
++    cacheable_groups_ptr,
++    query_start_loc_ptr,
++    positions_ptr,
++    replay_start_ptr,
++    replay_window,
++    pad_slot_id,
++    NUM_GROUPS: tl.constexpr,
++    BLOCK: tl.constexpr,
++):
++    req = tl.program_id(0)
++    start = tl.load(replay_start_ptr + req)
++    if start <= 0:
++        return
++    begin = tl.load(query_start_loc_ptr + req)
++    end = tl.load(query_start_loc_ptr + req + 1)
++    for tok in range(begin, end, BLOCK):
++        offsets = tok + tl.arange(0, BLOCK)
++        pos = tl.load(positions_ptr + offsets, mask=offsets < end, other=0)
++        replayed = (offsets < end) & (pos >= start) & (pos < start + replay_window)
++        for i in tl.static_range(NUM_GROUPS):
++            group = tl.load(cacheable_groups_ptr + i)
++            tl.store(
++                slot_mappings_ptr + group * group_stride + offsets,
++                pad_slot_id,
++                mask=replayed,
++            )
+ 
+ 
+ class EngramModelState(AscendModelState):
+@@ -47,6 +82,9 @@ class EngramModelState(AscendModelState):
+ 
+     def __init__(self, vllm_config, model, encoder_cache, device):
+         super().__init__(vllm_config, model, encoder_cache, device)
++        self._replay_start_np = np.zeros(self.max_num_reqs, dtype=np.int32)
++        self._replay_start = CpuGpuBuffer(self.max_num_reqs, dtype=torch.int32, device=device, pin_memory=False)
++        self._replay_groups: tuple[int, torch.Tensor] | None = None
+         depth = model.token_lookback_depth
+         self.lookback_token_ids: torch.Tensor | None = None
+         self._cg_mode: CUDAGraphMode | None = None
+@@ -62,6 +100,10 @@ class EngramModelState(AscendModelState):
+                     "engram_valid_token_count": torch.zeros(1, dtype=torch.int32, device=device),
+                 }
+ 
++    def add_request(self, req_index: int, new_req_data) -> None:
++        super().add_request(req_index, new_req_data)
++        self._replay_start_np[req_index] = int(getattr(new_req_data, "replay_start", 0))
++
+     def finish_execution(self, *, failed: bool) -> None:
+         # Engram owns its lookup buffers and events. Keep their retirement
+         # beside the input preparation instead of exposing them to the runner.
+@@ -81,10 +123,49 @@ class EngramModelState(AscendModelState):
+         kv_cache_config: KVCacheConfig,
+         for_capture: bool = False,
+         ubatch_idx: int = 0,
++        model_specific_attn_metadata=None,
+     ) -> dict[str, Any]:
+         # prepare_inputs runs before any forward context, so the graph mode of
+         # this step is only known here; engram overlap dispatch keys off it.
+         self._cg_mode = cudagraph_mode
++        if self._replay_groups is None:
++            from vllm_ascend.core.kv_cache_interface import is_prefix_cacheable
++
++            specs = [group.kv_cache_spec for group in kv_cache_config.kv_cache_groups]
++            windows = [int(getattr(spec, "prefix_replay_tokens", getattr(spec, "sliding_window", 0))) for spec in specs]
++            self._replay_groups = (
++                max(windows, default=0),
++                torch.tensor(
++                    [i for i, spec in enumerate(specs) if is_prefix_cacheable(spec)],
++                    dtype=torch.int32,
++                    device=self.device,
++                ),
++            )
++        replay_window, cacheable_groups = self._replay_groups
++        num_reqs = input_batch.num_reqs
++        replay_np = np.where(
++            input_batch.is_prefilling_np[:num_reqs],
++            self._replay_start_np[input_batch.idx_mapping_np[:num_reqs]],
++            0,
++        ).astype(np.int32)
++        self._replay_start.np[:num_reqs] = replay_np
++        self._replay_start.copy_to_gpu(num_reqs)
++        replay_start = self._replay_start.gpu[:num_reqs]
++        if replay_window > 0 and replay_np.any() and cacheable_groups.numel() > 0:
++            _pad_v2_replayed_slots_kernel[(num_reqs,)](
++                slot_mappings,
++                slot_mappings.stride(0),
++                cacheable_groups,
++                input_batch.query_start_loc,
++                input_batch.positions,
++                replay_start,
++                replay_window,
++                PAD_SLOT_ID,
++                NUM_GROUPS=cacheable_groups.numel(),
++                BLOCK=1024,
++            )
++        if model_specific_attn_metadata is None:
++            model_specific_attn_metadata = ReplayAttnMetadata(replay_start)
+         return super().prepare_attn(
+             input_batch,
+             cudagraph_mode,
+@@ -94,6 +175,7 @@ class EngramModelState(AscendModelState):
+             kv_cache_config,
+             for_capture=for_capture,
+             ubatch_idx=ubatch_idx,
++            model_specific_attn_metadata=model_specific_attn_metadata,
+         )
+ 
+     def prepare_engram_inputs(self, input_batch: AscendInputBatch, req_states) -> dict[str, Any]:
+diff --git a/vllm_ascend/models/deepseek_v41/model.py b/vllm_ascend/models/deepseek_v41/model.py
+index 51f793838..b556a02fc 100644
+--- a/vllm_ascend/models/deepseek_v41/model.py
++++ b/vllm_ascend/models/deepseek_v41/model.py
+@@ -58,6 +58,7 @@ from vllm_ascend.ascend_config import get_ascend_config
+ from vllm_ascend.attention.dsa_v41 import (
+     DeepseekV41CacheLayer,
+ )
++from vllm_ascend.core.kv_cache_interface import resolve_bounded_replay
+ from vllm_ascend.device.device_op import DeviceOperator
+ from vllm_ascend.device.hardware_profile import HardwareCapability, get_current_hardware_profile
+ from vllm_ascend.models.common.ops.sequence_parallel import (
+@@ -565,7 +566,7 @@ def build_layer_plan(config: Any) -> DeepseekV41Topology:
+ class AscendDeepseekV41SWACache(DeepseekV41CacheLayer):
+     """Ascend SWA cache registered with the V4.1 allocator."""
+ 
+-    def __init__(self, head_dim, window_size, dtype, prefix, cache_config):
++    def __init__(self, head_dim, window_size, dtype, prefix, cache_config, bounded_replay=False):
+         from vllm_ascend.models.layer.attention.layer import DSV4_BLOCK_SIZES
+ 
+         block_size = DSV4_BLOCK_SIZES[cache_config.block_size][0][1]
+@@ -575,6 +576,7 @@ class AscendDeepseekV41SWACache(DeepseekV41CacheLayer):
+             head_size=head_dim,
+             dtype=dtype,
+             cache_dtype=cache_config.cache_dtype,
++            bounded_replay=bounded_replay,
+         )
+         super().__init__(get_current_vllm_config(), prefix, spec)
+         self.head_dim = head_dim
+@@ -631,6 +633,11 @@ class DeepseekV41SWAAttention(nn.Module):
+             dtype=kv_cache_dtype,
+             prefix=f"{prefix}.swa_cache",
+             cache_config=cache_config,
++            # The target's sliding window is the one bounded replay rebuilds.
++            # The draft reaches this same call through its SWA cache subclass,
++            # which rebuilds the spec without the flag, so the feature is a
++            # strict addition to the target's group.
++            bounded_replay=resolve_bounded_replay(vllm_config, cache_config),
+         )
+ 
+         dsa_modules = DSAModules(
+diff --git a/vllm_ascend/ops/triton/compute_slot_mapping.py b/vllm_ascend/ops/triton/compute_slot_mapping.py
+index 4bb36a85f..aab98a102 100644
+--- a/vllm_ascend/ops/triton/compute_slot_mapping.py
++++ b/vllm_ascend/ops/triton/compute_slot_mapping.py
+@@ -383,3 +383,91 @@ def compute_slot_mapping_fused_groups(
+             PARALLEL_TILES=parallel_tiles,
+             BLOCK_TABLE_WINDOW_SIZE=block_table_window_size,
+         )
++
++
++@triton.jit(do_not_specialize=["replay_window"])
++def _pad_replayed_slots_kernel(
++    query_start_loc_ptr,  # [num_reqs + 1], int32
++    positions_ptr,  # [num_tokens], int64
++    replay_start_ptr,  # [max_num_reqs], int32; 0 = this req does not replay
++    slot_mapping_addrs_ptr,  # [group_count], uint64: slot_mapping.gpu of each group
++    cacheable_groups_ptr,  # [NUM_GROUPS], int32: indices of the cacheable groups
++    replay_window,  # The one window every replaying group agrees on
++    PAD_ID: tl.constexpr,
++    NUM_GROUPS: tl.constexpr,
++    TILE_BLOCK_SIZE: tl.constexpr,
++):
++    """Pad the replayed positions of the cacheable groups.
++
++    A request that hits a prefix cache keeps the hit's blocks, which are still
++    shared with every other request that hit the same prefix, so their KV must
++    not be written again -- the write would not be wrong, it would be a
++    *different* value landing in a block other requests read. The replayed
++    tokens are recomputed only to rebuild the sliding-window group, whose KV
++    does not survive in the prefix cache, so that group is the one that has to
++    keep its slots.
++
++    This runs after every group's slot mapping is final, so it covers the
++    context-parallel layouts too without knowing anything about them.
++    """
++    req_idx = tl.program_id(0)
++    replay_start = tl.load(replay_start_ptr + req_idx)
++    # Guarding on the start rather than on the upper bound alone is what keeps
++    # a request that is not replaying -- whose replay_start is 0 -- from having
++    # its first window of tokens padded. A start below zero is malformed (the
++    # scheduler derives it from a hit count), and padding around it would write
++    # the window into positions that belong to this request, so it takes the
++    # same exit rather than shifting the interval left.
++    if replay_start <= 0:
++        return
++    write_end = replay_start + replay_window
++    start_idx = tl.load(query_start_loc_ptr + req_idx).to(tl.int64)
++    end_idx = tl.load(query_start_loc_ptr + req_idx + 1).to(tl.int64)
++    for i in range(start_idx, end_idx, TILE_BLOCK_SIZE):
++        offsets = i + tl.arange(0, TILE_BLOCK_SIZE)
++        mask = offsets < end_idx
++        pos = tl.load(positions_ptr + offsets, mask=mask, other=0).to(tl.int32)
++        replayed = mask & (pos >= replay_start) & (pos < write_end)
++        for group_offset in tl.static_range(NUM_GROUPS):
++            group_idx = tl.load(cacheable_groups_ptr + group_offset)
++            slot_mapping_ptr = tl.cast(
++                tl.load(slot_mapping_addrs_ptr + group_idx),
++                tl.pointer_type(tl.int32),
++            )
++            tl.store(slot_mapping_ptr + offsets, PAD_ID, mask=replayed)
++
++
++def pad_replayed_slot_mapping(
++    num_reqs,
++    query_start_loc_ptr,
++    positions_ptr,
++    replay_start_ptr,
++    slot_mapping_addrs_ptr,
++    cacheable_groups_ptr,
++    replay_window,
++    *,
++    pad_id,
++    tile_block_size: int = 1024,
++):
++    """Overwrite the replayed slots of every cacheable group with ``pad_id``.
++
++    Launched once per step that replays at all, over every request in the batch:
++    ``replay_start_ptr`` carries 0 for the requests that are not replaying, and
++    those programs return immediately. ``cacheable_groups_ptr`` empty means
++    there is nothing to pad, which is the configuration where every group opted
++    out of prefix caching.
++    """
++    num_groups = cacheable_groups_ptr.shape[0]
++    if num_reqs == 0 or num_groups == 0:
++        return
++    _pad_replayed_slots_kernel[(num_reqs,)](
++        query_start_loc_ptr,
++        positions_ptr,
++        replay_start_ptr,
++        slot_mapping_addrs_ptr,
++        cacheable_groups_ptr,
++        replay_window,
++        PAD_ID=pad_id,
++        NUM_GROUPS=num_groups,
++        TILE_BLOCK_SIZE=tile_block_size,
++    )
+diff --git a/vllm_ascend/patch/__init__.py b/vllm_ascend/patch/__init__.py
+index fd49303e5..3cf15866e 100644
+--- a/vllm_ascend/patch/__init__.py
++++ b/vllm_ascend/patch/__init__.py
+@@ -776,6 +776,36 @@
+ #       Remove this patch once upstream vLLM adds the terminal short-circuit
+ #       to the outlines backend.
+ #
++# ** 20a. File: platform/patch_swa_bounded_replay.py**
++# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
++#   1. `vllm.v1.core.sched.output.CachedRequestData` (new field `replay_start`)
++#   2. `vllm.v1.core.sched.scheduler.Scheduler._make_cached_request_data`
++#    Why:
++#       Sliding-window bounded replay (vLLM #56227) rebuilds the sliding-window KV
++#       of a prefix hit by recomputing the hit's last window, and tells the
++#       worker where that run begins through `NewRequestData.replay_start`.
++#       Upstream's V2 model runner folds resumed requests into that same
++#       new-request list, so one field covers them. The V1 runner resumes a
++#       preempted request through `CachedRequestData` instead, and a resumed
++#       request is exactly the one that can be rewound a second time --
++#       preemption clears the computed count, so readmission runs the prefix
++#       lookup again and re-sets the replay start. Without the field on that
++#       payload, the worker would not know to stop writing the replayed
++#       positions and would overwrite blocks still shared with every other
++#       request that hit the same prefix.
++#    How:
++#       Declare `replay_start` on the payload -- msgpack encodes only declared
++#       fields, so an attribute set after construction never crosses the process
++#       boundary -- and fill it from the resumed requests inside the single
++#       method upstream builds that payload in. The field list is redeclared at
++#       import time because msgspec caches it per type. Inert on a pin that
++#       predates the feature, which is probed rather than version-compared.
++#    Related PR (if no, explain why):
++#       https://github.com/vllm-project/vllm/pull/56227
++#    Future Plan:
++#       Remove this patch once upstream carries the replay start on the V1
++#       resume path as well, i.e. once `CachedRequestData` declares the field.
++#
+ # ** 21. File: platform/patch_torch_accelerator.py**
+ # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+ #   1. `torch.accelerator.memory_stats`, `torch.accelerator.memory_reserved`,
+diff --git a/vllm_ascend/patch/platform/__init__.py b/vllm_ascend/patch/platform/__init__.py
+index c45f4079f..685e5aa77 100644
+--- a/vllm_ascend/patch/platform/__init__.py
++++ b/vllm_ascend/patch/platform/__init__.py
+@@ -56,6 +56,7 @@ import vllm_ascend.patch.platform.patch_engram_config  # noqa
+ import vllm_ascend.patch.platform.patch_glm5next_config  # noqa
+ import vllm_ascend.patch.platform.patch_indexer_kv_dtype  # noqa
+ import vllm_ascend.patch.platform.patch_kv_cache_dtype  # noqa
++import vllm_ascend.patch.platform.patch_swa_bounded_replay  # noqa
+ 
+ # ** File: platform/patch_kv_cache_utils.py **
+ # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+diff --git a/vllm_ascend/patch/platform/patch_kv_cache_coordinator.py b/vllm_ascend/patch/platform/patch_kv_cache_coordinator.py
+index b46efef38..59bf9b286 100644
+--- a/vllm_ascend/patch/platform/patch_kv_cache_coordinator.py
++++ b/vllm_ascend/patch/platform/patch_kv_cache_coordinator.py
+@@ -2,6 +2,8 @@
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+ import sys
+ from collections.abc import Mapping
++from copy import copy
++from dataclasses import replace
+ from math import lcm
+ 
+ import vllm
+@@ -533,15 +535,25 @@ def get_kv_cache_coordinator(  # type: ignore[misc]
+     # their independent manager geometry when prefix caching is disabled too.
+     num_cacheable_groups = sum(is_prefix_cacheable(group.kv_cache_spec) for group in kv_cache_config.kv_cache_groups)
+     has_private_groups = 0 < num_cacheable_groups < len(kv_cache_config.kv_cache_groups)
+-    if _is_deepseek_v4_kv_cache_config(kv_cache_config) or has_private_groups:
++    if num_cacheable_groups and (_is_deepseek_v4_kv_cache_config(kv_cache_config) or has_private_groups):
+         return AscendHybridKVCacheCoordinator(**hybrid_kwargs)  # type: ignore[call-arg]
+ 
+-    if len(kv_cache_config.kv_cache_groups) == 1 or not enable_caching:
++    if num_cacheable_groups == 0 or len(kv_cache_config.kv_cache_groups) == 1 or not enable_caching:
++        if num_cacheable_groups == 0:
++            # Upstream's no-prefix coordinator expects scheduler specs rather
++            # than the planner's uniform wrappers. Preserve the caller's config.
++            kv_cache_config = copy(kv_cache_config)
++            kv_cache_config.kv_cache_groups = [
++                replace(group, kv_cache_spec=_manager_spec(group.kv_cache_spec))
++                for group in kv_cache_config.kv_cache_groups
++            ]
+         orig_kwargs = dict(
+             kv_cache_config=kv_cache_config,
+             max_model_len=max_model_len,
+             use_eagle=use_eagle,
+-            enable_caching=enable_caching,
++            # A SWA-only bounded-replay backbone has no persistent KV to hit.
++            # Keep its private managers without constructing a hybrid lookup.
++            enable_caching=enable_caching and num_cacheable_groups > 0,
+             enable_kv_cache_events=enable_kv_cache_events,
+             dcp_world_size=dcp_world_size,
+             pcp_world_size=1,
+diff --git a/vllm_ascend/patch/platform/patch_swa_bounded_replay.py b/vllm_ascend/patch/platform/patch_swa_bounded_replay.py
+new file mode 100644
+index 000000000..f0579c408
+--- /dev/null
++++ b/vllm_ascend/patch/platform/patch_swa_bounded_replay.py
+@@ -0,0 +1,164 @@
++# Copyright (c) 2026 Huawei Technologies Co., Ltd. All Rights Reserved.
++# This file is a part of the vllm-ascend project.
++#
++# Licensed under the Apache License, Version 2.0 (the "License");
++# you may not use this file except in compliance with the License.
++# You may obtain a copy of the License at
++#
++#     http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS,
++# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++# See the License for the specific language governing permissions and
++# limitations under the License.
++
++"""Carry a resumed request's replay start to the V1 model runner (vLLM #56227).
++
++SWA bounded replay keeps the sliding-window KV out of the prefix cache and
++rebuilds it after a prefix hit by recomputing the hit's last window. Upstream
++ships the whole mechanism, and the part that tells the worker where the replayed
++run begins travels in the scheduling payload: ``NewRequestData.replay_start``,
++filled from ``Request.replay_start``.
++
++The V2 model runner folds resumed requests into that same new-request list, so
++one field covers it. The V1 runner resumes a preempted request through
++``CachedRequestData`` instead, and a resumed request is precisely the one that
++can be rewound a second time -- preemption clears the computed count, so
++readmission runs the prefix lookup again and re-sets the replay start. Without
++the field travelling with the payload, the worker would not know to stop writing
++the replayed positions, and would overwrite blocks that are still shared with
++every other request that hit the same prefix.
++
++So this patch adds the one field upstream does not have, and fills it where
++upstream builds that payload. Wrapping ``Scheduler._make_cached_request_data``
++rather than subclassing covers every Ascend scheduler at once, including the
++ones whose ``schedule()`` is a pinned copy of an older upstream body -- those
++call this same method.
++
++It reads ``Request.replay_start``, which upstream assigns at admission. A vLLM
++pin bump has to re-check that this still holds: a resumed request whose fresh
++admission did not rewind again has to end up with a zero replay start, or the
++worker would pad slots that were never replayed.
++
++Nothing here is Ascend-specific beyond the V1 payload it targets, so the patch
++is inert on a pin that predates #56227 -- see ``_upstream_carries_replay_start``.
++"""
++
++import dataclasses
++import functools
++import inspect
++
++from vllm.logger import logger
++from vllm.v1.core.sched.output import CachedRequestData
++from vllm.v1.core.sched.scheduler import Scheduler
++
++_EXPECTED_PARAMETERS = (
++    "self",
++    "running_reqs",
++    "resumed_reqs",
++    "num_scheduled_tokens",
++    "spec_decode_tokens",
++    "req_to_new_blocks",
++)
++
++
++def _upstream_carries_replay_start() -> bool:
++    """Whether the pinned vLLM ships the feature this patch extends.
++
++    Probed rather than read off a version: this repository supports two lanes
++    (main, which grows the feature, and the release tag, which never will), and
++    a version comparison would have to be revisited at every pin bump. The
++    method is upstream's own record that a prefix hit was rewound, which is the
++    thing this patch needs to exist; a pin without it has nothing to carry and
++    nothing to fill.
++    """
++    return hasattr(Scheduler, "_mark_prefix_replay")
++
++
++def _add_dataclass_field(cls: type, name: str, factory: type, annotation: type) -> None:
++    """Declare one more field on an already-processed dataclass.
++
++    ``SchedulerOutput`` and its payloads cross to the worker as msgpack, and
++    msgspec encodes a dataclass from its *declared* fields, so an attribute
++    written onto an instance never arrives. msgspec caches that field list per
++    type, which is why this has to run at import time -- before the first
++    payload is encoded -- rather than on first use.
++
++    Re-running ``dataclasses.dataclass`` regenerates ``__init__``, but it only
++    sets a method when it is absent from the class ``__dict__``, so the
++    generated ``__init__`` has to be dropped first. ``__repr__`` and ``__eq__``
++    are deliberately left alone: this payload defines its own (with token ids
++    redacted, so they cannot leak into logs) and would otherwise be replaced.
++    """
++    if name in cls.__dataclass_fields__:  # type: ignore[attr-defined]
++        return
++    cls.__annotations__[name] = annotation
++    # A mutable default must be a factory, or every instance would share it.
++    setattr(cls, name, dataclasses.field(default_factory=factory))
++    delattr(cls, "__init__")
++    dataclasses.dataclass(cls)
++    assert name in cls.__dataclass_fields__, f"{cls.__name__}.{name} was not declared"  # type: ignore[attr-defined]
++    assert name in inspect.signature(cls.__init__).parameters, (  # type: ignore[misc]
++        f"{cls.__name__}.__init__ does not accept {name}; msgpack could not encode it"
++    )
++
++
++def _patch_cached_request_data_replay_start() -> None:
++    """Declare ``CachedRequestData.replay_start`` so it survives the trip."""
++    _add_dataclass_field(CachedRequestData, "replay_start", dict, dict[str, int])
++
++
++def _patch_make_cached_request_data() -> None:
++    """Fill in the replay start of every resumed request that rewinds."""
++    original = Scheduler._make_cached_request_data
++    if getattr(original, "_vllm_ascend_swa_replay_patched", False):
++        return
++    current_parameters = tuple(inspect.signature(original).parameters)
++    if current_parameters != _EXPECTED_PARAMETERS:
++        raise RuntimeError(
++            "Cannot apply the SWA bounded replay resume patch: unexpected "
++            f"Scheduler._make_cached_request_data signature {current_parameters}"
++        )
++
++    @functools.wraps(original)
++    def _make_cached_request_data(
++        self,
++        running_reqs,
++        resumed_reqs,
++        num_scheduled_tokens,
++        spec_decode_tokens,
++        req_to_new_blocks,
++    ):
++        cached_reqs_data = original(
++            self,
++            running_reqs,
++            resumed_reqs,
++            num_scheduled_tokens,
++            spec_decode_tokens,
++            req_to_new_blocks,
++        )
++        # A dict keyed by request id rather than a list parallel to req_ids:
++        # an absent entry is the common case and has to mean "no replay"
++        # without depending on the payload's length.
++        cached_reqs_data.replay_start = {
++            request.request_id: request.replay_start for request in resumed_reqs if request.replay_start
++        }
++        return cached_reqs_data
++
++    _make_cached_request_data._vllm_ascend_swa_replay_patched = True  # type: ignore[attr-defined]
++    Scheduler._make_cached_request_data = _make_cached_request_data
++
++
++if _upstream_carries_replay_start():
++    # vLLM loads general plugins in the engine-core process and in every worker
++    # (``load_general_plugins``), so this module reaches both sides of the
++    # msgpack boundary -- the encoder needs the field declared to write it, the
++    # decoder needs it declared to accept it.
++    _patch_cached_request_data_replay_start()
++    _patch_make_cached_request_data()
++    logger.debug_once("SWA bounded replay: CachedRequestData.replay_start declared and filled from resumed requests.")
++else:
++    logger.debug_once(
++        "SWA bounded replay: this vLLM pin predates the feature; the resumed-request replay start is not patched."
++    )
+diff --git a/vllm_ascend/platform.py b/vllm_ascend/platform.py
+index e0051324e..d91e93870 100644
+--- a/vllm_ascend/platform.py
++++ b/vllm_ascend/platform.py
+@@ -1397,6 +1397,73 @@ def _setup_worker_and_scheduler(
+                 "vllm_ascend.core.batch_job_aware_scheduler.BatchJobAwareScheduler"
+             )
+ 
++    _downgrade_swa_bounded_replay(vllm_config, ascend_config)
++
++
++def _swa_bounded_replay_unsupported_mode(ascend_config) -> str | None:
++    """Name the Ascend mode that cannot honor SWA bounded replay.
++
++    Upstream implements the rewind inside ``Scheduler.schedule()``. Four Ascend
++    modes replace that method with a verbatim copy of an older upstream body, so
++    they neither rewind a prefix hit nor realize that the chunk they scheduled
++    is a replay; activating any of them therefore has to turn the switch off.
++
++    The other two modes reach upstream's ``schedule()`` and inherit the rewind:
++    ``batch_job_aware_scheduler`` calls ``super()``, and
++    ``short_request_first_scheduler`` does not override ``schedule()`` at all --
++    it only installs a request queue. Note that ``enable_balance_scheduling`` is
++    a fork despite being a monkeypatch rather than a ``scheduler_cls``, and that
++    its ``super().schedule()`` fallback only applies while balancing is off.
++
++    ``enable_dsa_cp`` is deliberately not here: DSA-CP is not a scheduler fork,
++    and its V4.1 metadata builder keeps the per-request channel the window clamp
++    needs, so that check belongs with the clamp rather than at startup.
++    """
++    scheduler_config = ascend_config.scheduler_config
++    if scheduler_config.recompute_scheduler_enable:
++        return "recompute_scheduler_enable"
++    if scheduler_config.dyntra_lb_config.enabled:
++        return "dyntra_lb_config"
++    if scheduler_config.profiling_chunk_config.enabled:
++        return "profiling_chunk_config"
++    if scheduler_config.enable_balance_scheduling:
++        return "enable_balance_scheduling"
++    return None
++
++
++def _downgrade_swa_bounded_replay(vllm_config: VllmConfig, ascend_config) -> None:
++    """Turn the SWA bounded replay switch off where this backend cannot honor it.
++
++    The switch defaults to on and is only read by a model the feature was
++    written for, so turning it off is invisible everywhere else: such a model's
++    sliding-window group then stays prefix-cacheable, which is the behavior from
++    before the feature. A downgrade rather than an error, because the switch
++    defaults to on while each of the modes below is an explicit user opt-in.
++    """
++    cache_config = vllm_config.cache_config
++    if cache_config is None or not getattr(cache_config, "swa_bounded_replay", False):
++        return
++
++    mode = _swa_bounded_replay_unsupported_mode(ascend_config)
++    if mode is None:
++        return
++
++    cache_config.swa_bounded_replay = False
++
++    from vllm_ascend.core.kv_cache_interface import supports_bounded_replay
++
++    if not supports_bounded_replay(vllm_config.model_config):
++        # Nothing would have replayed: the feature belongs to the DeepSeek-V4.1
++        # tree, and a V4 model never reads the switch. Warning here would tell
++        # the user a feature they never had is off.
++        return
++
++    logger.warning_once(
++        "SWA bounded replay is disabled: %s schedules with a pinned copy of the "
++        "scheduler, which cannot rewind a prefix hit.",
++        mode,
++    )
++
+ 
+ def _validate_sfa_dcp_kv_sp(vllm_config: VllmConfig) -> None:
+     parallel_config = vllm_config.parallel_config
+diff --git a/vllm_ascend/worker/block_table.py b/vllm_ascend/worker/block_table.py
+index f596dcd9c..8fe9da1fc 100644
+--- a/vllm_ascend/worker/block_table.py
++++ b/vllm_ascend/worker/block_table.py
+@@ -10,12 +10,16 @@ from vllm.v1.kv_cache_interface import (
+ )
+ from vllm.v1.utils import CpuGpuBuffer
+ 
+-from vllm_ascend.core.kv_cache_interface import is_circular_kv_cache_spec
++from vllm_ascend.core.kv_cache_interface import (
++    is_circular_kv_cache_spec,
++    is_prefix_cacheable,
++)
+ from vllm_ascend.distributed.utils import get_decode_context_model_parallel_world_size
+ from vllm_ascend.ops.triton.compute_slot_mapping import (
+     _compute_slot_mapping_kernel,
+     _next_power_of_2,
+     compute_slot_mapping_fused_groups,
++    pad_replayed_slot_mapping,
+ )
+ 
+ 
+@@ -58,6 +62,11 @@ class BlockTable:
+             kernel_sizes = [block_size]
+             self.max_num_blocks_per_req = max_num_blocks_per_req = 1
+         self.is_circular_group = kv_cache_group is not None and is_circular_kv_cache_spec(kv_cache_group.kv_cache_spec)
++        # Fixed for the group's lifetime. A bounded-replay sliding-window group
++        # opts out of prefix caching, so it is the one group that has to keep
++        # writing the replayed positions -- that write rebuilds its window.
++        # Every other group pads them.
++        self.is_prefix_cacheable = kv_cache_group is None or is_prefix_cacheable(kv_cache_group.kv_cache_spec)
+ 
+         # If kernel_sizes is None or [0], use physical block size (no splitting)
+         if kernel_sizes is None or kernel_sizes == [0]:
+@@ -446,6 +455,26 @@ class MultiGroupBlockTable:
+             )
+             self._fused_min_block_size = min(block_table.block_size for block_table in active_block_tables)
+ 
++        # The replayed-slot PAD pass addresses the groups' slot mappings
++        # directly, so unlike the fused kernel above it cannot be limited to the
++        # fused configuration -- that one additionally requires DCP to be off
++        # and every group to be splittable. Built unconditionally, mamba groups
++        # aside, which are the ones the fused path skips too.
++        self._replay_slot_mapping_addrs = torch.tensor(
++            [block_table.slot_mapping.gpu.data_ptr() for block_table in active_block_tables],
++            dtype=torch.uint64,
++            device=device,
++        )
++        # Only the cacheable groups get padded. A group that opted out of prefix
++        # caching never has its KV persisted, so it has no cached copy of the
++        # replayed positions to fall back on -- and for the bounded-replay
++        # sliding-window group, writing them is what rebuilds its window.
++        self._replay_cacheable_groups = torch.tensor(
++            [group_idx for group_idx, block_table in enumerate(active_block_tables) if block_table.is_prefix_cacheable],
++            dtype=torch.int32,
++            device=device,
++        )
++
+     def append_row(self, block_ids: tuple[list[int], ...], row_idx: int) -> None:
+         for i, block_table in enumerate(self.block_tables):
+             block_table.append_row(block_ids[i], row_idx)
+@@ -501,6 +530,39 @@ class MultiGroupBlockTable:
+             else:
+                 block_table.compute_slot_mapping(num_reqs, query_start_loc, positions)
+ 
++    def pad_replayed_slots(
++        self,
++        num_reqs: int,
++        query_start_loc: torch.Tensor,
++        positions: torch.Tensor,
++        replay_start: torch.Tensor,
++        replay_window: int,
++    ) -> None:
++        """Stop the cacheable groups from rewriting replayed KV.
++
++        A request that hit a prefix cache reuses the hit's blocks, which are
++        still shared with every other request that hit the same prefix, so the
++        KV they hold must not be written again -- not because the rewritten
++        values would be wrong for this request, but because they would be
++        different from what every other sharer reads. ``replay_start`` names,
++        per request, where the replayed run begins (0 for a request that is not
++        replaying), and that run is exactly what has to be skipped: the
++        sliding-window group rebuilds it itself.
++
++        Runs after every group's slot mapping is final, so it needs to know
++        nothing about how those were computed.
++        """
++        pad_replayed_slot_mapping(
++            num_reqs,
++            query_start_loc,
++            positions,
++            replay_start,
++            self._replay_slot_mapping_addrs,
++            self._replay_cacheable_groups,
++            replay_window,
++            pad_id=PAD_SLOT_ID,
++        )
++
+     def compute_slot_mapping_draft(
+         self,
+         req_indices: np.ndarray | torch.Tensor,
+diff --git a/vllm_ascend/worker/model_runner_v1.py b/vllm_ascend/worker/model_runner_v1.py
+index bb177e958..3d193190a 100644
+--- a/vllm_ascend/worker/model_runner_v1.py
++++ b/vllm_ascend/worker/model_runner_v1.py
+@@ -849,6 +849,22 @@ class NPUModelRunner(GPUModelRunner):
+                 )
+         self.discard_request_indices = self._make_buffer(self.max_num_reqs, dtype=torch.int64)
+         self.num_discarded_requests = 0
++        # The one replay window every bounded-replay KV cache group agrees on, 0
++        # when nothing replays -- and then the whole replay path is skipped, so
++        # a run without the feature pays nothing. ``initialize_kv_cache`` fills
++        # it in once the groups are final.
++        self.prefix_replay_tokens = 0
++        self._replay_starts: dict[str, int] = {}
++        # Per-request replay start: 0 for every request that is not replaying,
++        # else where that request's replayed run begins. Rebuilt on the CPU as
++        # part of the step and copied with the same pinned, non-blocking rhythm
++        # as ``num_computed_tokens``, so it adds no sync point.
++        self.replay_start = self._make_buffer(self.max_num_reqs, dtype=torch.int32)
++        # Whether the step being prepared replays. ``_dummy_run`` builds
++        # attention metadata without going through ``_prepare_inputs``, so this
++        # is also cleared there: otherwise a capture batch would hand the
++        # builder a buffer still holding the last real step's values.
++        self._replay_active = False
+ 
+     def _get_drafter(self):
+         return get_spec_decode_method(self.speculative_config.method, self.vllm_config, self.device, self)
+@@ -1041,6 +1057,7 @@ class NPUModelRunner(GPUModelRunner):
+         ).unsqueeze(1)
+ 
+     def _update_states(self, scheduler_output: "SchedulerOutput") -> Callable | None:
++        self._update_replay_requests(scheduler_output)
+         # Temporary rewind guard for KV-load-failure recompute.
+         # This can be removed after the upstream fix is merged.
+         req_data = scheduler_output.scheduled_cached_reqs
+@@ -1360,6 +1377,70 @@ class NPUModelRunner(GPUModelRunner):
+ 
+         self.maybe_save_ec_to_connector({mm_hash: output}, mm_hash)
+ 
++    def _update_replay_requests(self, scheduler_output: "SchedulerOutput") -> None:
++        """Keep replay boundaries across chunks, replacing them on readmission."""
++        if not self.prefix_replay_tokens:
++            return
++        for req_id in scheduler_output.finished_req_ids:
++            self._replay_starts.pop(req_id, None)
++        for req in scheduler_output.scheduled_new_reqs:
++            self._replay_starts.pop(req.req_id, None)
++            if req.replay_start:
++                self._replay_starts[req.req_id] = req.replay_start
++        cached = scheduler_output.scheduled_cached_reqs
++        for req_id in cached.resumed_req_ids:
++            # The resume payload omits zero boundaries. A resume without a
++            # fresh hit must discard the boundary from the previous admission.
++            self._replay_starts.pop(req_id, None)
++            start = cached.replay_start.get(req_id, 0)
++            if start:
++                self._replay_starts[req_id] = start
++
++    def _fill_replay_start(self, num_reqs: int) -> torch.Tensor | None:
++        """Gather saved boundaries for chunks still inside the replay window.
++
++        The window can span multiple scheduled chunks. Once a chunk starts at
++        or beyond its end, no cached slots need padding and the natural SWA
++        lower bound is already at or beyond the replay start. Checking token
++        positions also covers replay of generated tokens after preemption.
++        """
++        if not self.prefix_replay_tokens:
++            self._replay_active = False
++            return None
++
++        self.replay_start.np.fill(0)
++        replaying = False
++        for req_id, index in self.input_batch.req_id_to_index.items():
++            if index >= num_reqs:
++                continue
++            start = self._replay_starts.get(req_id, 0)
++            if not start:
++                continue
++            computed = self.input_batch.num_computed_tokens_cpu[index]
++            if start <= computed < start + self.prefix_replay_tokens:
++                self.replay_start.np[index] = start
++                replaying = True
++            else:
++                # Finished replay, or a recompute rewound below its boundary.
++                self._replay_starts.pop(req_id, None)
++        # Clear padded rows too so batch reordering cannot retain an old bound.
++        self.replay_start.copy_to_gpu()
++        self._replay_active = replaying
++        return self.replay_start.gpu[:num_reqs] if replaying else None
++
++    def _attn_replay_start(self, num_reqs_padded: int) -> torch.Tensor | None:
++        """What the step's attention metadata carries as its per-request replay
++        start, or None when the step does not replay.
++
++        None rather than an all-zero buffer because a dummy, profiling or
++        capture batch never goes through ``_prepare_inputs``: the buffer would
++        still hold the previous real step's values, and the attention builder
++        would clamp a window it was never asked to.
++        """
++        if not self._replay_active:
++            return None
++        return self.replay_start.gpu[:num_reqs_padded]
++
+     def _prepare_inputs(
+         self,
+         scheduler_output: "SchedulerOutput",
+@@ -1701,12 +1782,25 @@ class NPUModelRunner(GPUModelRunner):
+         if self._needs_seq_lens_cpu_sync and async_spec_decode_active:
+             self._correct_optimistic_seq_lens_cpu(num_reqs)
+ 
++        replay_start = self._fill_replay_start(num_reqs)
++
+         self.input_batch.block_table.compute_slot_mapping(
+             num_reqs,
+             self.query_start_loc.gpu[: num_reqs + 1],
+             self.positions[:total_num_scheduled_tokens],
+         )
+ 
++        if replay_start is not None:
++            # After every group's slot mapping is final, so this sees the same
++            # slots the attention kernels are about to be handed.
++            self.input_batch.block_table.pad_replayed_slots(
++                num_reqs,
++                self.query_start_loc.gpu[: num_reqs + 1],
++                self.positions[:total_num_scheduled_tokens],
++                replay_start,
++                self.prefix_replay_tokens,
++            )
++
+         if self.use_async_spec_decode and self.uses_mrope:
+             drift = self.num_computed_tokens[req_indices_gpu].to(
+                 torch.int64
+@@ -3757,6 +3851,10 @@ class NPUModelRunner(GPUModelRunner):
+             attn_state=self.attn_state,
+             decode_token_per_req=self.decode_token_per_req,
+             context_parallel_metadata=self.long_seq_metadata,
++            # 0 for every request that is not replaying, and for every padded
++            # row; a backend clamps the sliding-window lower bound of a
++            # replaying request to it.
++            replay_start=self._attn_replay_start(num_reqs_padded),
+             req_ids_tensor=(
+                 self._offload_req_ids_tensor.gpu[:num_reqs_padded]
+                 if self._offload_req_ids_tensor is not None
+@@ -4109,6 +4207,10 @@ class NPUModelRunner(GPUModelRunner):
+         # vllm-ascend does not support ubatch now
+         ubatch_slices, ubatch_slices_padded = None, None
+         attn_metadata: PerLayerAttnMetadata | None = None
++        # A dummy/profiling/capture batch never replays: it does not go through
++        # ``_prepare_inputs``, so clear the flag rather than let the metadata
++        # report the last real step's replay and clamp a window mid-capture.
++        self._replay_active = False
+         # _dummy_run shares pinned CPU buffers (seq_lens, query_start_loc,
+         # gdn_query_start_loc, etc.) with execute_model. It must participate in
+         # the same event protocol so that back-to-back dummy/real steps don't
+@@ -4692,6 +4794,15 @@ class NPUModelRunner(GPUModelRunner):
+         )
+         self.kernel_block_sizes = kernel_block_sizes
+         self.may_reinitialize_input_batch(kv_cache_config, kernel_block_sizes)
++        # The one replay window the KV cache groups agree on, 0 when nothing
++        # replays (the scheduler asserts the same agreement). Read after the
++        # calls above because those can still add or rewrap KV cache groups. The
++        # defensive read keeps a pin that predates the replay API at "nothing
++        # replays".
++        self.prefix_replay_tokens = max(
++            (getattr(group.kv_cache_spec, "prefix_replay_tokens", 0) for group in kv_cache_config.kv_cache_groups),
++            default=0,
++        )
+         if self.sparse_kv_offload_enabled:
+             self.sparse_kv_offload_manager = init_sparse_kv_offload_manager(
+                 self.vllm_config,
+diff --git a/vllm_ascend/worker/v2/model_states/default.py b/vllm_ascend/worker/v2/model_states/default.py
+index 51c3d4d86..b436cd759 100644
+--- a/vllm_ascend/worker/v2/model_states/default.py
++++ b/vllm_ascend/worker/v2/model_states/default.py
+@@ -28,6 +28,7 @@ from vllm.utils.platform_utils import is_pin_memory_available
+ from vllm.v1.kv_cache_interface import KVCacheConfig
+ from vllm.v1.utils import CpuGpuBuffer
+ from vllm.v1.worker.gpu.model_states.default import DefaultModelState
++from vllm.v1.worker.gpu.model_states.interface import ModelSpecificAttnMetadata
+ from vllm.v1.worker.utils import AttentionGroup
+ 
+ from vllm_ascend.ascend_config import get_ascend_config
+@@ -40,6 +41,18 @@ from vllm_ascend.distributed.kv_transfer.sparse_kv_offload.sparse_kv_offload_man
+ from vllm_ascend.worker.v2.attn_utils import build_attn_metadata, ring_state_update_skipped
+ from vllm_ascend.worker.v2.input_batch import AscendInputBatch
+ 
++
++class ReplayAttnMetadata(ModelSpecificAttnMetadata):
++    """Pass V4.1 replay boundaries to the SWA metadata builder."""
++
++    def __init__(self, replay_start: torch.Tensor):
++        self.replay_start = replay_start
++
++    def get_extra_common_attn_kwargs(self, cache_group_idx: int, num_reqs: int) -> dict[str, Any]:
++        del cache_group_idx
++        return {"replay_start": self.replay_start[:num_reqs]}
++
++
+ if TYPE_CHECKING:
+     from vllm_ascend.worker.device_metadata import TargetDeviceMetadata
+     from vllm_ascend.worker.v2.kvpp import KVPPRuntime
+@@ -175,6 +188,7 @@ class AscendModelState(DefaultModelState):
+         kv_cache_config: KVCacheConfig,
+         for_capture: bool = False,
+         ubatch_idx: int = 0,
++        model_specific_attn_metadata: ModelSpecificAttnMetadata | None = None,
+     ) -> dict[str, Any]:
+         """Override prepare_attn method because `build_attn_metadata` is different from vllm."""
+         # vLLM #50945 adds this contract; Ascend still disables DBO.
+@@ -300,6 +314,7 @@ class AscendModelState(DefaultModelState):
+             for_cudagraph_capture=for_capture,
+             # Same wiring as model_runner_v1
+             full_graph_mode=cudagraph_mode == CUDAGraphMode.FULL,
++            model_specific_attn_metadata=model_specific_attn_metadata,
+             req_ids_tensor=offload_req_ids.gpu[:num_reqs] if offload_req_ids is not None else None,
+             token_to_req=offload_token_to_req.gpu[:num_input_tokens] if offload_token_to_req is not None else None,
+             offload_dummy=getattr(input_batch, "is_dummy", False),
+diff --git a/vllm_ascend/worker/v2/model_states/mamba_hybrid.py b/vllm_ascend/worker/v2/model_states/mamba_hybrid.py
+index 0ef7b47dd..4c16c2ba6 100644
+--- a/vllm_ascend/worker/v2/model_states/mamba_hybrid.py
++++ b/vllm_ascend/worker/v2/model_states/mamba_hybrid.py
+@@ -26,6 +26,7 @@ from vllm.distributed.kv_transfer import get_kv_transfer_group, has_kv_transfer_
+ from vllm.model_executor.layers.mamba.mamba_utils import is_conv_state_dim_first
+ from vllm.v1.kv_cache_interface import KVCacheConfig
+ from vllm.v1.worker import mamba_utils
++from vllm.v1.worker.gpu.model_states.interface import ModelSpecificAttnMetadata
+ from vllm.v1.worker.gpu.model_states.mamba_hybrid import (
+     MambaHybridAttnMetadata,
+     MambaHybridModelState,
+@@ -257,6 +258,7 @@ class AscendMambaHybridModelState(MambaHybridModelState, AscendModelState):
+         kv_cache_config: KVCacheConfig,
+         for_capture: bool = False,
+         ubatch_idx: int = 0,
++        model_specific_attn_metadata: ModelSpecificAttnMetadata | None = None,
+     ) -> dict[str, Any]:
+         # Match the upstream Mamba contract without enabling DBO.
+         assert ubatch_idx == 0, "DBO is not supported on Ascend"
+@@ -302,6 +304,8 @@ class AscendMambaHybridModelState(MambaHybridModelState, AscendModelState):
+             num_accepted_tokens=num_accepted_tokens,
+             num_decode_draft_tokens_cpu=num_decode_draft_tokens_cpu,
+         )
++        # The Mamba model state builds its own complete attention metadata.
++        # The optional argument is accepted to match AscendModelState's API.
+         self.attn_metadata = build_attn_metadata(
+             attn_groups=attn_groups,
+             num_reqs=num_reqs,

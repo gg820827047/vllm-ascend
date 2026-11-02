@@ -1,0 +1,738 @@
+commit 97cd7add24ca26656140f2f67e02efe1e7ec9d5a
+Author:     wangbin207@huawei.com <53000276+qjgggsse@users.noreply.github.com>
+AuthorDate: Sat Oct 10 09:13:23 2026 +0800
+Commit:     GitHub <noreply@github.com>
+CommitDate: Sat Oct 10 09:13:23 2026 +0800
+
+    [Cherry-pick][v0.30.0][Performance]: optimize DeepSeek V4 TurboQuant framework path (#18127)
+    
+    This is a cherry-pick of PR #18037 onto the 0.30.0 branch.
+    
+    Share DSV4 transform tensors and cache KV plans, fuse scale correction
+    and cache
+    packing, and align DSpark context KV rotation and compressed attention
+    metadata. Restore the historical DSV4
+    Hadamard sequence while preserving the SFA baseline path and standard
+    CANN operator integration.
+    
+    Add regression coverage for transform compatibility, cache planning,
+    context rotation, and NPU finalize behavior.
+    
+    What this PR does / why we need it?
+    Does this PR introduce any user-facing change?
+    How was this patch tested?
+    • ### What this PR does / why we need it?
+    
+    Optimize the DeepSeek V4 TurboQuant path to reduce repeated allocations
+    and kernel launches, and keep DSpark
+    attention inputs consistent.
+    
+    • Share read-only transform tensors, centroids, and norm lookup tables
+    across DSV4 layers; cache contiguous inverse
+    transforms and TQ KV execution plans.
+    
+    • Fuse norm reduction, scale correction, and compact KV cache packing
+    into one Triton kernel.
+    • Rotate DSpark context KV into the same basis as queries and prevent
+    compressed TQ layers from using SWA-only
+    drafting metadata.
+    
+    • Restore the historical DSV4 Hadamard sign sequence for compatibility
+    with the previously validated
+    implementation.
+    
+    • Preserve the SFA baseline path and standard CANN TorchAPI/ACLNN
+    integration.
+    
+    Does this PR introduce any user-facing change?
+    No new configuration options or public API changes.
+    
+    DSV4 TurboQuant uses the historical rotation sequence and corrected
+    DSpark context handling, which may change
+    generated outputs compared with the current baseline. Non-TQ paths,
+    including C8 and A5 quantization modes 1/2,
+    retain their existing logic.
+    
+    How was this patch tested?
+    • 189 related unit tests passed, covering TurboQuant, DSA attention, and
+    DSpark context handling.
+    • 8 NPU finalize regression tests passed, covering packed codes, scale
+    correction, empty inputs, graph replay, and
+    compilation reuse across row counts.
+    
+    • On NPU, compared against the historical implementation using the same
+    TurboQuant operator: transforms, centroids,
+    norm lookup tables, and forward/inverse/compression results matched
+    exactly for 1, 17, and 257 rows.
+    
+    • Service smoke tests passed for short prompts, multi-turn chat,
+    streaming, and two concurrent requests before the
+    final Hadamard compatibility change.
+    
+    • Applicable pre-commit checks passed. actionlint was skipped due to an
+    environment bootstrap issue; no workflow
+    files changed.
+    
+    Long-context validation with the installed CANN 9.2 operator package
+    exposed numerical failures; the same
+    independent attention cases passed with the previously validated OPP
+    binaries. No framework workaround was
+    introduced. Full service validation after the final Hadamard change and
+    A5 hardware validation remain pending.
+    
+    vLLM main:
+    https://github.com/vllm-project/vllm/commit/ced6857afa0ea7b2e3f0846a62e1394e90f15607
+    
+    - vLLM main:
+    https://github.com/vllm-project/vllm/commit/ced6857afa0ea7b2e3f0846a62e1394e90f15607
+    
+    ---------
+    
+    Signed-off-by: wangbin207 <wangbin207@huawei.com>
+    Co-authored-by: wangbin207 <wangbin207@huawei.com>
+
+diff --git a/.github/workflows/scripts/estimated_times.yaml b/.github/workflows/scripts/estimated_times.yaml
+index 5f6c59461..f7e269727 100644
+--- a/.github/workflows/scripts/estimated_times.yaml
++++ b/.github/workflows/scripts/estimated_times.yaml
+@@ -75,6 +75,7 @@ estimated_times:
+   tests/e2e/pull_request/one_card/rlhf/state_transitions/test_sleep_wake.py: 790
+   tests/e2e/pull_request/one_card/test_sampler.py: 190
+   tests/e2e/pull_request/one_card/test_simple_cpu_offload.py: 240
++  tests/e2e/pull_request/one_card/test_turboquant_finalize.py: 30
+   tests/e2e/pull_request/one_card/test_vlm.py: 680
+   tests/e2e/pull_request/one_card/test_xlite.py: 430
+   tests/e2e/pull_request/one_card/test_batch_job_aware_scheduler_e2e.py: 820
+diff --git a/tests/e2e/pull_request/one_card/test_turboquant_finalize.py b/tests/e2e/pull_request/one_card/test_turboquant_finalize.py
+new file mode 100644
+index 000000000..08664f315
+--- /dev/null
++++ b/tests/e2e/pull_request/one_card/test_turboquant_finalize.py
+@@ -0,0 +1,70 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""Numerical and graph coverage for framework TurboQuant cache packing."""
++
++import pytest
++import torch
++import torch_npu  # noqa: F401
++
++from vllm_ascend.ops.triton.triton_utils import init_device_properties_triton
++from vllm_ascend.ops.triton.turboquant_finalize import turboquant_finalize
++from vllm_ascend.quantization.methods.kv_cache.turboquant.latent import CENTROIDS
++
++
++@pytest.mark.parametrize("rows", [0, 1, 8, 257])
++def test_fused_scale_and_packing(rows):
++    init_device_properties_triton()
++    torch.manual_seed(7)
++    # Enumerate every packed byte; use zero and varying nonzero input norms.
++    packed = torch.arange(256, dtype=torch.int32, device="npu").to(torch.uint8).repeat(rows, 1)
++    norm = torch.arange(rows, dtype=torch.float16, device="npu")
++    centroids = torch.tensor(CENTROIDS, dtype=torch.float32, device="npu")
++    byte = torch.arange(256, device="npu")
++    norm_lut = centroids[byte & 15].square() + centroids[byte >> 4].square()
++    scale = (norm.float() / norm_lut[packed.long()].sum(-1).sqrt()).half()
++    expected = torch.cat((packed, scale.view(torch.uint8).reshape(-1, 2)), dim=-1).unsqueeze(1)
++    actual = turboquant_finalize(packed, norm, norm_lut)
++    torch.testing.assert_close(actual.cpu(), expected.cpu(), rtol=0, atol=0)
++    if rows:
++        graph = torch.npu.NPUGraph()
++        with torch.npu.graph(graph):
++            captured = turboquant_finalize(packed, norm, norm_lut)
++        norm.mul_(0.5)
++        graph.replay()
++        eager = turboquant_finalize(packed, norm, norm_lut)
++        torch.testing.assert_close(captured.cpu(), eager.cpu(), rtol=0, atol=0)
++
++
++def test_finalize_reuses_kernel_for_new_row_counts(monkeypatch):
++    from vllm_ascend.ops.triton.turboquant_finalize import _finalize
++
++    init_device_properties_triton()
++    packed = torch.zeros((513, 256), dtype=torch.uint8, device="npu")
++    norm = torch.ones(513, dtype=torch.float16, device="npu")
++    norm_lut = torch.ones(256, dtype=torch.float32, device="npu")
++    turboquant_finalize(packed[:1], norm[:1], norm_lut)
++
++    def unexpected_compile(*args, **kwargs):
++        pytest.fail("A new row count must reuse the compiled finalize kernel")
++
++    monkeypatch.setattr(_finalize, "_do_compile", unexpected_compile)
++    for rows in (8, 17, 256, 257, 513):
++        actual = turboquant_finalize(packed[:rows], norm[:rows], norm_lut)
++        scales = actual[:, 0, 256:].contiguous().view(torch.float16)
++        torch.testing.assert_close(scales.cpu(), torch.full((rows, 1), 1 / 16, dtype=torch.float16))
++
++
++@pytest.mark.parametrize("rows", [1, 17, 513])
++def test_finalize_random_codes_match_scale_reference(rows):
++    init_device_properties_triton()
++    torch.manual_seed(73)
++    packed = torch.randint(0, 256, (rows, 256), device="npu", dtype=torch.uint8)
++    norm = (torch.rand(rows, device="npu") * 32).half()
++    byte = torch.arange(256, device="npu")
++    centroids = torch.tensor(CENTROIDS, dtype=torch.float32, device="npu")
++    lut = centroids[byte & 15].square() + centroids[byte >> 4].square()
++    result = turboquant_finalize(packed, norm, lut)
++    expected_scale = (norm.float() / lut[packed.long()].sum(-1).sqrt()).half()
++    torch.testing.assert_close(result[:, 0, :256].cpu(), packed.cpu(), rtol=0, atol=0)
++    actual_scale = result[:, 0, 256:].contiguous().view(torch.float16).flatten()
++    torch.testing.assert_close(actual_scale.cpu(), expected_scale.cpu(), rtol=0.001, atol=0)
+diff --git a/tests/ut/attention/test_dsa_v1.py b/tests/ut/attention/test_dsa_v1.py
+index 841612326..a32c10af7 100644
+--- a/tests/ut/attention/test_dsa_v1.py
++++ b/tests/ut/attention/test_dsa_v1.py
+@@ -2753,3 +2753,71 @@ def test_a5_fp8_o_proj_keeps_otp_collectives(tp_size, num_tokens):
+     bf16_mm.assert_not_called()
+     expected = x.sum((1, 2)).unsqueeze(1).expand(-1, 2)
+     torch.testing.assert_close(output, expected)
++
++
++@pytest.mark.parametrize("use_tq", [False, True])
++def test_kv_plan_reuse_is_turboquant_only(use_tq):
++    impl = AscendDSAImpl.__new__(AscendDSAImpl)
++    impl.vllm_config = _make_vllm_config()
++    impl.compress_ratio = 4
++    impl.turboquant = object() if use_tq else None
++    with patch("vllm_ascend.attention.dsa_v1.get_dsa_attn_kv_plan") as planner:
++        first = impl.get_kv_plan()
++        second = impl.get_kv_plan()
++    assert first is second
++    assert planner.call_count == (1 if use_tq else 2)
++    planner.assert_called_with(impl.vllm_config, 4)
++
++
++@pytest.mark.parametrize("use_tq", [False, True])
++@pytest.mark.parametrize("ratio", [1, 4, 128])
++@pytest.mark.parametrize("deferred", [False, True])
++def test_dspark_compressed_tq_metadata_keeps_full_context(use_tq, ratio, deferred):
++    config = _make_vllm_config(num_speculative_tokens=5)
++    config.model_config.hf_config.sliding_window = 128
++    config.speculative_config.method = "dspark"
++    config.cache_config = SimpleNamespace(cache_dtype="turboquant_4bit_nc" if use_tq else "auto")
++    with patch(f"{__name__}._make_vllm_config", return_value=config):
++        builder = _make_builder(compressor_ratio=ratio, num_speculative_tokens=5)
++    if deferred:
++        builder.enable_device_metadata()
++    builder._build_qli_metadata = MagicMock(return_value=None)
++    builder.num_actual_tokens = builder.num_decode_tokens = 5
++    builder.num_decodes = 1
++    builder.num_prefills = 0
++    builder.seq_lens = torch.tensor([261], dtype=torch.int32)
++    builder.block_table = torch.tensor([[0, 1, 2]], dtype=torch.int32)
++    query_start_loc = torch.tensor([0, 5], dtype=torch.int32)
++    common = SimpleNamespace(
++        num_reqs=1,
++        num_input_tokens=5,
++        positions=torch.arange(256, 261),
++        query_start_loc=query_start_loc,
++        query_start_loc_cpu=query_start_loc,
++        causal=False,
++    )
++    metadata_op = MagicMock(return_value=torch.zeros(DSA_METADATA_BUFFER_SIZE, dtype=torch.int32))
++    plan = _mock_dsa_kv_plan(
++        get_dsa_sparse_attn_metadata_op=metadata_op,
++        get_dsa_sparse_attn_metadata_kwargs={},
++    )
++    with (
++        patch("vllm_ascend.attention.dsa_v1.get_dsa_attn_kv_plan", return_value=plan),
++        patch("vllm_ascend.attention.dsa_v1.get_tensor_model_parallel_world_size", return_value=1),
++        patch("vllm_ascend.attention.dsa_v1.get_full_cos_and_sin_dsa", return_value=(None, None)),
++        patch("vllm_ascend.attention.dsa_v1.build_compressor_metadata_out"),
++    ):
++        metadata = builder.build_req_metadata(
++            common_attn_metadata=common,
++            seq_lens_cpu=builder.seq_lens,
++            num_actual_reqs=None,
++            cos=torch.ones(5),
++            sin=torch.zeros(5),
++        )
++        if deferred:
++            for task in builder.take_device_metadata_tasks():
++                task.run()
++    compressed_tq = use_tq and ratio > 1
++    assert metadata_op.call_args.kwargs["seqused_kv"].tolist() == [261 if compressed_tq else 133]
++    assert (metadata.dspark_swa_indices is None) == compressed_tq
++    assert metadata.ori_win_left == (127 if compressed_tq else 132)
+diff --git a/tests/ut/ops/test_rope_proxy.py b/tests/ut/ops/test_rope_proxy.py
+index b8148fbb6..5d9ec5238 100644
+--- a/tests/ut/ops/test_rope_proxy.py
++++ b/tests/ut/ops/test_rope_proxy.py
+@@ -248,3 +248,70 @@ def test_dspark_context_rope_reuses_all_layer_configs(monkeypatch, shared_config
+         assert call.args[0] is states
+         assert call.args[1] is slot
+         assert call.args[2] is layer.self_attn
++
++
++@pytest.mark.parametrize("use_tq", [False, True])
++@pytest.mark.parametrize("formatted_slots", [False, True])
++def test_dspark_turboquant_context_cache_uses_rotated_basis(monkeypatch, use_tq, formatted_slots):
++    from vllm_ascend.attention.dsa_v1 import AscendDSAImpl
++    from vllm_ascend.models.deepseek_v4 import dspark
++    from vllm_ascend.models.layer.attention.layer import DSAAttention
++    from vllm_ascend.ops.dsa import AscendDeepseekSparseAttention
++
++    shared_kv = torch.zeros(2, 1, 8)
++    rotated_kv = torch.ones_like(shared_kv)
++    slots = torch.tensor([0, 9], dtype=torch.int32)
++    slot_pairs = torch.tensor([[0, 0], [1, 1]], dtype=torch.int32)
++    if formatted_slots:
++        slots = slot_pairs
++    cache = torch.empty(2, 8, 1, 8, dtype=torch.bfloat16)
++    transform = SimpleNamespace(forward=Mock(return_value=rotated_kv))
++    # Use the real wrapper hierarchy; the transform belongs to the backend
++    # implementation and is not forwarded by either nn.Module wrapper.
++    wrapper = AscendDeepseekSparseAttention.__new__(AscendDeepseekSparseAttention)
++    torch.nn.Module.__init__(wrapper)
++    wrapper.dsa_attn = DSAAttention.__new__(DSAAttention)
++    torch.nn.Module.__init__(wrapper.dsa_attn)
++    impl = AscendDSAImpl.__new__(AscendDSAImpl)
++    impl.turboquant = transform if use_tq else None
++    wrapper.dsa_attn.impl = impl
++    attn = SimpleNamespace(dsa_attn=wrapper)
++    swa_layer = SimpleNamespace(block_size=8, kv_cache=cache)
++    attn.dsa_attn.swa_cache_layer = swa_layer
++    plan = SimpleNamespace(
++        format_dsa_slot_mapping=Mock(return_value=slot_pairs),
++        dsa_kv_compress_scatter=Mock(),
++    )
++    impl.get_kv_plan = Mock(return_value=plan)
++    writer = Mock()
++    from vllm_ascend.attention import dsa_attn_kv_plan
++
++    monkeypatch.setattr(dsa_attn_kv_plan, "get_dsa_attn_kv_plan", lambda _: plan)
++    monkeypatch.setattr(dsa_attn_kv_plan, "write_dsa_cache", writer)
++
++    model = SimpleNamespace(vllm_config=SimpleNamespace())
++    dspark.DeepseekV4DSparkModel._store_standard_swa_kv(model, shared_kv, slots, attn)
++
++    if use_tq:
++        transform.forward.assert_called_once_with(shared_kv)
++        writer.assert_called_once()
++        write_args = writer.call_args.args
++        assert write_args[0] is cache
++        assert write_args[1] is rotated_kv
++        torch.testing.assert_close(write_args[2], slot_pairs)
++        if formatted_slots:
++            impl.get_kv_plan.assert_not_called()
++            plan.format_dsa_slot_mapping.assert_not_called()
++        else:
++            impl.get_kv_plan.assert_called_once_with()
++            plan.format_dsa_slot_mapping.assert_called_once_with(slots, swa_layer.block_size)
++        plan.dsa_kv_compress_scatter.assert_not_called()
++    else:
++        transform.forward.assert_not_called()
++        writer.assert_not_called()
++        impl.get_kv_plan.assert_not_called()
++        plan.dsa_kv_compress_scatter.assert_called_once()
++        write_args = plan.dsa_kv_compress_scatter.call_args.args
++        assert write_args[0] is cache
++        assert write_args[1] is shared_kv
++        torch.testing.assert_close(write_args[2], slot_pairs)
+diff --git a/tests/ut/quantization/methods/kv_cache/turboquant/test_latent.py b/tests/ut/quantization/methods/kv_cache/turboquant/test_latent.py
+index 774aa8b33..eae61861a 100644
+--- a/tests/ut/quantization/methods/kv_cache/turboquant/test_latent.py
++++ b/tests/ut/quantization/methods/kv_cache/turboquant/test_latent.py
+@@ -1,6 +1,7 @@
+ # SPDX-License-Identifier: Apache-2.0
+ from unittest.mock import patch
+ 
++import numpy as np
+ import pytest
+ import torch
+ 
+@@ -16,9 +17,10 @@ def _quantize_reference(latent, centroids):
+     return packed, norm.half()
+ 
+ 
+-def test_rotation_preserves_attention_with_sinks():
++@pytest.mark.parametrize("legacy_hadamard", [False, True])
++def test_rotation_preserves_attention_with_sinks(legacy_hadamard):
+     torch.manual_seed(0)
+-    store = TurboQuantLatent()
++    store = TurboQuantLatent(legacy_hadamard=legacy_hadamard)
+     q, kv = torch.randn(3, 512), torch.randn(9, 512)
+     sinks = torch.randn(3, 1)
+ 
+@@ -31,13 +33,14 @@ def test_rotation_preserves_attention_with_sinks():
+     torch.testing.assert_close(actual, expected, atol=2e-6, rtol=2e-5)
+ 
+ 
++@pytest.mark.parametrize("legacy_hadamard", [False, True])
+ @pytest.mark.parametrize("rows", [0, 1, 17])
+-def test_packed_layout_norm_correction_and_zero_rows(rows):
++def test_packed_layout_norm_correction_and_zero_rows(rows, legacy_hadamard):
+     torch.manual_seed(3)
+     latent = torch.randn(rows, 1, 512)
+     if rows:
+         latent[0].zero_()
+-    store = TurboQuantLatent()
++    store = TurboQuantLatent(legacy_hadamard=legacy_hadamard)
+     with patch.object(latent_module, "_get_turbo_quant_op", return_value=_quantize_reference):
+         packed = store.compress(latent)
+     assert packed.shape == (rows, 1, 258)
+@@ -59,3 +62,46 @@ def test_transform_storage_is_reused():
+     pointers = (store.rotation.data_ptr(), store.centroids.data_ptr(), store.norm_lut.data_ptr())
+     store.forward(x)
+     assert pointers == (store.rotation.data_ptr(), store.centroids.data_ptr(), store.norm_lut.data_ptr())
++
++
++@pytest.mark.parametrize("legacy_hadamard", [False, True])
++def test_transform_sharing_and_inverse_layout(legacy_hadamard):
++    first, second = TurboQuantLatent(legacy_hadamard=legacy_hadamard), TurboQuantLatent(legacy_hadamard=legacy_hadamard)
++    for store in (first, second):
++        store._initialize(torch.device("cpu"))
++    for field in ("rotation", "centroids", "norm_lut"):
++        a, b = getattr(first, field), getattr(second, field)
++        torch.testing.assert_close(a, b, rtol=0, atol=0)
++        assert (a.data_ptr() == b.data_ptr()) == legacy_hadamard
++    if legacy_hadamard:
++        assert first.inverse_rotation is second.inverse_rotation
++        assert first.inverse_rotation.is_contiguous()
++        torch.testing.assert_close(first.inverse_rotation, first.rotation.T, rtol=0, atol=0)
++    else:
++        assert first.inverse_rotation is None
++
++
++@pytest.mark.parametrize("legacy_hadamard", [False, True], ids=["sfa_baseline", "dsv4_historical"])
++def test_rotation_and_packing_compatibility(legacy_hadamard):
++    store = TurboQuantLatent(legacy_hadamard=legacy_hadamard)
++    store._initialize(torch.device("cpu"))
++    h = np.ones((1, 1), dtype=np.float32)
++    while h.shape[0] < 512:
++        h = np.block([[h, h], [h, -h]])
++    rng = np.random.default_rng(0)
++    if legacy_hadamard:
++        rng.standard_normal(400_000)
++    signs = rng.choice([-1.0, 1.0], 512).astype(np.float32)
++    rotation = torch.tensor(signs[:, None] * h / 512**0.5)
++    torch.testing.assert_close(store.rotation, rotation, rtol=0, atol=0)
++    value = torch.randn(17, 1, 512)
++    raw = (value.float().reshape(-1, 512) @ rotation).contiguous()
++    packed, norm = _quantize_reference(raw, store.centroids)
++    scale = (norm.float() / store.norm_lut[packed.long()].sum(-1).sqrt()).half()
++    expected = torch.cat((packed, scale.view(torch.uint8).reshape(-1, 2)), dim=-1).unsqueeze(1)
++    with patch.object(latent_module, "_get_turbo_quant_op", return_value=_quantize_reference):
++        torch.testing.assert_close(store.compress(value), expected, rtol=0, atol=0)
++    inverse_rotation = rotation.T.contiguous() if legacy_hadamard else rotation.T
++    torch.testing.assert_close(
++        store.inverse(value), (value.flatten(0, 1) @ inverse_rotation).reshape_as(value), rtol=0, atol=0
++    )
+diff --git a/vllm_ascend/attention/dsa_v1.py b/vllm_ascend/attention/dsa_v1.py
+index d89a1946e..1b4b9b81b 100644
+--- a/vllm_ascend/attention/dsa_v1.py
++++ b/vllm_ascend/attention/dsa_v1.py
+@@ -22,6 +22,7 @@ from vllm_ascend.ascend_config import get_ascend_config
+ from vllm_ascend.ascend_forward_context import _EXTRA_CTX
+ from vllm_ascend.attention.attention_v1 import AscendAttentionState
+ from vllm_ascend.attention.dsa_attn_kv_plan import (
++    DsaAttnKvPlan,
+     get_dsa_attn_kv_plan,
+     is_a5_bf16_kv_enabled,
+     write_dsa_cache,
+@@ -1141,7 +1142,11 @@ class AscendDSAMetadataBuilder(AttentionMetadataBuilder[AscendDSAMetadata]):
+         dspark_swa_indices = None
+         vision_swa_indices = None
+         ori_win_left, ori_win_right = self.model_config.hf_config.sliding_window - 1, 0
+-        if not has_prefill and not common_attn_metadata.causal:
++        if (
++            not has_prefill
++            and not common_attn_metadata.causal
++            and (self.compressor_ratio <= 1 or not is_turboquant(self.vllm_config))
++        ):
+             # DSpark non-causal parallel drafting: every draft query attends to
+             # the trailing context window plus the whole current draft block.
+             # Not gated on the SAS metadata cache: the indices depend on the
+@@ -1575,6 +1580,16 @@ class AscendDSAImpl(AttentionImplBase[Any]):
+ 
+     _oproj_send_buf: torch.Tensor
+     turboquant: TurboQuantLatent | None = None
++    _tq_kv_plan: DsaAttnKvPlan | None = None
++
++    def get_kv_plan(self) -> DsaAttnKvPlan:
++        # Only TQ modules cache their fixed execution plan. Other cache modes
++        # retain the baseline planner and operator selection on every call.
++        if self.turboquant is None:
++            return get_dsa_attn_kv_plan(self.vllm_config, self.compress_ratio)
++        if self._tq_kv_plan is None:
++            self._tq_kv_plan = get_dsa_attn_kv_plan(self.vllm_config, self.compress_ratio)
++        return self._tq_kv_plan
+ 
+     def __init__(
+         self,
+@@ -1605,7 +1620,9 @@ class AscendDSAImpl(AttentionImplBase[Any]):
+         self.window_size = window_size
+         self.q_lora_rank = q_lora_rank
+         self.compress_ratio = compress_ratio
+-        self.turboquant = TurboQuantLatent() if is_turboquant(self.vllm_config) and compress_ratio == 4 else None
++        self.turboquant = (
++            TurboQuantLatent(legacy_hadamard=True) if is_turboquant(self.vllm_config) and compress_ratio == 4 else None
++        )
+         self.softmax_scale = self.head_dim**-0.5
+         self.support_fp8_attention = get_current_hardware_profile().supports(HardwareCapability.FP8_ATTENTION)
+ 
+@@ -2309,7 +2326,7 @@ class AscendDSAImpl(AttentionImplBase[Any]):
+ 
+         notify_kv_cache_written(layer_name)
+         wait_for_device_metadata(DeviceMetadataStage.ATTENTION, id(common_metadata.sas_metadata))
+-        kv_plan = get_dsa_attn_kv_plan(self.vllm_config, self.compress_ratio)
++        kv_plan = self.get_kv_plan()
+         attn_op = kv_plan.get_dsa_sparse_attn_op()
+         attn_kwargs = kv_plan.get_dsa_sparse_attn_base_kwargs()
+         if has_prefill:
+diff --git a/vllm_ascend/models/deepseek_v4/dspark.py b/vllm_ascend/models/deepseek_v4/dspark.py
+index 1b48c754e..c0d828bfa 100644
+--- a/vllm_ascend/models/deepseek_v4/dspark.py
++++ b/vllm_ascend/models/deepseek_v4/dspark.py
+@@ -213,7 +213,17 @@ class DeepseekV4DSparkModel(nn.Module):
+         while isinstance(swa_kv_cache, (list, tuple)) and len(swa_kv_cache) == 1:
+             swa_kv_cache = swa_kv_cache[0]
+ 
+-        from vllm_ascend.attention.dsa_attn_kv_plan import get_dsa_attn_kv_plan
++        from vllm_ascend.attention.dsa_attn_kv_plan import get_dsa_attn_kv_plan, write_dsa_cache
++
++        dsa_impl = attn.dsa_attn.dsa_attn.impl
++        turboquant = dsa_impl.turboquant
++        if turboquant is not None:
++            # Draft queries and context KV must use the same rotated basis.
++            shared_kv = turboquant.forward(shared_kv)
++            if slot_mapping.ndim == 1:
++                slot_mapping = dsa_impl.get_kv_plan().format_dsa_slot_mapping(slot_mapping, swa_cache_layer.block_size)
++            write_dsa_cache(swa_kv_cache, shared_kv, slot_mapping)
++            return
+ 
+         if slot_mapping.ndim == 1:
+             slot_mapping = get_dsa_attn_kv_plan(self.vllm_config).format_dsa_slot_mapping(
+diff --git a/vllm_ascend/ops/triton/docs/turboquant_finalize.md b/vllm_ascend/ops/triton/docs/turboquant_finalize.md
+new file mode 100644
+index 000000000..74f4aba91
+--- /dev/null
++++ b/vllm_ascend/ops/triton/docs/turboquant_finalize.md
+@@ -0,0 +1,78 @@
++# turboquant_finalize
++
++## Description
++
++- **Location**: `vllm_ascend/ops/triton/turboquant_finalize.py`.
++- **Function**: Fuse TurboQuant scale correction and compact cache-row packing. The CANN `cann_ops_nn.turbo_quant` operator produces packed 4-bit codes and the original vector norm. This kernel computes the corrected FP16 scale and appends its two bytes to the unchanged codes. It returns rows consumed by the DeepSeek V4 TurboQuant cache path; it does not quantize inputs, rotate vectors, compute attention, or scatter rows into the paged cache.
++- **Formula** (independently for each row `r`):
++
++  ```text
++  norm_lut[b] = centroids[b & 15]^2 + centroids[b >> 4]^2
++  selected_norm[r] = sqrt(sum(norm_lut[packed[r, j]], j=0..255))
++  scale[r] = fp16(fp32(norm[r]) / selected_norm[r])
++  bits[r] = bitcast_uint16(scale[r])
++  output[r, 0, 0:256] = packed[r, :]
++  output[r, 0, 256] = uint8(bits[r] & 255)
++  output[r, 0, 257] = uint8(bits[r] >> 8)
++  ```
++
++  The caller constructs `norm_lut` once from the same 16 centroids used for quantization. Each packed byte contains two codes: the low nibble selects the first centroid and the high nibble selects the second. Index conversion to int32 inside the kernel does not remap the codes.
++
++- **Algorithm flow** (processed row by row, independently):
++    1. Allocate a contiguous uint8 output of shape `[R, 1, 258]`. For `R=0`, return without launching a kernel.
++    2. Launch `min(R, get_vectorcore_num())` programs. Each program processes rows in a grid-stride loop, loading 256 packed bytes per row.
++    3. Look up the squared centroid norms, reduce in FP32, take the square root, and divide the original norm by the result.
++    4. Round the scale to FP16, bitcast it to uint16, and store its low and high bytes after the 256 unchanged code bytes.
++- **Supported modes**: Ascend NPU inference with Triton-Ascend, including eager execution and ACL graph capture/replay. Hardware validation for this change was on Atlas A3. Atlas A2 and 950PR&950DT validation is N/A; this document does not establish additional hardware support.
++
++## Parameters
++
++All three inputs are required. The Python entry point is `turboquant_finalize(packed, norm, norm_lut)`; `_finalize` is the private kernel.
++
++| Parameter | Input/Output/Attribute | Description | Data type | Data format |
++| --- | --- | --- | --- | --- |
++| `packed` | Input | Quantized codes for `R` vectors with head dimension 512, shape `[R, 256]` | uint8 | Contiguous ND |
++| `norm` | Input | Original vector norm from CANN TurboQuant, shape `[R]` | fp16 in the current caller and tests | Contiguous 1D |
++| `norm_lut` | Input | Squared-norm contribution for every packed byte, shape `[256]` | fp32 | Contiguous 1D |
++| Return value | Output | Codes followed by one FP16 scale per row, shape `[R, 1, 258]` | uint8 | Contiguous ND |
++| `rows` | Internal attribute | `R = packed.shape[0]`; excluded from value specialization | Integer, runtime scalar | Scalar |
++| `CODE_BYTES` | Internal attribute | `HEAD_DIM // 2` code bytes per row; currently 256 | Integer, constexpr | Scalar |
++| `ROW_BYTES` | Internal attribute | Shared cache constant `SLOT_BYTES`; currently 258. Scale bytes use `SCALE_LOW_OFFSET = CODE_BYTES` and `SCALE_HIGH_OFFSET = CODE_BYTES + 1` | Integer, constexpr | Scalar |
++
++## Constraints
++
++- All inputs must reside on the same NPU and satisfy the shapes, dtypes, and contiguous layouts above. The wrapper relies on its caller and does not validate these preconditions. Arbitrary strides and other head dimensions are not supported.
++- Every uint8 code value from 0 through 255 is a valid LUT index. The LUT must correspond to the quantizer's codebook and nibble order. The kernel does not retrain, reorder, or convert the codebook.
++- For finite corrected scales, `norm` must be finite and nonnegative, each row's LUT sum must be positive and finite, and the quotient must fit FP16. The fixed codebook used by the caller supplies positive squared-norm contributions. Zero original norms produce zero scales. No epsilon, clamping, or special NaN/Inf handling is added.
++- The output stores the FP16 bit pattern as low byte then high byte, matching the existing Ascend cache representation. Inputs are read-only; output is newly allocated. Paginated cache writes are handled separately by `write_dsa_cache` in `vllm_ascend/attention/dsa_attn_kv_plan.py`.
++- This path is selected for NPU tensors when `TurboQuantLatent(legacy_hadamard=True)` is used. The default SFA path retains its existing PyTorch postprocessing. Hadamard rotation itself is outside this kernel.
++- `rows` is not value-specialized, allowing different row counts to reuse the compiled kernel. This does not make a captured graph's shape dynamic: replay retains captured buffers, shapes, and launch arguments. Input values may be updated in the captured buffers before replay.
++- Forward inference only; autograd backward support is N/A.
++
++## Origin and Differences
++
++- **Origin**: Developed from the PyTorch postprocessing in `TurboQuantLatent.compress`, in `vllm_ascend/quantization/methods/kv_cache/turboquant/latent.py`. It is not a port of an upstream vLLM Triton operator.
++- **Differences**:
++    - Fuse index conversion, LUT lookup, reduction, square root, scale division, FP16 conversion, and concatenation into one kernel launch. Avoid materializing a full int64 index tensor and separate intermediate tensors.
++    - Preserve code bytes and the historical norm-correction formula. Reduction rounding may differ from separate PyTorch kernels; numerical tolerances are covered by the tests below.
++    - Bound the program count by the vector-core count and avoid specializing on prefill row counts.
++    - Keep the standard CANN TurboQuant and MixedQuantSparseFlashMla interfaces unchanged. Quantization and attention still execute through the standard operator packages; this kernel supplies framework-side postprocessing between them.
++
++Moving the same postprocessing into a separate CANN operator changes packaging and invocation but does not by itself remove its launch or intermediate reads. Fusing equivalent work inside a CANN producer could reduce those costs, but requires preserving the original public output semantics or defining an explicit compatible capability. The current `turbo_quant` norm output must not silently become a corrected scale for existing callers. CANN integration must preserve the codebook, rounding contract, and cache layout; a performance advantage requires measurement.
++
++## Test Cases
++
++The existing operator tests use the production width of 256 code bytes and a 258-byte output row. They cover:
++
++- `R=0, 1, 8, 257`, every possible packed byte, and zero/nonzero original norms. These deterministic cases compare the complete output with the PyTorch reference using `rtol=0, atol=0`.
++- ACL graph capture/replay for nonempty batches, changing norms in place before replay and comparing with eager output using `rtol=0, atol=0`.
++- Reuse of the compiled kernel when row counts change to `8, 17, 256, 257, 513` after warming up one row.
++- Random code bytes and finite norms for `R=1, 17, 513`: code bytes compare exactly; decoded FP16 scales compare with `rtol=0.001, atol=0` to account for reduction rounding.
++- CPU unit coverage for transform compatibility, packed layout, norm correction, and zero input rows. CPU tests do not execute the Triton kernel.
++
++The existing NPU suite is in the one-card PR directory. This documentation change does not relocate or add tests.
++
++```bash
++pytest -sv tests/e2e/pull_request/one_card/test_turboquant_finalize.py
++pytest -sv tests/ut/quantization/methods/kv_cache/turboquant/test_latent.py
++```
+diff --git a/vllm_ascend/ops/triton/turboquant_finalize.py b/vllm_ascend/ops/triton/turboquant_finalize.py
+new file mode 100644
+index 000000000..0a1780bdd
+--- /dev/null
++++ b/vllm_ascend/ops/triton/turboquant_finalize.py
+@@ -0,0 +1,40 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""Correct the TurboQuant scale and write compact cache rows in one launch."""
++
++import torch
++from vllm.triton_utils import tl, triton
++
++from vllm_ascend.ops.triton.triton_utils import get_vectorcore_num
++from vllm_ascend.quantization.methods.kv_cache.turboquant import HEAD_DIM, SLOT_BYTES
++
++# TurboQuant uses one byte per pair of 4-bit codes and stores one FP16 scale
++# after the code bytes. Reuse the cache layout constants for allocation and
++# pass the derived sizes as compile-time kernel arguments.
++CODE_BYTES = HEAD_DIM // 2
++
++
++# Prefill produces arbitrary row counts. Keep them out of the compilation key
++# so a new prompt length does not compile a kernel while decoding is active.
++@triton.jit(do_not_specialize=["rows"])
++def _finalize(packed, norm, norm_lut, output, rows, CODE_BYTES: tl.constexpr, ROW_BYTES: tl.constexpr):
++    SCALE_LOW_OFFSET: tl.constexpr = CODE_BYTES
++    SCALE_HIGH_OFFSET: tl.constexpr = SCALE_LOW_OFFSET + 1
++    columns = tl.arange(0, CODE_BYTES)
++    for row in range(tl.program_id(0), rows, tl.num_programs(0)):
++        codes = tl.load(packed + row * CODE_BYTES + columns)
++        squared_norm = tl.load(norm_lut + codes.to(tl.int32))
++        selected_norm = tl.sqrt(tl.sum(squared_norm, 0))
++        original_norm = tl.load(norm + row).to(tl.float32)
++        scale = (original_norm / selected_norm).to(tl.float16).to(tl.uint16, bitcast=True)
++        tl.store(output + row * ROW_BYTES + columns, codes)
++        tl.store(output + row * ROW_BYTES + SCALE_LOW_OFFSET, (scale & 255).to(tl.uint8))
++        tl.store(output + row * ROW_BYTES + SCALE_HIGH_OFFSET, (scale >> 8).to(tl.uint8))
++
++
++def turboquant_finalize(packed: torch.Tensor, norm: torch.Tensor, norm_lut: torch.Tensor) -> torch.Tensor:
++    rows = packed.shape[0]
++    output = torch.empty((rows, 1, SLOT_BYTES), dtype=torch.uint8, device=packed.device)
++    if rows:
++        _finalize[(min(rows, get_vectorcore_num()),)](packed, norm, norm_lut, output, rows, CODE_BYTES, SLOT_BYTES)
++    return output
+diff --git a/vllm_ascend/quantization/methods/kv_cache/turboquant/latent.py b/vllm_ascend/quantization/methods/kv_cache/turboquant/latent.py
+index 78177e04c..dd20db843 100644
+--- a/vllm_ascend/quantization/methods/kv_cache/turboquant/latent.py
++++ b/vllm_ascend/quantization/methods/kv_cache/turboquant/latent.py
+@@ -4,7 +4,7 @@
+ 
+ import math
+ from collections.abc import Callable
+-from functools import lru_cache
++from functools import cache, lru_cache
+ from importlib import import_module
+ 
+ import numpy as np
+@@ -12,6 +12,12 @@ import torch
+ 
+ from . import HEAD_DIM
+ 
++# The historical DeepSeek V4 Lloyd-Max codebook was trained from 400,000
++# standard-normal samples using the same seed-0 RNG as the Hadamard signs.
++# Consume exactly that many samples to preserve the rotation sequence with
++# the fixed codebook; this is a compatibility constant, not a tuning parameter.
++_LEGACY_LLOYD_MAX_SAMPLE_COUNT = 400_000
++
+ 
+ @lru_cache
+ def _get_turbo_quant_op() -> Callable:
+@@ -43,9 +49,16 @@ CENTROIDS = (
+ 
+ 
+ class TurboQuantLatent:
+-    """Own transform tensors per attention layer; initialize before graph capture."""
++    """Initialize before graph capture.
++
++    ``legacy_hadamard`` selects the historical post-Lloyd-Max rotation sequence
++    with shared transforms and fused NPU packing. The default retains the SFA
++    initialization and packing path.
++    """
+ 
+-    def __init__(self):
++    def __init__(self, *, legacy_hadamard: bool = False):
++        self._legacy_hadamard = legacy_hadamard
++        self.inverse_rotation: torch.Tensor | None = None
+         self.rotation: torch.Tensor | None = None
+         self.centroids: torch.Tensor | None = None
+         self.norm_lut: torch.Tensor | None = None
+@@ -55,10 +68,21 @@ class TurboQuantLatent:
+             if self.rotation.device != device:
+                 raise RuntimeError("TurboQuant transform cannot move devices after initialization")
+             return
++        if self._legacy_hadamard:
++            self.rotation, self.inverse_rotation, self.centroids, self.norm_lut = _get_legacy_transforms(device)
++            return
++        self._initialize_transforms(device)
++
++    def _initialize_transforms(self, device):
+         h = np.ones((1, 1), dtype=np.float32)
+         while h.shape[0] < HEAD_DIM:
+             h = np.block([[h, h], [h, -h]])
+-        signs = np.random.default_rng(0).choice([-1.0, 1.0], HEAD_DIM).astype(np.float32)
++        rng = np.random.default_rng(0)
++        if self._legacy_hadamard:
++            # Historical DSV4 code drew Lloyd-Max training samples before the
++            # signs. Preserve that sequence even though the codebook is fixed.
++            rng.standard_normal(_LEGACY_LLOYD_MAX_SAMPLE_COUNT)
++        signs = rng.choice([-1.0, 1.0], HEAD_DIM).astype(np.float32)
+         self.rotation = torch.tensor(signs[:, None] * h / math.sqrt(HEAD_DIM), device=device)
+         self.centroids = torch.tensor(CENTROIDS, dtype=torch.float32, device=device)
+         cent = np.asarray(CENTROIDS, dtype=np.float32)
+@@ -75,7 +99,9 @@ class TurboQuantLatent:
+         self._initialize(x.device)
+         rotation = self.rotation
+         assert rotation is not None
+-        return (x.float().reshape(-1, HEAD_DIM) @ rotation.T).to(x.dtype).reshape(x.shape)
++        inverse_rotation = self.inverse_rotation if self._legacy_hadamard else rotation.T
++        assert inverse_rotation is not None
++        return (x.float().reshape(-1, HEAD_DIM) @ inverse_rotation).to(x.dtype).reshape(x.shape)
+ 
+     def compress(self, x):
+         self._initialize(x.device)
+@@ -89,6 +115,22 @@ class TurboQuantLatent:
+         packed, norm = _get_turbo_quant_op()(rotated, centroids)
+         # ops-nn returns the original norm. MixedQuantSparseFlashMla multiplies
+         # centroids by scale directly; retain the old DS norm correction here.
++        if self._legacy_hadamard and packed.device.type == "npu":
++            from vllm_ascend.ops.triton.turboquant_finalize import turboquant_finalize
++
++            return turboquant_finalize(packed, norm, norm_lut)
+         selected_norm = norm_lut[packed.long()].sum(-1).sqrt()
+         scale = (norm.float() / selected_norm).to(torch.float16)
+         return torch.cat((packed, scale.view(torch.uint8).reshape(-1, 2)), dim=-1).unsqueeze(1)
++
++
++@cache
++def _get_legacy_transforms(device: torch.device) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
++    # Share read-only tensors across DSV4 layers, initialized before graph
++    # capture. SFA keeps its original per-layer initialization and math path.
++    store = TurboQuantLatent(legacy_hadamard=True)
++    store._initialize_transforms(device)
++    assert store.rotation is not None
++    assert store.centroids is not None
++    assert store.norm_lut is not None
++    return store.rotation, store.rotation.T.contiguous(), store.centroids, store.norm_lut

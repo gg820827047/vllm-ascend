@@ -1,0 +1,288 @@
+commit a650b067b11dd30cb44fb1ba89aaa447154892cc
+Author:     wuruiyun <86221670+wuruiyun@users.noreply.github.com>
+AuthorDate: Thu Oct 22 16:31:49 2026 +0800
+Commit:     GitHub <noreply@github.com>
+CommitDate: Thu Oct 22 16:31:49 2026 +0800
+
+    [Refactor][Worker] Drop the dead routed-experts (R3) plumbing after the AuxOutput migration (#17999)
+    
+    ### What this PR does / why we need it?
+    
+    vLLM moved routed-experts (R3 / routing replay) output to the
+    block-keyed **AuxOutput connector** (#45635)
+    and dropped the slot-indexed plumbing
+    (`ModelConfig.enable_return_routed_experts`,
+    `RoutedExpertsLists` / `RoutedExpertsTensors`,
+    `RoutedExpertsCapturer.get_routed_experts`,
+    `GPUModelRunner.init_routed_experts_capturer`).
+    
+    The Ascend migration itself already landed on main: the vendored
+    `GPUModelRunner.initialize_kv_cache`
+    (`patch/worker/patch_v2/patch_model_runner.py`) builds the connector
+    when
+    `aux_output_config.enabled` is set, and `_validate_aux_output_config`
+    rejects AuxOutput on the V1 runner.
+    
+    What is left is the pre-AuxOutput plumbing, which is now dead code on
+    vLLM main:
+    
+    - `worker/v2/model_runner.py` still drove the removed capturer from the
+    runner through
+    `getattr(self.model_config, "enable_return_routed_experts", False)`.
+    That field does not exist any more, so
+      the branch can never run; R3 is owned by the connector.
+    - `platform.py` still refused R3 on the V1 runner by reading the same
+    removed field, so the check could never
+    fire. Upstream and `_validate_aux_output_config` already reject that
+    combination (with a clearer message).
+    
+    This PR removes both, and the tests that stubbed those paths go away
+    with them (including the dead
+    validator's own parametrized test in `tests/ut/test_platform.py`).
+    
+    It also adds the one test the migration left behind: the vendored
+    initializer's AuxOutput wiring had no unit
+    test (the only case in that file disables it), so a new case asserts the
+    connector is built from the resolved
+    `kv_cache_config` and bound to the runner.
+    
+    Diff: 5 files, +39 / -42.
+    
+    ### Does this PR introduce _any_ user-facing change?
+    
+    No.
+    
+    ### How was this patch tested?
+    
+    Environment: Ascend 910, Qwen3-30B-A3B, `tensor_parallel_size=2` +
+    `enable_expert_parallel` (EP=1),
+    V2 model runner, `enforce_eager=True`; vLLM at the verified pin
+    `c4df37dfcc`
+    (`.github/vllm-main-verified.commit`, release line `v0.31.0`; 7 hits for
+    `aux_output_config`, 0 for
+    `RoutedExpertsLists`), vllm-ascend main `8a8e1e05e` + this PR.
+    
+    **1) Config level** (`EngineArgs(...).create_engine_config()`, no NPU):
+    
+    | `--enable-return-routed-experts` | model runner | result |
+    | --- | --- | --- |
+    | off | V1 | OK |
+    | off | V2 | OK |
+    | on | V1 | rejected: `enable_return_routed_experts (AuxOutput
+    Connector) is only supported by Model Runner V2 on Ascend.` |
+    | on | V2 | OK |
+    
+    **2) Unit tests**:
+    
+    ```bash
+    # the files touched by this PR
+    python -m pytest -q tests/ut/test_platform.py \
+        tests/ut/worker/test_model_runner_v2.py tests/ut/worker/test_model_runner_v2_kv_cache.py
+    # 281 passed, 2 skipped
+    
+    # the touched files plus the whole R3-related UT set
+    python -m pytest -q tests/ut/test_platform.py \
+        tests/ut/worker/test_model_runner_v2.py tests/ut/worker/test_model_runner_v2_kv_cache.py \
+        tests/ut/worker/test_model_runner_v1.py tests/ut/worker/test_model_runner_v1_nan_detection.py \
+        tests/ut/worker/test_routing_replay.py tests/ut/ops/test_routed_experts.py \
+        tests/ut/patch/worker/test_patch_routed_experts_capture.py
+    # 429 passed, 2 skipped
+    ```
+    
+    The new case runs on its own as well:
+    
+    `test_model_runner_v2_kv_cache.py::test_initialize_builds_aux_output_connector_when_enabled
+    PASSED`.
+    
+    **3) E2E** (`enable_return_routed_experts=True`, TP=2 + EP=1,
+    `max_model_len=1024`, `block_size=128`,
+    `gpu_memory_utilization=0.9`). Checks: R3 present and non-zero, row
+    count ==
+    `prompt_tokens + generated_tokens - 1`, identical R3 on a prefix-cache
+    hit (greedy), R3 for a chunked-prefill
+    request (401-token prompt), R3 for 4 concurrent requests, values in
+    range:
+    
+    | case | result |
+    | --- | --- |
+    | MRv2 + R3 **on** | **10/10** |
+    | MRv2 + R3 off | 4/4 |
+    | MRv1 + R3 off | 4/4 |
+    
+    
+    
+    - vLLM main: 0.30.1
+    
+    Signed-off-by: wuruiyun <1251540982@qq.com>
+
+diff --git a/tests/ut/test_platform.py b/tests/ut/test_platform.py
+index 7f5ffef15..e72cc9c6d 100644
+--- a/tests/ut/test_platform.py
++++ b/tests/ut/test_platform.py
+@@ -22,7 +22,6 @@ from vllm_ascend.platform import (
+     _validate_eplb_config,
+     _validate_parallel_config,
+     _validate_pcp_dcp_config,
+-    _validate_routing_replay_config,
+     _validate_sfa_dcp_kv_sp,
+ )
+ from vllm_ascend.utils import (
+@@ -301,22 +300,6 @@ def test_sfa_dcp_c8_hardware_validation(device_type, enable_sfa_c8):
+         _validate_parallel_config(config)
+ 
+ 
+-@pytest.mark.parametrize(
+-    "r3_requested,use_v2,expected_error",
+-    [(True, False, "only supported by the V2 model runner"), (True, True, None), (False, False, None)],
+-)
+-def test_routing_replay_requires_v2_model_runner(r3_requested, use_v2, expected_error):
+-    config = SimpleNamespace(
+-        model_config=SimpleNamespace(enable_return_routed_experts=r3_requested),
+-        use_v2_model_runner=use_v2,
+-    )
+-    if expected_error is None:
+-        _validate_routing_replay_config(config)
+-    else:
+-        with pytest.raises(ValueError, match=expected_error):
+-            _validate_routing_replay_config(config)
+-
+-
+ def test_visible_device_id_to_physical_device_id():
+     with (
+         patch("vllm_ascend.platform.bootstrap_custom_op_env"),
+@@ -338,7 +321,6 @@ class TestNPUPlatform(TestBase):
+         mock_vllm_config.model_config = MagicMock()
+         mock_vllm_config.model_config.is_hybrid = False
+         mock_vllm_config.model_config.is_encoder_decoder = False
+-        mock_vllm_config.model_config.enable_return_routed_experts = False
+         mock_vllm_config.device_config = MagicMock()
+         mock_vllm_config.device_config.device_type = "npu"
+         mock_vllm_config.parallel_config = MagicMock()
+diff --git a/tests/ut/worker/test_model_runner_v2.py b/tests/ut/worker/test_model_runner_v2.py
+index 56b2c1545..6fb25cb97 100644
+--- a/tests/ut/worker/test_model_runner_v2.py
++++ b/tests/ut/worker/test_model_runner_v2.py
+@@ -1278,8 +1278,7 @@ def test_initialize_kv_cache_installs_aclgraph_factory_and_pcp(a5, architecture)
+     runner.pcp_manager = MagicMock(spec=AscendPCPManager)
+     runner.model_state = SimpleNamespace(pcp_manager=None, kvpp_runtime=None)
+     runner.speculator = SimpleNamespace()
+-    runner.model_config = SimpleNamespace(enable_return_routed_experts=True, architecture=architecture)
+-    runner.init_routed_experts_capturer = MagicMock()
++    runner.model_config = SimpleNamespace(architecture=architecture)
+     kv_cache_config = KVCacheConfig(num_blocks=0, kv_cache_tensors=[], kv_cache_groups=[])
+     original = vllm_model_runner.ModelCudaGraphManager
+     seen = {}
+@@ -1331,7 +1330,6 @@ def test_initialize_kv_cache_installs_aclgraph_factory_and_pcp(a5, architecture)
+     assert runner.pcp_manager.vllm_config is runner.vllm_config
+     assert runner.model_state.pcp_manager is runner.pcp_manager
+     assert runner.speculator.pcp_manager is runner.pcp_manager
+-    runner.init_routed_experts_capturer.assert_called_once_with()
+ 
+ 
+ def test_initialize_kv_cache_forwards_allocation_context():
+@@ -1347,7 +1345,7 @@ def test_initialize_kv_cache_forwards_allocation_context():
+     runner.pcp_manager = None
+     runner.model_state = SimpleNamespace(pcp_manager=None, kvpp_runtime=None)
+     runner.speculator = None
+-    runner.model_config = SimpleNamespace(enable_return_routed_experts=False, architecture="OtherModel")
++    runner.model_config = SimpleNamespace(architecture="OtherModel")
+     called = False
+     captured_kwargs: dict[str, object] = {}
+     allocation_context = object()
+diff --git a/tests/ut/worker/test_model_runner_v2_kv_cache.py b/tests/ut/worker/test_model_runner_v2_kv_cache.py
+index c4e18afc2..373b3e24f 100644
+--- a/tests/ut/worker/test_model_runner_v2_kv_cache.py
++++ b/tests/ut/worker/test_model_runner_v2_kv_cache.py
+@@ -67,6 +67,43 @@ def test_initialize_preserves_connector_containers_and_flattens_runner_cache(is_
+         assert caches["other"] is other
+ 
+ 
++def test_initialize_builds_aux_output_connector_when_enabled():
++    """The vendored initializer keeps upstream's AuxOutput connector wiring."""
++    caches = {"attention": torch.empty(3, 4)}
++    runner = MagicMock()
++    runner.device = torch.device("cpu")
++    runner.is_encoder_decoder = False
++    runner.speculator = None
++    runner.vocab_size = 16
++    runner.max_model_len = 128
++    runner.cache_config.kv_sharing_fast_prefill = False
++    # Mirror of the case above: exercise the AuxOutput branch only.
++    runner.vllm_config.aux_output_config.enabled = True
++    runner.jit_warmup_registry.activate.side_effect = nullcontext
++    config = KVCacheConfig(num_blocks=3, kv_cache_tensors=[], kv_cache_groups=[])
++
++    with (
++        patch.object(upstream, "init_attn_backend", return_value=([], MagicMock(), [])),
++        patch.object(upstream, "maybe_create_adaptive_verification_manager", return_value=None),
++        patch.object(upstream, "BlockTables"),
++        patch.object(upstream.pcp, "maybe_build_pcp_manager", return_value=None),
++        patch.object(upstream, "maybe_build_ubatch_runner", return_value=None),
++        patch.object(upstream, "initialize_mamba_ssu_backend"),
++        patch.object(upstream, "has_compiled_submodule", return_value=False),
++        patch.object(upstream, "ModelCudaGraphManager"),
++        patch.object(upstream, "check_attention_cp_compatibility"),
++        patch.object(upstream, "init_kv_cache", return_value=caches),
++        patch.object(upstream, "get_kv_connector"),
++        patch.object(upstream, "get_aux_output_connector", return_value="aux") as get_aux,
++    ):
++        upstream.GPUModelRunner.initialize_kv_cache(runner, config, is_profiling=False)
++
++    # The initializer deep-copies the config, so assert against the resolved one
++    # (identity shortcut) instead of comparing the original object by value.
++    get_aux.assert_called_once_with(runner.model, runner.vllm_config, runner.kv_cache_config)
++    assert runner.aux_output_connector == "aux"
++
++
+ def test_mrv2_block_copy_preserves_segmented_mamba_storage():
+     storage = torch.arange(36, dtype=torch.float32)
+     conv = storage[:12].view(3, 4)
+diff --git a/vllm_ascend/platform.py b/vllm_ascend/platform.py
+index 7627dae12..9495ce5c4 100644
+--- a/vllm_ascend/platform.py
++++ b/vllm_ascend/platform.py
+@@ -514,7 +514,6 @@ class NPUPlatform(Platform):
+         _validate_model_runner_config(vllm_config)
+         cls._validate_indexer_pp_config(vllm_config)
+ 
+-        _validate_routing_replay_config(vllm_config)
+         _validate_pcp_dcp_config(vllm_config)
+         _validate_draft_decode_context_parallel_config(vllm_config)
+         _validate_parallel_config(vllm_config)
+@@ -1736,20 +1735,6 @@ def _validate_engram_config(vllm_config: VllmConfig) -> None:
+         raise ValueError("Ascend Engram requires indexed safetensors (auto/safetensors), or dummy weights.")
+ 
+ 
+-def _validate_routing_replay_config(vllm_config: VllmConfig) -> None:
+-    """Refuse routed-experts capture (R3) on the V1 model runner.
+-
+-    Its R3 data plane was removed here, so without this check the engine would
+-    start and silently return no ``routed_experts``.
+-    """
+-    r3_requested = getattr(vllm_config.model_config, "enable_return_routed_experts", False)
+-    if r3_requested and not vllm_config.use_v2_model_runner:
+-        raise ValueError(
+-            "routed-experts capture (--enable-return-routed-experts) is only supported by the "
+-            "V2 model runner; set VLLM_USE_V2_MODEL_RUNNER=1 or drop the flag."
+-        )
+-
+-
+ def _validate_parallel_config(vllm_config: VllmConfig) -> None:
+     parallel_config = vllm_config.parallel_config
+     if not vllm_config.use_v2_model_runner and parallel_config.prefill_context_parallel_size > 1:
+diff --git a/vllm_ascend/worker/v2/model_runner.py b/vllm_ascend/worker/v2/model_runner.py
+index 4b057334a..9c5bf360f 100644
+--- a/vllm_ascend/worker/v2/model_runner.py
++++ b/vllm_ascend/worker/v2/model_runner.py
+@@ -543,11 +543,6 @@ class NPUModelRunner(GPUModelRunner):
+             for group in groups
+         )
+ 
+-        # Legacy (pre-AuxOutput) R3 path; the getattr keeps MRv2 startable on a
+-        # vLLM lane where ModelConfig no longer exposes the flag.
+-        if getattr(self.model_config, "enable_return_routed_experts", False):
+-            self.init_routed_experts_capturer()
+-
+         self.kvpp = KVPPRuntime.create_from_kv_cache(
+             vllm_config=self.vllm_config,
+             kv_cache_config=self.kv_cache_config,

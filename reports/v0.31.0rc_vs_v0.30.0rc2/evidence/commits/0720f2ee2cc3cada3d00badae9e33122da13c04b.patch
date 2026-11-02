@@ -1,0 +1,720 @@
+commit 0720f2ee2cc3cada3d00badae9e33122da13c04b
+Author:     gq-bao <gavin.gq.bao@gmail.com>
+AuthorDate: Fri Oct 16 17:45:11 2026 +0800
+Commit:     GitHub <noreply@github.com>
+CommitDate: Fri Oct 16 17:45:11 2026 +0800
+
+    [Performance][KVPool] Reduce AscendStore lookup and save overhead (#18907)
+    
+    ### What this PR does / why we need it?
+    
+    Main-branch counterpart of #18837. Long-input AscendStore lookup and
+    non-layerwise save repeatedly expand local HBM hits, walk excluded
+    chunks, and recompute identical reachability masks.
+    
+    - Mark complete HBM-prefix hashes lazily instead of building local-hit
+    sets for every group. Keep the existing managers' terminal-hash
+    selection and complete-block boundaries.
+    - Start chunk iteration at the first eligible, addressable block and use
+    `itertools.compress` to select mask-allowed chunks. Preserve short-mask
+    bounds, physical block mapping, NULL filtering, and sharding over
+    eligible candidates.
+    - Pass store masks directly to the shared iterator, removing the extra
+    mask copy, rewrite, and `any()` scan. Keep loaded-range and durable-save
+    filtering, including rechecking align-state slots that become valid
+    later.
+    - Reuse reachable masks with a per-coordinator `lru_cache(maxsize=32)`,
+    keyed by aligned length, retention interval, and prompt length. Return
+    copies to isolate callers.
+    
+    ### Does this PR introduce _any_ user-facing change?
+    
+    No API, configuration, cache-key format, or model-computation changes.
+    
+    ### How was this patch tested?
+    
+    Ascend A3 hosts 119/120, 32 NPUs: P DP4 x TP4 and D DP16 x TP1;
+    concurrency 49; the same 196 captured chat inputs after four prefix
+    warmups; one output token. Requests use the PD proxy inside the serving
+    container, with the same working communication configuration in all
+    three cases.
+    
+    | Configuration | Input token/s | Prefill metric token/s | Input loss vs
+    HBM | Prefill loss vs HBM |
+    | --- | ---: | ---: | ---: | ---: |
+    | HBM reference | 249359.16 | 5777.35 | 0.00% | 0.00% |
+    | Installed baseline + pool | 208662.01 | 4810.14 | 16.32% | 16.74% |
+    | Optimized compatibility port + pool | 242531.18 | 5634.96 | 2.74% |
+    2.46% |
+    
+    The optimized port improves input throughput by **16.23%** and the
+    Prefill metric by **17.15%** over the installed pool baseline. Input
+    throughput is input tokens / formal wall-clock span; the Prefill metric
+    is input tokens / summed end-to-end TTFT.
+    
+    These measurements use a compatibility port on the installed v0.30
+    runtime, with one formal replay per configuration; they are not a direct
+    benchmark of this main-branch head. Each case completes 196/196 requests
+    and 200 native PD copies with zero transfer failures. P-side external
+    hits are zero, so this comparison measures overhead under local prefix
+    reuse. State-cache warm/cold output consistency remains unresolved in
+    both the installed baseline and optimized port; full-vocabulary logits
+    were not compared.
+    
+    - vLLM main:
+    https://github.com/vllm-project/vllm/commit/c4df37dfcc7f72ca41cd43801a468526ecf99a2b
+    
+    ---------
+    
+    Signed-off-by: bowgneo <gavin.gq.bao@gmail.com>
+    Co-authored-by: zouyida2052 <zouyida2002@gmail.com>
+
+diff --git a/tests/ut/distributed/ascend_store/_mock_deps.py b/tests/ut/distributed/ascend_store/_mock_deps.py
+index 4fa72ed31..5148e5328 100644
+--- a/tests/ut/distributed/ascend_store/_mock_deps.py
++++ b/tests/ut/distributed/ascend_store/_mock_deps.py
+@@ -47,6 +47,8 @@ if "torch" not in sys.modules and importlib.util.find_spec("torch") is None:
+     _torch.int8 = "int8"  # type: ignore[attr-defined]
+     _torch.dtype = str  # type: ignore[attr-defined]
+     _torch.zeros = MagicMock(return_value=MagicMock())  # type: ignore[attr-defined]
++    _torch.empty = MagicMock()  # type: ignore[attr-defined]
++    _torch.uint8 = "uint8"  # type: ignore[attr-defined]
+     _torch.sum = MagicMock(return_value=0)  # type: ignore[attr-defined]
+     _torch.device = MagicMock()  # type: ignore[attr-defined]
+     _torch.distributed = MagicMock()  # type: ignore[attr-defined]
+@@ -87,8 +89,13 @@ _vllm_mock_modules = [
+     "vllm.logger",
+     "vllm.model_executor",
+     "vllm.model_executor.layers",
++    "vllm.model_executor.layers.attention",
++    "vllm.model_executor.layers.attention_layer_base",
+     "vllm.model_executor.layers.linear",
+     "vllm.model_executor.layers.quantization",
++    "vllm.model_executor.models",
++    "vllm.model_executor.models.extract_hidden_states",
++    "vllm.model_executor.models.utils",
+     "vllm.platforms",
+     "vllm.platforms.interface",
+     "vllm.utils",
+@@ -123,6 +130,11 @@ if _MOCK_VLLM_DEPS:
+ if _MOCK_VLLM_DEPS:
+     sys.modules["vllm.utils.math_utils"].cdiv = lambda a, b: -(-a // b)  # type: ignore[attr-defined]
+     sys.modules["vllm.logger"].logger = logging.getLogger("vllm")  # type: ignore[attr-defined]
++    sys.modules["vllm.utils.torch_utils"].get_dtype_size = lambda dtype: {  # type: ignore[attr-defined]
++        "int8": 1,
++        "float16": 2,
++        "float32": 4,
++    }[dtype]
+ 
+ _base_mod: Any = (
+     sys.modules["vllm.distributed.kv_transfer.kv_connector.v1.base"] if _MOCK_VLLM_DEPS else types.SimpleNamespace()
+@@ -336,6 +348,9 @@ class _FakeSingleTypeKVCacheManager:
+         pcp_world_size=1,
+     ):
+         computed: tuple[list[object], ...] = tuple([] for _ in kv_cache_group_ids)
++        scale = kv_cache_spec.block_size // block_pool.hash_block_size
++        if scale > 1:
++            block_hashes = [block_hashes[i] for i in range(scale - 1, len(block_hashes), scale)]
+         max_blocks = max_length // kv_cache_spec.block_size
+         for block_hash in list(block_hashes)[:max_blocks]:
+             cached = block_pool.get_cached_block(block_hash, kv_cache_group_ids)
+diff --git a/tests/ut/distributed/ascend_store/test_coordinator.py b/tests/ut/distributed/ascend_store/test_coordinator.py
+index 3480fc4bf..bedbac3ea 100644
+--- a/tests/ut/distributed/ascend_store/test_coordinator.py
++++ b/tests/ut/distributed/ascend_store/test_coordinator.py
+@@ -19,6 +19,7 @@ import inspect
+ import unittest
+ from dataclasses import dataclass, replace
+ from unittest.mock import patch
++from weakref import ref
+ 
+ # isort: off
+ import tests.ut.distributed.ascend_store._mock_deps  # noqa: F401, E402
+@@ -196,6 +197,12 @@ class TestAscendStoreCoordinator(unittest.TestCase):
+         )
+ 
+         self.assertEqual(hit_length, 0)
++        for local, expected in ((16383, 0), (16384, 16384)):
++            with self.subTest(local=local):
++                self.assertEqual(
++                    coord.find_reachable_hit_tokens(block_hashes, 16384, lambda *args: [], hbm_hit_tokens=local),
++                    expected,
++                )
+ 
+     def test_store_mask_uses_manager_reachability(self):
+         coord = AscendStoreCoordinator(
+@@ -345,6 +352,35 @@ class TestAscendStoreCoordinator(unittest.TestCase):
+         self.assertEqual(calls, [True, True])
+         self.assertEqual(masks, ([True, False, True, False], [True, False, True, False]))
+ 
++    def test_reachable_mask_cache_preserves_inputs_and_caller_isolation(self):
++        coord = AscendStoreCoordinator(
++            [KVCacheGroupSpec(["layer.0"], _sliding_spec(16, 32))],
++            scheduler_block_size=16,
++            hash_block_size=16,
++            group_block_sizes=[16],
++            group_cache_families=["c1"],
++        )
++        with patch(
++            "vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.coordinator._reachable_block_mask",
++            side_effect=lambda *args, **kwargs: [True] + [False] * (kwargs["end_block"] - 1),
++        ) as build_mask:
++            coord.store_mask(32, 33)[0][0] = False
++            self.assertEqual(coord.store_mask(32, 33), ([True, False],))
++            coord.lookup_mask(32)[0][0] = False
++            self.assertEqual(coord.lookup_mask(32), ([True, False],))
++            self.assertEqual(build_mask.call_count, 2)
++            coord.retention_interval = 64
++            coord.store_mask(32, 33)
++            coord.store_mask(48, 33)
++            coord.store_mask(32, 65)
++            self.assertEqual(build_mask.call_count, 5)
++
++        cached_masks = coord._cached_reachable_masks
++        coord_ref = ref(coord)
++        del coord
++        self.assertIsNone(coord_ref())
++        self.assertGreater(cached_masks.cache_info().currsize, 0)
++
+     def test_compressed_masks_use_full_attention_reachability(self):
+         coord = AscendStoreCoordinator(
+             [KVCacheGroupSpec(["layer.0"], _full_spec(block_size=512))],
+diff --git a/tests/ut/distributed/ascend_store/test_kv_transfer.py b/tests/ut/distributed/ascend_store/test_kv_transfer.py
+index 143fba890..403e4ac2c 100644
+--- a/tests/ut/distributed/ascend_store/test_kv_transfer.py
++++ b/tests/ut/distributed/ascend_store/test_kv_transfer.py
+@@ -553,6 +553,32 @@ class TestKVCacheStoreSendingThread(unittest.TestCase):
+         )
+         return t, store
+ 
++    def test_save_keeps_checks_for_align_state_slots(self):
++        thread, store = self._make_thread()
++        thread.group_uses_align_state = [True]
++        store.exists = MagicMock(
++            side_effect=lambda keys: [int(any(key in call[0] for call in store.put_calls)) for key in keys]
++        )
++        for token_len, saved_tokens, block_ids in ((32, 0, [0, 2]), (48, 32, [1, 2, 3])):
++            request = ReqMeta(
++                req_id="r1",
++                token_len_chunk=token_len,
++                save_start_token=saved_tokens,
++                block_ids=block_ids,
++                block_hashes=["h0", "h1", "h2"][: token_len // 16],
++                skip_null_blocks_by_group=[True],
++            )
++            thread.add_stored_request(request)
++            thread.request_queue.put(request)
++            thread._handle_request(request)
++
++            self.assertEqual(thread.get_saved_offset("r1"), token_len)
++
++        self.assertEqual(
++            [[key.rsplit("@", 1)[1] for key in call[0]] for call in store.put_calls],
++            [["h1"], ["h0", "h2"]],
++        )
++
+     def test_write_shards_cover_filtered_blocks_once(self):
+         hashes = [f"h{i}" for i in range(8)]
+         for pcp_size in (1, 2, 4):
+@@ -1039,8 +1065,12 @@ class TestKVCacheStoreSendingThread(unittest.TestCase):
+         self.assertEqual(len(store.put_calls), 1)
+ 
+     def test_handle_request_applies_store_mask(self):
++        class StoreMask(list):
++            def __iter__(self):
++                raise AssertionError("The complete historical mask must not be scanned")
++
+         store = FakeStore([0, 0])
+-        db = MaskedFakeTokenDatabase(masks=([True, False],))
++        db = MaskedFakeTokenDatabase(masks=(StoreMask([True, True, False]),))
+         t = KVCacheStoreSendingThread(
+             m_store=store,
+             token_database=db,
+@@ -1054,16 +1084,19 @@ class TestKVCacheStoreSendingThread(unittest.TestCase):
+         )
+         req = ReqMeta(
+             req_id="r1",
+-            token_len_chunk=32,
+-            block_ids=[0, 1],
+-            block_hashes=[b"h0", b"h1"],  # type: ignore[arg-type]
++            token_len_chunk=48,
++            save_start_token=32,
++            block_ids=[1, 2, 3],
++            block_hashes=["h0", "h1", "h2"],
+             current_event=None,
+         )
+         t.add_stored_request(req)
++        t._saved_offsets["r1"] = 16
+         t.request_queue.put(req)
+         t._handle_request(req)
+         keys, _, _ = store.put_calls[0]
+-        self.assertEqual(len(keys), 1)
++        self.assertEqual([key.rsplit("@", 1)[1] for key in keys], ["h1"])
++        self.assertEqual(db.masks[0], [True, True, False])
+ 
+     def test_handle_request_skips_compressed_hit_in_raw_token_domain(self):
+         t, store = self._make_thread([0, 0], block_size=64)
+diff --git a/tests/ut/distributed/ascend_store/test_metadata.py b/tests/ut/distributed/ascend_store/test_metadata.py
+index f2e9a3e87..c3d5d2678 100644
+--- a/tests/ut/distributed/ascend_store/test_metadata.py
++++ b/tests/ut/distributed/ascend_store/test_metadata.py
+@@ -18,6 +18,7 @@
+ import unittest
+ from dataclasses import replace
+ from types import SimpleNamespace
++from unittest.mock import MagicMock
+ 
+ import tests.ut.distributed.ascend_store._mock_deps  # noqa: F401, E402
+ from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.metadata import (
+@@ -218,12 +219,14 @@ class TestChunkedTokenDatabase(unittest.TestCase):
+     def test_process_tokens_with_tail_clipped_block_ids_maps_tail_chunks(self):
+         db = ChunkedTokenDatabase([self.meta], block_size=[128], partitions=None)
+         hashes = [bytes([idx % 251]) * 32 for idx in range(128)]
++        predicate = MagicMock(return_value=True)
+ 
+         result = list(
+             db.process_token_key_strings_with_block_ids(
+                 128 * 128,
+                 hashes,
+                 [1000, 1001, 1002, 1003],
++                chunk_filter=predicate,
+             )
+         )
+ 
+@@ -235,6 +238,7 @@ class TestChunkedTokenDatabase(unittest.TestCase):
+             [block_id for _, _, _, _, block_id in result],
+             [1000, 1001, 1002, 1003],
+         )
++        self.assertEqual(predicate.call_count, 4)
+ 
+     def test_process_tokens_token_len_shorter_than_all_blocks(self):
+         hashes = ["a", "b", "c", "d"]
+@@ -296,17 +300,26 @@ class TestChunkedTokenDatabase(unittest.TestCase):
+     def test_key_strings_pre_shard_after_filtering(self):
+         hashes = ["a", "b", "c", "d"]
+         store_mask = [True, False, True, True]
++        predicate = MagicMock(return_value=True)
+         result = list(
+             self.db.process_token_key_strings_with_block_ids(
+                 64,
+                 hashes,
+                 [10, 11, 12, 13],
+-                chunk_filter=lambda start: store_mask[start // 16],
++                chunk_mask=store_mask,
++                chunk_filter=predicate,
+                 shard_rank=1,
+                 shard_size=2,
+             )
+         )
+         self.assertEqual([(start, end, block_id) for start, end, _, _, block_id in result], [(32, 48, 12)])
++        self.assertEqual(predicate.call_count, 3)
++
++    def test_lookup_mask_start_and_short_mask_bounds(self):
++        for mask, expected in ((None, [32, 48]), ([], []), ([True, True, True], [32])):
++            with self.subTest(mask=mask):
++                result = list(self.db.process_token_key_strings(64, ["a", "b", "c", "d"], mask_num=17, chunk_mask=mask))
++                self.assertEqual([item[0] for item in result], expected)
+ 
+     def test_compressed_keys_use_logical_spans_and_values_use_physical_rows(self):
+         db = ChunkedTokenDatabase(
+diff --git a/tests/ut/distributed/ascend_store/test_pool_worker.py b/tests/ut/distributed/ascend_store/test_pool_worker.py
+index df687389e..c06f16395 100644
+--- a/tests/ut/distributed/ascend_store/test_pool_worker.py
++++ b/tests/ut/distributed/ascend_store/test_pool_worker.py
+@@ -737,11 +737,11 @@ class TestKVPoolWorkerHelpers(unittest.TestCase):
+         worker.m_store = MagicMock()
+         worker.token_database = MagicMock()
+ 
+-        def process_token_key_strings(token_len, block_hashes, mask_num, kv_cache_group_id, chunk_filter):
++        def process_token_key_strings(token_len, block_hashes, mask_num, kv_cache_group_id, chunk_mask):
+             return [
+                 (start, start + 128, f"key{start // 128}", f"h{start // 128}".encode())
+                 for start in range(mask_num, token_len, 128)
+-                if chunk_filter(start)
++                if chunk_mask is None or (start // 128 < len(chunk_mask) and chunk_mask[start // 128])
+             ]
+ 
+         worker.token_database.process_token_key_strings.side_effect = process_token_key_strings
+@@ -774,7 +774,7 @@ class TestKVPoolWorkerHelpers(unittest.TestCase):
+         store_mask.assert_not_called()
+         worker.token_database.process_tokens.assert_not_called()
+ 
+-    def test_external_coordinator_lookup_preseeds_hbm_hits(self):
++    def test_external_coordinator_lookup_preserves_hbm_hits(self):
+         cls = self._make_worker_class()
+         worker = self._make_lookup_worker(cls, self._make_sparse_swa_coordinator())
+         worker.m_store.exists.return_value = [1]
+@@ -792,7 +792,7 @@ class TestKVPoolWorkerHelpers(unittest.TestCase):
+                 hbm_hit_tokens=128,
+             )
+ 
+-        # The locally computed block is preseeded and never queried; only the
++        # The locally computed block is recognized without a query; only the
+         # tail block beyond the HBM hit goes to the pool.
+         self.assertEqual(hit, 256)
+         worker.m_store.exists.assert_called_once_with(["key1"])
+diff --git a/vllm_ascend/distributed/kv_transfer/kv_pool/ascend_store/coordinator.py b/vllm_ascend/distributed/kv_transfer/kv_pool/ascend_store/coordinator.py
+index f23a30c12..ebc44de50 100644
+--- a/vllm_ascend/distributed/kv_transfer/kv_pool/ascend_store/coordinator.py
++++ b/vllm_ascend/distributed/kv_transfer/kv_pool/ascend_store/coordinator.py
+@@ -3,8 +3,10 @@ from __future__ import annotations
+ import inspect
+ from collections.abc import Callable, Iterable, Sequence
+ from dataclasses import replace
++from functools import lru_cache, partial
+ from importlib import import_module
+ from typing import Any, cast
++from weakref import proxy
+ 
+ from vllm.logger import logger
+ from vllm.utils.math_utils import cdiv
+@@ -26,6 +28,7 @@ from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.metadata import (
+ 
+ _CACHE_MISSING = object()
+ _MANAGER_CLASS_CACHE_ATTR = "_manager_class_cache"
++_REACHABLE_MASK_CACHE_SIZE = 32
+ 
+ # kwargs every reachable_block_mask implementation must accept. Used when the
+ # manager's signature cannot be introspected.
+@@ -40,6 +43,38 @@ _REACHABLE_MASK_KWARGS_CACHE: dict[type[SingleTypeKVCacheManager], frozenset[str
+ GroupHitQuery = Callable[[int, Sequence[BlockHash | str], Sequence[bool] | None], Iterable[BlockHash | str]]
+ 
+ 
++class _HBMBlockHash(bytes):
++    """A hash whose complete hash block is already computed locally."""
++
++
++class _HBMPrefixBlockHashes(Sequence[BlockHash]):
++    """Mark local hashes on access, without expanding per-group hit sets.
++
++    Managers select each group's terminal hash without copying it. That hash
++    is local exactly when the complete group block ends within the HBM prefix;
++    an interior hash cannot make a larger, partially local block hit.
++    """
++
++    def __init__(self, block_hashes: Sequence[BlockHash], num_hbm_hashes: int) -> None:
++        self._block_hashes = block_hashes
++        self._num_hbm_hashes = num_hbm_hashes
++
++    def __len__(self) -> int:
++        return len(self._block_hashes)
++
++    def __getitem__(self, index):
++        if isinstance(index, slice):
++            return [self[i] for i in range(*index.indices(len(self)))]
++        if index < 0:
++            index += len(self)
++        if not 0 <= index < len(self):
++            raise IndexError(index)
++        block_hash = self._block_hashes[index]
++        if index < self._num_hbm_hashes:
++            return cast(BlockHash, _HBMBlockHash(block_hash_to_bytes(block_hash)))
++        return block_hash
++
++
+ class ExternalCachedBlockPool:
+     """Duck-typed BlockPool backed by external AscendStore key existence."""
+ 
+@@ -60,7 +95,7 @@ class ExternalCachedBlockPool:
+         block_hash: BlockHash,
+         group_ids: list[int],
+     ) -> list[KVCacheBlock] | None:
+-        if self._exists is None:
++        if self._exists is None or isinstance(block_hash, _HBMBlockHash):
+             return [self._present_block] * len(group_ids)
+         h = block_hash_to_bytes(block_hash)
+         if all((group_id, h) in self._exists for group_id in group_ids):
+@@ -113,6 +148,10 @@ class AscendStoreCoordinator:
+             self.eagle_group_ids = set(range(len(kv_cache_groups)))
+ 
+         self._verify_and_split_kv_cache_groups()
++        # Do not keep the coordinator alive through its cache while GC is frozen.
++        self._cached_reachable_masks = lru_cache(maxsize=_REACHABLE_MASK_CACHE_SIZE)(
++            partial(type(self)._reachable_masks, proxy(self))
++        )
+ 
+     def _verify_and_split_kv_cache_groups(self) -> None:
+         attention_groups: list[tuple[KVCacheSpec, list[int], type[SingleTypeKVCacheManager]]] = []
+@@ -151,7 +190,7 @@ class AscendStoreCoordinator:
+ 
+     def find_longest_cache_hit(
+         self,
+-        block_hashes: list[BlockHash],
++        block_hashes: Sequence[BlockHash],
+         max_length: int,
+         cached_block_pool: ExternalCachedBlockPool,
+         *,
+@@ -225,8 +264,8 @@ class AscendStoreCoordinator:
+         aligned_token_len: int,
+         num_prompt_tokens: int | None = None,
+     ) -> tuple[list[bool], ...]:
+-        masks = self._reachable_masks(aligned_token_len, self.retention_interval, num_prompt_tokens)
+-        return tuple([True] * num_chunks if mask is None else mask for num_chunks, mask in masks)
++        masks = self._cached_reachable_masks(aligned_token_len, self.retention_interval, num_prompt_tokens)
++        return tuple([True] * num_chunks if mask is None else mask.copy() for num_chunks, mask in masks)
+ 
+     def lookup_mask(
+         self,
+@@ -234,11 +273,11 @@ class AscendStoreCoordinator:
+     ) -> tuple[list[bool] | None, ...]:
+         # Probe candidate replay boundaries as well as segment boundaries;
+         # find_longest_cache_hit still requires all necessary states to exist.
+-        masks = self._reachable_masks(aligned_token_len, self.retention_interval, None)
++        masks = self._cached_reachable_masks(aligned_token_len, self.retention_interval, None)
+         for num_chunks, mask in masks:
+             if mask is not None:
+                 assert len(mask) == num_chunks
+-        return tuple(None if mask is None or all(mask) else mask for _, mask in masks)
++        return tuple(None if mask is None or all(mask) else mask.copy() for _, mask in masks)
+ 
+     def find_reachable_hit_tokens(
+         self,
+@@ -247,6 +286,7 @@ class AscendStoreCoordinator:
+         query_group_hits: GroupHitQuery,
+         *,
+         log_context: str = "reachable_lookup",
++        hbm_hit_tokens: int = 0,
+     ) -> int:
+         """Reachability-aware external hit lookup shared by both transfer paths.
+ 
+@@ -260,7 +300,9 @@ class AscendStoreCoordinator:
+         ``query_group_hits(group_id, group_block_hashes, lookup_mask)`` must
+         return the subset of ``group_block_hashes`` present in the pool for
+         that group, using whichever key layout and query backend the caller
+-        owns.
++        owns. When ``hbm_hit_tokens`` is provided, the callback only returns
++        external hits; locally computed complete blocks are marked lazily for
++        the existing managers, including each group's terminal-hash selection.
+         """
+         aligned_len = cdiv(token_len, self.lcm_block_size) * self.lcm_block_size
+         lookup_masks = self.lookup_mask(aligned_len)
+@@ -273,11 +315,15 @@ class AscendStoreCoordinator:
+             hits = query_group_hits(group_id, group_block_hashes, lookup_masks[group_id])
+             exists.update((group_id, block_hash_to_bytes(hit)) for hit in hits)
+ 
+-        if not exists:
++        if not exists and hbm_hit_tokens <= 0:
+             logger.debug("%s: token_len=%d no pooled blocks found", log_context, token_len)
+             return 0
++        hit_hashes: Sequence[BlockHash] = block_hashes
++        if hbm_hit_tokens > 0:
++            num_hbm_hashes = min(hbm_hit_tokens // self.hash_block_size, token_len // self.hash_block_size)
++            hit_hashes = _HBMPrefixBlockHashes(block_hashes, num_hbm_hashes)
+         _, hit_length = self.find_longest_cache_hit(
+-            block_hashes,
++            hit_hashes,
+             token_len,
+             ExternalCachedBlockPool(self.hash_block_size, exists),
+             apply_eagle=False,
+@@ -285,12 +331,14 @@ class AscendStoreCoordinator:
+         logger.debug("%s: token_len=%d hit_tokens=%d", log_context, token_len, hit_length)
+         return hit_length
+ 
+-    def block_hashes_for_spec(self, block_hashes: list[BlockHash], spec: KVCacheSpec) -> BlockHashList:
+-        return block_hashes
++    def block_hashes_for_spec(self, block_hashes: Sequence[BlockHash], spec: KVCacheSpec) -> BlockHashList:
++        # Managers accept lazy sequences and preserve their terminal hashes
++        # when resolving each group's block-size view.
++        return cast(BlockHashList, block_hashes)
+ 
+     def _find_hit_blocks(
+         self,
+-        block_hashes: list[BlockHash],
++        block_hashes: Sequence[BlockHash],
+         max_length: int,
+         cached_block_pool: ExternalCachedBlockPool,
+         *,
+diff --git a/vllm_ascend/distributed/kv_transfer/kv_pool/ascend_store/kv_transfer.py b/vllm_ascend/distributed/kv_transfer/kv_pool/ascend_store/kv_transfer.py
+index adf9769e3..e22c44c0f 100644
+--- a/vllm_ascend/distributed/kv_transfer/kv_pool/ascend_store/kv_transfer.py
++++ b/vllm_ascend/distributed/kv_transfer/kv_pool/ascend_store/kv_transfer.py
+@@ -1238,13 +1238,13 @@ class KVCacheStoreSendingThread(KVTransferThread):
+         )
+         save_start_token = self.get_saved_offset(req_id)
+ 
+-        def should_skip(start: int, end: int) -> bool:
++        def should_skip(start: int, end: int, group_save_start: int) -> bool:
+             # This is the worker's durable high-water mark and intentionally
+             # may lag ReqMeta.save_start_token. In Decode-only mode the first
+             # job therefore checks the complete prefix and can restore missing
+             # ancestors of the new Decode block. After a successful store it
+             # advances, avoiding a full-prefix lookup on later boundaries.
+-            if end <= save_start_token:
++            if end <= group_save_start:
+                 return True
+             return skip_end > skip_start and start >= skip_start and end <= skip_end
+ 
+@@ -1252,24 +1252,10 @@ class KVCacheStoreSendingThread(KVTransferThread):
+             group_block_size = self._get_block_size(group_id)
+ 
+             group_store_mask = (
+-                list(store_masks[group_id]) if store_masks is not None and group_id < len(store_masks) else None
++                store_masks[group_id] if store_masks is not None and group_id < len(store_masks) else None
+             )
+-            if group_store_mask is not None:
+-                skipped_chunks = 0
+-                for chunk_id, allowed in enumerate(group_store_mask):
+-                    start = chunk_id * group_block_size
+-                    if allowed and should_skip(start, start + group_block_size):
+-                        group_store_mask[chunk_id] = False
+-                        skipped_chunks += 1
+-                if skipped_chunks:
+-                    logger.debug(
+-                        "KV pool put skipped %d pooled chunks for request %s group %d",
+-                        skipped_chunks,
+-                        req_id,
+-                        group_id,
+-                    )
+-                if not group_store_mask or not any(group_store_mask):
+-                    continue
++            if group_store_mask is not None and not group_store_mask:
++                continue
+ 
+             starts: list[int] = []
+             ends: list[int] = []
+@@ -1279,18 +1265,15 @@ class KVCacheStoreSendingThread(KVTransferThread):
+             block_ids = req_meta.block_ids_by_group[group_id]
+             skip_null_blocks = self._skip_null_blocks(req_meta, group_id)
+             align_state_group = group_id < len(self.group_uses_align_state) and self.group_uses_align_state[group_id]
++            # Align-state slots below the saved extent can become valid later.
++            save_start = 0 if align_state_group else save_start_token
+ 
+             def chunk_filter(
+                 start: int,
+                 group_block_size=group_block_size,
+-                group_store_mask=group_store_mask,
++                save_start=save_start,
+             ) -> bool:
+-                block_idx = start // group_block_size
+-                mask_allows = group_store_mask is None or (
+-                    block_idx < len(group_store_mask) and group_store_mask[block_idx]
+-                )
+-                chunk_start = block_idx * group_block_size
+-                return mask_allows and not should_skip(chunk_start, chunk_start + group_block_size)
++                return not should_skip(start, start + group_block_size, save_start)
+ 
+             tp_replicas = self.put_step if self.dcp_size <= 1 and not align_state_group else 1
+             # PCP=2, TP=4, KV heads=2, tp_replicas=2:
+@@ -1308,6 +1291,7 @@ class KVCacheStoreSendingThread(KVTransferThread):
+                 chunk_filter=chunk_filter,
+                 shard_rank=self.pcp_rank * tp_replicas + self.tp_rank % tp_replicas,
+                 shard_size=self.pcp_size * tp_replicas,
++                chunk_mask=group_store_mask,
+             )
+             for start, end, key, block_hash, block_id in iterator:
+                 starts.append(start)
+diff --git a/vllm_ascend/distributed/kv_transfer/kv_pool/ascend_store/metadata.py b/vllm_ascend/distributed/kv_transfer/kv_pool/ascend_store/metadata.py
+index 776349406..9005904b2 100644
+--- a/vllm_ascend/distributed/kv_transfer/kv_pool/ascend_store/metadata.py
++++ b/vllm_ascend/distributed/kv_transfer/kv_pool/ascend_store/metadata.py
+@@ -3,6 +3,7 @@ from __future__ import annotations
+ import math
+ from collections.abc import Callable, Iterable, Mapping, Sequence
+ from dataclasses import dataclass, field
++from itertools import compress
+ from typing import Any, cast
+ 
+ import numpy as np
+@@ -545,6 +546,7 @@ class ChunkedTokenDatabase:
+         chunk_filter: Callable[[int], bool] | None = None,
+         shard_rank: int | None = None,
+         shard_size: int | None = None,
++        chunk_mask: Sequence[bool] | None = None,
+     ) -> Iterable[tuple[int, int, BlockHash | str, int | None]]:
+         # Private circular state has no prefix key, even when its block size
+         # happens to be divisible by the request's hashing unit.
+@@ -558,13 +560,17 @@ class ChunkedTokenDatabase:
+             return
+         num_logical_blocks = min(len(grouped_hashes), cdiv(token_len, logical_block_size)) if token_len > 0 else 0
+         block_id_offset = max(num_logical_blocks - len(block_ids), 0) if block_ids is not None else 0
++        first_chunk = max(0, cdiv(mask_num, logical_block_size), block_id_offset)
++        chunk_ids: Iterable[int] = range(first_chunk, num_logical_blocks)
++        if chunk_mask is not None:
++            # Unlike transfer-range masks, a short lookup/store mask excludes
++            # chunks beyond its end. compress stops at the shorter iterator.
++            chunk_ids = compress(chunk_ids, chunk_mask[first_chunk:num_logical_blocks])
+         candidate_index = 0
+ 
+-        for chunk_id in range(num_logical_blocks):
++        for chunk_id in chunk_ids:
+             start_idx = chunk_id * logical_block_size
+             end_idx = min(start_idx + logical_block_size, token_len)
+-            if start_idx < mask_num:
+-                continue
+             if end_idx <= start_idx:
+                 continue
+             if chunk_filter is not None and not chunk_filter(start_idx):
+@@ -624,6 +630,7 @@ class ChunkedTokenDatabase:
+         mask_num: int = 0,
+         kv_cache_group_id: int = 0,
+         chunk_filter: Callable[[int], bool] | None = None,
++        chunk_mask: Sequence[bool] | None = None,
+     ) -> Iterable[tuple[int, int, str, BlockHash | str]]:
+         """Yield cache key strings directly without materializing PoolKey objects."""
+         prefix = self._get_key_prefix(kv_cache_group_id)
+@@ -633,6 +640,7 @@ class ChunkedTokenDatabase:
+             mask_num,
+             kv_cache_group_id,
+             chunk_filter=chunk_filter,
++            chunk_mask=chunk_mask,
+         ):
+             yield start, end, prefix + block_hash_to_str(hash_val), hash_val
+ 
+@@ -647,6 +655,7 @@ class ChunkedTokenDatabase:
+         chunk_filter: Callable[[int], bool] | None = None,
+         shard_rank: int | None = None,
+         shard_size: int | None = None,
++        chunk_mask: Sequence[bool] | None = None,
+     ) -> Iterable[tuple[int, int, str, BlockHash | str, int]]:
+         """Yield cache key strings and resolved block ids without PoolKey allocation."""
+         prefix = self._get_key_prefix(kv_cache_group_id)
+@@ -660,6 +669,7 @@ class ChunkedTokenDatabase:
+             chunk_filter=chunk_filter,
+             shard_rank=shard_rank,
+             shard_size=shard_size,
++            chunk_mask=chunk_mask,
+         ):
+             assert block_id is not None
+             yield start, end, prefix + block_hash_to_str(hash_val), hash_val, block_id
+diff --git a/vllm_ascend/distributed/kv_transfer/kv_pool/ascend_store/pool_worker.py b/vllm_ascend/distributed/kv_transfer/kv_pool/ascend_store/pool_worker.py
+index fbeb5732f..aaa096c32 100644
+--- a/vllm_ascend/distributed/kv_transfer/kv_pool/ascend_store/pool_worker.py
++++ b/vllm_ascend/distributed/kv_transfer/kv_pool/ascend_store/pool_worker.py
+@@ -3646,20 +3646,8 @@ class KVPoolWorker:
+         ) -> list[BlockHash | str]:
+             group_block_size = coordinator.group_effective_block_sizes[group_id]
+             present: list[BlockHash | str] = []
+-            if hbm_hit_tokens:
+-                # Blocks already computed locally are present by construction;
+-                # the pool only has to confirm the blocks beyond them.
+-                present.extend(group_block_hashes[: hbm_hit_tokens // group_block_size])
+             lookup_start = hbm_hit_tokens // group_block_size * group_block_size
+ 
+-            def chunk_filter(
+-                start: int,
+-                group_block_size=group_block_size,
+-                lookup_mask=lookup_mask,
+-            ) -> bool:
+-                chunk_idx = start // group_block_size
+-                return lookup_mask is None or (chunk_idx < len(lookup_mask) and lookup_mask[chunk_idx])
+-
+             keys: list[str] = []
+             chunk_hashes: list[BlockHash | str] = []
+             variant_counts: list[int] = []
+@@ -3668,7 +3656,7 @@ class KVPoolWorker:
+                 block_hashes,
+                 mask_num=lookup_start,
+                 kv_cache_group_id=group_id,
+-                chunk_filter=chunk_filter,
++                chunk_mask=lookup_mask,
+             ):
+                 variants = self._expand_lookup_key_variants(key_string, group_id, include_all_ranks)
+                 keys.extend(variants)
+@@ -3699,6 +3687,7 @@ class KVPoolWorker:
+             token_len,
+             query_group_hits,
+             log_context="KV pool coordinator lookup",
++            hbm_hit_tokens=hbm_hit_tokens,
+         )
+ 
+     def lookup_scheduler(

@@ -1,0 +1,1863 @@
+commit f16e5e26801f86b071bca6454c9b9b2b63362e0a
+Author:     Zeyu Yang <yangzeyu7@huawei.com>
+AuthorDate: Wed Oct 21 09:22:50 2026 +0800
+Commit:     GitHub <noreply@github.com>
+CommitDate: Wed Oct 21 09:22:50 2026 +0800
+
+    [Refactor][Worker] Isolate the V1 model runner core into worker/v1/ (#18863)
+    
+    ### What this PR does / why we need it?
+    
+    It creates the **V1 zone** `vllm_ascend/worker/v1/` and moves the V1
+    core into it, so that the upcoming default flip (and the eventual final
+    removal) operates on a contained, deletable module instead of a
+    half-shared one.
+    
+    #### Target architecture (see the RFC #18850)
+    
+    ```
+    main
+     |  worker/worker.py  <-- runner-selection branch is the ONLY V1 entry point
+     |
+     +-- worker/v1/            V1 zone: deployable as a unit, deletable as a unit
+     |    |  model_runner.py       (was worker/model_runner_v1.py)
+     |    |  kv_block_zeroer.py    (was inside worker/utils.py)
+     |    |  __init__.py
+     |
+     +-- shared                 importable by BOTH v1 and v2
+     |    worker/utils.py (base class + kernel + layout helpers)
+     |    worker/encoder_acl_graph.py
+     |    spec_decode/{utils,llm_base_proposer,dspark_utils}.py
+     |    ops/, model_executor/warmup/, ...
+     |
+     +-- V2 layer               must NOT reference worker/v1/**
+          worker/v2/**, patch/**
+    ```
+    
+    Dependency direction is one-way: `worker/v1/** -> shared` is allowed;
+    the reverse (`shared -> worker/v1/**`, `v2 -> worker/v1/**`) is
+    forbidden.
+    
+    #### Moves
+    
+    - `worker/model_runner_v1.py` -> `worker/v1/model_runner.py` (`git mv`,
+    history preserved; `NPUModelRunner` — the only content change is the one
+    import line).
+    - Extract the V1-only `AscendKVBlockZeroer` out of the shared
+    `worker/utils.py` into `worker/v1/kv_block_zeroer.py`. The Triton kernel
+    `_zero_kv_blocks_kernel` and the two cache-layout helpers stay in the
+    shared module and are imported *by* the V1 zone — i.e. `v1 -> shared`,
+    the allowed direction.
+    - `worker/utils.py` drops the moved class plus its now-unused imports
+    (`AttentionGroup`, `KVBlockZeroer`, `largest_power_of_2_divisor`,
+    `get_vectorcore_num`, `Any`).
+    
+    #### Reference updates
+    
+    - `worker/worker.py`: the deferred import inside the V1 model-runner
+    factory now points at `worker.v1.model_runner`.
+    - V1-bound adapters repointed: `_310p/model_runner_310p.py`,
+    `xlite/xlite_model_runner.py`.
+    - Runtime symbol strings rewritten to
+    `vllm_ascend.worker.v1.model_runner:...` in `profiling_config.py` (21
+    symbols), `observability/config/base_metrics.yaml` (2 symbols) and the
+    two documentation copies. The symbol set was verified **identical**
+    before/after — only the module prefix changes.
+    - Tests: module paths, the `AscendKVBlockZeroer` import path,
+    source-file text reads and the zeroer `monkeypatch` target updated. Test
+    file names are intentionally unchanged.
+    - `docs/**` + `AGENTS.md` path refresh; four comment-only references in
+    `worker/v2/*`, `model_executor/warmup/*` and `quantization/configs/*`
+    reworded so the V2 zone contains no literal V1 path.
+    
+    #### Dependency contract after this PR
+    
+    Nothing outside `worker/v1/**` and its dedicated tests imports V1,
+    except the transitional whitelist (`worker/worker.py` lazy import,
+    `_310p`, `xlite`) that a later PR relocates. `worker/v2/**` and
+    `patch/**` reference the zone nowhere.
+    
+    ### Does this PR introduce _any_ user-facing change?
+    
+    No. Only module paths move. Runner selection, configuration surface,
+    entry points and the `VLLM_USE_V2_MODEL_RUNNER=0` escape hatch are
+    unchanged.
+    
+    ### How was this patch tested?
+    
+    Static verification (no `vllm` / `pytest` available in my local
+    environment, so runtime validation is delegated to CI):
+    
+    1. **Dependency direction** — repo-wide grep:
+    - no residual reference to `vllm_ascend.worker.model_runner_v1` anywhere
+    in `vllm_ascend/`;
+       - `worker/v2/**` and `patch/**` contain no reference to `worker.v1` /
+    `worker/v1/` (the single `AscendV2KVBlockZeroer` hit is an unrelated,
+         same-named V2 class in `worker/v2/utils.py`);
+    - the V1-reference whitelist is exactly `worker.py`, `_310p`, `xlite`.
+    2. **Symbol integrity** — the set of `module:Class.method` symbol
+    strings in `profiling_config.py`, `base_metrics.yaml` and the two doc
+    copies is byte-identical before and after, modulo the module prefix.
+    3. **Import integrity** — every name imported from the shared
+    `worker/utils.py` by the V1 zone still exists there;
+    `AscendKVBlockZeroer` is gone from the shared module and present in
+    `worker/v1/kv_block_zeroer.py`.
+    4. **AST / syntax** — all 36 changed `.py` files parse; no bare
+    `model_runner_v1` identifier is used without being bound; `python -m
+    compileall` passes on the changed sources.
+    5. **Rename fidelity** — `git diff -M` reports `R099` for the runner
+    move, i.e. a pure rename with one changed line.
+    
+    - vLLM main:
+    https://github.com/vllm-project/vllm/commit/a98247ab4db686ee03c66d5feb3c761e52a2f8ab
+    
+    ---------
+    
+    Signed-off-by: yangzeyu <yangzeyu7@huawei.com>
+
+diff --git a/AGENTS.md b/AGENTS.md
+index f3b7f37e2..3714cc377 100644
+--- a/AGENTS.md
++++ b/AGENTS.md
+@@ -170,7 +170,7 @@ Reviewers must verify:
+ 
+ **NPU Model Runner Files:**
+ 
+-- `vllm_ascend/worker/model_runner_v1.py` - vLLM v1 model runner
++- `vllm_ascend/worker/v1/model_runner.py` - vLLM v1 model runner (isolated V1 zone, removal-tracked)
+ - `vllm_ascend/worker/v2/model_runner.py` - vLLM v2 model runner
+ - `vllm_ascend/_310p/model_runner_310p.py` - Ascend 310P model runner
+ 
+diff --git a/docs/source/developer_guide/Design_Documents/context_parallel.md b/docs/source/developer_guide/Design_Documents/context_parallel.md
+index 268c2d3da..d443669d2 100644
+--- a/docs/source/developer_guide/Design_Documents/context_parallel.md
++++ b/docs/source/developer_guide/Design_Documents/context_parallel.md
+@@ -194,7 +194,7 @@ Extensions need consistent topology checks, query/cache mappings, and output lay
+ ## Related Files
+ 
+ - Slot mapping: `vllm_ascend/worker/block_table.py`
+-- Input and attention metadata: `vllm_ascend/worker/model_runner_v1.py`
++- Input and attention metadata: `vllm_ascend/worker/v1/model_runner.py`
+ - Shared DCP backend capabilities: `vllm_ascend/attention/context_parallel/common_cp.py`
+ - GQA DCP backend: `vllm_ascend/attention/context_parallel/attention_cp.py`
+ - MLA DCP backend: `vllm_ascend/attention/context_parallel/mla_cp.py`
+diff --git a/docs/source/developer_guide/Design_Documents/dynamic_chunked_pipeline_parallel.md b/docs/source/developer_guide/Design_Documents/dynamic_chunked_pipeline_parallel.md
+index 439dff66d..9da9b8202 100644
+--- a/docs/source/developer_guide/Design_Documents/dynamic_chunked_pipeline_parallel.md
++++ b/docs/source/developer_guide/Design_Documents/dynamic_chunked_pipeline_parallel.md
+@@ -105,7 +105,7 @@ After each batch, feature vectors `[Σ(C+H)·C, Σ(C+H), N]` and actual executio
+ | **Scheduler** | `vllm_ascend/core/scheduler_profiling_chunk.py` | Integrate CPP scheduling |
+ | **EngineCore** | `vllm_ascend/patch/platform/patch_profiling_chunk.py` | Startup profiling, record execution time |
+ | **NPUWorker** | `vllm_ascend/worker/worker.py` | Execute real forward pass profiling |
+-| **NPUModelRunner** | `vllm_ascend/worker/model_runner_v1.py` | `profile_cpp=True` mode |
++| **NPUModelRunner** | `vllm_ascend/worker/v1/model_runner.py` | `profile_cpp=True` mode |
+ 
+ ### Workflow
+ 
+diff --git a/docs/source/developer_guide/performance_and_debug/service_profiling_guide.md b/docs/source/developer_guide/performance_and_debug/service_profiling_guide.md
+index 495deeaca..9fa4378ed 100644
+--- a/docs/source/developer_guide/performance_and_debug/service_profiling_guide.md
++++ b/docs/source/developer_guide/performance_and_debug/service_profiling_guide.md
+@@ -318,7 +318,7 @@ The `attributes` field supports flexible custom attribute collection and allows
+ ###### Example
+ 
+ ```yaml
+-- symbol: vllm_ascend.worker.model_runner_v1:NPUModelRunner.execute_model
++- symbol: vllm_ascend.worker.v1.model_runner:NPUModelRunner.execute_model
+   name: ModelRunnerExecuteModel
+   domain: ModelExecute
+   attributes:
+diff --git a/docs/source/user_guide/ms_service_metric.md b/docs/source/user_guide/ms_service_metric.md
+index cc47e09a4..cc265a316 100644
+--- a/docs/source/user_guide/ms_service_metric.md
++++ b/docs/source/user_guide/ms_service_metric.md
+@@ -57,7 +57,7 @@ vLLM Ascend-owned metric configurations are stored as YAML files in `vllm_ascend
+ Example:
+ 
+ ```yaml
+-- symbol: vllm_ascend.worker.model_runner_v1:NPUModelRunner.execute_model
++- symbol: vllm_ascend.worker.v1.model_runner:NPUModelRunner.execute_model
+   handler: ms_service_metric.provider_handlers:model_runner_phase_handler
+   metrics:
+     - name: executor:model_runner_execute_model:duration
+diff --git a/tests/deepseek_v41_utils.py b/tests/deepseek_v41_utils.py
+index 17be6d1a6..3d152a661 100644
+--- a/tests/deepseek_v41_utils.py
++++ b/tests/deepseek_v41_utils.py
+@@ -315,7 +315,7 @@ def make_cache_config(num_blocks, *, block_size=128, head_size=512, index_size=1
+ 
+ 
+ def allocate_cache_views(config, device="cpu"):
+-    from vllm_ascend.worker.model_runner_v1 import NPUModelRunner
++    from vllm_ascend.worker.v1.model_runner import NPUModelRunner
+ 
+     specs = {n: s for g in config.kv_cache_groups for n, s in g.kv_cache_spec.kv_cache_specs.items()}
+     backings, caches = [], {}
+diff --git a/tests/e2e/nightly/single_node/ops/singlecard_ops/test_qfa_c8_paged_layout.py b/tests/e2e/nightly/single_node/ops/singlecard_ops/test_qfa_c8_paged_layout.py
+index 74ec48f0b..e7edb1b0f 100644
+--- a/tests/e2e/nightly/single_node/ops/singlecard_ops/test_qfa_c8_paged_layout.py
++++ b/tests/e2e/nightly/single_node/ops/singlecard_ops/test_qfa_c8_paged_layout.py
+@@ -20,7 +20,7 @@ from vllm_ascend.attention.attention_c8_mxfp import (
+     scatter_mxfp_pa_nz_kv_cache,
+ )
+ from vllm_ascend.ops.triton.triton_utils import init_device_properties_triton
+-from vllm_ascend.worker.utils import AscendKVBlockZeroer
++from vllm_ascend.worker.v1.kv_block_zeroer import AscendKVBlockZeroer
+ 
+ 
+ @pytest.mark.parametrize("query_tokens", [1, 64])
+diff --git a/tests/e2e/nightly/single_node/ops/singlecard_ops/triton/test_kv_block_zeroer.py b/tests/e2e/nightly/single_node/ops/singlecard_ops/triton/test_kv_block_zeroer.py
+index 8646b2344..2383ba420 100644
+--- a/tests/e2e/nightly/single_node/ops/singlecard_ops/triton/test_kv_block_zeroer.py
++++ b/tests/e2e/nightly/single_node/ops/singlecard_ops/triton/test_kv_block_zeroer.py
+@@ -17,7 +17,7 @@ import pytest
+ import torch
+ 
+ from vllm_ascend.ops.triton.triton_utils import init_device_properties_triton
+-from vllm_ascend.worker.utils import AscendKVBlockZeroer
++from vllm_ascend.worker.v1.kv_block_zeroer import AscendKVBlockZeroer
+ 
+ 
+ @pytest.fixture(scope="module", autouse=True)
+diff --git a/tests/e2e/pull_request/four_card/test_graph_mode.py b/tests/e2e/pull_request/four_card/test_graph_mode.py
+index e60b2100b..0c2ca0a54 100644
+--- a/tests/e2e/pull_request/four_card/test_graph_mode.py
++++ b/tests/e2e/pull_request/four_card/test_graph_mode.py
+@@ -400,7 +400,7 @@ def _install_spies(metrics: dict[str, Any] | None):
+     if metrics is None:
+         return contextlib.nullcontext()
+ 
+-    from vllm_ascend.worker.model_runner_v1 import NPUModelRunner
++    from vllm_ascend.worker.v1.model_runner import NPUModelRunner
+ 
+     def make_spy(cls, method_name, capture_mem):
+         original = getattr(cls, method_name)
+diff --git a/tests/e2e/pull_request/one_card/test_model_runner_v1_with_device.py b/tests/e2e/pull_request/one_card/test_model_runner_v1_with_device.py
+index b298123c0..09d35f02d 100644
+--- a/tests/e2e/pull_request/one_card/test_model_runner_v1_with_device.py
++++ b/tests/e2e/pull_request/one_card/test_model_runner_v1_with_device.py
+@@ -28,8 +28,8 @@ from vllm.v1.kv_cache_interface import (
+ import vllm_ascend.compilation.acl_graph as acl_graph
+ from vllm_ascend.ascend_config import FinegrainedTPConfig
+ from vllm_ascend.ascend_forward_context import MoECommType
+-from vllm_ascend.worker.model_runner_v1 import NPUModelRunner
+ from vllm_ascend.worker.npu_input_batch import NPUInputBatch
++from vllm_ascend.worker.v1.model_runner import NPUModelRunner
+ 
+ BLOCK_SIZE = 128
+ NUM_BLOCKS = 10
+@@ -495,7 +495,7 @@ def test_stateful_handoff_preserves_decode_graph(
+         packed_tensor[0, 1:] = 32
+         packed_tensor[1, 1:] = CUDAGraphMode.FULL.value
+ 
+-    module = "vllm_ascend.worker.model_runner_v1"
++    module = "vllm_ascend.worker.v1.model_runner"
+     monkeypatch.setattr(f"{module}.should_skip_allreduce_across_dp_group", lambda *args: False)
+     # Keep the test focused on graph dispatch: MC2 requires uniform DP inputs
+     # even when an incomplete handoff forces the batch back to eager mode.
+diff --git a/tests/e2e/pull_request/two_card/aclgraph/test_aclgraph_capture_replay.py b/tests/e2e/pull_request/two_card/aclgraph/test_aclgraph_capture_replay.py
+index 9a773b658..ea57487ca 100644
+--- a/tests/e2e/pull_request/two_card/aclgraph/test_aclgraph_capture_replay.py
++++ b/tests/e2e/pull_request/two_card/aclgraph/test_aclgraph_capture_replay.py
+@@ -37,7 +37,7 @@ MODELS = [
+ 
+ def _install_spies(counters: dict[str, Any]) -> contextlib.ExitStack:
+     """Installs thread-safe spies on NPU methods to track invocation counts."""
+-    from vllm_ascend.worker.model_runner_v1 import NPUModelRunner
++    from vllm_ascend.worker.v1.model_runner import NPUModelRunner
+ 
+     def make_spy(cls, method_name, counter):
+         original = getattr(cls, method_name)
+diff --git a/tests/ut/_310p/test_model_runner_310p.py b/tests/ut/_310p/test_model_runner_310p.py
+index 6ae33ae67..e1e5b8daf 100644
+--- a/tests/ut/_310p/test_model_runner_310p.py
++++ b/tests/ut/_310p/test_model_runner_310p.py
+@@ -112,7 +112,7 @@ def test_graph_dispatch_does_not_treat_later_prefill_chunk_as_decode() -> None:
+     runner.speculative_config = None
+ 
+     with patch(
+-        "vllm_ascend.worker.model_runner_v1.NPUModelRunner._determine_batch_execution_and_padding",
++        "vllm_ascend.worker.v1.model_runner.NPUModelRunner._determine_batch_execution_and_padding",
+         return_value="dispatch-result",
+     ) as parent_dispatch:
+         result = runner._determine_batch_execution_and_padding(
+diff --git a/tests/ut/attention/test_kv_cache_mxfp.py b/tests/ut/attention/test_kv_cache_mxfp.py
+index 2ddf44c99..3f5d1f499 100644
+--- a/tests/ut/attention/test_kv_cache_mxfp.py
++++ b/tests/ut/attention/test_kv_cache_mxfp.py
+@@ -16,7 +16,8 @@ from vllm_ascend.attention.attention_c8_mxfp import (
+     mxfp_packet_size_bytes,
+     mxfp_paged_cache_views,
+ )
+-from vllm_ascend.worker.utils import AscendKVBlockZeroer, copy_kv_cache_blocks_inplace
++from vllm_ascend.worker.utils import copy_kv_cache_blocks_inplace
++from vllm_ascend.worker.v1.kv_block_zeroer import AscendKVBlockZeroer
+ 
+ 
+ def _spec(ratio=1, heads=1, v_dim=256, padding=0):
+diff --git a/tests/ut/models/test_deepseek_v41_cache.py b/tests/ut/models/test_deepseek_v41_cache.py
+index d748368fd..638e67395 100644
+--- a/tests/ut/models/test_deepseek_v41_cache.py
++++ b/tests/ut/models/test_deepseek_v41_cache.py
+@@ -374,7 +374,7 @@ def test_shared_slots_isolate_groups_and_recycled_ids(config, runtime):
+ 
+ 
+ def test_view_with_nonzero_backing_storage_offset():
+-    from vllm_ascend.worker.model_runner_v1 import NPUModelRunner
++    from vllm_ascend.worker.v1.model_runner import NPUModelRunner
+ 
+     spec = AscendMLAAttentionSpec(block_size=16, num_kv_heads=1, head_size=4, dtype=torch.bfloat16)
+     backing = torch.zeros(16 + 2 * 256, dtype=torch.uint8)
+@@ -405,7 +405,7 @@ def test_v2_view_with_nonzero_initial_offset():
+ 
+ 
+ def test_view_accepts_latest_vllm_int8_backing_storage():
+-    from vllm_ascend.worker.model_runner_v1 import NPUModelRunner
++    from vllm_ascend.worker.v1.model_runner import NPUModelRunner
+ 
+     spec = AscendMLAAttentionSpec(block_size=16, num_kv_heads=1, head_size=4, dtype=torch.bfloat16)
+     raw = torch.zeros(2 * 256, dtype=torch.int8)
+diff --git a/tests/ut/models/test_deepseek_v41_dspark.py b/tests/ut/models/test_deepseek_v41_dspark.py
+index dd547ca1b..c95738064 100644
+--- a/tests/ut/models/test_deepseek_v41_dspark.py
++++ b/tests/ut/models/test_deepseek_v41_dspark.py
+@@ -27,7 +27,7 @@ from vllm_ascend.models.deepseek_v41.dspark import (
+     DeepseekV41DSparkSWACache,
+ )
+ from vllm_ascend.models.deepseek_v41.model import AscendDeepseekV41SWACache, DeepseekV41Model
+-from vllm_ascend.worker.model_runner_v1 import NPUModelRunner
++from vllm_ascend.worker.v1.model_runner import NPUModelRunner
+ 
+ 
+ def test_draft_cache_uses_v41_backend_and_explicit_deepseek_v41_spec(monkeypatch):
+diff --git a/tests/ut/models/test_engram.py b/tests/ut/models/test_engram.py
+index 911986c2c..403256e68 100644
+--- a/tests/ut/models/test_engram.py
++++ b/tests/ut/models/test_engram.py
+@@ -122,7 +122,7 @@ def test_loader_preserves_checkpoint_shards_across_dp_pcp_tp(tmp_path, monkeypat
+     assert len(barriers) == (8 if shared else 0)
+ 
+ 
+-from vllm_ascend.worker.model_runner_v1 import NPUModelRunner
++from vllm_ascend.worker.v1.model_runner import NPUModelRunner
+ 
+ 
+ @pytest.mark.parametrize(
+diff --git a/tests/ut/patch/platform/test_patch_pp_mtp.py b/tests/ut/patch/platform/test_patch_pp_mtp.py
+index 1397df920..25dcfbe14 100644
+--- a/tests/ut/patch/platform/test_patch_pp_mtp.py
++++ b/tests/ut/patch/platform/test_patch_pp_mtp.py
+@@ -24,7 +24,7 @@ from vllm_ascend.patch.platform.patch_pp_mtp import (
+     _use_pp_ipc_runtime_patch,
+     _use_pp_mtp_runtime_patch,
+ )
+-from vllm_ascend.worker.model_runner_v1 import NPUModelRunner
++from vllm_ascend.worker.v1.model_runner import NPUModelRunner
+ 
+ 
+ @pytest.mark.parametrize(
+@@ -217,7 +217,7 @@ def test_pp_ipc_sampled_token_handoff_advances_async_non_last_rank_state(
+     monkeypatch,
+ ):
+     monkeypatch.setattr(
+-        "vllm_ascend.worker.model_runner_v1.get_pp_group",
++        "vllm_ascend.worker.v1.model_runner.get_pp_group",
+         lambda: SimpleNamespace(is_last_rank=False),
+     )
+ 
+@@ -274,7 +274,7 @@ def test_pp_ipc_sampled_token_handoff_keeps_sync_path_on_scheduler_tokens(
+     monkeypatch,
+ ):
+     monkeypatch.setattr(
+-        "vllm_ascend.worker.model_runner_v1.get_pp_group",
++        "vllm_ascend.worker.v1.model_runner.get_pp_group",
+         lambda: SimpleNamespace(is_last_rank=False),
+     )
+ 
+diff --git a/tests/ut/runtime_guard/test_hooks.py b/tests/ut/runtime_guard/test_hooks.py
+index d5c2fcf1f..a2ecdb07c 100644
+--- a/tests/ut/runtime_guard/test_hooks.py
++++ b/tests/ut/runtime_guard/test_hooks.py
+@@ -35,7 +35,7 @@ def test_guard_step_sits_below_inference_mode():
+     assert len(fns) == 1
+     assert _decorator_names(fns[0]) == ["inference_mode", "runtime_guard_step"]
+     # v1 must stay unwired.
+-    v1 = (_WORKER_ROOT / "model_runner_v1.py").read_text(encoding="utf-8")
++    v1 = (_WORKER_ROOT / "v1" / "model_runner.py").read_text(encoding="utf-8")
+     assert "runtime_guard" not in v1
+ 
+ 
+diff --git a/tests/ut/runtime_guard/test_unified_wiring.py b/tests/ut/runtime_guard/test_unified_wiring.py
+index 0cd6dbe0e..4f8162fe1 100644
+--- a/tests/ut/runtime_guard/test_unified_wiring.py
++++ b/tests/ut/runtime_guard/test_unified_wiring.py
+@@ -128,7 +128,7 @@ def test_runners_call_run_sample_phase():
+     from pathlib import Path
+ 
+     root = Path(__file__).resolve().parents[3] / "vllm_ascend"
+-    v1 = (root / "worker" / "model_runner_v1.py").read_text(encoding="utf-8")
++    v1 = (root / "worker" / "v1" / "model_runner.py").read_text(encoding="utf-8")
+     v2 = (root / "worker" / "v2" / "model_runner.py").read_text(encoding="utf-8")
+     hooks = (root / "observability" / "runtime_guard" / "hooks.py").read_text(encoding="utf-8")
+     # v1 stays unwired.
+diff --git a/tests/ut/spec_decode/test_eagle_proposer.py b/tests/ut/spec_decode/test_eagle_proposer.py
+index 6016d4067..2c2c9d3b7 100644
+--- a/tests/ut/spec_decode/test_eagle_proposer.py
++++ b/tests/ut/spec_decode/test_eagle_proposer.py
+@@ -1587,9 +1587,9 @@ class TestEagleProposerPropose:
+         assert not missing, f"Missing dataclass fields: {missing}"
+ 
+ 
+-        import vllm_ascend.worker.model_runner_v1
+-        assert hasattr(vllm_ascend.worker.model_runner_v1, "NPUModelRunner")
+-        RunnerCls = vllm_ascend.worker.model_runner_v1.NPUModelRunner
++        import vllm_ascend.worker.v1.model_runner
++        assert hasattr(vllm_ascend.worker.v1.model_runner, "NPUModelRunner")
++        RunnerCls = vllm_ascend.worker.v1.model_runner.NPUModelRunner
+         src = inspect.getsource(RunnerCls.__init__)
+         fields = {
+             "dcp_size",
+@@ -2511,10 +2511,10 @@ class TestRunMergedDraft(TestBase):
+         sig_name = self.get_param_names(sig)
+         assert sig_name == ["self", "num_input_tokens", "_context_slots"]
+ 
+-        import vllm_ascend.worker.model_runner_v1
++        import vllm_ascend.worker.v1.model_runner
+ 
+-        assert hasattr(vllm_ascend.worker.model_runner_v1, "NPUModelRunner")
+-        RunnerCls = vllm_ascend.worker.model_runner_v1.NPUModelRunner
++        assert hasattr(vllm_ascend.worker.v1.model_runner, "NPUModelRunner")
++        RunnerCls = vllm_ascend.worker.v1.model_runner.NPUModelRunner
+         src = inspect.getsource(RunnerCls.__init__)
+         fields = {
+             "dcp_size",
+diff --git a/tests/ut/spec_decode/test_extract_hidden_states_proposer.py b/tests/ut/spec_decode/test_extract_hidden_states_proposer.py
+index daa68b2ae..c90826a31 100644
+--- a/tests/ut/spec_decode/test_extract_hidden_states_proposer.py
++++ b/tests/ut/spec_decode/test_extract_hidden_states_proposer.py
+@@ -32,7 +32,7 @@ from vllm_ascend.ascend_config import init_ascend_config
+ from vllm_ascend.spec_decode.extract_hidden_states_proposer import (
+     AscendExtractHiddenStatesProposer,
+ )
+-from vllm_ascend.worker.model_runner_v1 import NPUModelRunner
++from vllm_ascend.worker.v1.model_runner import NPUModelRunner
+ 
+ 
+ @pytest.fixture(autouse=True)
+diff --git a/tests/ut/spec_decode/test_step3p5_source_regression.py b/tests/ut/spec_decode/test_step3p5_source_regression.py
+index 833da797b..f667fafd9 100644
+--- a/tests/ut/spec_decode/test_step3p5_source_regression.py
++++ b/tests/ut/spec_decode/test_step3p5_source_regression.py
+@@ -103,7 +103,7 @@ def test_pad_query_start_loc_for_fia_first_arg_is_query_start_loc() -> None:
+     num_reqs (int) and eventually triggering:
+         TypeError: unsupported operand type(s) for *: 'CUDAGraphMode' and 'int'
+ 
+-    See model_runner_v1.py:_pad_query_start_loc_for_fia and the correct call
++    See worker/v1/model_runner.py:_pad_query_start_loc_for_fia and the correct call
+     pattern at llm_base_proposer.py:730–736.
+     """
+     propose = _method(STEP3P5, "AscendStep3p5MTPProposer", "_propose")
+diff --git a/tests/ut/test_profiling_config.py b/tests/ut/test_profiling_config.py
+index e7dd1ab8a..c50a736b7 100644
+--- a/tests/ut/test_profiling_config.py
++++ b/tests/ut/test_profiling_config.py
+@@ -16,7 +16,7 @@ def test_service_profiling_symbols_yaml():
+         "vllm.entrypoints.openai.chat_completion.serving:OpenAIServingChat.create_chat_completion",
+         "vllm.v1.engine.async_llm:AsyncLLM.generate",
+         "vllm_ascend.core.recompute_scheduler:RecomputeScheduler.schedule",
+-        "vllm_ascend.worker.model_runner_v1:NPUModelRunner._model_forward",
++        "vllm_ascend.worker.v1.model_runner:NPUModelRunner._model_forward",
+         "vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake_connector:MooncakeConnector.start_load_kv",
+         "vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake_connector:MooncakeConnectorScheduler.get_num_new_matched_tokens",
+         "vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake_connector:MooncakeConnectorScheduler.update_state_after_alloc",
+diff --git a/tests/ut/worker/test_fused_mla_cache_lifecycle.py b/tests/ut/worker/test_fused_mla_cache_lifecycle.py
+index fbe974a04..f6a414730 100644
+--- a/tests/ut/worker/test_fused_mla_cache_lifecycle.py
++++ b/tests/ut/worker/test_fused_mla_cache_lifecycle.py
+@@ -8,7 +8,8 @@ import torch
+ from vllm.v1.core.kv_cache_utils import KVCacheBlockCopy
+ from vllm.v1.kv_cache_interface import MLAAttentionSpec
+ 
+-from vllm_ascend.worker.utils import AscendKVBlockZeroer, copy_kv_cache_blocks_inplace
++from vllm_ascend.worker.utils import copy_kv_cache_blocks_inplace
++from vllm_ascend.worker.v1.kv_block_zeroer import AscendKVBlockZeroer
+ 
+ MANAGER_BLOCK_SIZE = 384
+ KERNEL_BLOCK_SIZE = 128
+diff --git a/tests/ut/worker/test_glm5next_pooled_cache.py b/tests/ut/worker/test_glm5next_pooled_cache.py
+index a616603ee..b40ef3028 100644
+--- a/tests/ut/worker/test_glm5next_pooled_cache.py
++++ b/tests/ut/worker/test_glm5next_pooled_cache.py
+@@ -26,7 +26,7 @@ from vllm_ascend.models.glm5next.cache_config import (
+ )
+ from vllm_ascend.models.glm5next.cache_views import view_kpool_tail_cache
+ from vllm_ascend.utils import get_kv_cache_tensor_layers
+-from vllm_ascend.worker.model_runner_v1 import NPUModelRunner
++from vllm_ascend.worker.v1.model_runner import NPUModelRunner
+ from vllm_ascend.worker.v2 import attn_utils
+ 
+ MAIN = "model.layers.1.attn"
+diff --git a/tests/ut/worker/test_kv_block_zeroer.py b/tests/ut/worker/test_kv_block_zeroer.py
+index 352da291c..0ca34ff67 100644
+--- a/tests/ut/worker/test_kv_block_zeroer.py
++++ b/tests/ut/worker/test_kv_block_zeroer.py
+@@ -20,8 +20,8 @@ import pytest
+ import torch
+ from vllm.v1.kv_cache_interface import FullAttentionSpec, MambaSpec
+ 
+-from vllm_ascend.worker import utils as worker_utils
+-from vllm_ascend.worker.utils import AscendKVBlockZeroer
++from vllm_ascend.worker.v1 import kv_block_zeroer
++from vllm_ascend.worker.v1.kv_block_zeroer import AscendKVBlockZeroer
+ 
+ 
+ class _FakeKernel:
+@@ -118,8 +118,8 @@ def test_zero_block_ids_dispatches_per_segment_page_sizes(
+     zeroer._ids_gpu = torch.empty(4, dtype=torch.int64)
+ 
+     fake_kernel = _FakeKernel()
+-    monkeypatch.setattr(worker_utils, "_zero_kv_blocks_kernel", fake_kernel)
+-    monkeypatch.setattr(worker_utils, "get_vectorcore_num", lambda: 8)
++    monkeypatch.setattr(kv_block_zeroer, "_zero_kv_blocks_kernel", fake_kernel)
++    monkeypatch.setattr(kv_block_zeroer, "get_vectorcore_num", lambda: 8)
+ 
+     zeroer.zero_block_ids([1, 3])
+ 
+diff --git a/tests/ut/worker/test_kv_cache_allocation_scope.py b/tests/ut/worker/test_kv_cache_allocation_scope.py
+index 877ba5e84..b098890ff 100644
+--- a/tests/ut/worker/test_kv_cache_allocation_scope.py
++++ b/tests/ut/worker/test_kv_cache_allocation_scope.py
+@@ -9,7 +9,7 @@ from unittest.mock import MagicMock, patch
+ import torch
+ 
+ from vllm_ascend._310p.model_runner_310p import NPUModelRunner310
+-from vllm_ascend.worker.model_runner_v1 import NPUModelRunner
++from vllm_ascend.worker.v1.model_runner import NPUModelRunner
+ from vllm_ascend.worker.worker import NPUWorker
+ 
+ 
+diff --git a/tests/ut/worker/test_layerwise_kv_allocation.py b/tests/ut/worker/test_layerwise_kv_allocation.py
+index fbe2b7e7c..ffa945b3f 100644
+--- a/tests/ut/worker/test_layerwise_kv_allocation.py
++++ b/tests/ut/worker/test_layerwise_kv_allocation.py
+@@ -11,7 +11,7 @@ from vllm_ascend.core.kv_cache_interface import AscendMLAAttentionSpec, AscendSF
+ from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.layerwise_cache_layout import (
+     apply_layerwise_kv_cache_plan,
+ )
+-from vllm_ascend.worker.model_runner_v1 import NPUModelRunner
++from vllm_ascend.worker.v1.model_runner import NPUModelRunner
+ 
+ 
+ @pytest.mark.parametrize("reuse", [False, True])
+diff --git a/tests/ut/worker/test_model_runner_v1.py b/tests/ut/worker/test_model_runner_v1.py
+index 83160e894..59eeacb40 100644
+--- a/tests/ut/worker/test_model_runner_v1.py
++++ b/tests/ut/worker/test_model_runner_v1.py
+@@ -57,7 +57,7 @@ from vllm_ascend.patch.platform.patch_kv_cache_utils import (
+ )
+ from vllm_ascend.spec_decode.dspark_proposer import AscendDSparkProposer
+ from vllm_ascend.utils import AscendDeviceType, vllm_version_is
+-from vllm_ascend.worker.model_runner_v1 import NPUModelRunner
++from vllm_ascend.worker.v1.model_runner import NPUModelRunner
+ from vllm_ascend.worker.v2.kvpp import KVPPRuntime
+ 
+ 
+@@ -107,7 +107,7 @@ class TestGlm5MtpGraphMetadata(unittest.TestCase):
+         runner = self._build_dispatch_runner(speculative=True)
+ 
+         with patch(
+-            "vllm_ascend.worker.model_runner_v1.enable_sp",
++            "vllm_ascend.worker.v1.model_runner.enable_sp",
+             return_value=False,
+         ):
+             runner._determine_batch_execution_and_padding(
+@@ -140,7 +140,7 @@ class TestGlm5MtpGraphMetadata(unittest.TestCase):
+                 # Extra stale rows must not affect the real batch decision.
+                 runner.input_batch.num_computed_tokens_cpu = np.array(computed + [0])
+                 runner.input_batch.num_prompt_tokens = np.array(prompts + [999])
+-                with patch("vllm_ascend.worker.model_runner_v1.enable_sp", return_value=False):
++                with patch("vllm_ascend.worker.v1.model_runner.enable_sp", return_value=False):
+                     runner._determine_batch_execution_and_padding(
+                         num_tokens=4 * len(computed),
+                         num_reqs=len(computed),
+@@ -159,7 +159,7 @@ class TestGlm5MtpGraphMetadata(unittest.TestCase):
+                 runner.uniform_decode_query_len = 1
+                 runner.input_batch.num_computed_tokens_cpu = np.array([computed])
+                 runner.input_batch.num_prompt_tokens = np.array([2049])
+-                with patch("vllm_ascend.worker.model_runner_v1.enable_sp", return_value=False):
++                with patch("vllm_ascend.worker.v1.model_runner.enable_sp", return_value=False):
+                     runner._determine_batch_execution_and_padding(
+                         num_tokens=1,
+                         num_reqs=1,
+@@ -192,7 +192,7 @@ class TestDPPaddingPolicy(unittest.TestCase):
+         is_draft=False,
+         mega_moe=False,
+     ):
+-        module = "vllm_ascend.worker.model_runner_v1"
++        module = "vllm_ascend.worker.v1.model_runner"
+ 
+         def all_reduce(packed_tensor, group):
+             remote_rank = 1 - runner.dp_rank
+@@ -214,7 +214,7 @@ class TestDPPaddingPolicy(unittest.TestCase):
+ 
+     def test_skip_dp_sync_keeps_local_token_count(self):
+         runner = self._make_runner()
+-        module = "vllm_ascend.worker.model_runner_v1"
++        module = "vllm_ascend.worker.v1.model_runner"
+         with (
+             patch(f"{module}.should_skip_allreduce_across_dp_group", return_value=True),
+             patch(f"{module}.dist.all_reduce") as all_reduce,
+@@ -231,7 +231,7 @@ class TestDPPaddingPolicy(unittest.TestCase):
+     def test_single_dp_does_not_synchronize(self):
+         runner = self._make_runner()
+         runner.dp_size = 1
+-        with patch("vllm_ascend.worker.model_runner_v1.dist.all_reduce") as all_reduce:
++        with patch("vllm_ascend.worker.v1.model_runner.dist.all_reduce") as all_reduce:
+             self.assertEqual(runner._sync_metadata_across_dp(8), (8, None, CUDAGraphMode.NONE))
+         all_reduce.assert_not_called()
+ 
+@@ -457,7 +457,7 @@ class TestDummyRunSlotInvalidation(unittest.TestCase):
+                 runner._get_cumsum_and_arange = check_padded_schedule
+                 runner._pad_query_start_loc_for_fia = check_offsets
+                 with (
+-                    patch("vllm_ascend.worker.model_runner_v1.using_paged_attention", return_value=False),
++                    patch("vllm_ascend.worker.v1.model_runner.using_paged_attention", return_value=False),
+                     self.assertRaisesRegex(RuntimeError, "logical query lengths checked"),
+                 ):
+                     runner._dummy_run(num_tokens, uniform_decode=True, cudagraph_runtime_mode=CUDAGraphMode.FULL)
+@@ -598,7 +598,7 @@ class TestDummyRunSlotInvalidation(unittest.TestCase):
+         runner._build_attention_metadata = check_slots_before_build
+ 
+         with (
+-            patch("vllm_ascend.worker.model_runner_v1.using_paged_attention", return_value=False),
++            patch("vllm_ascend.worker.v1.model_runner.using_paged_attention", return_value=False),
+             self.assertRaisesRegex(RuntimeError, "metadata checked"),
+         ):
+             runner._dummy_run(2, cudagraph_runtime_mode=CUDAGraphMode.FULL, is_graph_capturing=True)
+@@ -727,10 +727,10 @@ class TestDeviceMetadataFullGraphEvents(unittest.TestCase):
+             events.append("context_exit")
+ 
+         with (
+-            patch("vllm_ascend.worker.model_runner_v1.get_pp_group", return_value=SimpleNamespace(is_first_rank=True)),
+-            patch("vllm_ascend.worker.model_runner_v1.lmhead_tp_enable", return_value=False),
+-            patch("vllm_ascend.worker.model_runner_v1.set_ascend_forward_context", forward_context),
+-            patch("vllm_ascend.worker.model_runner_v1.update_cos_sin"),
++            patch("vllm_ascend.worker.v1.model_runner.get_pp_group", return_value=SimpleNamespace(is_first_rank=True)),
++            patch("vllm_ascend.worker.v1.model_runner.lmhead_tp_enable", return_value=False),
++            patch("vllm_ascend.worker.v1.model_runner.set_ascend_forward_context", forward_context),
++            patch("vllm_ascend.worker.v1.model_runner.update_cos_sin"),
+         ):
+             runner._dummy_run(4, cudagraph_runtime_mode=CUDAGraphMode.FULL, is_graph_capturing=True)
+ 
+@@ -945,7 +945,7 @@ class TestDrafterMaxModelLen(unittest.TestCase):
+                     num_spec_tokens_to_schedule=draft_width,
+                 )
+                 self.assertFalse(runner._input_fits_in_drafter(SimpleNamespace(max_seq_len=1020)))
+-                with patch("vllm_ascend.worker.model_runner_v1.get_pp_group") as pp:
++                with patch("vllm_ascend.worker.v1.model_runner.get_pp_group") as pp:
+                     pp.return_value.world_size = 1
+                     runner._skip_drafting(scheduler_output)
+                 runner.draft_token_ids_event.record.assert_not_called()
+@@ -986,7 +986,7 @@ class TestDrafterMaxModelLen(unittest.TestCase):
+                 runner.input_batch.sampling_metadata.output_token_ids = [[1]] if mode == "penalties" else []
+                 scheduler_output = SimpleNamespace(has_structured_output_requests=mode == "structured")
+                 with (
+-                    patch("vllm_ascend.worker.model_runner_v1.get_pp_group") as pp,
++                    patch("vllm_ascend.worker.v1.model_runner.get_pp_group") as pp,
+                     patch("torch.npu.current_stream"),
+                     patch("torch.npu.stream", return_value=nullcontext()),
+                 ):
+@@ -1058,7 +1058,7 @@ class TestAcceptedTokenSnapshot(unittest.TestCase):
+             kwargs["num_accepted_tokens_cpu_tensor"][:3].copy_(kwargs["num_accepted_tokens_gpu"][:3])
+ 
+         with patch(
+-            "vllm_ascend.worker.model_runner_v1.mamba_utils.postprocess_mamba_align_gpu",
++            "vllm_ascend.worker.v1.model_runner.mamba_utils.postprocess_mamba_align_gpu",
+             side_effect=postprocess,
+         ):
+             runner._update_states_after_model_execute(
+@@ -1126,7 +1126,7 @@ class TestAcceptedTokenSnapshot(unittest.TestCase):
+                 runner.mamba_state_idx = {}
+                 runner.num_spec_tokens = 3
+                 with patch(
+-                    "vllm_ascend.worker.model_runner_v1.mamba_utils.postprocess_mamba_all", create=True
++                    "vllm_ascend.worker.v1.model_runner.mamba_utils.postprocess_mamba_all", create=True
+                 ) as postprocess_all:
+                     runner._update_states_after_model_execute(torch.tensor([[10, -1], [11, 12]]), SimpleNamespace())
+                 np.testing.assert_array_equal(runner.num_accepted_tokens.np[:2], [1, 2])
+@@ -1277,7 +1277,7 @@ class TestNPUModelRunnerKVCache(unittest.TestCase):
+ 
+         with (
+             patch.multiple(
+-                "vllm_ascend.worker.model_runner_v1",
++                "vllm_ascend.worker.v1.model_runner",
+                 DeviceMemoryProfiler=memory_profiler,
+                 get_model=load_target,
+                 get_pp_group=lambda: SimpleNamespace(world_size=1),
+@@ -1303,7 +1303,7 @@ class TestNPUModelRunnerKVCache(unittest.TestCase):
+                 join_early_kernel_warmup=MagicMock(),
+             ),
+             patch(
+-                "vllm_ascend.worker.model_runner_v1.breakable_cudagraph.is_breakable_cudagraph_enabled",
++                "vllm_ascend.worker.v1.model_runner.breakable_cudagraph.is_breakable_cudagraph_enabled",
+                 return_value=False,
+             ),
+         ):
+@@ -1360,14 +1360,14 @@ class TestNPUModelRunnerKVCache(unittest.TestCase):
+ 
+         flash_profile = SimpleNamespace(supports=lambda capability: capability is HardwareCapability.MLA_FLASH)
+         with patch(
+-            "vllm_ascend.worker.model_runner_v1.get_flashmla_ops",
++            "vllm_ascend.worker.v1.model_runner.get_flashmla_ops",
+             return_value=(MagicMock(), MagicMock()),
+         ):
+             for q_heads in (8, 12, 64, 96):
+                 with self.subTest(q_heads=q_heads):
+                     spec = replace(spec, num_heads=q_heads)
+                     with patch(
+-                        "vllm_ascend.worker.model_runner_v1.get_current_hardware_profile",
++                        "vllm_ascend.worker.v1.model_runner.get_current_hardware_profile",
+                         return_value=flash_profile,
+                     ):
+                         fused = runner._reshape_kv_cache_tensors(kv_cache_config, {layer_name: (raw,)})[layer_name]
+@@ -1380,7 +1380,7 @@ class TestNPUModelRunnerKVCache(unittest.TestCase):
+         # models on the FIA-compatible component-major layout.
+         spec = replace(spec, num_heads=48)
+         with patch(
+-            "vllm_ascend.worker.model_runner_v1.get_current_hardware_profile",
++            "vllm_ascend.worker.v1.model_runner.get_current_hardware_profile",
+             return_value=flash_profile,
+         ):
+             a5_fallback = runner._reshape_kv_cache_tensors(kv_cache_config, {layer_name: (raw,)})[layer_name]
+@@ -1392,10 +1392,10 @@ class TestNPUModelRunnerKVCache(unittest.TestCase):
+         spec = replace(spec, num_heads=64)
+         with (
+             patch(
+-                "vllm_ascend.worker.model_runner_v1.get_current_hardware_profile",
++                "vllm_ascend.worker.v1.model_runner.get_current_hardware_profile",
+                 return_value=flash_profile,
+             ),
+-            patch("vllm_ascend.worker.model_runner_v1.get_flashmla_ops", return_value=None),
++            patch("vllm_ascend.worker.v1.model_runner.get_flashmla_ops", return_value=None),
+         ):
+             missing_flashmla_ops = runner._reshape_kv_cache_tensors(kv_cache_config, {layer_name: (raw,)})[layer_name]
+ 
+@@ -1415,11 +1415,11 @@ class TestNPUModelRunnerKVCache(unittest.TestCase):
+         )
+         with (
+             patch(
+-                "vllm_ascend.worker.model_runner_v1.get_current_hardware_profile",
++                "vllm_ascend.worker.v1.model_runner.get_current_hardware_profile",
+                 return_value=flash_profile,
+             ),
+             patch(
+-                "vllm_ascend.worker.model_runner_v1.get_flashmla_ops",
++                "vllm_ascend.worker.v1.model_runner.get_flashmla_ops",
+                 return_value=(MagicMock(), MagicMock()),
+             ),
+         ):
+@@ -1434,11 +1434,11 @@ class TestNPUModelRunnerKVCache(unittest.TestCase):
+         runner.vllm_config.kv_transfer_config.kv_connector_extra_config["decode"]["tp_size"] = 2
+         with (
+             patch(
+-                "vllm_ascend.worker.model_runner_v1.get_current_hardware_profile",
++                "vllm_ascend.worker.v1.model_runner.get_current_hardware_profile",
+                 return_value=flash_profile,
+             ),
+             patch(
+-                "vllm_ascend.worker.model_runner_v1.get_flashmla_ops",
++                "vllm_ascend.worker.v1.model_runner.get_flashmla_ops",
+                 return_value=(MagicMock(), MagicMock()),
+             ),
+         ):
+@@ -1448,7 +1448,7 @@ class TestNPUModelRunnerKVCache(unittest.TestCase):
+         runner.vllm_config.kv_transfer_config = None
+ 
+         with patch(
+-            "vllm_ascend.worker.model_runner_v1.get_current_hardware_profile",
++            "vllm_ascend.worker.v1.model_runner.get_current_hardware_profile",
+             return_value=SimpleNamespace(supports=lambda capability: False),
+         ):
+             nope, rope = runner._reshape_kv_cache_tensors(kv_cache_config, {layer_name: (raw,)})[layer_name]
+@@ -1483,21 +1483,21 @@ class TestNPUModelRunnerKVCache(unittest.TestCase):
+         runner.compilation_config = SimpleNamespace(static_forward_context={layer_name: attn_module})
+ 
+         with patch(
+-            "vllm_ascend.worker.model_runner_v1.supports_component_major_mla_pd",
++            "vllm_ascend.worker.v1.model_runner.supports_component_major_mla_pd",
+             return_value=True,
+         ):
+             self.assertFalse(runner._uses_single_raw_mla_cache(layer_name, spec, attn_module))
+ 
+         attn_module.impl.enable_kv_nz = False
+         with patch(
+-            "vllm_ascend.worker.model_runner_v1.supports_component_major_mla_pd",
++            "vllm_ascend.worker.v1.model_runner.supports_component_major_mla_pd",
+             return_value=True,
+         ):
+             self.assertFalse(runner._uses_single_raw_mla_cache(layer_name, spec, attn_module))
+ 
+         attn_module.impl.pcp_enabled = True
+         with patch(
+-            "vllm_ascend.worker.model_runner_v1.supports_component_major_mla_pd",
++            "vllm_ascend.worker.v1.model_runner.supports_component_major_mla_pd",
+             return_value=True,
+         ):
+             self.assertFalse(runner._uses_single_raw_mla_cache(layer_name, spec, attn_module))
+@@ -1505,7 +1505,7 @@ class TestNPUModelRunnerKVCache(unittest.TestCase):
+ 
+         attn_module.impl.is_pcp_decode_sharded = True
+         with patch(
+-            "vllm_ascend.worker.model_runner_v1.supports_component_major_mla_pd",
++            "vllm_ascend.worker.v1.model_runner.supports_component_major_mla_pd",
+             return_value=True,
+         ):
+             self.assertFalse(runner._uses_single_raw_mla_cache(layer_name, spec, attn_module))
+@@ -1516,7 +1516,7 @@ class TestNPUModelRunnerKVCache(unittest.TestCase):
+         runner.vllm_config.scheduler_config.max_num_batched_tokens = 16384
+         attn_module.impl._dcp_current_kv_buffers_are_sufficient = lambda: False
+         with patch(
+-            "vllm_ascend.worker.model_runner_v1.supports_component_major_mla_pd",
++            "vllm_ascend.worker.v1.model_runner.supports_component_major_mla_pd",
+             return_value=True,
+         ):
+             self.assertFalse(runner._uses_single_raw_mla_cache(layer_name, spec, attn_module))
+@@ -1528,7 +1528,7 @@ class TestNPUModelRunnerKVCache(unittest.TestCase):
+         )
+         attn_module.impl._dcp_current_kv_buffers_are_sufficient = lambda: True
+         with patch(
+-            "vllm_ascend.worker.model_runner_v1.supports_component_major_mla_pd",
++            "vllm_ascend.worker.v1.model_runner.supports_component_major_mla_pd",
+             return_value=True,
+         ):
+             self.assertTrue(runner._uses_single_raw_mla_cache(layer_name, spec, attn_module))
+@@ -1536,7 +1536,7 @@ class TestNPUModelRunnerKVCache(unittest.TestCase):
+         attn_module.impl.dcp_enabled = False
+         attn_module.impl.supports_strided_mla_writer = lambda: True
+         with patch(
+-            "vllm_ascend.worker.model_runner_v1.supports_component_major_mla_pd",
++            "vllm_ascend.worker.v1.model_runner.supports_component_major_mla_pd",
+             return_value=True,
+         ):
+             self.assertTrue(runner._uses_single_raw_mla_cache(layer_name, spec, attn_module))
+@@ -1546,7 +1546,8 @@ class TestNPUModelRunnerKVCache(unittest.TestCase):
+     def test_kvpp_allocate_and_reshape_views(self):
+         from tests.ut.kvpp_utils import assert_attention_cache_views, make_attention_cache_case, make_cache_config
+         from vllm_ascend.core import kv_cache_placement
+-        from vllm_ascend.worker import kvpp_cache, model_runner_v1
++        from vllm_ascend.worker import kvpp_cache
++        from vllm_ascend.worker.v1 import model_runner as model_runner_v1
+ 
+         for packed in (False, True):
+             with self.subTest(packed=packed):
+@@ -1714,7 +1715,7 @@ class TestNPUModelRunnerKVCache(unittest.TestCase):
+             ],
+         )
+ 
+-        with patch("vllm_ascend.worker.model_runner_v1.requires_contiguous_pa_kv_cache", return_value=pa_enabled):
++        with patch("vllm_ascend.worker.v1.model_runner.requires_contiguous_pa_kv_cache", return_value=pa_enabled):
+             raw_caches = runner._allocate_kv_cache_tensors(kv_cache_config)
+ 
+         uses_contiguous_cache = xlite_enabled or backend.is_sparse() or pa_enabled or dcp_size > 1
+@@ -1876,7 +1877,7 @@ class TestNPUModelRunnerKVCache(unittest.TestCase):
+             )
+         return SimpleNamespace(kv_cache_groups=groups)
+ 
+-    @patch("vllm_ascend.worker.model_runner_v1.NPUInputBatch")
++    @patch("vllm_ascend.worker.v1.model_runner.NPUInputBatch")
+     def test_matching_single_group_keeps_existing_input_batch(self, input_batch_cls):
+         runner = self._build_reinitialize_runner()
+         original_input_batch = runner.input_batch
+@@ -1887,7 +1888,7 @@ class TestNPUModelRunnerKVCache(unittest.TestCase):
+         input_batch_cls.assert_not_called()
+         assert runner.input_batch is original_input_batch
+ 
+-    @patch("vllm_ascend.worker.model_runner_v1.NPUInputBatch")
++    @patch("vllm_ascend.worker.v1.model_runner.NPUInputBatch")
+     def test_kernel_size_change_reinitializes_with_flat_values(self, input_batch_cls):
+         runner = self._build_reinitialize_runner()
+         config = self._cache_config_with_block_sizes(384)
+@@ -1915,7 +1916,7 @@ class TestNPUModelRunnerKVCache(unittest.TestCase):
+             reasoning_config=None,
+         )
+ 
+-    @patch("vllm_ascend.worker.model_runner_v1.NPUInputBatch")
++    @patch("vllm_ascend.worker.v1.model_runner.NPUInputBatch")
+     def test_multiple_groups_reinitialize_even_when_sizes_match(self, input_batch_cls):
+         runner = self._build_reinitialize_runner()
+         config = self._cache_config_with_block_sizes(128, 128)
+@@ -1926,7 +1927,7 @@ class TestNPUModelRunnerKVCache(unittest.TestCase):
+         assert input_batch_cls.call_args.kwargs["kernel_block_sizes"] == [128, 128]
+         assert input_batch_cls.call_args.kwargs["max_num_blocks_per_req"] == [10, 11]
+ 
+-    @patch("vllm_ascend.worker.model_runner_v1.NPUInputBatch")
++    @patch("vllm_ascend.worker.v1.model_runner.NPUInputBatch")
+     def test_reinitialize_rejects_cpu_offload(self, input_batch_cls):
+         runner = self._build_reinitialize_runner()
+         runner.offload_config.uva.cpu_offload_gb = 1
+@@ -2054,7 +2055,7 @@ class TestNPUModelRunnerKVCache(unittest.TestCase):
+             2 * kv_cache_spec.page_size_bytes,
+         )
+ 
+-    @patch("vllm_ascend.worker.model_runner_v1.get_layers_from_vllm_config")
++    @patch("vllm_ascend.worker.v1.model_runner.get_layers_from_vllm_config")
+     def test_mla_spec_preserves_block_stride_layout_contract(
+         self,
+         mock_get_layers,
+@@ -2085,8 +2086,8 @@ class TestNPUModelRunnerKVCache(unittest.TestCase):
+         self.assertTrue(spec.indexes_kv_by_block_stride)
+         self.assertEqual(spec.num_heads, 64)
+ 
+-    @patch("vllm_ascend.worker.model_runner_v1.has_ec_transfer", return_value=False)
+-    @patch("vllm_ascend.worker.model_runner_v1.get_layers_from_vllm_config")
++    @patch("vllm_ascend.worker.v1.model_runner.has_ec_transfer", return_value=False)
++    @patch("vllm_ascend.worker.v1.model_runner.get_layers_from_vllm_config")
+     def test_mamba_alignment_excludes_auxiliary_glm_caches(
+         self,
+         mock_get_layers,
+@@ -2147,7 +2148,7 @@ class TestNPUModelRunnerKVCache(unittest.TestCase):
+             "model.layers.0.linear_attn": FakeMamba(mamba_spec),
+         }
+ 
+-        with patch("vllm_ascend.worker.model_runner_v1.MambaBase", FakeMamba):
++        with patch("vllm_ascend.worker.v1.model_runner.MambaBase", FakeMamba):
+             specs = runner.get_kv_cache_spec()
+ 
+         self.assertEqual(
+@@ -2157,7 +2158,7 @@ class TestNPUModelRunnerKVCache(unittest.TestCase):
+         self.assertIsNone(specs["model.layers.1.indexer.k_cache"].page_size_padded)
+         self.assertIsNone(specs["model.layers.1.indexer.tail_cache"].page_size_padded)
+ 
+-    @patch("vllm_ascend.worker.model_runner_v1.get_layers_from_vllm_config")
++    @patch("vllm_ascend.worker.v1.model_runner.get_layers_from_vllm_config")
+     def test_mla_rope_modes_and_cache_layers_use_separate_metadata_groups(self, mock_get_layers):
+         class FakeBuilder:
+             def __init__(self, _spec, layer_names, _config, _device):
+@@ -2279,9 +2280,9 @@ class TestNPUModelRunnerKVCache(unittest.TestCase):
+                 runner.drafter = None
+                 runner.use_aclgraph = False
+                 with (
+-                    patch("vllm_ascend.worker.model_runner_v1.enable_dsa_cp", return_value=cp_enabled),
+-                    patch("vllm_ascend.worker.model_runner_v1.enable_sp", return_value=enable_sp),
+-                    patch("vllm_ascend.worker.model_runner_v1.update_pass_config", return_value=nullcontext()),
++                    patch("vllm_ascend.worker.v1.model_runner.enable_dsa_cp", return_value=cp_enabled),
++                    patch("vllm_ascend.worker.v1.model_runner.enable_sp", return_value=enable_sp),
++                    patch("vllm_ascend.worker.v1.model_runner.update_pass_config", return_value=nullcontext()),
+                 ):
+                     runner._check_and_update_cudagraph_mode([], [])
+                     dispatcher = runner.cudagraph_dispatcher
+@@ -2337,7 +2338,7 @@ class TestNPUModelRunnerKVCache(unittest.TestCase):
+         assert raw_caches[layer_names[0]][0] is not raw_caches[layer_names[1]][0]
+         assert raw_caches[layer_names[0]][1] is not raw_caches[layer_names[1]][1]
+ 
+-    @patch("vllm_ascend.worker.model_runner_v1.requires_contiguous_pa_kv_cache", return_value=True)
++    @patch("vllm_ascend.worker.v1.model_runner.requires_contiguous_pa_kv_cache", return_value=True)
+     def test_hybrid_backing_is_unchanged_when_pa_is_configured(self, _mock_requires_contiguous):
+         self.test_hybrid_descriptors_share_standardized_backing_allocation()
+ 
+@@ -2557,7 +2558,7 @@ class TestNPUModelRunnerKVCache(unittest.TestCase):
+         self.assertEqual(k_cache.shape, (2, 16, 8, 64))
+         self.assertEqual(v_cache.shape, (2, 16, 8, 64))
+ 
+-    @patch("vllm_ascend.worker.model_runner_v1.get_layers_from_vllm_config")
++    @patch("vllm_ascend.worker.v1.model_runner.get_layers_from_vllm_config")
+     def test_hybrid_mla_cache_uses_logical_kernel_block_shape(
+         self,
+         mock_get_layers,
+@@ -2737,8 +2738,8 @@ class TestNPUModelRunnerKVCache(unittest.TestCase):
+             self.assertEqual(k_cache.shape, (2, 4, 2, 3))
+             self.assertEqual(v_cache.shape, (2, 4, 2, 3))
+ 
+-    @patch("vllm_ascend.worker.model_runner_v1.has_ec_transfer", return_value=False)
+-    @patch("vllm_ascend.worker.model_runner_v1.get_layers_from_vllm_config")
++    @patch("vllm_ascend.worker.v1.model_runner.has_ec_transfer", return_value=False)
++    @patch("vllm_ascend.worker.v1.model_runner.get_layers_from_vllm_config")
+     def test_sparse_layer_without_indexer_allocates_only_mla_kv_cache(
+         self,
+         mock_get_layers,
+@@ -2801,7 +2802,7 @@ class TestNPUModelRunnerKVCache(unittest.TestCase):
+         self.assertEqual(raw_k_cache.numel(), 2 * 16 * 512 * 2)
+         self.assertEqual(raw_v_cache.numel(), 2 * 16 * 64 * 2)
+ 
+-    @patch("vllm_ascend.worker.model_runner_v1.get_layers_from_vllm_config")
++    @patch("vllm_ascend.worker.v1.model_runner.get_layers_from_vllm_config")
+     def test_sparse_layer_packs_the_turboquant_main_cache(
+         self,
+         mock_get_layers,
+@@ -2840,8 +2841,8 @@ class TestNPUModelRunnerKVCache(unittest.TestCase):
+         self.assertEqual(spec.head_size, get_tq_fused_slot_bytes(512, 64))
+         self.assertEqual(spec.dtype, torch.int8)
+ 
+-    @patch("vllm_ascend.worker.model_runner_v1.has_ec_transfer", return_value=False)
+-    @patch("vllm_ascend.worker.model_runner_v1.get_layers_from_vllm_config")
++    @patch("vllm_ascend.worker.v1.model_runner.has_ec_transfer", return_value=False)
++    @patch("vllm_ascend.worker.v1.model_runner.get_layers_from_vllm_config")
+     def test_sparse_layer_allocates_one_packed_turboquant_tensor(
+         self,
+         mock_get_layers,
+@@ -2899,8 +2900,8 @@ class TestNPUModelRunnerKVCache(unittest.TestCase):
+         (raw_cache,) = raw_caches[layer_name]
+         self.assertEqual(raw_cache.numel(), 2 * 16 * spec.head_size)
+ 
+-    @patch("vllm_ascend.worker.model_runner_v1.has_ec_transfer", return_value=False)
+-    @patch("vllm_ascend.worker.model_runner_v1.get_layers_from_vllm_config")
++    @patch("vllm_ascend.worker.v1.model_runner.has_ec_transfer", return_value=False)
++    @patch("vllm_ascend.worker.v1.model_runner.get_layers_from_vllm_config")
+     def test_sparse_indexer_allocates_separate_replicated_cache_tensor(
+         self,
+         mock_get_layers,
+@@ -3013,8 +3014,8 @@ class TestNPUModelRunnerKVCache(unittest.TestCase):
+         self.assertEqual(v_cache.shape, (2, 16, 1, 64))
+         self.assertEqual(indexer_cache.shape, (4, 16, 1, 128))
+ 
+-    @patch("vllm_ascend.worker.model_runner_v1.has_ec_transfer", return_value=False)
+-    @patch("vllm_ascend.worker.model_runner_v1.get_layers_from_vllm_config")
++    @patch("vllm_ascend.worker.v1.model_runner.has_ec_transfer", return_value=False)
++    @patch("vllm_ascend.worker.v1.model_runner.get_layers_from_vllm_config")
+     def test_sparse_indexer_skips_allocation_for_runtime_shared_s_layer(
+         self,
+         mock_get_layers,
+@@ -3203,11 +3204,11 @@ class TestNPUModelRunnerKVCache(unittest.TestCase):
+                     self.assertEqual(indexer_cache[1].dtype, torch.float16)
+ 
+     @patch(
+-        "vllm_ascend.worker.model_runner_v1.get_current_hardware_profile",
++        "vllm_ascend.worker.v1.model_runner.get_current_hardware_profile",
+         return_value=get_hardware_profile(AscendDeviceType.A5),
+     )
+-    @patch("vllm_ascend.worker.model_runner_v1.has_ec_transfer", return_value=False)
+-    @patch("vllm_ascend.worker.model_runner_v1.get_layers_from_vllm_config")
++    @patch("vllm_ascend.worker.v1.model_runner.has_ec_transfer", return_value=False)
++    @patch("vllm_ascend.worker.v1.model_runner.get_layers_from_vllm_config")
+     def test_a5_sparse_c8_specs_keep_main_and_indexer_layouts_separate(
+         self,
+         mock_get_layers,
+@@ -3296,11 +3297,11 @@ class TestNPUModelRunnerKVCache(unittest.TestCase):
+                 self.assertEqual(indexer_spec.cache_sparse_li_c8, enable_li_c8)
+ 
+     @patch(
+-        "vllm_ascend.worker.model_runner_v1.get_current_hardware_profile",
++        "vllm_ascend.worker.v1.model_runner.get_current_hardware_profile",
+         return_value=get_hardware_profile(AscendDeviceType.A5),
+     )
+-    @patch("vllm_ascend.worker.model_runner_v1.has_ec_transfer", return_value=False)
+-    @patch("vllm_ascend.worker.model_runner_v1.get_layers_from_vllm_config")
++    @patch("vllm_ascend.worker.v1.model_runner.has_ec_transfer", return_value=False)
++    @patch("vllm_ascend.worker.v1.model_runner.get_layers_from_vllm_config")
+     def test_a5_sparse_li_c4_specs_keep_main_and_indexer_layouts_separate(
+         self,
+         mock_get_layers,
+@@ -3797,8 +3798,8 @@ class TestNPUModelRunnerOutputTokenIds(unittest.TestCase):
+         runner.use_compress = False
+         return runner
+ 
+-    @patch("vllm_ascend.worker.model_runner_v1.get_ascend_config")
+-    @patch("vllm_ascend.worker.model_runner_v1.lmhead_tp_enable")
++    @patch("vllm_ascend.worker.v1.model_runner.get_ascend_config")
++    @patch("vllm_ascend.worker.v1.model_runner.lmhead_tp_enable")
+     def test_sample_updates_output_token_ids_before_sampler(self, mock_lmhead_tp_enable, mock_get_ascend_config):
+         """Verify output_token_ids are updated before sampler is called"""
+         mock_lmhead_tp_enable.return_value = False
+@@ -3997,10 +3998,10 @@ class TestNPUModelRunnerDebugger(unittest.TestCase):
+         debugger.start.assert_called_once_with(runner.model, scheduled_tokens={"req-0": 42})
+         self.assertTrue(runner._debugger_started)
+ 
+-    @patch("vllm_ascend.worker.model_runner_v1.has_kv_transfer_group", return_value=False)
+-    @patch("vllm_ascend.worker.model_runner_v1.has_ec_transfer", return_value=False)
+-    @patch("vllm_ascend.worker.model_runner_v1.get_pp_group")
+-    @patch("vllm_ascend.worker.model_runner_v1.record_function_or_nullcontext")
++    @patch("vllm_ascend.worker.v1.model_runner.has_kv_transfer_group", return_value=False)
++    @patch("vllm_ascend.worker.v1.model_runner.has_ec_transfer", return_value=False)
++    @patch("vllm_ascend.worker.v1.model_runner.get_pp_group")
++    @patch("vllm_ascend.worker.v1.model_runner.record_function_or_nullcontext")
+     def test_execute_model_skips_dump_start_for_dp_dummy_run(
+         self, mock_record_function, mock_get_pp_group, _mock_has_ec_transfer, _mock_has_kv_transfer_group
+     ):
+@@ -4037,10 +4038,10 @@ class TestNPUModelRunnerDebugger(unittest.TestCase):
+         )
+         runner._start_dump_data.assert_not_called()
+ 
+-    @patch("vllm_ascend.worker.model_runner_v1.has_kv_transfer_group", return_value=False)
+-    @patch("vllm_ascend.worker.model_runner_v1.has_ec_transfer", return_value=False)
+-    @patch("vllm_ascend.worker.model_runner_v1.get_pp_group")
+-    @patch("vllm_ascend.worker.model_runner_v1.record_function_or_nullcontext")
++    @patch("vllm_ascend.worker.v1.model_runner.has_kv_transfer_group", return_value=False)
++    @patch("vllm_ascend.worker.v1.model_runner.has_ec_transfer", return_value=False)
++    @patch("vllm_ascend.worker.v1.model_runner.get_pp_group")
++    @patch("vllm_ascend.worker.v1.model_runner.record_function_or_nullcontext")
+     def test_execute_model_starts_dump_for_real_batch(
+         self, mock_record_function, mock_get_pp_group, _mock_has_ec_transfer, _mock_has_kv_transfer_group
+     ):
+@@ -4138,7 +4139,7 @@ class TestCorrectOptimisticSeqLensCpu(unittest.TestCase):
+ 
+ class TestKVPPExecute(unittest.TestCase):
+     def test_history_gate_uses_only_actual_requests(self):
+-        from vllm_ascend.worker import model_runner_v1 as module
++        from vllm_ascend.worker.v1 import model_runner as module
+ 
+         events: list[object] = []
+         result = SimpleNamespace()
+diff --git a/tests/ut/worker/test_model_runner_v1_nan_detection.py b/tests/ut/worker/test_model_runner_v1_nan_detection.py
+index 71ad3e365..fe7b81628 100644
+--- a/tests/ut/worker/test_model_runner_v1_nan_detection.py
++++ b/tests/ut/worker/test_model_runner_v1_nan_detection.py
+@@ -5,7 +5,7 @@ from unittest.mock import MagicMock, patch
+ import numpy as np
+ import torch
+ 
+-from vllm_ascend.worker.model_runner_v1 import NPUModelRunner
++from vllm_ascend.worker.v1.model_runner import NPUModelRunner
+ 
+ 
+ class TestNPUModelRunnerNaNDetection(unittest.TestCase):
+@@ -42,7 +42,7 @@ class TestNPUModelRunnerNaNDetection(unittest.TestCase):
+         hidden_states = torch.zeros(num_reqs, 4)
+         return scheduler_output, sampler_output, hidden_states
+ 
+-    @patch("vllm_ascend.worker.model_runner_v1.envs.VLLM_COMPUTE_NANS_IN_LOGITS", True)
++    @patch("vllm_ascend.worker.v1.model_runner.envs.VLLM_COMPUTE_NANS_IN_LOGITS", True)
+     def test_bookkeeping_sync_returns_per_request_nan_counts_first(self):
+         runner = self._build_runner(num_reqs=3)
+         logits = torch.tensor(
+@@ -63,7 +63,7 @@ class TestNPUModelRunnerNaNDetection(unittest.TestCase):
+         self.assertEqual(result[3], [[1], [2], [3]])
+         self.assertEqual(result[5], ["req-0", "req-1", "req-2"])
+ 
+-    @patch("vllm_ascend.worker.model_runner_v1.envs.VLLM_COMPUTE_NANS_IN_LOGITS", False)
++    @patch("vllm_ascend.worker.v1.model_runner.envs.VLLM_COMPUTE_NANS_IN_LOGITS", False)
+     def test_bookkeeping_sync_skips_nan_computation_when_disabled(self):
+         runner = self._build_runner(num_reqs=2)
+         runner._get_nans_in_logits = MagicMock()
+@@ -76,7 +76,7 @@ class TestNPUModelRunnerNaNDetection(unittest.TestCase):
+         runner._get_nans_in_logits.assert_not_called()
+ 
+     @patch(
+-        "vllm_ascend.worker.model_runner_v1.envs.VLLM_COMPUTE_NANS_IN_LOGITS",
++        "vllm_ascend.worker.v1.model_runner.envs.VLLM_COMPUTE_NANS_IN_LOGITS",
+         True,
+     )
+     def test_bookkeeping_sync_keeps_nan_counts_on_device_when_async(self):
+@@ -99,7 +99,7 @@ class TestNPUModelRunnerNaNDetection(unittest.TestCase):
+         torch.testing.assert_close(result[1], torch.tensor([2, 0, 3], dtype=result[1].dtype))
+         runner._get_nans_in_logits.assert_not_called()
+ 
+-    @patch("vllm_ascend.worker.model_runner_v1.envs.VLLM_COMPUTE_NANS_IN_LOGITS", True)
++    @patch("vllm_ascend.worker.v1.model_runner.envs.VLLM_COMPUTE_NANS_IN_LOGITS", True)
+     def test_bookkeeping_sync_reports_zero_nans_for_none_logits(self):
+         runner = self._build_runner(num_reqs=2)
+         scheduler_output, sampler_output, hidden_states = self._make_inputs(num_reqs=2)
+@@ -108,7 +108,7 @@ class TestNPUModelRunnerNaNDetection(unittest.TestCase):
+ 
+         self.assertEqual(result[0], {"req-0": 0, "req-1": 0})
+ 
+-    @patch("vllm_ascend.worker.model_runner_v1.envs.VLLM_COMPUTE_NANS_IN_LOGITS", True)
++    @patch("vllm_ascend.worker.v1.model_runner.envs.VLLM_COMPUTE_NANS_IN_LOGITS", True)
+     def test_bookkeeping_sync_defaults_to_zero_when_req_has_no_logits_row(self):
+         runner = self._build_runner(num_reqs=3)
+         logits = torch.tensor(
+diff --git a/tests/ut/worker/test_replay_slot_padding.py b/tests/ut/worker/test_replay_slot_padding.py
+index ad473e646..0476491a8 100644
+--- a/tests/ut/worker/test_replay_slot_padding.py
++++ b/tests/ut/worker/test_replay_slot_padding.py
+@@ -40,7 +40,7 @@ from vllm_ascend.core.kv_cache_interface import (
+     AscendIndexerKPoolTailSpec,
+     register_ascend_kv_cache_specs,
+ )
+-from vllm_ascend.worker.model_runner_v1 import NPUModelRunner
++from vllm_ascend.worker.v1.model_runner import NPUModelRunner
+ 
+ # The prefix-replay geometry upstream's own test uses: a 100-token prompt with a
+ # 96-token hit and a 32-token window recomputes [64, 96).
+diff --git a/tests/ut/worker/test_routing_replay.py b/tests/ut/worker/test_routing_replay.py
+index 9ff2b3941..14f514b57 100644
+--- a/tests/ut/worker/test_routing_replay.py
++++ b/tests/ut/worker/test_routing_replay.py
+@@ -12,7 +12,7 @@ from vllm_ascend.ops.fused_moe.fused_moe import AscendMoERunner
+ from vllm_ascend.ops.fused_moe.router.grouped_topk_router import (
+     AscendGroupedTopKRouter,
+ )
+-from vllm_ascend.worker.model_runner_v1 import NPUModelRunner
++from vllm_ascend.worker.v1.model_runner import NPUModelRunner
+ 
+ 
+ def test_upstream_routed_experts_binder_supports_ascend_router():
+diff --git a/vllm_ascend/_310p/model_runner_310p.py b/vllm_ascend/_310p/model_runner_310p.py
+index a8aabc04a..e52b4dfe8 100644
+--- a/vllm_ascend/_310p/model_runner_310p.py
++++ b/vllm_ascend/_310p/model_runner_310p.py
+@@ -61,7 +61,7 @@ from vllm_ascend.utils import (
+     is_rc_device,
+     lmhead_tp_enable,
+ )
+-from vllm_ascend.worker.model_runner_v1 import NPUModelRunner
++from vllm_ascend.worker.v1.model_runner import NPUModelRunner
+ 
+ _NGRAM_GRAPH_UNIFORM_DECODE_QUERY_LEN = 1
+ _ATTENTION_BLOCK_SIZE_LIMIT = 128 * 128
+diff --git a/vllm_ascend/model_executor/warmup/rejection_sampler_triton_warmup.py b/vllm_ascend/model_executor/warmup/rejection_sampler_triton_warmup.py
+index d88ec367a..142b17179 100644
+--- a/vllm_ascend/model_executor/warmup/rejection_sampler_triton_warmup.py
++++ b/vllm_ascend/model_executor/warmup/rejection_sampler_triton_warmup.py
+@@ -75,7 +75,7 @@ def _is_ngram_spec_method(spec_config) -> bool:
+ def _collect_no_draft_probs_values(spec_config, pipeline_parallel_size: int) -> list[bool]:
+     """Return ``NO_DRAFT_PROBS`` values that match the live rejection_sample path.
+ 
+-    ``model_runner_v1._sample`` passes ``draft_probs=None`` when PP==1.
++    The V1 model runner's ``_sample`` passes ``draft_probs=None`` when PP==1.
+     ngram never provides draft probs. Model-based drafts may supply probs only
+     when PP>1.
+     """
+diff --git a/vllm_ascend/observability/config/base_metrics.yaml b/vllm_ascend/observability/config/base_metrics.yaml
+index 617b85f5a..58060e5cf 100644
+--- a/vllm_ascend/observability/config/base_metrics.yaml
++++ b/vllm_ascend/observability/config/base_metrics.yaml
+@@ -10,15 +10,15 @@
+   handler: ms_service_metric.provider_handlers:scheduler_scheduler_hooker
+ 
+ # Model runner metrics.
+-- symbol: vllm_ascend.worker.model_runner_v1:NPUModelRunner.execute_model
++- symbol: vllm_ascend.worker.v1.model_runner:NPUModelRunner.execute_model
+   handler: ms_service_metric.provider_handlers:init_data_parallel_worker
+ 
+-- symbol: vllm_ascend.worker.model_runner_v1:NPUModelRunner.execute_model
++- symbol: vllm_ascend.worker.v1.model_runner:NPUModelRunner.execute_model
+   handler: ms_service_metric.provider_handlers:model_runner_phase_handler
+   metrics:
+     - name: executor:model_runner_execute_model:duration
+ 
+-- symbol: vllm_ascend.worker.model_runner_v1:NPUModelRunner._prepare_inputs
++- symbol: vllm_ascend.worker.v1.model_runner:NPUModelRunner._prepare_inputs
+   handler: ms_service_metric.provider_handlers:model_runner_phase_handler
+   metrics:
+     - name: executor:prepare_inputs:duration
+diff --git a/vllm_ascend/profiling_config.py b/vllm_ascend/profiling_config.py
+index 3e4ae8c30..7fadb1822 100644
+--- a/vllm_ascend/profiling_config.py
++++ b/vllm_ascend/profiling_config.py
+@@ -87,16 +87,16 @@ SERVICE_PROFILING_SYMBOLS_YAML = f"""
+   handler: ms_service_profiler.patcher.vllm.handlers.v1.model_handlers:execute_model
+   name: modelExec
+ 
+-- symbol: vllm_ascend.worker.model_runner_v1:NPUModelRunner.execute_model
++- symbol: vllm_ascend.worker.v1.model_runner:NPUModelRunner.execute_model
+   name: modelRunnerExec
+   handler: ms_service_profiler.patcher.vllm.handlers.v1.model_handlers:execute_model_runner
+   domain: Execute
+ 
+-- symbol: vllm_ascend.worker.model_runner_v1:NPUModelRunner._update_states
++- symbol: vllm_ascend.worker.v1.model_runner:NPUModelRunner._update_states
+   name: _update_states
+   domain: Execute
+ 
+-- symbol: vllm_ascend.worker.model_runner_v1:NPUModelRunner._prepare_inputs
++- symbol: vllm_ascend.worker.v1.model_runner:NPUModelRunner._prepare_inputs
+   name: _prepare_inputs
+   domain: Execute
+ 
+@@ -114,7 +114,7 @@ SERVICE_PROFILING_SYMBOLS_YAML = f"""
+   handler: ms_service_profiler.patcher.vllm.handlers.v1.model_handlers:record_function_or_nullcontext
+ 
+ # ===== MTP / NPUModelRunner =====
+-- symbol: vllm_ascend.worker.model_runner_v1:NPUModelRunner.propose_draft_token_ids
++- symbol: vllm_ascend.worker.v1.model_runner:NPUModelRunner.propose_draft_token_ids
+   min_version: "0.9.1"
+   handler: ms_service_profiler.patcher.vllm.handlers.v1.mtp_handlers:propose_draft_token_ids_npu
+ 
+@@ -142,7 +142,7 @@ SERVICE_PROFILING_SYMBOLS_YAML = f"""
+   min_version: "0.9.1"
+   handler: ms_service_profiler.patcher.vllm.handlers.v1.meta_handlers:init_data_parallel
+ 
+-- symbol: vllm_ascend.worker.model_runner_v1:NPUModelRunner.execute_model
++- symbol: vllm_ascend.worker.v1.model_runner:NPUModelRunner.execute_model
+   min_version: "0.9.1"
+   handler: ms_service_profiler.patcher.vllm.handlers.v1.meta_handlers:init_data_parallel_worker
+ 
+@@ -208,23 +208,23 @@ SERVICE_PROFILING_SYMBOLS_YAML = f"""
+   handler: ms_service_profiler.patcher.vllm.handlers.v1.model_handlers:execute_model
+   domain: Execute
+   name: modelExec
+-- symbol: vllm_ascend.worker.model_runner_v1:NPUModelRunner._calc_spec_decode_metadata
++- symbol: vllm_ascend.worker.v1.model_runner:NPUModelRunner._calc_spec_decode_metadata
+   min_version: "0.9.1"
+   domain: SpecDecode
+   name: NPUModelRunner._calc_spec_decode_metadata
+-- symbol: vllm_ascend.worker.model_runner_v1:NPUModelRunner._build_attn_state
++- symbol: vllm_ascend.worker.v1.model_runner:NPUModelRunner._build_attn_state
+   min_version: "0.9.1"
+   domain: SpecDecode
+   name: NPUModelRunner._build_attn_state
+-- symbol: vllm_ascend.worker.model_runner_v1:NPUModelRunner._determine_batch_execution_and_padding
++- symbol: vllm_ascend.worker.v1.model_runner:NPUModelRunner._determine_batch_execution_and_padding
+   min_version: "0.9.1"
+   domain: Execute
+   name: NPUModelRunner._determine_batch_execution_and_padding
+-- symbol: vllm_ascend.worker.model_runner_v1:NPUModelRunner._pad_for_sequence_parallelism
++- symbol: vllm_ascend.worker.v1.model_runner:NPUModelRunner._pad_for_sequence_parallelism
+   min_version: "0.9.1"
+   domain: Execute
+   name: NPUModelRunner._pad_for_sequence_parallelism
+-- symbol: vllm_ascend.worker.model_runner_v1:NPUModelRunner._sync_metadata_across_dp
++- symbol: vllm_ascend.worker.v1.model_runner:NPUModelRunner._sync_metadata_across_dp
+   min_version: "0.9.1"
+   domain: Execute
+   name: NPUModelRunner._sync_metadata_across_dp
+@@ -232,7 +232,7 @@ SERVICE_PROFILING_SYMBOLS_YAML = f"""
+   min_version: "0.9.1"
+   domain: Execute
+   name: CudagraphDispatcher.dispatch
+-- symbol: vllm_ascend.worker.model_runner_v1:_post_process_cudagraph_mode
++- symbol: vllm_ascend.worker.v1.model_runner:_post_process_cudagraph_mode
+   min_version: "0.9.1"
+   domain: Execute
+   name: _post_process_cudagraph_mode
+@@ -252,15 +252,15 @@ SERVICE_PROFILING_SYMBOLS_YAML = f"""
+   min_version: "0.9.1"
+   domain: SpecDecode
+   name: draft_compute_token_ids
+-- symbol: vllm_ascend.worker.model_runner_v1:NPUModelRunner._build_attention_metadata
++- symbol: vllm_ascend.worker.v1.model_runner:NPUModelRunner._build_attention_metadata
+   min_version: "0.9.1"
+   domain: Execute
+   name: NPUModelRunner._build_attention_metadata
+-- symbol: vllm_ascend.worker.model_runner_v1:NPUModelRunner._sanitize_placeholder_input_ids_for_forward
++- symbol: vllm_ascend.worker.v1.model_runner:NPUModelRunner._sanitize_placeholder_input_ids_for_forward
+   min_version: "0.9.1"
+   domain: SpecDecode
+   name: NPUModelRunner._sanitize_placeholder_input_ids_for_forward
+-- symbol: vllm_ascend.worker.model_runner_v1:NPUModelRunner._preprocess
++- symbol: vllm_ascend.worker.v1.model_runner:NPUModelRunner._preprocess
+   min_version: "0.9.1"
+   domain: Execute
+   name: NPUModelRunner._preprocess
+@@ -268,7 +268,7 @@ SERVICE_PROFILING_SYMBOLS_YAML = f"""
+   min_version: "0.9.1"
+   domain: Execute
+   name: rotary.update_cos_sin
+-- symbol: vllm_ascend.worker.model_runner_v1:NPUModelRunner._model_forward
++- symbol: vllm_ascend.worker.v1.model_runner:NPUModelRunner._model_forward
+   min_version: "0.9.1"
+   domain: ModelForward
+   name: NPUModelRunner._model_forward
+@@ -279,31 +279,31 @@ SERVICE_PROFILING_SYMBOLS_YAML = f"""
+     expr: this | attr dp_rank | str
+   - name: npu_id
+     expr: this | attr device | attr index | str
+-- symbol: vllm_ascend.worker.model_runner_v1:NPUModelRunner._update_full_graph_params_if_needed
++- symbol: vllm_ascend.worker.v1.model_runner:NPUModelRunner._update_full_graph_params_if_needed
+   min_version: "0.9.1"
+   domain: ModelForward
+   name: NPUModelRunner._update_full_graph_params_if_needed
+-- symbol: vllm_ascend.worker.model_runner_v1:NPUModelRunner._all_gather_hidden_states_and_aux
++- symbol: vllm_ascend.worker.v1.model_runner:NPUModelRunner._all_gather_hidden_states_and_aux
+   min_version: "0.9.1"
+   domain: ModelForward
+   name: NPUModelRunner._all_gather_hidden_states_and_aux
+-- symbol: vllm_ascend.worker.model_runner_v1:NPUModelRunner._dummy_run
++- symbol: vllm_ascend.worker.v1.model_runner:NPUModelRunner._dummy_run
+   min_version: "0.9.1"
+   domain: Execute
+   name: NPUModelRunner._dummy_run
+-- symbol: vllm_ascend.worker.model_runner_v1:NPUModelRunner.sample_tokens
++- symbol: vllm_ascend.worker.v1.model_runner:NPUModelRunner.sample_tokens
+   min_version: "0.9.1"
+   domain: Sample
+   name: NPUModelRunner.sample_tokens
+-- symbol: vllm_ascend.worker.model_runner_v1:NPUModelRunner._sample
++- symbol: vllm_ascend.worker.v1.model_runner:NPUModelRunner._sample
+   min_version: "0.9.1"
+   domain: Sample
+   name: NPUModelRunner._sample
+-- symbol: vllm_ascend.worker.model_runner_v1:NPUModelRunner._bookkeeping_sync
++- symbol: vllm_ascend.worker.v1.model_runner:NPUModelRunner._bookkeeping_sync
+   min_version: "0.9.1"
+   domain: Execute
+   name: NPUModelRunner._bookkeeping_sync
+-- symbol: vllm_ascend.worker.model_runner_v1:NPUModelRunner._poll_late_kv_connector_output
++- symbol: vllm_ascend.worker.v1.model_runner:NPUModelRunner._poll_late_kv_connector_output
+   min_version: "0.9.1"
+   domain: KVTransfer
+   name: NPUModelRunner._poll_late_kv_connector_output
+diff --git a/vllm_ascend/worker/utils.py b/vllm_ascend/worker/utils.py
+index 4b35dd2dd..2ae9190e5 100644
+--- a/vllm_ascend/worker/utils.py
++++ b/vllm_ascend/worker/utils.py
+@@ -1,10 +1,8 @@
+ from collections.abc import Iterable, Iterator, Sequence
+ from contextlib import contextmanager
+-from typing import Any
+ 
+ import torch
+ from vllm.triton_utils import tl, triton
+-from vllm.utils.math_utils import largest_power_of_2_divisor
+ from vllm.utils.torch_utils import get_dtype_size
+ from vllm.v1.core.kv_cache_utils import KVCacheBlockCopy
+ from vllm.v1.kv_cache_interface import (
+@@ -17,12 +15,10 @@ from vllm.v1.kv_cache_interface import (
+ )
+ from vllm.v1.worker.utils import (
+     AttentionGroup,
+-    KVBlockZeroer,
+     prepare_kernel_block_sizes,
+     select_common_block_size,
+ )
+ 
+-from vllm_ascend.ops.triton.triton_utils import get_vectorcore_num
+ from vllm_ascend.utils import vllm_version_is
+ 
+ 
+@@ -306,164 +302,3 @@ def _is_page_strided_mla_cache(kv: torch.Tensor, spec: FullAttentionSpec, ratio:
+         and not kv.is_contiguous()
+         and kv.stride(0) > kv[0].numel()
+     )
+-
+-
+-class AscendKVBlockZeroer(KVBlockZeroer):
+-    """Manages efficient zeroing of KV cache blocks via a Triton kernel.
+-
+-    Call :meth:`init_meta` once after KV caches are allocated to precompute
+-    segment addresses, then call :meth:`zero_block_ids` each step to zero
+-    newly-allocated blocks.
+-    """
+-
+-    def __init__(self, device: torch.device, pin_memory: bool) -> None:
+-        self.device = device
+-        self.pin_memory = pin_memory
+-        self._meta: tuple[torch.Tensor, torch.Tensor, int, int, int] | None = None
+-        self._seg_page_strides: torch.Tensor | None = None
+-        self._id_cap: int = 0
+-        self._ids_pinned: torch.Tensor | None = None
+-        self._ids_gpu: torch.Tensor | None = None
+-
+-    def init_meta(
+-        self,
+-        attn_groups_iter: Iterable["AttentionGroup"],
+-        kernel_block_sizes: list[int],
+-        cache_dtype: str,
+-        runner_only_attn_layers: set[str],
+-        static_forward_context: dict[str, Any],
+-    ) -> None:
+-        """One-time precomputation for zero_block_ids.
+-
+-        Builds absolute-address table for the Triton zeroing kernel.
+-        Each entry is the absolute byte address of a segment start on the
+-        GPU, so segments in different CUDA allocations work correctly.
+-
+-        Block IDs from the scheduler reference logical blocks whose size
+-        may differ from the kernel block size (virtual block splitting).
+-        Each segment's page size accounts for this ratio so that
+-        ``block_id * page_size_el`` lands at the correct offset.
+-
+-        Only AttentionSpec layers are processed; Mamba layers are skipped.
+-        """
+-        seen_ptrs: set[int] = set()
+-        seg_addrs: list[int] = []
+-        seg_page_sizes: list[int] = []
+-        seg_page_strides: list[int] = []
+-
+-        for group in attn_groups_iter:
+-            spec = group.kv_cache_spec
+-            if not isinstance(spec, FullAttentionSpec):
+-                continue
+-            if group.kv_cache_group_id >= len(kernel_block_sizes):
+-                continue
+-            kernel_bs = kernel_block_sizes[group.kv_cache_group_id]
+-            assert kernel_bs > 0 and spec.block_size % kernel_bs == 0
+-            ratio = spec.block_size // kernel_bs
+-
+-            for layer_name in group.layer_names:
+-                if layer_name in runner_only_attn_layers:
+-                    continue
+-                kv_cache = static_forward_context[layer_name].kv_cache
+-                # Fused MLA is one tensor, and component-major MLA views share
+-                # one physical page; zero once from the NoPE start. The legacy
+-                # K/V protocol still zeroes each component separately.
+-                if _component_views_share_slot(kv_cache, spec):
+-                    kv_tensors = (kv_cache[0],)
+-                elif isinstance(kv_cache, torch.Tensor):
+-                    kv_tensors = (kv_cache,)
+-                else:
+-                    kv_tensors = kv_cache
+-                    if cache_dtype == "mxfp8" and len(kv_tensors) == 4:
+-                        # V scales are checkpoint constants, initialized before
+-                        # capture. Clearing a recycled block must preserve them.
+-                        kv_tensors = kv_tensors[:3]
+-                for kv in kv_tensors:
+-                    dp = kv.data_ptr()
+-                    if dp in seen_ptrs:
+-                        continue
+-                    seen_ptrs.add(dp)
+-
+-                    el = kv.element_size()
+-                    if _is_page_strided_mla_cache(kv, spec, ratio):
+-                        physical_page_bytes = kv.stride(0) * el * ratio
+-                        assert physical_page_bytes % 4 == 0
+-                        physical_page_el = physical_page_bytes // 4
+-                        seg_addrs.append(dp)
+-                        seg_page_sizes.append(physical_page_el)
+-                        seg_page_strides.append(physical_page_el)
+-                        continue
+-
+-                    payload_bytes = kv[0].numel() * el
+-                    stride_bytes = kv.stride(0) * el
+-                    assert kv[0].is_contiguous(), "KV block payload must be contiguous"
+-                    assert payload_bytes % 4 == 0 and stride_bytes % 4 == 0
+-                    # A physical stride may include other caches and padding.
+-                    # Only clear the payload. Contiguous subblocks can be
+-                    # coalesced; strided subblocks need one segment each.
+-                    contiguous = payload_bytes == stride_bytes
+-                    for subblock in range(1 if contiguous else ratio):
+-                        seg_addrs.append(dp + subblock * stride_bytes)
+-                        seg_page_sizes.append(payload_bytes * (ratio if contiguous else 1) // 4)
+-                        seg_page_strides.append(stride_bytes * ratio // 4)
+-
+-        if not seg_addrs:
+-            self._meta = None
+-            self._seg_page_strides = None
+-            return
+-
+-        # _zero_kv_blocks_kernel will use int64 zeros, to meet the UB size, we use blk_size=64B/8B=8192
+-        max_page_size_el = max(seg_page_sizes)
+-        blk_size = min(
+-            min(largest_power_of_2_divisor(page_size_el) for page_size_el in seg_page_sizes),
+-            8192,
+-        )
+-        self._id_cap = 8192
+-        self._ids_pinned = torch.empty(
+-            self._id_cap,
+-            dtype=torch.int64,
+-            pin_memory=self.pin_memory,
+-        )
+-        self._ids_gpu = torch.empty(self._id_cap, dtype=torch.int64, device=self.device)
+-        self._seg_page_strides = torch.tensor(seg_page_strides, dtype=torch.int64, device=self.device)
+-        self._meta = (
+-            torch.tensor(seg_addrs, dtype=torch.uint64, device=self.device),
+-            torch.tensor(seg_page_sizes, dtype=torch.int64, device=self.device),
+-            max_page_size_el // blk_size,
+-            blk_size,
+-            len(seg_addrs),
+-        )
+-
+-    def zero_block_ids(self, block_ids: list[int]) -> None:
+-        """Zero the KV cache memory for the given block IDs."""
+-        if not block_ids or self._meta is None:
+-            return
+-        seg_addrs, seg_page_sizes, max_chunks, blk_size, n_segs = self._meta
+-        n_blocks = len(block_ids)
+-        if n_blocks > self._id_cap:
+-            self._id_cap = n_blocks * 2
+-            self._ids_pinned = torch.empty(
+-                self._id_cap,
+-                dtype=torch.int64,
+-                pin_memory=self.pin_memory,
+-            )
+-            self._ids_gpu = torch.empty(self._id_cap, dtype=torch.int64, device=self.device)
+-        assert self._ids_pinned is not None and self._ids_gpu is not None
+-        self._ids_pinned[:n_blocks].numpy()[:] = block_ids
+-        idx = self._ids_gpu[:n_blocks]
+-        idx.copy_(self._ids_pinned[:n_blocks], non_blocking=True)
+-        total_work = n_blocks * n_segs * max_chunks
+-        grid = min(total_work, get_vectorcore_num()) if total_work > 0 else 0
+-        if grid == 0:
+-            return
+-        _zero_kv_blocks_kernel[(grid,)](
+-            seg_addrs,
+-            seg_page_sizes,
+-            idx,
+-            n_blocks,
+-            self._seg_page_strides if self._seg_page_strides is not None else seg_page_sizes,
+-            N_SEGS=n_segs,
+-            MAX_CHUNKS=max_chunks,
+-            BLOCK_SIZE=blk_size,
+-            GRID_SIZE=grid,
+-        )
+diff --git a/vllm_ascend/worker/v1/__init__.py b/vllm_ascend/worker/v1/__init__.py
+new file mode 100644
+index 000000000..e69de29bb
+diff --git a/vllm_ascend/worker/v1/kv_block_zeroer.py b/vllm_ascend/worker/v1/kv_block_zeroer.py
+new file mode 100644
+index 000000000..bd05d1488
+--- /dev/null
++++ b/vllm_ascend/worker/v1/kv_block_zeroer.py
+@@ -0,0 +1,193 @@
++#
++# Copyright (c) 2026 Huawei Technologies Co., Ltd. All Rights Reserved.
++#
++# Licensed under the Apache License, Version 2.0 (the "License");
++# you may not use this file except in compliance with the License.
++# You may obtain a copy of the License at
++#
++#     http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS,
++# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++# See the License for the specific language governing permissions and
++# limitations under the License.
++# This file is a part of the vllm-ascend project.
++#
++"""V1-only KV block zeroer."""
++
++from collections.abc import Iterable
++from typing import Any
++
++import torch
++from vllm.utils.math_utils import largest_power_of_2_divisor
++from vllm.v1.kv_cache_interface import FullAttentionSpec
++from vllm.v1.worker.utils import AttentionGroup, KVBlockZeroer
++
++from vllm_ascend.ops.triton.triton_utils import get_vectorcore_num
++from vllm_ascend.worker.utils import (
++    _component_views_share_slot,
++    _is_page_strided_mla_cache,
++    _zero_kv_blocks_kernel,
++)
++
++
++class AscendKVBlockZeroer(KVBlockZeroer):
++    """Manages efficient zeroing of KV cache blocks via a Triton kernel.
++
++    Call :meth:`init_meta` once after KV caches are allocated to precompute
++    segment addresses, then call :meth:`zero_block_ids` each step to zero
++    newly-allocated blocks.
++    """
++
++    def __init__(self, device: torch.device, pin_memory: bool) -> None:
++        self.device = device
++        self.pin_memory = pin_memory
++        self._meta: tuple[torch.Tensor, torch.Tensor, int, int, int] | None = None
++        self._seg_page_strides: torch.Tensor | None = None
++        self._id_cap: int = 0
++        self._ids_pinned: torch.Tensor | None = None
++        self._ids_gpu: torch.Tensor | None = None
++
++    def init_meta(
++        self,
++        attn_groups_iter: Iterable["AttentionGroup"],
++        kernel_block_sizes: list[int],
++        cache_dtype: str,
++        runner_only_attn_layers: set[str],
++        static_forward_context: dict[str, Any],
++    ) -> None:
++        """One-time precomputation for zero_block_ids.
++
++        Builds absolute-address table for the Triton zeroing kernel.
++        Each entry is the absolute byte address of a segment start on the
++        GPU, so segments in different CUDA allocations work correctly.
++
++        Block IDs from the scheduler reference logical blocks whose size
++        may differ from the kernel block size (virtual block splitting).
++        Each segment's page size accounts for this ratio so that
++        ``block_id * page_size_el`` lands at the correct offset.
++
++        Only AttentionSpec layers are processed; Mamba layers are skipped.
++        """
++        seen_ptrs: set[int] = set()
++        seg_addrs: list[int] = []
++        seg_page_sizes: list[int] = []
++        seg_page_strides: list[int] = []
++
++        for group in attn_groups_iter:
++            spec = group.kv_cache_spec
++            if not isinstance(spec, FullAttentionSpec):
++                continue
++            if group.kv_cache_group_id >= len(kernel_block_sizes):
++                continue
++            kernel_bs = kernel_block_sizes[group.kv_cache_group_id]
++            assert kernel_bs > 0 and spec.block_size % kernel_bs == 0
++            ratio = spec.block_size // kernel_bs
++
++            for layer_name in group.layer_names:
++                if layer_name in runner_only_attn_layers:
++                    continue
++                kv_cache = static_forward_context[layer_name].kv_cache
++                # Fused MLA is one tensor, and component-major MLA views share
++                # one physical page; zero once from the NoPE start. The legacy
++                # K/V protocol still zeroes each component separately.
++                if _component_views_share_slot(kv_cache, spec):
++                    kv_tensors = (kv_cache[0],)
++                elif isinstance(kv_cache, torch.Tensor):
++                    kv_tensors = (kv_cache,)
++                else:
++                    kv_tensors = kv_cache
++                    if cache_dtype == "mxfp8" and len(kv_tensors) == 4:
++                        # V scales are checkpoint constants, initialized before
++                        # capture. Clearing a recycled block must preserve them.
++                        kv_tensors = kv_tensors[:3]
++                for kv in kv_tensors:
++                    dp = kv.data_ptr()
++                    if dp in seen_ptrs:
++                        continue
++                    seen_ptrs.add(dp)
++
++                    el = kv.element_size()
++                    if _is_page_strided_mla_cache(kv, spec, ratio):
++                        physical_page_bytes = kv.stride(0) * el * ratio
++                        assert physical_page_bytes % 4 == 0
++                        physical_page_el = physical_page_bytes // 4
++                        seg_addrs.append(dp)
++                        seg_page_sizes.append(physical_page_el)
++                        seg_page_strides.append(physical_page_el)
++                        continue
++
++                    payload_bytes = kv[0].numel() * el
++                    stride_bytes = kv.stride(0) * el
++                    assert kv[0].is_contiguous(), "KV block payload must be contiguous"
++                    assert payload_bytes % 4 == 0 and stride_bytes % 4 == 0
++                    # A physical stride may include other caches and padding.
++                    # Only clear the payload. Contiguous subblocks can be
++                    # coalesced; strided subblocks need one segment each.
++                    contiguous = payload_bytes == stride_bytes
++                    for subblock in range(1 if contiguous else ratio):
++                        seg_addrs.append(dp + subblock * stride_bytes)
++                        seg_page_sizes.append(payload_bytes * (ratio if contiguous else 1) // 4)
++                        seg_page_strides.append(stride_bytes * ratio // 4)
++
++        if not seg_addrs:
++            self._meta = None
++            self._seg_page_strides = None
++            return
++
++        # _zero_kv_blocks_kernel will use int64 zeros, to meet the UB size, we use blk_size=64B/8B=8192
++        max_page_size_el = max(seg_page_sizes)
++        blk_size = min(
++            min(largest_power_of_2_divisor(page_size_el) for page_size_el in seg_page_sizes),
++            8192,
++        )
++        self._id_cap = 8192
++        self._ids_pinned = torch.empty(
++            self._id_cap,
++            dtype=torch.int64,
++            pin_memory=self.pin_memory,
++        )
++        self._ids_gpu = torch.empty(self._id_cap, dtype=torch.int64, device=self.device)
++        self._seg_page_strides = torch.tensor(seg_page_strides, dtype=torch.int64, device=self.device)
++        self._meta = (
++            torch.tensor(seg_addrs, dtype=torch.uint64, device=self.device),
++            torch.tensor(seg_page_sizes, dtype=torch.int64, device=self.device),
++            max_page_size_el // blk_size,
++            blk_size,
++            len(seg_addrs),
++        )
++
++    def zero_block_ids(self, block_ids: list[int]) -> None:
++        """Zero the KV cache memory for the given block IDs."""
++        if not block_ids or self._meta is None:
++            return
++        seg_addrs, seg_page_sizes, max_chunks, blk_size, n_segs = self._meta
++        n_blocks = len(block_ids)
++        if n_blocks > self._id_cap:
++            self._id_cap = n_blocks * 2
++            self._ids_pinned = torch.empty(
++                self._id_cap,
++                dtype=torch.int64,
++                pin_memory=self.pin_memory,
++            )
++            self._ids_gpu = torch.empty(self._id_cap, dtype=torch.int64, device=self.device)
++        assert self._ids_pinned is not None and self._ids_gpu is not None
++        self._ids_pinned[:n_blocks].numpy()[:] = block_ids
++        idx = self._ids_gpu[:n_blocks]
++        idx.copy_(self._ids_pinned[:n_blocks], non_blocking=True)
++        total_work = n_blocks * n_segs * max_chunks
++        grid = min(total_work, get_vectorcore_num()) if total_work > 0 else 0
++        if grid == 0:
++            return
++        _zero_kv_blocks_kernel[(grid,)](
++            seg_addrs,
++            seg_page_sizes,
++            idx,
++            n_blocks,
++            self._seg_page_strides if self._seg_page_strides is not None else seg_page_sizes,
++            N_SEGS=n_segs,
++            MAX_CHUNKS=max_chunks,
++            BLOCK_SIZE=blk_size,
++            GRID_SIZE=grid,
++        )
+diff --git a/vllm_ascend/worker/model_runner_v1.py b/vllm_ascend/worker/v1/model_runner.py
+similarity index 99%
+rename from vllm_ascend/worker/model_runner_v1.py
+rename to vllm_ascend/worker/v1/model_runner.py
+index 144bc1aa8..5c1f7d505 100644
+--- a/vllm_ascend/worker/model_runner_v1.py
++++ b/vllm_ascend/worker/v1/model_runner.py
+@@ -244,7 +244,6 @@ from vllm_ascend.worker.device_metadata import (
+ from vllm_ascend.worker.kvpp_cache import allocate_kvpp_cache
+ from vllm_ascend.worker.npu_input_batch import NPUInputBatch
+ from vllm_ascend.worker.utils import (
+-    AscendKVBlockZeroer,
+     copy_kv_cache_blocks_inplace,
+     disable_compilation,
+     get_single_raw_mla_backing,
+@@ -252,6 +251,7 @@ from vllm_ascend.worker.utils import (
+     prepare_ascend_kernel_block_sizes,
+     row_major_strides,
+ )
++from vllm_ascend.worker.v1.kv_block_zeroer import AscendKVBlockZeroer
+ from vllm_ascend.worker.v2.kvpp import KVPPRuntime
+ 
+ from vllm_ascend.ascend_forward_context import (  # isort: skip
+@@ -302,9 +302,6 @@ from vllm_ascend.core.profiling_chunk_predictor import (
+ v41_metadata_builder_type: type[AscendDSAV41MetadataBuilder] = AscendDSAV41MetadataBuilder
+ v41_cache_layer_type: type[DeepseekV41CacheLayer] = DeepseekV41CacheLayer
+ 
+-# if true, allow tensor initialization and casting with internal format (e.g., NZ)
+-torch.npu.config.allow_internal_format = True
+-
+ AttnMetadataDict: TypeAlias = dict[str, AttentionMetadata]
+ # list when ubatching is enabled
+ PerLayerAttnMetadata: TypeAlias = list[AttnMetadataDict] | AttnMetadataDict
+diff --git a/vllm_ascend/worker/worker.py b/vllm_ascend/worker/worker.py
+index 26eab07bf..2abeaf4a0 100644
+--- a/vllm_ascend/worker/worker.py
++++ b/vllm_ascend/worker/worker.py
+@@ -114,7 +114,6 @@ from vllm_ascend.utils import (
+     register_device_print,
+     setup_ascend_local_comm_res,
+ )
+-from vllm_ascend.worker.model_runner_v1 import NPUModelRunner
+ 
+ torch._dynamo.trace_rules.clear_lru_cache()  # noqa: E402
+ from torch._dynamo.variables import TorchInGraphFunctionVariable  # noqa: E402
+@@ -127,6 +126,21 @@ torch_non_c_binding_in_graph_functions_npu = dict.fromkeys(
+ torch_non_c_binding_in_graph_functions_npu["torch.npu.stream"] = TorchInGraphFunctionVariable  # noqa: E402
+ torch._dynamo.trace_rules.torch_name_rule_map.append(torch_non_c_binding_in_graph_functions_npu)  # noqa: E402
+ 
++# if true, allow tensor initialization and casting with internal format (e.g., NZ)
++torch.npu.config.allow_internal_format = True
++
++
++class _V1ModelRunnerFactory:
++    """Import the V1 model runner only when one is actually constructed."""
++
++    def __call__(self, *args: Any, **kwargs: Any) -> Any:
++        from vllm_ascend.worker.v1.model_runner import NPUModelRunner
++
++        return NPUModelRunner(*args, **kwargs)
++
++
++NPUModelRunner = _V1ModelRunnerFactory()
++
+ 
+ class NPUWorker(WorkerBase):
+     def __init__(
+diff --git a/vllm_ascend/xlite/xlite_model_runner.py b/vllm_ascend/xlite/xlite_model_runner.py
+index 16a1466e6..48e476249 100644
+--- a/vllm_ascend/xlite/xlite_model_runner.py
++++ b/vllm_ascend/xlite/xlite_model_runner.py
+@@ -28,7 +28,7 @@ from vllm.logger import logger
+ from vllm.v1.kv_cache_interface import KVCacheConfig
+ 
+ from vllm_ascend.ascend_config import get_ascend_config
+-from vllm_ascend.worker.model_runner_v1 import NPUModelRunner
++from vllm_ascend.worker.v1.model_runner import NPUModelRunner
+ from vllm_ascend.worker.v2.model_runner import NPUModelRunner as NPUModelRunnerV2
+ from vllm_ascend.xlite.utils import _TensorRepr
+ from vllm_ascend.xlite.xlite import XliteWrapper
+@@ -114,7 +114,7 @@ class XliteModelRunnerMixin:
+ 
+ 
+ class XliteModelRunner(XliteModelRunnerMixin, NPUModelRunner):  # type: ignore[misc]
+-    """xlite model runner for model runner V1 (`vllm_ascend/worker/model_runner_v1.py`).
++    """xlite model runner for model runner V1 (`vllm_ascend/worker/v1/model_runner.py`).
+ 
+     Remove this class together with `NPUModelRunner` V1 when the V1 runner is dropped; the mixin and
+     `XliteModelRunnerV2` below stay.

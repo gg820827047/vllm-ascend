@@ -1,0 +1,281 @@
+commit 87f2b060adff3079bd63f995c6c628820fec0f9d
+Author:     chenxi-hh <32731611+chenxi-hh@users.noreply.github.com>
+AuthorDate: Thu Oct 22 01:05:00 2026 +0800
+Commit:     GitHub <noreply@github.com>
+CommitDate: Thu Oct 22 01:05:00 2026 +0800
+
+    [BugFix][Ops] Fix GDN recurrent state indices exceeding the token count (#19378)
+    
+    ### What this PR does / why we need it?
+    
+    The CANN `recurrent_gated_delta_rule` kernel requires
+    `len(ssm_state_indices) == T`, where `T` is the number of q/k/v rows.
+    Three call sites in `vllm_ascend/ops/gdn.py` violated this contract:
+    
+    - **Pure-decode path** passed the request-granularity buffer unsliced.
+    Block-table rows also cover FIA/graph padding rows, so a 30-token decode
+    batch padded to 32 requests fails the kernel tiling check:
+    `ssm_state_indices length must equal T, but got 32 and T is 30`.
+    - **Mixed prefill+decode path** sliced by `num_decodes`, which also
+    counts requests scheduled with zero tokens (e.g. requests pinned at
+    `max_model_len`), producing an index tensor longer than the decode token
+    count.
+    - **Speculative path** flattened all draft slots wholesale, including
+    slots left unused when a sequence capped at `max_model_len` carries
+    fewer than `num_spec + 1` query tokens.
+    
+    This PR adds `_flatten_recurrent_state_indices` (mirroring the 310P
+    `_flatten_state_indices` contract) and uses it in all three recurrent
+    calls:
+    
+    - 1D indices: slice to `[:total_tokens]` following the existing
+    live-rows-first convention
+    - 2D uniform: fast path `reshape(-1)`, no extra cost on the hot path
+    - 2D non-uniform: per-sequence compaction that keeps the first
+    `query_len` slots of each row
+    
+    ### Does this PR introduce _any_ user-facing change?
+    
+    No. Decode steps that previously aborted with the
+    `RecurrentGatedDeltaRule` tiling error now run correctly; no API or
+    behavior change otherwise.
+    
+    ### How was this patch tested?
+    
+    - Unit tests added: `tests/ut/ops/test_gdn_recurrent_state_indices.py`
+    (`pytest -sv tests/ut/ops/test_gdn_recurrent_state_indices.py`),
+    covering the 1D padding-row case (the reported 32-vs-30 failure), the 2D
+    uniform fast path, non-uniform draft-slot compaction, zero-length
+    sequences, query-length clamping and the missing-`query_start_loc` error
+    path
+    - `ruff check` / `ruff format` clean
+    - Verified against the reported workload (long prompt with `max_tokens`
+    exactly filling `max-model-len`), where decode steps with request-count
+    padding previously crashed
+    
+    ---
+    
+    ### Checklist
+    
+    #### Testing
+    
+    - [ ] **Boundary / edge-case coverage**: I reviewed whether this change
+    involves
+    boundary conditions (e.g. empty input, single/zero element, min/max
+    values,
+    off-by-one, sequence-length limits, integer overflow). Where applicable,
+    I
+    added unit tests covering these edge cases in `tests/ut/` or
+    `tests/e2e/`.
+    - [ ] **Regression test**: If this PR fixes a bug, I added a regression
+    test
+      that would fail without the fix.
+    - [ ] **Error / failure path coverage**: I covered abnormal paths
+    (exceptions,
+    timeouts, out-of-range, division by zero) in addition to the happy path.
+    - [ ] **Meaningful & reliable tests**: New tests assert real behavior
+    and are
+      not written merely to satisfy CI.
+    - [ ] **Performance impact**: If this PR touches a performance-sensitive
+    path,
+      I attached benchmark results and added performance regression tests.
+    
+    - vLLM main:
+    https://github.com/vllm-project/vllm/commit/a98247ab4db686ee03c66d5feb3c761e52a2f8ab
+    
+    ---------
+    
+    Signed-off-by: chenxi-hh <chen464822955@163.com>
+
+diff --git a/tests/ut/ops/test_gdn_recurrent_state_indices.py b/tests/ut/ops/test_gdn_recurrent_state_indices.py
+new file mode 100644
+index 000000000..b20f45117
+--- /dev/null
++++ b/tests/ut/ops/test_gdn_recurrent_state_indices.py
+@@ -0,0 +1,98 @@
++# SPDX-License-Identifier: Apache-2.0
++import numpy as np
++import pytest
++import torch
++
++from vllm_ascend.ops.gdn import _flatten_recurrent_state_indices
++
++
++@pytest.mark.parametrize("num_rows, total_tokens", [(30, 30), (32, 30), (33, 30), (1, 1)])
++def test_1d_indices_sliced_to_token_count(num_rows, total_tokens):
++    indices = torch.arange(num_rows, dtype=torch.int32)
++    flattened = _flatten_recurrent_state_indices(indices, total_tokens)
++    assert flattened.shape[0] == total_tokens
++    torch.testing.assert_close(flattened, indices[:total_tokens])
++    assert flattened.is_contiguous()
++
++
++def test_2d_uniform_slots_flatten_without_query_start_loc():
++    indices = torch.arange(8, dtype=torch.int32).reshape(4, 2)
++    flattened = _flatten_recurrent_state_indices(indices, 8)
++    torch.testing.assert_close(flattened, indices.reshape(-1))
++    assert flattened.is_contiguous()
++
++
++def test_2d_non_uniform_slots_drop_unused_draft_slots():
++    indices = torch.arange(6, dtype=torch.int32).reshape(3, 2) + 10
++    query_start_loc = torch.tensor([0, 2, 3, 5], dtype=torch.int32)
++    flattened = _flatten_recurrent_state_indices(indices, 5, query_start_loc)
++    torch.testing.assert_close(flattened, torch.tensor([10, 11, 12, 14, 15], dtype=torch.int32))
++
++
++def test_2d_zero_length_sequences_dropped():
++    indices = torch.tensor([[7, 8], [9, 10], [11, 12]], dtype=torch.int32)
++    query_start_loc = torch.tensor([0, 0, 2, 2], dtype=torch.int32)
++    flattened = _flatten_recurrent_state_indices(indices, 2, query_start_loc)
++    torch.testing.assert_close(flattened, torch.tensor([9, 10], dtype=torch.int32))
++
++
++def test_2d_query_lens_clamped_to_slot_count():
++    indices = torch.tensor([[1, 2], [3, 4]], dtype=torch.int32)
++    query_start_loc = torch.tensor([0, 3, 4], dtype=torch.int32)
++    flattened = _flatten_recurrent_state_indices(indices, 3, query_start_loc)
++    torch.testing.assert_close(flattened, torch.tensor([1, 2, 3], dtype=torch.int32))
++
++
++def test_2d_missing_query_start_loc_raises():
++    indices = torch.arange(6, dtype=torch.int32).reshape(3, 2)
++    with pytest.raises(ValueError, match="query_start_loc is required"):
++        _flatten_recurrent_state_indices(indices, 5)
++
++
++@pytest.mark.parametrize(
++    "query_lens, num_padding",
++    [
++        ([1] * 30, 0),
++        ([1] * 30, 2),
++        ([1] * 16 + [128, 64, 32, 16, 8, 4, 2, 512], 0),
++        ([1] * 16 + [100, 50, 25], 3),
++    ],
++)
++def test_decode_indices_match_request_slot_layout(query_lens, num_padding):
++    """Every decode token must land in the state slot of its own request.
++
++    Ground truth is the runner-authoritative token layout
++    (model_runner_v1.py:1305): tokens are packed by request slot order via
++    ``np.repeat(arange(num_rows), num_scheduled_tokens)``, with decode rows
++    (query_len == 1) preceding prefill rows and padding rows contributing
++    zero tokens (scheduler writes ``num_scheduled_tokens`` only for requests
++    with ``num_new_tokens > 0``; FIA/graph padding appends rows after
++    ``num_reqs``). The helper's ``[:total_tokens]`` slice must therefore
++    reproduce that mapping exactly.
++    """
++    num_rows = len(query_lens)
++    total_rows = num_rows + num_padding
++    block_table = torch.arange(total_rows * 8, dtype=torch.int32).reshape(total_rows, 8)
++    indices_full = block_table[:, 0]
++
++    scheduled = np.array(query_lens + [0] * num_padding, dtype=np.int64)
++    req_indices = np.repeat(np.arange(total_rows), scheduled)
++    num_decode_tokens = sum(1 for q in query_lens if q == 1)
++
++    flattened = _flatten_recurrent_state_indices(indices_full, num_decode_tokens)
++    expected = block_table[torch.from_numpy(req_indices[:num_decode_tokens]), 0]
++    torch.testing.assert_close(flattened, expected)
++    assert flattened.tolist() == [block_table[r, 0].item() for r in req_indices[:num_decode_tokens]]
++
++
++@pytest.mark.parametrize("lens", [[2, 2, 2], [2, 1, 2], [1, 2, 1], [2, 0, 2], [1, 1, 1, 1]])
++def test_spec_indices_match_token_slot_layout(lens):
++    """Spec token t of sequence s must land in slot (s, t - start_s)."""
++    num_slots = 2
++    indices = torch.arange(len(lens) * num_slots, dtype=torch.int32).reshape(len(lens), num_slots) + 10
++    qsl = torch.tensor(np.concatenate([[0], np.cumsum(lens)]), dtype=torch.int32)
++    total = int(sum(lens))
++
++    flattened = _flatten_recurrent_state_indices(indices, total, qsl)
++    expected = [indices[s, j].item() for s, length in enumerate(lens) for j in range(length)]
++    assert flattened.tolist() == expected
+diff --git a/vllm_ascend/ops/gdn.py b/vllm_ascend/ops/gdn.py
+index 5d11c47d7..6a9423f22 100644
+--- a/vllm_ascend/ops/gdn.py
++++ b/vllm_ascend/ops/gdn.py
+@@ -144,6 +144,46 @@ def _normalize_causal_cache_indices(cache_indices: torch.Tensor) -> torch.Tensor
+     raise ValueError(f"GDN causal cache_indices must be 1D or 2D, got shape={tuple(cache_indices.shape)}")
+ 
+ 
++def _flatten_recurrent_state_indices(
++    state_indices: torch.Tensor,
++    total_tokens: int,
++    query_start_loc: torch.Tensor | None = None,
++) -> torch.Tensor:
++    """Reduce state indices to exactly one entry per recurrent token.
++
++    ``torch_npu.npu_recurrent_gated_delta_rule`` requires
++    ``len(ssm_state_indices) == T`` where T is the number of q/k/v rows.
++    Block-table-derived index tensors carry one entry per request row, which
++    also covers FIA/graph padding rows and requests scheduled with zero
++    tokens, while speculative rows carry one entry per draft slot, including
++    slots left unused when a sequence capped at max_model_len carries fewer
++    than ``num_spec + 1`` query tokens. 1D indices follow the live-rows-first
++    convention; 2D indices keep the first ``query_len`` slots of each row.
++    """
++    if state_indices.ndim == 1:
++        # Plain slice: zero device work. The block-table column view is
++        # strided and the kernel accepted strided input here before the fix,
++        # so forcing contiguity would add a per-layer copy on the hot path.
++        return state_indices[:total_tokens]
++    num_seqs, num_slots = state_indices.shape
++    if total_tokens == num_seqs * num_slots:
++        return state_indices.reshape(-1).contiguous()
++    if query_start_loc is None:
++        raise ValueError("query_start_loc is required to flatten non-uniform speculative state indices")
++    # Variable-length speculative sequences: map each token to its
++    # (sequence, slot) pair on device. The output length is host-known
++    # (total_tokens), so this path stays sync-free, unlike masked_select or
++    # a CPU compaction whose output shape depends on device data.
++    qsl = query_start_loc[: num_seqs + 1]
++    lens = (qsl[1:] - qsl[:-1]).clamp_(min=0, max=num_slots)
++    bounds = lens.cumsum(0)
++    starts = bounds - lens
++    token_ids = torch.arange(total_tokens, device=state_indices.device, dtype=qsl.dtype)
++    seq_ids = torch.searchsorted(bounds, token_ids, right=True).clamp_(max=num_seqs - 1)
++    slot_ids = (token_ids - starts[seq_ids]).clamp_(min=0, max=num_slots - 1)
++    return state_indices[seq_ids, slot_ids].contiguous()
++
++
+ def _split_head_first_conv_output(
+     output: torch.Tensor, num_k_heads: int, num_v_heads: int
+ ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+@@ -674,7 +714,11 @@ class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
+                 beta=beta_spec.squeeze(0),
+                 scale=key_spec.shape[-1] ** -0.5,
+                 actual_seq_lengths=actual_seq_lengths,
+-                ssm_state_indices=spec_state_indices_tensor.flatten(),
++                ssm_state_indices=_flatten_recurrent_state_indices(
++                    spec_state_indices_tensor,
++                    query_spec.shape[1],
++                    spec_causal_conv1d_meta.query_start_loc,
++                ),
+                 num_accepted_tokens=spec_causal_conv1d_meta.num_accepted_tokens.to(torch.int32),
+             ).unsqueeze(0)
+         else:
+@@ -703,7 +747,10 @@ class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
+                 beta=beta_non_spec[:, :num_decode_tokens].squeeze(0),
+                 scale=key_decode.shape[-1] ** -0.5,
+                 actual_seq_lengths=actual_seq_lengths,
+-                ssm_state_indices=non_spec_state_indices_tensor[: attn_metadata.num_decodes],
++                ssm_state_indices=_flatten_recurrent_state_indices(
++                    non_spec_state_indices_tensor,
++                    num_decode_tokens,
++                ),
+             ).unsqueeze(0)
+         else:
+             core_attn_out_decode = None
+@@ -833,7 +880,10 @@ class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
+                 beta=beta_non_spec.squeeze(0) if beta_non_spec is not None else beta_non_spec,
+                 scale=key_non_spec.shape[-1] ** -0.5,
+                 actual_seq_lengths=actual_seq_lengths,
+-                ssm_state_indices=non_spec_state_indices_tensor,
++                ssm_state_indices=_flatten_recurrent_state_indices(
++                    non_spec_state_indices_tensor,
++                    num_decode_tokens,
++                ),
+             ).unsqueeze(0)
+         else:
+             core_attn_out_non_spec, last_recurrent_state = None, None

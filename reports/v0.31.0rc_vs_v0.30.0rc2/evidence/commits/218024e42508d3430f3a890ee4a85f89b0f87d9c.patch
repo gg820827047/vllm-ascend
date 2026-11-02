@@ -1,0 +1,1058 @@
+commit 218024e42508d3430f3a890ee4a85f89b0f87d9c
+Author:     lijiahang226 <216526138+lijiahang226@users.noreply.github.com>
+AuthorDate: Wed Oct 14 22:18:26 2026 +0800
+Commit:     GitHub <noreply@github.com>
+CommitDate: Wed Oct 14 22:18:26 2026 +0800
+
+    [Feature][Ops] Add Triton cache adapters for CANN pooled indexing (#18295)
+    
+    ### What this PR does / why we need it?
+    
+    Adds three fused Triton adapters for the BF16 GLM-5.3-Flash CANN
+    KeyPool/PoolKeyIndexer integration in #16730. CANN performs pooling and
+    index selection; these adapters translate vLLM's paged metadata,
+    persistent caches and SFA index layout at the operator boundaries.
+    
+    - **Metadata and tail addressing:** `_build_keypool_metadata_kernel`
+    builds pooled lengths, query boundaries, compact cache slots, tail
+    history/write addresses and MTP retained rows. DSA-CP additionally
+    receives rank-local query boundaries and causal prefix lengths. Both
+    metadata and tail preparation reuse this kernel.
+    - **Cache writes:** `_write_keypool_caches_kernel` updates the BF16
+    pooled cache and FP32 tail key/gate cache in one launch, using CANN
+    state outputs or the speculative input rows as appropriate.
+    - **Index packing:** `_pack_indices_kernel` combines selected history
+    indices with the unpooled causal tail, writes the existing SFA output
+    buffer and masks graph-padding rows with `-1`.
+    
+    The kernels write preallocated buffers, honor tensor strides and invalid
+    slots, and avoid device-to-host count extraction. Metadata tiles adapt
+    to workload size while request inversion is bounded to fit Ascend
+    unified buffer storage. Runtime request/token counts, tail row width and
+    input row stride are not specialization keys. Request inversion and tail
+    column tiles are fixed by the serving layout; metadata token tiles
+    retain four bounded sizes (8/16/32/64).
+    
+    The follow-up AscendC integration is #16730, which calls the
+    image-provided CANN KeyPool/PoolKeyIndexer operators and selects the GLM
+    pooled-indexer backend. This PR supplies the three Triton boundary
+    adapters; full-model use requires both PRs.
+    
+    Refs #15665
+    
+    ### Does this PR introduce _any_ user-facing change?
+    
+    Provides the three adapters required by #16730; it does not select the
+    model backend itself. This PR supports BF16 pooled indexing, including
+    MTP and DSA-CP metadata. FP8 LI cache support remains in its separate
+    PR. SFA's FP8/FP16 cache formats and attention kernels are unchanged.
+    
+    ### How was this patch tested?
+    
+    - Five wrapper mock tests cover launch parameters and buffer reuse.
+    Eleven real NPU operator tests cover cache writes, index packing,
+    metadata padding, DSA-CP boundaries and graph replay.
+    
+    Current revision: all 16 operator/wrapper tests passed on A5/CANN 9.2.0
+    (Triton Ascend 3.2.2), including changing widths/strides and graph
+    replay. The actual Ascend JIT binder reduced the tested cache-width,
+    tail-width, request-tile and position-alignment key counts from 4/4/8/2
+    to 1/1/1/1. Four metadata cases, including 65,536 tokens with 128 and
+    257 requests, matched the pre-specialization-change adapter outputs
+    exactly. Current-head pre-commit and mypy passed. This revision has no
+    new full-model accuracy/performance result. Warm operator comparison
+    against previous PR head `8f8cf126` (64 calls per graph, 7 alternating
+    rounds): 8K/8-request metadata 19.96 → 26.34 μs (+6.38 μs / +32%) with
+    the fixed 128-request tile; 64K/128 requests stayed within 0.06%. MTP
+    tail (64 requests) increased 0.30 μs; cache writes and index packing
+    changed by less than 0.04 μs across the selected cases. All 9 cases
+    matched exactly. Compilation and full-model execution are excluded.
+    
+    Earlier joint full-model performance with #16730 + #18295 on A5/CANN
+    9.2.0, TP8/EP/MTP3, BF16 indexer and FP8 SFA cache, using `vllm bench
+    serve` (vLLM `0.30.0+empty`), 256 output tokens, seed 1024 and
+    temperature 0. Reference: frozen main
+    [`05fa3be5`](https://github.com/vllm-project/vllm-ascend/commit/05fa3be5f50306a151d4863735d3d84ce63dc0a2).
+    Each case/arm ran once without active profiling; all requests succeeded
+    with exact lengths and no KV preemption.
+    
+    | Input / concurrency / requests | Output tokens/s (main → combined) |
+    Throughput Δ | Mean TTFT Δ | Mean TPOT Δ |
+    | --- | --- | --- | --- | --- |
+    | 4096 / C8 / 64 | 340.033 → 443.616 | +30.46% | −7.46% | −25.58% |
+    | 4096 / C64 / 128 | 676.309 → 737.094 | +8.99% | −6.74% | −4.29% |
+    | 4096 / C90 / 180 | 712.100 → 724.663 | +1.76% | +0.22% | −2.39% |
+    | 65536 / C8 / 16 | 40.798 → 49.467 | +21.25% | −17.65% | −15.10% |
+    | 1048576 / C4 / 8 | 0.873 → 1.998 | +128.80% | −55.44% | −57.64% |
+    
+    Output throughput includes prefill and queueing. The candidate also
+    contains newer upstream changes, so these results do not isolate CANN or
+    Triton gains. At 1M, mean TTFT was 647.24 → 288.41 s and mean TPOT
+    1897.44 → 803.83 ms; client C4 reached peak running 3 on both arms. Both
+    arms extended the native total-token limit by 256 to allow output
+    (`max_model_len`/`max_position_embeddings=1048832`, unchanged RoPE).
+    This is not 1M semantic accuracy validation; the separate C1 rank-0
+    profile is excluded from these measurements.
+    
+    The earlier combined main CANN/Triton implementation completed two full
+    GSM8K runs per arm (1319 questions, C64, temperature 0, seed 1024,
+    max_tokens 4096). Raw scores: candidate 1267/1272, frozen main 05fa
+    1264/1269; no request errors or truncated outputs. Each paired
+    difference was +0.227 percentage points (18 gained, 15 lost after the
+    same format audit; exact paired p=0.728), within the 0.379-point repeat
+    variation. This does not establish an accuracy improvement or isolate
+    Triton effects. These full-model measurements precede the latest
+    runtime-parameter and MTP tail-address revisions; current-head
+    full-model accuracy remains pending.
+    
+    - vLLM main:
+    https://github.com/vllm-project/vllm/commit/c4df37dfcc7f72ca41cd43801a468526ecf99a2b
+    
+    Signed-off-by: Li Jiahang <216526138+lijiahang226@users.noreply.github.com>
+
+diff --git a/.github/workflows/scripts/estimated_times.yaml b/.github/workflows/scripts/estimated_times.yaml
+index d1fb8ce24..914c4691a 100644
+--- a/.github/workflows/scripts/estimated_times.yaml
++++ b/.github/workflows/scripts/estimated_times.yaml
+@@ -165,3 +165,4 @@ estimated_times:
+   tests/e2e/pull_request/one_card/test_thinking_budget.py: 80
+   tests/e2e/pull_request/one_card/test_model_runner_v1_with_device.py: 70
+   tests/e2e/pull_request/one_card/test_msa_index_score.py: 40
++  tests/e2e/pull_request/one_card/test_glm5next_pooled_cache_write.py: 30
+diff --git a/tests/e2e/pull_request/one_card/test_glm5next_pooled_cache_write.py b/tests/e2e/pull_request/one_card/test_glm5next_pooled_cache_write.py
+new file mode 100644
+index 000000000..86da0bca8
+--- /dev/null
++++ b/tests/e2e/pull_request/one_card/test_glm5next_pooled_cache_write.py
+@@ -0,0 +1,239 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++from types import SimpleNamespace
++
++import pytest
++import torch
++import torch_npu  # noqa: F401
++
++from vllm_ascend.ops.triton import glm5_next_cann_keypool as adapters
++
++
++@pytest.mark.parametrize("cp_start", [None, 0, 4, 8])
++@torch.inference_mode()
++def test_cann_facing_metadata_and_tail_indices(cp_start):
++    device = "npu"
++    common = SimpleNamespace(
++        num_reqs=3,
++        num_actual_tokens=6,
++        query_start_loc=torch.tensor([0, 3, 6, -1], dtype=torch.int32, device=device),
++        seq_lens=torch.tensor([65539, 65542, 0], dtype=torch.int32, device=device),
++        positions=torch.tensor([65536, 65537, 65538, 65539, 65540, 65541], device=device),
++        slot_mapping=torch.tensor([-1, 0, 1, 135, 136, 137], device=device),
++        block_table_tensor=torch.tensor([[1, 9], [0, 9], [-1, 9]], dtype=torch.int32, device=device)[:, :1],
++    )
++    fields = {
++        "positions": (8, torch.int64),
++        "slot_mapping": (8, torch.int64),
++        "seq_lens": (3, torch.int64),
++        "raw_seq_lens": (3, torch.int32),
++        "query_start_loc": (4, torch.int32),
++        "cum_query_lens": (3, torch.int64),
++        "start_pos": (3, torch.int32),
++        "pool_tail": (3, torch.int64),
++        "start_offsets": (3, torch.int32),
++        "pooled_slot_mapping": (9, torch.int64),
++    }
++    buffers = SimpleNamespace(
++        **{name: torch.full((size,), 77, dtype=dtype, device=device) for name, (size, dtype) in fields.items()}
++    )
++    query = (
++        None
++        if cp_start is None
++        else SimpleNamespace(
++            positions=buffers.positions[cp_start : cp_start + 4],
++            **{
++                name: torch.full((3,), 77, dtype=torch.int64, device=device)
++                for name in ("cum_query_lens", "seq_lens", "pool_tail")
++            },
++        )
++    )
++    outputs = adapters.build_keypool_metadata(
++        common, buffers, 8, 6, 128, 4, query_metadata=query, local_start=cp_start or 0
++    )
++    if query is not None:
++        expected_query = {
++            0: ([3, 4, 4], [16384, 16385, 0], [3, 0, 0]),
++            4: ([0, 2, 2], [0, 16385, 0], [0, 2, 0]),
++            8: ([0, 0, 0], [0, 0, 0], [0, 0, 0]),
++        }[cp_start]
++        for field, values in zip(("cum_query_lens", "seq_lens", "pool_tail"), expected_query):
++            torch.testing.assert_close(
++                getattr(query, field).cpu(), torch.tensor(values, dtype=torch.int64), rtol=0, atol=0
++            )
++    expected = (
++        [65536, 65537, 65538, 65539, 65540, 65541, 0, 0],
++        [-1, -1, -1, 33, -1, -1, -1, -1],
++        [16384, 16385, 0],
++        [65539, 65542, 0],
++        [0, 3, 6, 6],
++        [3, 6, 6],
++        [65536, 65539, 0],
++        [3, 2, 0],
++    )
++    for output, values in zip(outputs, expected):
++        torch.testing.assert_close(output.cpu(), torch.tensor(values, dtype=output.dtype), rtol=0, atol=0)
++    assert buffers.start_offsets.cpu().tolist() == [0, 3, 0]
++    assert buffers.pooled_slot_mapping.cpu().tolist() == [-1, 33, -1, -1, -1, -1, 77, 77, 77]
++
++    tail_buffers = {
++        name: torch.full((3, 9), 77, dtype=torch.int64, device=device) for name in ("writes", "state", "retained")
++    }
++    tail_buffers["history"] = torch.empty(3, 4, dtype=torch.int64, device=device)
++    ordinary = adapters.build_tail_inputs(common, 4, 4, 80, 0, tail_buffers)
++    assert ordinary.history_indices.cpu().tolist() == [[80, 81, 82, 83], [0, 1, 2, 3], [0, 1, 2, 3]]
++    assert ordinary.write_indices.cpu().tolist() == [[80, 81, 82, -1], [0, 1, -1, -1], [-1, -1, -1, -1]]
++    assert ordinary.state_indices.cpu().tolist() == [[4, 5, 6, 7], [20, 21, 22, 23], [12, 13, 14, 15]]
++    assert ordinary.retained_indices is None
++    common.slot_mapping.copy_(torch.tensor([7, 8, 9, 0, 1, 14], device=device))
++    speculative = adapters.build_tail_inputs(common, 4, 7, 80, 3, tail_buffers)
++    assert speculative.history_indices.cpu().tolist() == [[82, 83, 84, 85], [2, 3, 4, 5], [0, 1, 2, 3]]
++    assert speculative.retained_indices.cpu().tolist() == [[0, 1, 2], [3, 4, 5], [3, 4, 5]]
++    assert speculative.write_indices.cpu().tolist() == [[82, 83, 84], [5, 6, 0], [-1, -1, -1]]
++    common.slot_mapping[1] = -1
++    speculative = adapters.build_tail_inputs(common, 4, 9, 80, 6, tail_buffers)
++    assert speculative.write_indices.cpu().tolist() == [
++        [-1, -1, -1, 87, -1, 80],
++        [-1, -1, -1, 1, 2, 3],
++        [-1, -1, -1, -1, -1, -1],
++    ]
++    suffix = torch.tensor([[87, -1, 80], [1, 2, 3], [-1, -1, -1]], device=device)
++    for width in (1, 3, 9):
++        inputs = adapters.build_tail_inputs(common, 4, 9, 80, width, tail_buffers)
++        columns = min(width, 3)
++        torch.testing.assert_close(inputs.write_indices[:, -columns:], suffix[:, -columns:], rtol=0, atol=0)
++        if width > 3:
++            assert (inputs.write_indices[:, :-3] == -1).all()
++
++
++@pytest.mark.parametrize("use_graph", [False, True])
++@torch.inference_mode()
++def test_cache_writes_with_changing_row_width_and_stride(use_graph):
++    dim, device = 128, "npu"
++    tail = torch.empty((2, 7, 2 * dim), device=device)
++    cache = torch.empty((2, 32, 1, dim), dtype=torch.bfloat16, device=device)
++    key = torch.arange(6 * dim, dtype=torch.float32, device=device).view(6, dim)
++    gate = key + 1000
++    pooled = torch.ones((1, dim), dtype=torch.bfloat16, device=device)
++    metadata = SimpleNamespace(pooled_slot_mapping=torch.tensor([0], device=device))
++    expected = torch.full_like(tail, 17)
++    expected[0, :2] = torch.cat((key[:2], gate[:2]), dim=1)
++    expected[1, :2] = torch.cat((key[2:4], gate[2:4]), dim=1)
++    for width in (1, 3, 6, 1):
++        storage = torch.empty((6 // width, width + 3), dtype=torch.int64, device=device)
++        writes = storage[:, :width]
++        writes.copy_(torch.tensor([0, 1, 7, 8, -1, 14], device=device).view(-1, width))
++        inputs = SimpleNamespace(write_indices=writes, state_indices=None, page_rows=7)
++        tail.fill_(17)
++        cache.fill_(17)
++
++        def run(inputs=inputs):
++            adapters.write_keypool_caches(
++                tail, cache, key, gate, pooled, metadata, SimpleNamespace(cann_inputs=inputs), None
++            )
++
++        run()
++        if use_graph:
++            graph = torch.npu.NPUGraph()
++            with torch.npu.graph(graph):
++                run()
++            graph.replay()
++        torch.testing.assert_close(tail, expected, rtol=0, atol=0)
++        torch.testing.assert_close(cache[0, 0, 0], pooled[0], rtol=0, atol=0)
++        assert (cache[0, 1:] == 17).all() and (cache[1] == 17).all()
++
++
++@pytest.mark.parametrize("use_graph", [False, True])
++@pytest.mark.parametrize("speculative", [False, True])
++@torch.inference_mode()
++def test_padded_cache_writes_and_business_shape_index_packing(use_graph, speculative):
++    dim, topk, device = 128, 2048, "npu"
++    tail_storage = torch.full((2 * 80 * 2 * dim + 2 * dim,), 17.0, device=device)
++    tail = tail_storage.as_strided((2, 7, 2 * dim), (80 * 2 * dim, 2 * dim, 1), dim)
++    cache_storage = torch.full((3 * 48 * dim + 2 * dim,), 17, dtype=torch.bfloat16, device=device)
++    cache = cache_storage.as_strided((3, 32, 1, dim), (48 * dim, dim, dim, 1), dim)
++    key = torch.arange(5 * dim, dtype=torch.float32, device=device).view(5, dim)
++    gate = key + 1000
++    state = torch.cat((key, gate), dim=1)
++    pooled = (
++        torch.arange(4 * (dim + 64), dtype=torch.float32, device=device).view(4, dim + 64).to(torch.bfloat16)[:, :dim]
++    )
++    writes = torch.tensor([[6, 86, 160, 7, -1]], device=device)
++    metadata = SimpleNamespace(
++        pooled_slot_mapping=torch.tensor([0, 33, 96, -1], device=device),
++        positions=torch.tensor([65536, 65539, 65540], device=device),
++        cum_query_lens=torch.tensor([1, 3], device=device),
++    )
++    tail_metadata = SimpleNamespace(
++        cann_inputs=SimpleNamespace(
++            write_indices=writes, state_indices=torch.arange(5, device=device).view(1, 5), page_rows=80
++        )
++    )
++    indices = torch.arange(2051, dtype=torch.int32, device=device).expand(5, -1).contiguous()
++    output = torch.full((7, 2080), 17, dtype=torch.int32, device=device)
++
++    def run():
++        adapters.write_keypool_caches(
++            tail,
++            cache,
++            key if speculative else None,
++            gate if speculative else None,
++            pooled,
++            metadata,
++            tail_metadata,
++            state,
++        )
++        return adapters.pack_keypool_indices(indices, metadata, topk, 4, output)
++
++    for _ in range(3):
++        run()
++    graph = torch.npu.NPUGraph() if use_graph else None
++    if graph is not None:
++        with torch.npu.graph(graph):
++            result = run()
++    for advance in (0, 1):
++        writes.copy_(torch.tensor([[6 - advance, 86 - advance, 160, 7, -1]], device=device))
++        metadata.positions.copy_(torch.tensor([65536 + advance, 65539, 65540 + advance], device=device))
++        tail_storage.fill_(17)
++        cache_storage.fill_(17)
++        output.fill_(17)
++        if graph is not None:
++            graph.replay()
++        else:
++            result = run()
++        expected_tail = torch.full_like(tail_storage, 17)
++        expected_tail[dim + (6 - advance) * 2 * dim : dim + (7 - advance) * 2 * dim] = torch.cat((key[0], gate[0]))
++        expected_tail[dim + (86 - advance) * 2 * dim : dim + (87 - advance) * 2 * dim] = torch.cat((key[1], gate[1]))
++        expected_cache = torch.full_like(cache_storage, 17)
++        expected_cache[dim : 2 * dim] = pooled[0]
++        expected_cache[50 * dim : 51 * dim] = pooled[1]
++        expected_output = torch.full_like(output, 17)
++        expected_output[:5].fill_(-1)
++        expected_output[:3, :topk] = torch.arange(topk, dtype=torch.int32, device=device)
++        expected_output[:3, topk] = torch.tensor([65536, -1, 65540], dtype=torch.int32, device=device)
++        if advance:
++            expected_output[:3, topk + 1] = torch.tensor([65537, -1, 65541], dtype=torch.int32, device=device)
++        torch.testing.assert_close(tail_storage, expected_tail, rtol=0, atol=0)
++        torch.testing.assert_close(cache_storage, expected_cache, rtol=0, atol=0)
++        torch.testing.assert_close(output, expected_output, rtol=0, atol=0)
++        assert result.shape == (5, 1, 2051)
++        assert result.data_ptr() == output.data_ptr()
++        key.add_(1)
++        gate.add_(2)
++        state.copy_(torch.cat((key, gate), dim=1))
++        pooled.add_(3)
++
++
++@torch.inference_mode()
++def test_business_shape_index_packing_in_place():
++    indices = torch.arange(2051, dtype=torch.int32, device="npu").expand(5, -1).contiguous()
++    metadata = SimpleNamespace(
++        positions=torch.tensor([65536, 65539, 65540], device="npu"),
++        cum_query_lens=torch.tensor([1, 3], device="npu"),
++    )
++    result = adapters.pack_keypool_indices(indices, metadata, 2048, 4)
++    expected = torch.full_like(indices, -1)
++    expected[:3, :2048] = torch.arange(2048, dtype=torch.int32, device="npu")
++    expected[:3, 2048] = torch.tensor([65536, -1, 65540], dtype=torch.int32, device="npu")
++    torch.testing.assert_close(indices, expected, rtol=0, atol=0)
++    assert result.data_ptr() == indices.data_ptr()
+diff --git a/tests/ut/ops/test_cann_keypool_adapters.py b/tests/ut/ops/test_cann_keypool_adapters.py
+new file mode 100644
+index 000000000..e20a64ae0
+--- /dev/null
++++ b/tests/ut/ops/test_cann_keypool_adapters.py
+@@ -0,0 +1,153 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++from types import SimpleNamespace
++from unittest.mock import MagicMock
++
++import pytest
++import torch
++
++from vllm_ascend.ops.triton import glm5_next_cann_keypool as adapters
++
++
++@pytest.fixture(autouse=True)
++def mock_triton_launch_config(monkeypatch):
++    triton = MagicMock()
++    triton.cdiv = MagicMock(wraps=lambda x, y: (x + y - 1) // y)
++    triton.next_power_of_2 = MagicMock(wraps=lambda x: 1 << (max(x, 1) - 1).bit_length())
++    monkeypatch.setattr(adapters, "triton", triton)
++
++
++@pytest.mark.parametrize("retained_width,cp_start", [(0, None), (3, 2)])
++def test_metadata_launches_use_preallocated_request_and_tail_buffers(monkeypatch, retained_width, cp_start):
++    launch = MagicMock()
++    monkeypatch.setattr(adapters, "_build_keypool_metadata_kernel", launch)
++    common = SimpleNamespace(
++        num_reqs=2,
++        num_actual_tokens=3,
++        query_start_loc=torch.tensor([0, 2, 3], dtype=torch.int32),
++        seq_lens=torch.tensor([65538, 65539], dtype=torch.int32),
++        positions=torch.empty(3, dtype=torch.int64),
++        slot_mapping=torch.empty(3, dtype=torch.int64),
++        block_table_tensor=torch.empty(2, 1, dtype=torch.int32),
++    )
++    fields = (
++        "positions",
++        "slot_mapping",
++        "seq_lens",
++        "raw_seq_lens",
++        "query_start_loc",
++        "cum_query_lens",
++        "start_pos",
++        "pool_tail",
++    )
++    buffers = SimpleNamespace(
++        **{name: torch.empty(5, dtype=torch.int64) for name in (*fields, "start_offsets", "pooled_slot_mapping")}
++    )
++    query = (
++        None
++        if cp_start is None
++        else SimpleNamespace(
++            positions=buffers.positions[cp_start:4],
++            **{name: torch.empty(2, dtype=torch.int64) for name in ("cum_query_lens", "seq_lens", "pool_tail")},
++        )
++    )
++    result = adapters.build_keypool_metadata(
++        common, buffers, 4, 3, 128, 4, query_metadata=query, local_start=cp_start or 0
++    )
++    for view, name, size in zip(result, fields, (4, 4, 2, 2, 3, 2, 2, 2)):
++        assert view.data_ptr() == getattr(buffers, name).data_ptr()
++        assert view.shape == (size,)
++    assert launch.__getitem__.return_value.call_count == 1
++    args = launch.__getitem__.return_value.call_args.args
++    assert args[0] is common.query_start_loc
++    assert args[1] is common.seq_lens
++    assert args[2] is common.positions
++    assert args[3] is common.slot_mapping
++    if query is None:
++        assert args[-6:] == (None, None, None, 0, 0, False)
++    else:
++        assert args[-6] is query.cum_query_lens
++        assert args[-5] is query.seq_lens
++        assert args[-4] is query.pool_tail
++        assert args[-3:] == (cp_start, 4, True)
++
++    tail_buffers = {name: torch.empty(2, 7, dtype=torch.int64) for name in ("history", "writes", "state", "retained")}
++    tail_buffers["history"] = torch.empty(2, 4, dtype=torch.int64)
++    tail = adapters.build_tail_inputs(common, 4, 7, 80, retained_width, tail_buffers)
++    assert launch.__getitem__.return_value.call_count == 2
++    assert tail.page_rows == 80
++    assert tail.history_indices.shape == (2, 4)
++    assert tail.history_indices.data_ptr() == tail_buffers["history"].data_ptr()
++    width = retained_width or 4
++    for view, name in ((tail.write_indices, "writes"), (tail.state_indices, "state")):
++        assert view.shape == (2, width)
++        assert view.data_ptr() == tail_buffers[name].data_ptr()
++        assert view.is_contiguous()
++    if retained_width:
++        assert tail.retained_indices.shape == (2, width)
++        assert tail.retained_indices.data_ptr() == tail_buffers["retained"].data_ptr()
++    else:
++        assert tail.retained_indices is None
++    args = launch.__getitem__.return_value.call_args.args
++    assert args[0] is common.query_start_loc
++    assert args[2] is common.positions
++    assert args[26] == common.positions.stride(0)
++    assert args[4] is common.block_table_tensor
++    assert args[15] is tail.history_indices
++    assert args[16] is tail.write_indices
++    assert args[17] is tail.state_indices
++    assert args[18] is tail.retained_indices
++    assert args[30:35] == (4, 7, 80, width, True)
++
++
++@pytest.mark.parametrize("use_output_buffer", [False, True])
++def test_business_shape_index_packing_reuses_output_without_running_kernel(monkeypatch, use_output_buffer):
++    launch = MagicMock()
++    monkeypatch.setattr(adapters, "_pack_indices_kernel", launch)
++    adapters.triton.next_power_of_2.return_value = 4096
++    indices = torch.empty(3, 2051, dtype=torch.int32)
++    storage = torch.empty(5, 2080, dtype=torch.int32) if use_output_buffer else None
++    metadata = SimpleNamespace(
++        positions=torch.empty(2, dtype=torch.int64), cum_query_lens=torch.empty(2, dtype=torch.int64)
++    )
++    result = adapters.pack_keypool_indices(indices, metadata, 2048, 4, storage)
++    output = storage if use_output_buffer else indices
++    assert result.shape == (3, 1, 2051)
++    assert result.data_ptr() == output.data_ptr()
++    assert result.stride(0) == output.stride(0)
++    args = launch.__getitem__.return_value.call_args.args
++    assert args[0] is indices
++    assert args[1] is metadata.positions
++    assert args[2] is metadata.cum_query_lens
++    assert args[3].data_ptr() == output.data_ptr()
++    assert args[4:11] == (2051, output.stride(0), 2048, 4, 2, output.shape[1], 4096)
++
++
++def test_cache_writer_passes_padded_page_and_block_layout_without_running_kernel(monkeypatch):
++    launch = MagicMock()
++    monkeypatch.setattr(adapters, "_write_keypool_caches_kernel", launch)
++    dim = 128
++    tail = torch.empty(3, 80, 2 * dim)[:, :7]
++    cache = torch.empty(3, 48, 1, dim)[:, :32]
++    pooled = torch.empty(4, dim + 64)[:, :dim]
++    writes = torch.tensor([[1, 81, 241]], dtype=torch.int64)
++    state_rows = torch.empty_like(writes)
++    slots = torch.tensor([0, 33, 96, -1], dtype=torch.int64)
++    metadata = SimpleNamespace(pooled_slot_mapping=slots)
++    tail_metadata = SimpleNamespace(
++        cann_inputs=SimpleNamespace(write_indices=writes, state_indices=state_rows, page_rows=80)
++    )
++    state = torch.empty(5, 4, 2 * dim)
++    adapters.write_keypool_caches(tail, cache, None, None, pooled, metadata, tail_metadata, state)
++    args = launch.__getitem__.return_value.call_args.args
++    assert launch.__getitem__.call_args.args == ((7,),)
++    assert args[0] is tail
++    assert args[1] is cache
++    tensors = [arg for arg in args if isinstance(arg, torch.Tensor)]
++    assert any(arg is slots for arg in tensors)
++    assert any(arg is writes for arg in tensors)
++    assert any(arg is state_rows for arg in tensors)
++    scalars = [arg for arg in args if isinstance(arg, int)]
++    assert scalars[:7] == [3, dim, 80, 3, 7, 3, 32]
++    assert 48 * dim in scalars
++    assert dim + 64 in scalars
+diff --git a/vllm_ascend/ops/triton/docs/glm5_next_cann_keypool.md b/vllm_ascend/ops/triton/docs/glm5_next_cann_keypool.md
+new file mode 100644
+index 000000000..89a1c17af
+--- /dev/null
++++ b/vllm_ascend/ops/triton/docs/glm5_next_cann_keypool.md
+@@ -0,0 +1,96 @@
++# glm5_next_cann_keypool
++
++## Description
++
++- **Function**: Three Triton kernel types adapt GLM-5.3-Flash metadata, cache writes and token indices to CANN `KeyPool`/`PoolKeyIndexer`. The entry points are in `vllm_ascend/ops/triton/glm5_next_cann_keypool.py`.
++- **Formula**: With pool size `P`, logical block size `L`, position `p` and raw slot `s`, a completed pool has `(p + 1) % P == 0` and compressed slot `(s // L) * (L // P) + (s % L) // P`. A negative slot remains invalid. The visible tail starts at `a = ((p + 1) // P) * P` and contains `[a, ..., p]`, appended after `min(a, topk)` history columns.
++- **Algorithm flow**:
++    1. `_build_keypool_metadata_kernel` has two modes, exposed by `build_keypool_metadata` and `build_tail_inputs`. They build compressed request boundaries/slots and raw-tail read/write addresses once per metadata build. The resulting buffers are reused across layers. DSA-CP also builds rank-local cumulative query ends, visible pool counts and tail lengths in the same launch. Completed pools retain their compact output row even when their cache slot is evicted.
++    2. After CANN `KeyPool` has consumed the old tail, `_write_keypool_caches_kernel` writes the raw FP32 tail and completed BF16 pools in one launch. Non-MTP reads updated CANN state; MTP writes retained projected key/gate rows so rejected candidates can be overwritten after logical rollback.
++    3. `_pack_indices_kernel` preserves the selected history, appends the causal tail and clears padded rows/alignment columns in one launch. It can write directly into the SFA output buffer.
++- **Supported modes**: Eager execution and fixed-shape NPU graph capture/replay.
++
++## Parameters
++
++`R` is the padded request count, `T` the padded token count, `A` the actual token count, `D` the head dimension, `C` the tail ring capacity, `B` the compressed kernel block size and `W = retained_width or P`. Model values are `D=128`, `P=4` and `topk=2048`. All tensors are on the same NPU; scalar attributes are Python integers.
++
++### build_keypool_metadata
++
++| Parameter | Input/Output/Attribute | Description | Data type | Data format |
++| --- | --- | --- | --- | --- |
++| `common` | Input | `num_reqs=R`, `num_actual_tokens=A`; `query_start_loc[R+1]`, `seq_lens[R]`, `positions[source]`, `slot_mapping[source]` | int attributes; int32 boundaries/lengths, int64 positions/slots | ND; input vector strides supported |
++| `buffers` | Output storage | Preallocated fields listed below | Object containing NPU tensors | Contiguous ND |
++| `tokens` | Attribute | `T`, including graph padding | int | Scalar |
++| `source` | Attribute | Number of available source positions/slots | int | Scalar |
++| `logical` | Attribute | `L`, raw tokens per logical cache block | int | Scalar |
++| `ratio` | Attribute | `P`, raw tokens per completed pool | int | Scalar |
++| `query_metadata` | Optional output storage | DSA-CP local `positions`, preallocated `cum_query_lens[R]`, `seq_lens[R]` and `pool_tail[R]`; the latter three receive local query ends and causal prefix lengths | int64 tensors or `None` | Contiguous ND |
++| `local_start` | Attribute | First packed global token owned by this rank; its interval has `query_metadata.positions.numel()` tokens | int | Scalar |
++| Return tuple | Output | Views of `positions[T]`, `slot_mapping[T]`, `seq_lens[R]`, `raw_seq_lens[R]`, `query_start_loc[R+1]`, `cum_query_lens[R]`, `start_pos[R]`, `pool_tail[R]`, in that order | Dtypes below | Contiguous ND |
++
++| Buffer field | Description | Data type | Minimum capacity |
++| --- | --- | --- | --- |
++| `positions`, `slot_mapping` | Absolute positions and compressed slots; missing positions become 0, invalid slots become -1 | int64 | `[T]` each |
++| `seq_lens`, `raw_seq_lens` | Complete-pool counts and raw sequence lengths | int64, int32 respectively | `[R]` each |
++| `query_start_loc`, `cum_query_lens` | Query boundaries with a leading zero, and exclusive ends without it | int32, int64 respectively | `[R+1]`, `[R]` |
++| `start_pos`, `start_offsets`, `pool_tail` | Raw request start, start modulo `P`, and raw sequence length modulo `P` | int32, int32, int64 respectively | `[R]` each |
++| `pooled_slot_mapping` | Sentinel at index 0, then compact completed-pool destinations, padded with -1 | int64 | `[1+min(T, T//P+R)]` |
++
++### build_tail_inputs
++
++| Parameter | Input/Output/Attribute | Description | Data type | Data format |
++| --- | --- | --- | --- | --- |
++| `common` | Input | The request attributes/boundaries/lengths above, plus `slot_mapping[A]` and `block_table_tensor[R, M]`; column 0 owns each request's tail block | int32 boundaries/lengths/table; int64 slots | ND; vector and table row strides supported; table columns contiguous |
++| `pool` | Attribute | `P` | int | Scalar |
++| `capacity` | Attribute | `C`, raw rows retained per request | int | Scalar |
++| `page_rows` | Attribute | Physical rows per tail page, including padding | int | Scalar |
++| `retained_width` | Attribute | 0 for non-MTP; number of retained query rows per request for MTP | int | Scalar |
++| `buffers` | Output storage | `history[R,P]`, and `writes`, `state`, `retained`, each with at least `R*W` elements | int64 | Contiguous ND |
++| Return object | Output | `history_indices[R,P]`, `write_indices[R,W]`, `state_indices[R,W]`, `retained_indices[R,W]` and `page_rows`; retained indices are `None` for non-MTP | int64 tensors; int attribute | Views into supplied buffers |
++
++### write_keypool_caches
++
++| Parameter | Input/Output/Attribute | Description | Data type | Data format |
++| --- | --- | --- | --- | --- |
++| `tail` | Input/output | Request-owned raw key/gate ring, `[Ntail,C,2D]` | FP32 | ND; padded page stride supported |
++| `cache` | Input/output | Completed pooled keys, `[Ncache,B,1,D]` | BF16 | ND; padded block stride supported |
++| `key`, `gate` | Input | MTP retained projections, each `[R*W,D]`; both `None` for non-MTP | FP32 or `None` | Contiguous ND |
++| `pooled` | Input | CANN completed-pool vectors, `[Q,D]` | BF16 | ND; row stride supported |
++| `metadata` | Input | `pooled_slot_mapping[Q]`, the destination of each compact pooled row | int64 | Contiguous ND |
++| `tail_metadata` | Input | `cann_inputs` from `build_tail_inputs` | Object | N/A |
++| `state` | Input | Updated CANN state, `[1+2R,P,2D]`; read only for non-MTP | FP32 | Contiguous ND |
++| Return value | Output | N/A; returns `None` and mutates `tail`/`cache` | N/A | N/A |
++
++### pack_keypool_indices
++
++| Parameter | Input/Output/Attribute | Description | Data type | Data format |
++| --- | --- | --- | --- | --- |
++| `indices` | Input/output | CANN token indices, `[T,I]`; reused in place when `output_buffer=None` | int32 | ND; padded row stride, contiguous columns |
++| `metadata` | Input | `positions[T]`, `cum_query_lens[R]` | int64 | Contiguous ND |
++| `topk` | Attribute | Maximum selected history tokens, a positive multiple of `P` | int | Scalar |
++| `pool_size` | Attribute | `P` | int | Scalar |
++| `output_buffer` | Optional output | Existing `[capacity,O]` SFA buffer; defaults to `indices` | int32 or `None` | ND; padded row stride, contiguous columns |
++| Return value | Output | Logical token indices, `[T,1,topk+P-1]`; unused entries are -1 | int32 | View into the output buffer |
++
++## Constraints
++
++- Inference only. `P>1`, `D>0`, `L%P==0`, `0<=A<=source<=T`, and input storage must cover every actual token. This adapter documents the BF16 cache path.
++- Queries are contiguous within each request and packed in request order. Normalize a negative query boundary to `A`, clamp boundaries to `A`, then require nondecreasing boundaries beginning at 0 and ending at `A`. Raw sequence lengths must cover the request's query length; actual positions are nonnegative and consistent with those lengths.
++- DSA-CP partitions the packed global query into contiguous rank intervals. Each local request sees only the prefix through its last local query; requests without local queries have zero visible length. KeyPool/cache writes still use global request metadata, while selection and packing use local query metadata.
++- Tail blocks are request-local. Use `C=P` for non-MTP and `C=P+num_speculative_tokens` for speculative decoding; `0<retained_width<=C` when MTP is enabled. `page_rows>=C` and `page_rows*2D==tail.stride(0)` preserve shared page padding.
++- `tail` rows, `cache` tokens and vector columns must be contiguous. Only tail page, compressed block and pooled-vector row strides may include padding. `cache` has exactly one KV head. Metadata output buffers must not overlap unrelated tensors.
++- Invalid tail/pooled destinations are skipped. Valid destinations must be unique within their respective write set; duplicate destinations can race. CANN state and projections must be ready before cache writes. Reads of historical tail rows must finish before any overwrite.
++- Packing requires `R>0` for a nonempty launch, `I>=topk`, output capacity at least `T`, and `O>=topk+P-1`. In-place packing also requires `I>=topk+P-1`. Do not use partially overlapping input/output views. Raw positions and cache addresses use int64; final SFA token indices must fit int32.
++- Packing clears all output columns for rows beyond the final query end, and clears alignment columns beyond `topk+P-1`. Output rows beyond `T` and unselected cache bytes remain untouched.
++- Metadata handles padded requests, evicted slots and empty source vectors. A fully empty model forward is handled by the caller before index packing. Padding storage must still have the declared capacity.
++- Graph replay requires stable shapes, strides, addresses and scalar attributes. Request lengths, positions, slots and page contents can change in the existing buffers. Metadata is refreshed in capture/replay; cache writes and packing use those refreshed values.
++- Pooled metadata tiles adapt from 8 to 64 rows, targeting 32 programs; tail preparation uses 8-row tiles. Request inversion tiles are capped at 128 to bound unified-buffer storage. Runtime counts avoid specializing on every batch size; strides, pool dimensions and power-of-two vector widths still specialize compilation.
++
++## Origin and Differences
++
++- **Origin**: Developed for the CANN GLM-5.3-Flash pooled-indexer integration, with the same logical slot and tail contract as the existing GLM KPool path.
++- **Differences**: Replaces separate boundary conversions, compact-slot construction, tail/cache scatter and output padding operations with three kernel types. The metadata kernel runs in two modes per metadata build; this is not a claim of only three launches per model step. Key pooling and TopK scoring remain CANN operations. FP32 tail and BF16 completed keys are preserved.
++
++## Example
++
++For `P=4`, `L=128`, `D=128`, a token at position 65539 completes a pool. Raw slot 135 maps to compressed slot 33. With `topk=2048`, position 65540 has a tail beginning at 65540, placed in column 2048; columns 2049 and 2050 are -1. This is logical token addressing, while compressed writes use physical cache slots.
+diff --git a/vllm_ascend/ops/triton/glm5_next_cann_keypool.py b/vllm_ascend/ops/triton/glm5_next_cann_keypool.py
+new file mode 100644
+index 000000000..d271fb24a
+--- /dev/null
++++ b/vllm_ascend/ops/triton/glm5_next_cann_keypool.py
+@@ -0,0 +1,425 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""Three fused adapters for CANN pooled indexing: inputs, cache writes and indices."""
++
++from types import SimpleNamespace
++
++from vllm.triton_utils import tl, triton
++
++
++@triton.jit(do_not_specialize=["tail_rows", "tail_blocks", "cache_blocks", "INPUT_STRIDE", "INPUT_WIDTH"])
++def _write_keypool_caches_kernel(
++    tail,
++    cache,
++    key,
++    gate,
++    pooled,
++    writes,
++    state_rows,
++    state,
++    slots,
++    tail_rows,
++    HEAD_DIM: tl.constexpr,
++    PAGE_ROWS: tl.constexpr,
++    tail_blocks,
++    CAPACITY: tl.constexpr,
++    cache_blocks,
++    BLOCK_SIZE: tl.constexpr,
++    CACHE_STRIDE: tl.constexpr,
++    POOLED_STRIDE: tl.constexpr,
++    INPUT_STRIDE,
++    INPUT_WIDTH,
++    SPECULATIVE: tl.constexpr,
++    BLOCK: tl.constexpr,
++):
++    row = tl.program_id(0)
++    cols = tl.arange(0, BLOCK)
++    if row < tail_rows:
++        input_row = row // INPUT_WIDTH * INPUT_STRIDE + row % INPUT_WIDTH
++        dest = tl.load(writes + input_row).to(tl.int64)
++        valid = (dest >= 0) & (dest // PAGE_ROWS < tail_blocks) & (dest % PAGE_ROWS < CAPACITY)
++        if SPECULATIVE:
++            k = tl.load(key + row * HEAD_DIM + cols, valid & (cols < HEAD_DIM), other=0)
++            g = tl.load(
++                gate + row * HEAD_DIM + cols - HEAD_DIM, valid & (cols >= HEAD_DIM) & (cols < 2 * HEAD_DIM), other=0
++            )
++            tail_value = tl.where(cols < HEAD_DIM, k, g)
++        else:
++            source = tl.load(state_rows + input_row, valid, other=0).to(tl.int64)
++            tail_value = tl.load(state + source * 2 * HEAD_DIM + cols, valid & (cols < 2 * HEAD_DIM), other=0)
++        tl.store(tail + dest * 2 * HEAD_DIM + cols, tail_value, valid & (cols < 2 * HEAD_DIM))
++    else:
++        pool_row = row - tail_rows
++        slot = tl.load(slots + pool_row).to(tl.int64)
++        valid = (slot >= 0) & (slot < cache_blocks * BLOCK_SIZE)
++        pool_value = tl.load(pooled + pool_row * POOLED_STRIDE + cols, valid & (cols < HEAD_DIM), other=0)
++        address = cache + slot // BLOCK_SIZE * CACHE_STRIDE + slot % BLOCK_SIZE * HEAD_DIM + cols
++        tl.store(address, pool_value, valid & (cols < HEAD_DIM))
++
++
++def write_keypool_caches(tail, cache, key, gate, pooled, metadata, tail_metadata, state):
++    inputs = tail_metadata.cann_inputs
++    writes = inputs.write_indices
++    tail_rows = writes.numel()
++    pooled_rows = pooled.shape[0]
++    # Each program writes one row: tail rows first, then pooled rows.
++    _write_keypool_caches_kernel[(tail_rows + pooled_rows,)](
++        tail,
++        cache,
++        key,
++        gate,
++        pooled,
++        writes,
++        inputs.state_indices,
++        state,
++        metadata.pooled_slot_mapping,
++        tail_rows,
++        cache.shape[-1],
++        inputs.page_rows,
++        tail.shape[0],
++        tail.shape[1],
++        cache.shape[0],
++        cache.shape[1],
++        cache.stride(0),
++        pooled.stride(0),
++        writes.stride(0),
++        writes.shape[1],
++        key is not None,
++        triton.next_power_of_2(2 * cache.shape[-1]),
++    )
++
++
++@triton.jit(do_not_specialize=["num_reqs"], do_not_specialize_on_alignment=["positions"])
++def _pack_indices_kernel(
++    indices,
++    positions,
++    cumulative,
++    output,
++    INPUT_STRIDE: tl.constexpr,
++    OUTPUT_STRIDE: tl.constexpr,
++    TOPK: tl.constexpr,
++    POOL_SIZE: tl.constexpr,
++    num_reqs,
++    OUTPUT_COLS: tl.constexpr,
++    BLOCK: tl.constexpr,
++):
++    row = tl.program_id(0)
++    cols = tl.arange(0, BLOCK)
++    valid_row = row < tl.load(cumulative + num_reqs - 1)
++    position = tl.load(positions + row, valid_row, other=0).to(tl.int64)
++    tail_start = (position + 1) // POOL_SIZE * POOL_SIZE
++    history = tl.minimum(tail_start, TOPK).to(tl.int32)
++    value = tl.load(indices + row * INPUT_STRIDE + cols, valid_row & (cols < history), other=-1)
++    tail_columns = cols - history
++    tail_count = (position + 1 - tail_start).to(tl.int32)
++    # Keep wide index vectors in int32: Ascend scalarizes int64 vector
++    # conversion to the int32 SFA output. Only position arithmetic is int64.
++    tail_value = tail_start.to(tl.int32) + tail_columns
++    value = tl.where(
++        valid_row & (tail_columns >= 0) & (tail_columns < tail_count) & (cols < TOPK + POOL_SIZE - 1),
++        tail_value,
++        value,
++    )
++    tl.store(output + row * OUTPUT_STRIDE + cols, value, cols < OUTPUT_COLS)
++
++
++def pack_keypool_indices(indices, metadata, topk, pool_size, output_buffer=None):
++    positions, cumulative = metadata.positions, metadata.cum_query_lens
++    output = indices if output_buffer is None else output_buffer[: indices.shape[0]]
++    _pack_indices_kernel[(indices.shape[0],)](
++        indices,
++        positions,
++        cumulative,
++        output,
++        indices.stride(0),
++        output.stride(0),
++        topk,
++        pool_size,
++        cumulative.numel(),
++        output.shape[1],
++        triton.next_power_of_2(output.shape[1]),
++    )
++    return output[:, : topk + pool_size - 1].unsqueeze(1)
++
++
++METADATA_BLOCK = 64
++METADATA_MIN_BLOCK = 8
++METADATA_PROGRAMS = 32
++# Bound the request inversion tile to fit Ascend unified buffer storage.
++METADATA_REQUEST_BLOCK = 128
++
++
++@triton.jit(do_not_specialize=["n", "tokens", "source", "actual", "pooled_rows", "cp_start", "cp_end", "WIDTH"])
++def _build_keypool_metadata_kernel(
++    raw_query,
++    raw_lengths,
++    raw_positions,
++    raw_slots,
++    pages,
++    positions,
++    slots,
++    seq,
++    raw,
++    query,
++    ends,
++    starts,
++    tails,
++    offsets,
++    compact,
++    history,
++    writes,
++    state,
++    retained,
++    n,
++    tokens,
++    source,
++    actual,
++    pooled_rows,
++    QUERY_STRIDE: tl.constexpr,
++    SEQ_STRIDE: tl.constexpr,
++    POS_STRIDE: tl.constexpr,
++    SLOT_STRIDE: tl.constexpr,
++    PAGE_STRIDE: tl.constexpr,
++    LOGICAL: tl.constexpr,
++    POOL: tl.constexpr,
++    CAPACITY: tl.constexpr,
++    PAGE_ROWS: tl.constexpr,
++    WIDTH,
++    TAIL_MODE: tl.constexpr,
++    SPECULATIVE: tl.constexpr,
++    BLOCK: tl.constexpr,
++    REQUESTS: tl.constexpr,
++    COLUMNS: tl.constexpr,
++    cp_ends,
++    cp_seq,
++    cp_tails,
++    cp_start,
++    cp_end,
++    CP_MODE: tl.constexpr,
++):
++    row = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
++    q0 = tl.load(raw_query + row * QUERY_STRIDE, row <= n, other=0)
++    q0 = tl.minimum(tl.where(q0 < 0, actual, q0), actual)
++    q1 = tl.load(raw_query + (row + 1) * QUERY_STRIDE, row < n, other=0)
++    q1 = tl.minimum(tl.where(q1 < 0, actual, q1), actual)
++    length = q1 - q0
++    raw_len = tl.load(raw_lengths + row * SEQ_STRIDE, row < n, other=0)
++    start = raw_len - length
++    if TAIL_MODE:
++        cols = tl.arange(0, COLUMNS)
++        page = tl.load(pages + row * PAGE_STRIDE, row < n, other=0).to(tl.int64)
++        hist = tl.maximum(page, 0)[:, None] * PAGE_ROWS + ((start - start % POOL)[:, None] + cols[None, :]) % CAPACITY
++        tl.store(history + row[:, None] * POOL + cols[None, :], hist, (row[:, None] < n) & (cols[None, :] < POOL))
++        if SPECULATIVE:
++            source_row = q1[:, None] - WIDTH + cols[None, :]
++            safe = tl.maximum(source_row, 0)
++            tl.store(
++                retained + row[:, None] * WIDTH + cols[None, :],
++                safe.to(tl.int64),
++                (row[:, None] < n) & (cols[None, :] < WIDTH),
++            )
++            slot = tl.load(
++                raw_slots + safe * SLOT_STRIDE, (row[:, None] < n) & (cols[None, :] < WIDTH) & (safe < actual), other=-1
++            ).to(tl.int64)
++            pos = tl.load(
++                raw_positions + safe * POS_STRIDE,
++                (row[:, None] < n) & (cols[None, :] < WIDTH) & (safe < actual),
++                other=0,
++            ).to(tl.int64)
++            address = page[:, None] * PAGE_ROWS + pos % CAPACITY
++            address = tl.where((source_row >= q0[:, None]) & (slot >= 0) & (page[:, None] >= 0), address, -1)
++        else:
++            end = start % POOL + length
++            state_row = (row + 1 + tl.where(end >= POOL, n, 0))[:, None] * POOL + cols[None, :]
++            tl.store(
++                state + row[:, None] * WIDTH + cols[None, :],
++                state_row.to(tl.int64),
++                (row[:, None] < n) & (cols[None, :] < WIDTH),
++            )
++            pos = (start + length - end % POOL)[:, None] + cols[None, :]
++            address = page[:, None] * PAGE_ROWS + pos % CAPACITY
++            address = tl.where(
++                (length[:, None] > 0) & (cols[None, :] < (end % POOL)[:, None]) & (page[:, None] >= 0), address, -1
++            )
++        tl.store(writes + row[:, None] * WIDTH + cols[None, :], address, (row[:, None] < n) & (cols[None, :] < WIDTH))
++    else:
++        pos = tl.load(raw_positions + row * POS_STRIDE, row < source, other=0).to(tl.int64)
++        slot = tl.load(raw_slots + row * SLOT_STRIDE, row < source, other=-1).to(tl.int64)
++        compressed = slot // LOGICAL * (LOGICAL // POOL) + slot % LOGICAL // POOL
++        tl.store(positions + row, pos, row < tokens)
++        tl.store(slots + row, tl.where((slot >= 0) & ((pos + 1) % POOL == 0), compressed, -1), row < tokens)
++        tl.store(query + row, q0, row <= n)
++        tl.store(seq + row, raw_len // POOL, row < n)
++        tl.store(raw + row, raw_len, row < n)
++        tl.store(ends + row, q1, row < n)
++        tl.store(starts + row, start, row < n)
++        tl.store(tails + row, raw_len % POOL, row < n)
++        tl.store(offsets + row, start % POOL, row < n)
++        if CP_MODE:
++            local_end = tl.minimum(q1, cp_end)
++            has_query = local_end > tl.maximum(q0, cp_start)
++            local_length = tl.where(has_query, tl.maximum(raw_len - tl.maximum(q1 - cp_end, 0), 0), 0)
++            tl.store(cp_ends + row, tl.maximum(local_end - cp_start, 0), row < n)
++            tl.store(cp_seq + row, local_length // POOL, row < n)
++            tl.store(cp_tails + row, local_length % POOL, row < n)
++        # Invert request pool counts to locate each compact output's boundary
++        # token directly; evicted slots still occupy their CANN output row.
++        prefix = tl.full((), 0, tl.int32)
++        compact_address = tl.full((BLOCK,), -1, tl.int64)
++        for request_start in range(0, n, REQUESTS):
++            req = request_start + tl.arange(0, REQUESTS)
++            begin = tl.load(raw_query + req * QUERY_STRIDE, req < n, other=0)
++            finish = tl.load(raw_query + (req + 1) * QUERY_STRIDE, req < n, other=0)
++            begin = tl.minimum(tl.where(begin < 0, actual, begin), actual)
++            finish = tl.minimum(tl.where(finish < 0, actual, finish), actual)
++            total = tl.load(raw_lengths + req * SEQ_STRIDE, req < n, other=0)
++            first = total - (finish - begin)
++            count = total // POOL - first // POOL
++            inclusive = prefix + tl.cumsum(count, 0)
++            prior = inclusive - count
++            match = (req[None, :] < n) & (row[:, None] >= prior[None, :]) & (row[:, None] < inclusive[None, :])
++            boundary = begin[None, :] + POOL - first[None, :] % POOL - 1 + (row[:, None] - prior[None, :]) * POOL
++            token = tl.sum(tl.where(match, boundary, 0), 1)
++            valid = tl.sum(match.to(tl.int32), 1) > 0
++            pool_slot = tl.load(
++                raw_slots + token * SLOT_STRIDE, valid & (token < source) & (row < pooled_rows), other=-1
++            ).to(tl.int64)
++            address = pool_slot // LOGICAL * (LOGICAL // POOL) + pool_slot % LOGICAL // POOL
++            compact_address = tl.where(valid & (pool_slot >= 0), address, compact_address)
++            prefix += tl.sum(count, 0)
++        tl.store(compact + row + 1, compact_address, row < pooled_rows)
++        if tl.program_id(0) == 0:
++            tl.store(compact, -1)
++
++
++def build_keypool_metadata(common, buffers, tokens, source, logical, ratio, *, query_metadata=None, local_start=0):
++    n = common.num_reqs
++    pooled = min(tokens, tokens // ratio + n)
++    # Fully padded buckets can have empty source tensors. Keep masked input
++    # pointers backed by allocated storage without adding a device operation.
++    source_positions = common.positions if source else buffers.positions
++    source_slots = common.slot_mapping if source else buffers.slot_mapping
++    block = min(
++        METADATA_BLOCK,
++        max(METADATA_MIN_BLOCK, triton.next_power_of_2(triton.cdiv(max(tokens, n + 1), METADATA_PROGRAMS))),
++    )
++    _build_keypool_metadata_kernel[(triton.cdiv(max(tokens, n + 1), block),)](
++        common.query_start_loc,
++        common.seq_lens,
++        source_positions,
++        source_slots,
++        None,
++        buffers.positions,
++        buffers.slot_mapping,
++        buffers.seq_lens,
++        buffers.raw_seq_lens,
++        buffers.query_start_loc,
++        buffers.cum_query_lens,
++        buffers.start_pos,
++        buffers.pool_tail,
++        buffers.start_offsets,
++        buffers.pooled_slot_mapping,
++        None,
++        None,
++        None,
++        None,
++        n,
++        tokens,
++        source,
++        common.num_actual_tokens,
++        pooled,
++        common.query_start_loc.stride(0),
++        common.seq_lens.stride(0),
++        source_positions.stride(0),
++        source_slots.stride(0),
++        0,
++        logical,
++        ratio,
++        0,
++        0,
++        0,
++        False,
++        False,
++        block,
++        METADATA_REQUEST_BLOCK,
++        1,
++        query_metadata.cum_query_lens if query_metadata is not None else None,
++        query_metadata.seq_lens if query_metadata is not None else None,
++        query_metadata.pool_tail if query_metadata is not None else None,
++        local_start,
++        local_start + query_metadata.positions.numel() if query_metadata is not None else 0,
++        query_metadata is not None,
++    )
++    return (
++        buffers.positions[:tokens],
++        buffers.slot_mapping[:tokens],
++        buffers.seq_lens[:n],
++        buffers.raw_seq_lens[:n],
++        buffers.query_start_loc[: n + 1],
++        buffers.cum_query_lens[:n],
++        buffers.start_pos[:n],
++        buffers.pool_tail[:n],
++    )
++
++
++def build_tail_inputs(common, pool, capacity, page_rows, retained_width, buffers):
++    n = common.num_reqs
++    width = retained_width or pool
++    history = buffers["history"][:n]
++    writes = buffers["writes"].view(-1)[: n * width].view(n, width)
++    state = buffers["state"].view(-1)[: n * width].view(n, width)
++    retained = buffers["retained"].view(-1)[: n * width].view(n, width) if retained_width else None
++    _build_keypool_metadata_kernel[(triton.cdiv(n + 1, METADATA_MIN_BLOCK),)](
++        common.query_start_loc,
++        common.seq_lens,
++        common.positions,
++        common.slot_mapping,
++        common.block_table_tensor,
++        None,
++        None,
++        None,
++        None,
++        None,
++        None,
++        None,
++        None,
++        None,
++        None,
++        history,
++        writes,
++        state,
++        retained,
++        n,
++        0,
++        0,
++        common.num_actual_tokens,
++        0,
++        common.query_start_loc.stride(0),
++        common.seq_lens.stride(0),
++        common.positions.stride(0),
++        common.slot_mapping.stride(0),
++        common.block_table_tensor.stride(0),
++        0,
++        pool,
++        capacity,
++        page_rows,
++        width,
++        True,
++        retained_width > 0,
++        METADATA_MIN_BLOCK,
++        1,
++        triton.next_power_of_2(max(pool, capacity)),
++        None,
++        None,
++        None,
++        0,
++        0,
++        False,
++    )
++    return SimpleNamespace(
++        history_indices=history,
++        write_indices=writes,
++        state_indices=state,
++        retained_indices=retained,
++        page_rows=page_rows,
++    )

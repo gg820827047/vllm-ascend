@@ -1,0 +1,694 @@
+commit c64e357f718f465b34cdfa929db75f7d59a11e3d
+Author:     Tjh-UKN <74061534+Tjh-UKN@users.noreply.github.com>
+AuthorDate: Tue Oct 13 10:40:36 2026 +0800
+Commit:     GitHub <noreply@github.com>
+CommitDate: Tue Oct 13 10:40:36 2026 +0800
+
+    [MRV2][Feature][msprobe] Add direct msprobe dump support to model runner v2 (#16125)
+    
+    ### What this PR does / why we need it?
+    
+    msprobe-based accuracy data dump is currently wired only into the v1
+    `NPUModelRunner`. When serving with model runner v2
+    (`VLLM_USE_V2_MODEL_RUNNER=1`), the existing
+    `--additional-config '{"dump_config": ...}'` (or `dump_config_path`)
+    options silently produce no dump data, so the msprobe accuracy-debugging
+    workflow cannot be used on v2.
+    
+    This PR ports the same instrumentation to the v2 `NPUModelRunner`,
+    driven by the identical `AscendConfig` fields — no new flags and no DFX
+    involvement:
+    
+    - `__init__`: create `PrecisionDebugger` for eager mode
+      (`cudagraph_mode == NONE`) or `AclGraphDumper` for aclgraph modes,
+      only when a dump config is present (no msprobe dependency otherwise).
+    - `load_model`: start the dumper before aclgraph capture (v1 parity:
+      v1 starts it at the end of `load_model`).
+    - `execute_model`: open the dump window for real steps and
+      scheduler-driven dummy runs
+      (`dump_forward = dummy_run or total_num_scheduled_tokens > 0`), then
+      close it with `dump=False` for dummy runs, and close it for PP
+      non-last ranks (which return `IntermediateTensors` and never reach
+      `sample_tokens`).
+    - `sample_tokens`: close the per-step dump cycle on the normal
+      last-PP-rank path (`start -> forward -> stop -> step`).
+    - `_start_dump_data` / `_finalize_dump_data` helpers, identical to v1.
+    
+    Beyond a literal port, two insertion points are adapted to the v2
+    architecture, where the engine only calls `sample_tokens` when
+    `execute_model` returns `None`, and the worker routes pooling to
+    `pool()`:
+    
+    1. **Pooling models**: in v2 the worker calls `model_runner.pool()`
+       instead of `sample_tokens`, so the dump cycle is closed in a
+       `pool()` override (v1 parity: v1 finalizes after `_pool()`).
+       Without this, dumping a pooling model would never reach `step()`.
+    2. **Internal `_dummy_run` calls**: `profile_run` (including the MC2
+       dummy) and memory-profiling forwards bypass `execute_model` and call
+       `_dummy_run` directly. v1 flushes the dump window with
+       `_finalize_dump_data(dump=False)` at the end of every `_dummy_run`;
+       the same flush is added here, otherwise capture/profiling forwards
+       leak into the first real step's dump data and shift step numbering.
+    
+    Known limitation: EC transfer (encoder-only ranks) has an explicit dump
+    branch in v1, but EC transfer is not yet supported by model runner v2
+    in vllm-ascend; when it lands, the encoder-only path will need the same
+    start/finalize treatment.
+    
+    The approach follows @djh95's `feat/decouple-msprobe-dfx` branch,
+    rebased onto current main and extended with the two v2-specific fixes
+    above.
+    
+    ### Does this PR introduce _any_ user-facing change?
+    
+    Yes: msprobe dump now works with model runner v2 through the existing
+    `dump_config` / `dump_config_path` additional-config options. No new
+    CLI/API surface, and behavior is unchanged when no dump config is set.
+    
+    ### How was this patch tested?
+    
+    - Insertion points were cross-checked against the v1 call sites in
+      `model_runner_v1.py` and the vllm v2 engine/worker call flow
+      (`execute_model` -> optional `pool()` -> `sample_tokens` only on
+      `None` return).
+    - Manual verification steps on NPU:
+      1. Eager mode: `VLLM_USE_V2_MODEL_RUNNER=1 vllm serve <model>
+         --additional-config '{"dump_config": {"task": "statistics",
+         "level": "L1", "dump_path": "/data/msprobe_dump", "statistics":
+         {"list": []}}}'`, send a few requests, verify
+         `dump_path/step*/rank*/dump.json` is produced per step.
+      2. aclgraph mode (default cudagraph mode): same command, verify
+         `AclGraphDumper` writes per-step data (requires msprobe built with
+         `aclgraph_dump` enabled).
+      3. PP=2: verify non-last ranks also produce one dump step per
+         scheduler step.
+    - CI.
+    
+    - vLLM main:
+    https://github.com/vllm-project/vllm/commit/8cc9aa5ad350f6f80cf3bebb298d410803ff75a9
+    
+    Signed-off-by: Tjh-UKN <2559659915@qq.com>
+    Signed-off-by: TAJh <taojiaheng1@huawei.com>
+
+diff --git a/tests/ut/kv_offload/test_dspark_resident_kv.py b/tests/ut/kv_offload/test_dspark_resident_kv.py
+index 5f39df229..b650f59c2 100644
+--- a/tests/ut/kv_offload/test_dspark_resident_kv.py
++++ b/tests/ut/kv_offload/test_dspark_resident_kv.py
+@@ -6,6 +6,7 @@ from unittest.mock import Mock, patch
+ 
+ import pytest
+ import torch
++from vllm.config import CUDAGraphMode
+ from vllm.v1.kv_cache_interface import FullAttentionSpec, KVCacheConfig, KVCacheGroupSpec, KVCacheTensor
+ from vllm.v1.worker.gpu.model_runner import GPUModelRunner
+ 
+@@ -60,6 +61,8 @@ def _prefill_runner(
+     connector="SfaRemoteD2HConnector",
+ ):
+     runner = NPUModelRunner.__new__(NPUModelRunner)
++    runner.debugger = None
++    runner.compilation_config = SimpleNamespace(cudagraph_mode=CUDAGraphMode.NONE if eager else CUDAGraphMode.FULL)
+     extra = {} if ids is None else {"dspark_aux_hidden_state_layer_ids": ids}
+     runner.vllm_config = SimpleNamespace(
+         kv_transfer_config=SimpleNamespace(
+diff --git a/tests/ut/worker/test_adaptive_verification.py b/tests/ut/worker/test_adaptive_verification.py
+index 9bbf3b5b8..f6bf9b6ad 100644
+--- a/tests/ut/worker/test_adaptive_verification.py
++++ b/tests/ut/worker/test_adaptive_verification.py
+@@ -68,6 +68,7 @@ def test_adaptive_tail_dummy_run_balances_moe_routing(adaptive_verification, con
+     runner = NPUModelRunner.__new__(NPUModelRunner)
+     runner.input_buffers = SimpleNamespace(dummy_num_tokens=None)
+     runner.compilation_config = SimpleNamespace(cudagraph_mode=CUDAGraphMode.NONE)
++    runner.debugger = None
+     runner.max_num_reqs = 32
+     runner.max_num_tokens = 256
+     runner.speculator = None
+@@ -202,6 +203,7 @@ def test_adaptive_idle_dp_restores_request_count_after_target_forward(
+     monkeypatch, adaptive, dummy, profile, context_len, scheduled_reqs, has_state, expected_reqs
+ ):
+     runner = NPUModelRunner.__new__(NPUModelRunner)
++    runner.debugger = None
+     runner.ascend_config = SimpleNamespace(
+         scheduler_config=SimpleNamespace(profiling_chunk_config=SimpleNamespace(need_timing=False))
+     )
+@@ -214,7 +216,10 @@ def test_adaptive_idle_dp_restores_request_count_after_target_forward(
+         padded_batch = AscendInputBatch.make_dummy(16, 32, buffers)
+     ExecutionState = namedtuple("ExecutionState", "input_batch hidden_states dp_sync")
+     state = ExecutionState(padded_batch, object(), object())
+-    scheduler = SimpleNamespace(num_scheduled_tokens={f"dummy-{i}": 1 for i in range(scheduled_reqs)})
++    scheduler = SimpleNamespace(
++        num_scheduled_tokens={f"dummy-{i}": 1 for i in range(scheduled_reqs)},
++        total_num_scheduled_tokens=scheduled_reqs,
++    )
+     module = "vllm_ascend.worker.v2.model_runner."
+     monkeypatch.setattr(module + "has_kv_transfer_group", lambda: False)
+     monkeypatch.setattr(module + "should_skip_allreduce_across_dp_group", lambda _config: False)
+diff --git a/tests/ut/worker/test_model_runner_v2.py b/tests/ut/worker/test_model_runner_v2.py
+index 25c418cec..70b76324d 100644
+--- a/tests/ut/worker/test_model_runner_v2.py
++++ b/tests/ut/worker/test_model_runner_v2.py
+@@ -8,6 +8,7 @@ import numpy as np
+ import pytest
+ import torch
+ from vllm.config import CUDAGraphMode
++from vllm.sequence import IntermediateTensors
+ from vllm.v1.kv_cache_interface import KVCacheConfig
+ from vllm.v1.worker.gpu import model_runner as vllm_model_runner
+ from vllm.v1.worker.gpu.model_runner import BatchReqState, GPUModelRunner
+@@ -36,6 +37,10 @@ def _make_runner(need_timing: bool = True):
+     runner.execute_model_state = None
+     runner.use_pp = False
+     runner.is_last_pp_rank = False
++    runner.is_pooling_model = False
++    # Dump contract from the production initializer; helpers no-op on None.
++    runner.debugger = None
++    runner._debugger_started = False
+     runner.attn_groups = []
+     runner.adaptive_verification = None
+     runner.input_buffers = SimpleNamespace(dummy_num_tokens=None)
+@@ -63,7 +68,7 @@ def _make_runner(need_timing: bool = True):
+ )
+ def test_metadata_and_dp_skip_scopes_coexist_and_retire(monkeypatch, dummy, profile, fail):
+     runner = _make_runner(need_timing=False)
+-    scheduler_output = SimpleNamespace()
++    scheduler_output = SimpleNamespace(total_num_scheduled_tokens=0, num_scheduled_tokens={})
+     active = set()
+     events: list[str | tuple[str, bool]] = []
+ 
+@@ -225,7 +230,7 @@ def test_capture_model_uses_ascend_context_and_encoder_update_stream():
+ 
+ def test_execute_model_records_profiling_time():
+     runner = _make_runner()
+-    scheduler_output = SimpleNamespace(disable_profiling_timing=False)
++    scheduler_output = SimpleNamespace(disable_profiling_timing=False, total_num_scheduled_tokens=0)
+ 
+     with (
+         patch.object(
+@@ -262,7 +267,7 @@ def test_execute_model_records_profiling_time():
+ def test_execute_model_disables_profiling_timer_and_clears_stale_time():
+     runner = _make_runner()
+     runner._cpp_execution_time_ms = 123.0
+-    scheduler_output = SimpleNamespace(disable_profiling_timing=True)
++    scheduler_output = SimpleNamespace(disable_profiling_timing=True, total_num_scheduled_tokens=0)
+ 
+     with (
+         patch.object(
+@@ -288,7 +293,9 @@ def test_execute_model_disables_profiling_timer_and_clears_stale_time():
+ 
+ def test_execute_model_skips_dp_coordination_when_safe():
+     runner = _make_runner(need_timing=False)
+-    scheduler_output = SimpleNamespace(disable_profiling_timing=True)
++    scheduler_output = SimpleNamespace(
++        disable_profiling_timing=True, total_num_scheduled_tokens=0, num_scheduled_tokens={}
++    )
+     coordination_context = MagicMock()
+ 
+     with (
+@@ -482,6 +489,281 @@ def test_prepare_inputs_preserves_pcp_tokens_and_forwards_graph_padding():
+     assert batch_desc_kw.id == "batch_desc"
+ 
+ 
++def _make_dump_runner(debugger=None):
++    runner = _make_runner(need_timing=False)
++    runner.debugger = debugger
++    runner.model = Mock()
++    runner._debugger_started = False
++    return runner
++
++
++def test_start_dump_data_starts_debugger_and_forwards_kwargs():
++    debugger = Mock(spec=["start", "step"])
++    runner = _make_dump_runner(debugger)
++
++    runner._start_dump_data(scheduled_tokens={0: 4})
++
++    debugger.start.assert_called_once_with(runner.model, scheduled_tokens={0: 4})
++    assert runner._debugger_started is True
++
++
++def test_start_dump_data_noop_when_already_started():
++    debugger = Mock(spec=["start", "step"])
++    runner = _make_dump_runner(debugger)
++    runner._debugger_started = True
++
++    runner._start_dump_data()
++
++    debugger.start.assert_not_called()
++    debugger.step.assert_not_called()
++
++
++def test_dump_helpers_noop_without_debugger():
++    # No dump config: helpers must be safe no-ops (no AttributeError).
++    runner = _make_dump_runner(None)
++
++    runner._start_dump_data()
++    runner._finalize_dump_data(dump=False)
++
++
++def test_finalize_dump_data_stops_stop_capable_debugger():
++    debugger = Mock()
++    runner = _make_dump_runner(debugger)
++    runner._debugger_started = True
++
++    runner._finalize_dump_data()
++
++    debugger.stop.assert_called_once_with()
++    debugger.step.assert_called_once_with()
++    assert runner._debugger_started is False
++
++
++def test_finalize_dump_data_keeps_window_open_for_graph_debugger():
++    # AclGraphDumper has no stop(); the window stays open across steps and
++    # each step only calls step() (v1 parity).
++    debugger = Mock(spec=["start", "step"])
++    runner = _make_dump_runner(debugger)
++    runner._debugger_started = True
++
++    runner._finalize_dump_data()
++
++    debugger.step.assert_called_once_with()
++    assert runner._debugger_started is True
++
++
++@pytest.fixture
++def stub_dp_skip_gate(monkeypatch):
++    monkeypatch.setattr(
++        "vllm_ascend.worker.v2.model_runner.should_skip_allreduce_across_dp_group",
++        lambda _config: False,
++    )
++
++
++def test_execute_model_opens_dump_window_for_real_step(stub_dp_skip_gate):
++    debugger = Mock(spec=["start", "step"])
++    runner = _make_dump_runner(debugger)
++    scheduler_output = SimpleNamespace(
++        disable_profiling_timing=False,
++        total_num_scheduled_tokens=4,
++        num_scheduled_tokens={0: 4},
++    )
++
++    with patch.object(GPUModelRunner, "execute_model", return_value=None):
++        output = runner.execute_model(scheduler_output)
++
++    assert output is None
++    debugger.start.assert_called_once_with(runner.model, scheduled_tokens={0: 4})
++    # Last-PP-rank path: the cycle is closed later in sample_tokens().
++    debugger.step.assert_not_called()
++
++
++def test_execute_model_skips_dump_when_no_tokens_scheduled(stub_dp_skip_gate):
++    debugger = Mock(spec=["start", "step"])
++    runner = _make_dump_runner(debugger)
++    scheduler_output = SimpleNamespace(
++        disable_profiling_timing=False,
++        total_num_scheduled_tokens=0,
++        num_scheduled_tokens={},
++    )
++
++    with patch.object(GPUModelRunner, "execute_model", return_value=None):
++        runner.execute_model(scheduler_output)
++
++    debugger.start.assert_not_called()
++    debugger.step.assert_not_called()
++
++
++def test_execute_model_skips_eager_dump_for_dummy_run(stub_dp_skip_gate):
++    debugger = Mock(spec=["start", "stop", "step"])
++    runner = _make_dump_runner(debugger)
++    scheduler_output = SimpleNamespace(
++        disable_profiling_timing=False,
++        total_num_scheduled_tokens=4,
++        num_scheduled_tokens={"_dummy_req_0": 4},
++    )
++
++    with patch.object(GPUModelRunner, "execute_model", return_value=None):
++        runner.execute_model(scheduler_output, dummy_run=True)
++
++    debugger.start.assert_not_called()
++    debugger.step.assert_not_called()
++
++
++def test_execute_model_closes_graph_dummy_run_without_writing(stub_dp_skip_gate):
++    debugger = Mock(spec=["start", "step"])
++    runner = _make_dump_runner(debugger)
++    # Graph dumping starts in load_model() before capture/profile dummy runs.
++    runner._debugger_started = True
++    scheduler_output = SimpleNamespace(
++        disable_profiling_timing=False,
++        total_num_scheduled_tokens=4,
++        num_scheduled_tokens={"_dummy_req_0": 4},
++    )
++
++    with patch.object(GPUModelRunner, "execute_model", return_value=None):
++        runner.execute_model(scheduler_output, dummy_run=True)
++
++    debugger.start.assert_not_called()
++    debugger.step.assert_called_once_with(dump=False)
++
++
++@pytest.mark.parametrize("graph_dump", [False, True])
++def test_pp_decoding_dump_finalizes_once_per_sampled_step(graph_dump, stub_dp_skip_gate):
++    debugger = Mock(spec=["start", "step"] if graph_dump else ["start", "stop", "step"])
++    runner = _make_dump_runner(debugger)
++    runner.pcp_manager = None
++    runner._debugger_started = graph_dump
++    scheduler_output = SimpleNamespace(
++        disable_profiling_timing=False,
++        total_num_scheduled_tokens=4,
++        num_scheduled_tokens={0: 4},
++    )
++    intermediate = IntermediateTensors({"hidden": torch.zeros(1, 2)})
++
++    with (
++        patch.object(GPUModelRunner, "execute_model", return_value=intermediate),
++        patch.object(GPUModelRunner, "sample_tokens", return_value="out"),
++    ):
++        for step in range(2):
++            assert runner.execute_model(scheduler_output) is intermediate
++            assert debugger.step.call_count == step
++            assert runner.sample_tokens(None) == "out"
++            assert debugger.step.call_count == step + 1
++
++    assert debugger.start.call_count == (0 if graph_dump else 2)
++    if not graph_dump:
++        assert debugger.stop.call_count == 2
++
++
++def test_execute_model_finalizes_dump_for_pooling_pp_non_last_rank(stub_dp_skip_gate):
++    debugger = Mock(spec=["start", "step"])
++    runner = _make_dump_runner(debugger)
++    runner.is_pooling_model = True
++    scheduler_output = SimpleNamespace(
++        disable_profiling_timing=False,
++        total_num_scheduled_tokens=4,
++        num_scheduled_tokens={0: 4},
++    )
++    intermediate = IntermediateTensors({"hidden": torch.zeros(1, 2)})
++
++    with patch.object(GPUModelRunner, "execute_model", return_value=intermediate):
++        output = runner.execute_model(scheduler_output)
++
++    assert output is intermediate
++    debugger.start.assert_called_once()
++    # Non-last pooling ranks return before the worker calls pool().
++    debugger.step.assert_called_once_with()
++
++
++def test_sample_tokens_closes_dump_cycle_on_last_rank():
++    debugger = Mock(spec=["start", "step"])
++    runner = _make_dump_runner(debugger)
++    runner.pcp_manager = None
++    runner._debugger_started = True
++
++    with patch.object(GPUModelRunner, "sample_tokens", return_value="out"):
++        result = runner.sample_tokens("grammar")
++
++    assert result == "out"
++    debugger.step.assert_called_once_with()
++
++
++@pytest.mark.parametrize("load_dummy_weights", [False, True])
++def test_load_model_starts_dump_before_capture_in_graph_mode(load_dummy_weights):
++    debugger = Mock(spec=["start", "step"])
++    runner = _make_dump_runner(debugger)
++    runner.compilation_config = SimpleNamespace(cudagraph_mode=CUDAGraphMode.FULL)
++
++    aux_layers = (2, 4)
++    with (
++        patch.object(GPUModelRunner, "load_model") as parent_load_model,
++        patch("vllm_ascend.worker.v2.model_runner.get_pd_dspark_aux_layer_ids", return_value=aux_layers),
++    ):
++        runner.load_model(load_dummy_weights, "load_arg", load_option=True)
++
++    parent_load_model.assert_called_once_with(load_dummy_weights, "load_arg", load_option=True)
++    assert runner.pd_dspark_aux_layer_ids == aux_layers
++    debugger.start.assert_called_once_with(runner.model)
++
++
++def test_load_model_skips_dump_in_eager_mode():
++    debugger = Mock(spec=["start", "step"])
++    runner = _make_dump_runner(debugger)
++    runner.compilation_config = SimpleNamespace(cudagraph_mode=CUDAGraphMode.NONE)
++
++    with patch.object(GPUModelRunner, "load_model"):
++        runner.load_model()
++
++    debugger.start.assert_not_called()
++
++
++def test_pool_closes_dump_cycle_for_pooling_models():
++    # Pooling models never reach sample_tokens(): the worker calls pool()
++    # directly, so the dump cycle must be closed there.
++    debugger = Mock(spec=["start", "step"])
++    runner = _make_dump_runner(debugger)
++    runner._debugger_started = True
++
++    with patch.object(GPUModelRunner, "pool", return_value="pooled") as parent_pool:
++        result = runner.pool()
++
++    assert result == "pooled"
++    parent_pool.assert_called_once_with()
++    debugger.step.assert_called_once_with()
++
++
++@pytest.mark.parametrize("is_profile", [False, True])
++@pytest.mark.parametrize("lmhead_tp", [False, True])
++def test_dummy_run_flushes_dump_window_without_writing(is_profile, lmhead_tp):
++    debugger = Mock(spec=["start", "step"])
++    runner = _make_dump_runner(debugger)
++    runner._debugger_started = True
++    runner.max_num_tokens = runner.max_num_reqs = 8
++    runner.speculator = None
++    outputs = (Mock(), Mock())
++
++    with (
++        patch.object(GPUModelRunner, "_dummy_run", return_value=outputs) as parent_dummy_run,
++        patch("vllm_ascend.worker.v2.model_runner.lmhead_tp_enable", return_value=lmhead_tp),
++    ):
++        result = runner._dummy_run(8, is_profile=is_profile, skip_eplb=True)
++
++    assert result[0] is outputs[0]
++    assert result[1] is outputs[1]
++    parent_dummy_run.assert_called_once_with(
++        8,
++        skip_attn=False,
++        uniform_decode=False,
++        context_len=0,
++        skip_eplb=True,
++        is_profile=is_profile,
++    )
++    # Capture/profiling forwards must not leak into the first real step.
++    debugger.step.assert_called_once_with(dump=False)
++    # The lmhead TP join happens inside execute_model; do not repeat it here.
++    runner.model.compute_logits.assert_not_called()
++
++
+ @pytest.mark.parametrize("num_reqs,num_tokens", [(4, 4), (2, 6)])
+ def test_pcp_dummy_refreshes_captured_buffers_after_real_batch(num_reqs, num_tokens):
+     runner = _make_runner()
+@@ -600,7 +882,8 @@ def test_kvpp_history_ignores_padding_and_dummy_work(monkeypatch, computed, dumm
+         "vllm_ascend.worker.v2.model_runner.should_skip_allreduce_across_dp_group",
+         lambda _config: False,
+     )
+-    assert runner.execute_model(SimpleNamespace(), dummy_run=dummy_run, is_profile=is_profile) is metadata
++    scheduler_output = SimpleNamespace(total_num_scheduled_tokens=0, num_scheduled_tokens={})
++    assert runner.execute_model(scheduler_output, dummy_run=dummy_run, is_profile=is_profile) is metadata
+     assert events == ([("prepare", expected)] if enabled else []) + ["forward", "complete"]
+     assert state.kvpp_is_dummy_run is False
+ 
+@@ -639,7 +922,7 @@ def test_init_without_speculation(use_pp):
+     vllm_config = SimpleNamespace(
+         parallel_config=SimpleNamespace(enable_eplb=False, pipeline_parallel_size=2 if use_pp else 1)
+     )
+-    ascend_config = SimpleNamespace(eplb_config=SimpleNamespace(load_collection_phase="all"))
++    ascend_config = SimpleNamespace(eplb_config=SimpleNamespace(load_collection_phase="all"), dump_config_path=None)
+ 
+     # Complete the fake with the fields NPUModelRunner reads (mirrors FinegrainedTPConfig).
+     ascend_config.finegrained_tp_config = SimpleNamespace(
+@@ -687,7 +970,7 @@ def test_init_without_speculation(use_pp):
+ 
+ def test_init_spec_pp_full_graph_and_speculator():
+     vllm_config = SimpleNamespace(parallel_config=SimpleNamespace(enable_eplb=True, pipeline_parallel_size=2))
+-    ascend_config = SimpleNamespace(eplb_config=SimpleNamespace(load_collection_phase="decode"))
++    ascend_config = SimpleNamespace(eplb_config=SimpleNamespace(load_collection_phase="decode"), dump_config_path=None)
+ 
+     # Complete the fake with the fields NPUModelRunner reads (mirrors FinegrainedTPConfig).
+     ascend_config.finegrained_tp_config = SimpleNamespace(
+diff --git a/tests/ut/worker/test_model_runner_v2_finegrained_tp.py b/tests/ut/worker/test_model_runner_v2_finegrained_tp.py
+index c84d3c73b..5477683bb 100644
+--- a/tests/ut/worker/test_model_runner_v2_finegrained_tp.py
++++ b/tests/ut/worker/test_model_runner_v2_finegrained_tp.py
+@@ -39,6 +39,9 @@ def _make_runner(max_num_reqs=8, decode_query_len=2, vocab=6):
+     runner.adaptive_verification = None
+     runner.max_num_reqs = max_num_reqs
+     runner.decode_query_len = decode_query_len
++    # Dump contract from the production initializer; helpers no-op on None.
++    runner.debugger = None
++    runner._debugger_started = False
+     # Extra fields for the execute_model-path tests below.
+     runner.device = torch.device("cpu")
+     runner.is_last_pp_rank = True
+diff --git a/tests/ut/worker/test_pcp_manager_v2.py b/tests/ut/worker/test_pcp_manager_v2.py
+index 825a97b10..98a90ecb0 100644
+--- a/tests/ut/worker/test_pcp_manager_v2.py
++++ b/tests/ut/worker/test_pcp_manager_v2.py
+@@ -1107,6 +1107,9 @@ def test_sample_tokens_uses_global_batch_only_on_non_last_pp_rank(
+     runner.pcp_manager = manager
+     runner.is_last_pp_rank = is_last_pp_rank
+     runner.speculator = None
++    # Dump contract from the production initializer; helpers no-op on None.
++    runner.debugger = None
++    runner._debugger_started = False
+     runner.prompt_logprobs_worker = None
+     # vLLM main added these ExecuteModelState fields.
+     state_kwargs: dict = {}
+diff --git a/tests/ut/worker/test_v2_dummy_padding.py b/tests/ut/worker/test_v2_dummy_padding.py
+index 66574cc3c..eb6569ba4 100644
+--- a/tests/ut/worker/test_v2_dummy_padding.py
++++ b/tests/ut/worker/test_v2_dummy_padding.py
+@@ -27,6 +27,7 @@ def runner(buffers):
+     runner = NPUModelRunner.__new__(NPUModelRunner)
+     runner.vllm_config = SimpleNamespace(kv_transfer_config=None)
+     runner.input_buffers = buffers
++    runner.debugger = None
+     runner.compilation_config = SimpleNamespace(cudagraph_mode=CUDAGraphMode.PIECEWISE)
+     runner.decode_query_len = 2
+     runner.pcp_manager = None
+diff --git a/vllm_ascend/worker/v2/model_runner.py b/vllm_ascend/worker/v2/model_runner.py
+index c04a84192..7fb2ae10d 100644
+--- a/vllm_ascend/worker/v2/model_runner.py
++++ b/vllm_ascend/worker/v2/model_runner.py
+@@ -251,6 +251,25 @@ class NPUModelRunner(GPUModelRunner):
+         set_mc2_mask(vllm_config, self.device)
+         set_potential_max_tokens(vllm_config)
+ 
++        # msprobe dump (same as v1 NPUModelRunner; not via DFX).
++        dump_cfg = self.ascend_config.dump_config_path
++        self.debugger = None
++        if dump_cfg is not None:
++            self._debugger_started = False
++            if self.compilation_config.cudagraph_mode == CUDAGraphMode.NONE:
++                from msprobe.pytorch import PrecisionDebugger
++
++                self.debugger = PrecisionDebugger(dump_cfg)
++            else:
++                try:
++                    from msprobe.pytorch import AclGraphDumper
++                except Exception as exc:
++                    raise RuntimeError(
++                        "Failed to import AclGraphDumper from msprobe. "
++                        "Please install/rebuild msprobe with aclgraph_dump enabled."
++                    ) from exc
++
++                self.debugger = AclGraphDumper(dump_cfg)
+         self.runtime_guard = RuntimeGuardProcessor.bind(self)
+ 
+     @property
+@@ -261,6 +280,11 @@ class NPUModelRunner(GPUModelRunner):
+         aux_layers = get_pd_dspark_aux_layer_ids(self.vllm_config)
+         super().load_model(load_dummy_weights, *args, **kwargs)
+         self.pd_dspark_aux_layer_ids = aux_layers
++        # In cudagraph modes the dumper must be started before graph capture so
++        # that aclgraph capture/replay is instrumented (v1 parity: v1 starts
++        # the dumper at the end of load_model).
++        if self.compilation_config.cudagraph_mode != CUDAGraphMode.NONE:
++            self._start_dump_data()
+ 
+     def _restore_replicated_draft_target_states(self) -> None:
+         """Restore target states consumed by a replicated PCP draft."""
+@@ -333,7 +357,21 @@ class NPUModelRunner(GPUModelRunner):
+         if pcp_manager is not None and isinstance(pcp_manager, AscendPCPManager):
+             pcp_manager._sampling_hidden_restored = False
+         self._restore_replicated_draft_target_states()
+-        return super().sample_tokens(grammar_output)
++        output = super().sample_tokens(grammar_output)
++        # Close the per-step msprobe dump cycle on the normal last-PP-rank
++        # path (v1 parity: v1 finalizes at the end of sample_tokens).
++        self._finalize_dump_data()
++        return output
++
++    def pool(self):
++        output = super().pool()
++        # Pooling models never go through sample_tokens() in the v2
++        # architecture: the worker calls pool() directly, and the engine skips
++        # sampling whenever execute_model()/pool() returns a non-None output.
++        # Close the dump cycle here, mirroring v1 which finalizes after
++        # _pool() on the pooling path.
++        self._finalize_dump_data()
++        return output
+ 
+     def get_kv_cache_spec(self) -> dict[str, KVCacheSpec]:
+         return apply_dspark_resident_kv_specs(
+@@ -525,6 +563,13 @@ class NPUModelRunner(GPUModelRunner):
+             assert kv_connector_metadata is not None
+             get_kv_transfer_group().handle_preemptions(kv_connector_metadata)
+ 
++        dump_forward = dummy_run or scheduler_output.total_num_scheduled_tokens > 0
++        # Eager PrecisionDebugger is started only for real scheduler steps.
++        # Graph dumping is already active from load_model(), so dummy forwards
++        # only need to flush the graph dumper below without writing a step.
++        if dump_forward and not dummy_run:
++            self._start_dump_data(scheduled_tokens=scheduler_output.num_scheduled_tokens)
++
+         self.model_state.kvpp_is_dummy_run = dummy_run or is_profile
+         dp_coordination_context = (
+             skip_dp_coordination() if should_skip_allreduce_across_dp_group(self.vllm_config) else nullcontext()
+@@ -564,6 +609,14 @@ class NPUModelRunner(GPUModelRunner):
+             self.model.compute_logits(self.execute_model_state.hidden_states[dummy_indices])
+         self.kvpp.complete_forward()
+ 
++        if dump_forward:
++            if dummy_run:
++                self._finalize_dump_data(dump=False)
++            elif isinstance(output, IntermediateTensors) and self.is_pooling_model:
++                # Non-last pooling ranks do not reach pool(). Decoding ranks
++                # finalize after sample_tokens(), including non-last PP ranks.
++                self._finalize_dump_data()
++
+         self._cpp_execution_time_ms = _finish_profiling_chunk_timing(
+             profiling_config,
+             execution_start_time,
+@@ -1108,7 +1161,7 @@ class NPUModelRunner(GPUModelRunner):
+             skip_ring_state_update(skip_ring),
+             load_balance_ctx,
+         ):
+-            return super()._dummy_run(
++            output = super()._dummy_run(
+                 num_tokens,
+                 *args,
+                 skip_attn=skip_attn,
+@@ -1118,6 +1171,12 @@ class NPUModelRunner(GPUModelRunner):
+                 is_profile=is_profile,
+                 **kwargs,
+             )
++        # Flush the dump window opened across dummy forwards without writing
++        # data, so capture/profiling forwards do not leak into the first real
++        # step (v1 parity: v1 finalizes with dump=False at the end of
++        # _dummy_run).
++        self._finalize_dump_data(dump=False)
++        return output
+ 
+     def postprocess_sampled(
+         self,
+@@ -1260,6 +1319,21 @@ class NPUModelRunner(GPUModelRunner):
+ 
+         return query_start_loc_np, num_reqs_padded
+ 
++    def _start_dump_data(self, **kwargs) -> None:
++        if self.debugger is None or self._debugger_started:
++            return
++        self.debugger.start(self.model, **kwargs)
++        self._debugger_started = True
++
++    def _finalize_dump_data(self, **kwargs) -> None:
++        if self.debugger is None or not self._debugger_started:
++            return
++        if hasattr(self.debugger, "stop"):
++            self.debugger.stop()
++            self._debugger_started = False
++
++        self.debugger.step(**kwargs)
++
+     def _pad_adaptive_query_start_loc_for_fia(
+         self,
+         num_tokens_padded: int,

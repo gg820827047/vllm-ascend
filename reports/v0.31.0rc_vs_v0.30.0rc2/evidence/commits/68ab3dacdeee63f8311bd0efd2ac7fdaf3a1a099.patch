@@ -1,0 +1,525 @@
+commit 68ab3dacdeee63f8311bd0efd2ac7fdaf3a1a099
+Author:     recky-c <ruiqicheng510@gmail.com>
+AuthorDate: Tue Oct 13 22:30:32 2026 +0800
+Commit:     GitHub <noreply@github.com>
+CommitDate: Tue Oct 13 22:30:32 2026 +0800
+
+    [Bugfix] Support A5 SFA C8 decode context parallelism (#18319)
+    
+    ### What this PR does / why we need it?
+    
+    A5 SFA C8 decode context parallelism needs quantized KV block transport
+    and per-shard softmax statistics. The previous capability guard rejects
+    this configuration; the CANN C8 path does not provide the LSE statistics
+    needed to merge DCP shards.
+    
+    This patch preserves packed FP8 bytes during block selection and
+    communication, routes A5 C8 LSE requests to
+    `KvQuantSparseFlashAttentionVllm`, and returns softmax max/sum with
+    correct padded-index and empty-shard handling. It registers the A5 C8
+    DCP capability while retaining platform validation. RoPE64 calls without
+    LSE keep the CANN path.
+    
+    ### Does this PR introduce _any_ user-facing change?
+    
+    Yes. A5 sparse attention with FP8 KV cache can use decode context
+    parallelism. Model weight quantization is unchanged, and no new CLI flag
+    is added. SFA C8 is derived from the KV cache dtype and sparse model
+    configuration.
+    
+    ### How was this patch tested?
+    
+    - Built the standard A5 wheel with `COMPILE_CUSTOM_KERNELS=1`; verified
+    six C8 kernel binaries and matching metadata in the package.
+    
+    - A5: the existing operator test file passed all 13 cases after review
+    consolidation (the original case plus 12 A5 LSE cases): 16/32/64 heads
+    with complete, padded, and empty selections. Padded outputs were checked
+    against an independent valid-index reference; LSE max absolute error was
+    below 1e-6. Two simulated eight-shard merges also passed, including
+    seven empty shards.
+    
+    - CP/hardware-profile unit tests: 203 passed. Platform tests: 146
+    passed, 1 skipped. Ruff and diff checks passed for the review revision;
+    refreshed CI is pending.
+    
+    - Full GLM-5.2 MXFP8 model: MRV2, TP8 x PP2, layers 38/40, DCP8, FP8 KV
+    completed a real arithmetic decode correctly. The same PR wheel was
+    installed on both nodes and its custom API library was observed in
+    worker mappings.
+    
+    Full-model GSM8K comparison (same 500 questions, prompt, seed 1024,
+    temperature 0, and max output 2048): GLM-5.2 MXFP8 weights, FP8 KV/SFA
+    C8, MRV2, TP8 x PP2 with a 38/40 layer partition, FULL_DECODE_ONLY
+    graphs, and request concurrency 64.
+    
+    | Metric | DCP1 | DCP8 within each PP stage |
+    | --- | ---: | ---: |
+    | Correct answers | 482/500 | 484/500 |
+    | Accuracy | 96.4% | 96.8% |
+    
+    DCP8 improved aggregate accuracy by 0.4 percentage points: 7 questions
+    changed from incorrect to correct and 5 from correct to incorrect. No
+    aggregate accuracy decrease was observed in this run; outputs are not
+    claimed to be identical. Runtime diagnostics confirmed
+    `enable_sparse_sfa_c8=true` and all 16 workers entering the custom C8
+    LSE route with `return_lse=True`, with DCP group size 8 in both PP
+    stages.
+    
+    Review consolidation: removed the extra build-artifact guard and newly
+    added FP8 byte UT; retained existing hardware/platform expectation
+    updates. A5 LSE coverage lives in the existing operator test file.
+    Custom operator registration reuses the existing worker -> CaMem global
+    extension import; no new import is added to device_op.py. A fresh A5
+    worker import confirmed that the extension and custom C8 operator are
+    already registered. Kernel numerical code is unchanged by this revision.
+    The full-model result table above was collected before this
+    test/registration cleanup.
+    
+    
+    - vLLM main:
+    https://github.com/vllm-project/vllm/commit/8cc9aa5ad350f6f80cf3bebb298d410803ff75a9
+    
+    ---------
+    
+    Signed-off-by: chengruiqi (C) <c00913489@china.huawei.com>
+    Co-authored-by: chengruiqi (C) <c00913489@china.huawei.com>
+
+diff --git a/csrc/attention/kv_quant_sparse_flash_attention_vllm/op_kernel/arch35/kv_quant_sparse_flash_attention_vllm_kernel_mla.h b/csrc/attention/kv_quant_sparse_flash_attention_vllm/op_kernel/arch35/kv_quant_sparse_flash_attention_vllm_kernel_mla.h
+index f06ea9e37..01e4e17d5 100644
+--- a/csrc/attention/kv_quant_sparse_flash_attention_vllm/op_kernel/arch35/kv_quant_sparse_flash_attention_vllm_kernel_mla.h
++++ b/csrc/attention/kv_quant_sparse_flash_attention_vllm/op_kernel/arch35/kv_quant_sparse_flash_attention_vllm_kernel_mla.h
+@@ -56,7 +56,7 @@ public:
+                                 __gm__ uint8_t *sparseIndices, __gm__ uint8_t* keyScale,
+                                 __gm__ uint8_t* valueScale, __gm__ uint8_t *blockTable,
+                                 __gm__ uint8_t *actualSeqLengthsQ, __gm__ uint8_t *actualSeqLengths,
+-                                __gm__ uint8_t *attentionOut, __gm__ uint8_t *workspace,
++                                __gm__ uint8_t *attentionOut, __gm__ uint8_t *softmaxMax, __gm__ uint8_t *softmaxSum, __gm__ uint8_t *workspace,
+                                 const KvQuantSparseFlashAttentionVllmTilingDataMla *__restrict tiling,
+ 				                TPipe *tPipe);
+     __aicore__ inline void Process();
+@@ -99,6 +99,7 @@ private:
+     __gm__ int32_t *actualSeqQlenAddr = nullptr;
+ 
+     GlobalTensor<int32_t> actualSeqLengthsQGm;
++    GlobalTensor<int32_t> sparseIndicesGm;
+     uint32_t usedCoreNum = 0U;
+ 
+     /* workspace 空间 */
+@@ -126,7 +127,7 @@ __aicore__ inline void KvQuantSparseFlashAttentionVllmMla<CubeBlockType, VecBloc
+     __gm__ uint8_t *key, __gm__ uint8_t *value,
+     __gm__ uint8_t *sparseIndices, __gm__ uint8_t* keyScale,
+     __gm__ uint8_t* valueScale, __gm__ uint8_t *blockTable, __gm__ uint8_t *actualSeqLengthsQ,
+-    __gm__ uint8_t *actualSeqLengths, __gm__ uint8_t *attentionOut, __gm__ uint8_t *workspace,
++    __gm__ uint8_t *actualSeqLengths, __gm__ uint8_t *attentionOut, __gm__ uint8_t *softmaxMax, __gm__ uint8_t *softmaxSum, __gm__ uint8_t *workspace,
+     const KvQuantSparseFlashAttentionVllmTilingDataMla *__restrict tiling,
+     TPipe *tPipe)
+ {
+@@ -153,7 +154,7 @@ __aicore__ inline void KvQuantSparseFlashAttentionVllmMla<CubeBlockType, VecBloc
+         constInfo.needInit = this->sharedParams.needInit;
+         constInfo.dSizeV = 512;
+     }
+-    vecBlock.CleanOutput(attentionOut, constInfo);
++    vecBlock.CleanOutput(attentionOut, softmaxMax, softmaxSum, constInfo);
+     /* cube侧不依赖sharedParams的scalar前置 */
+     InitMMResBuf(workspace);
+     if ASCEND_IS_AIC {
+@@ -324,6 +325,7 @@ __aicore__ inline void KvQuantSparseFlashAttentionVllmMla<CubeBlockType, VecBloc
+         actualSeqKvlenAddr = (__gm__ int32_t *)actualSeqLengths;
+     }
+ 
++    sparseIndicesGm.SetGlobalBuffer((__gm__ int32_t *)sparseIndices);
+     vecBlock.InitGlobalBuffer(key, value, sparseIndices, blockTable);
+     cubeBlock.InitCubeInput(actualSeqLengthsQ, constInfo);
+ }
+@@ -555,6 +557,26 @@ __aicore__ inline void KvQuantSparseFlashAttentionVllmMla<CubeBlockType, VecBloc
+                     runParam, this->constInfo, gS1Index, this->actualSeqQlenAddr);
+                 bool s2NoNeedCalc =
+                     ComputeS2LoopInfo<TEMPLATE_INTF_ARGS>(runParam, this->constInfo);
++                if (!s1NoNeedCalc && !s2NoNeedCalc && sharedParams.returnSoftmaxLse) {
++                    // CP compacts valid indices followed by -1 padding. Both
++                    // AIC and AIV must use the same valid task length.
++                    uint64_t queryOffset = runParam.boIdx * constInfo.s1Size + runParam.s1oIdx;
++                    if constexpr (LAYOUT_T == QSFA_LAYOUT::TND) {
++                        queryOffset = (runParam.boIdx == 0 ? 0 : actualSeqQlenAddr[runParam.boIdx - 1]) + runParam.s1oIdx;
++                    }
++                    const uint64_t offset = queryOffset * constInfo.sparseBlockCount;
++                    int64_t lo = 0;
++                    int64_t hi = runParam.s2LineEndIdx;
++                    while (lo < hi) {
++                        const int64_t mid = lo + (hi - lo) / 2;
++                        if (sparseIndicesGm.GetValue(offset + mid) >= 0) { lo = mid + 1; }
++                        else { hi = mid; }
++                    }
++                    runParam.s2LineEndIdx = lo;
++                    runParam.kvLoopEndIdx = (lo + constInfo.s2BaseSize - 1) / constInfo.s2BaseSize;
++                    runParam.s2LoopEndIdx = runParam.kvLoopEndIdx;
++                    s2NoNeedCalc = lo == 0;
++                }
+                 // s1和s2有任意一个不需要算, 则continue, 如果是当前核最后一次循环，则补充计算taskIdx+2的部分
+                 if (s1NoNeedCalc || s2NoNeedCalc) {
+                     continue;
+diff --git a/csrc/attention/kv_quant_sparse_flash_attention_vllm/op_kernel/arch35/kv_quant_sparse_flash_attention_vllm_service_vector_mla.h b/csrc/attention/kv_quant_sparse_flash_attention_vllm/op_kernel/arch35/kv_quant_sparse_flash_attention_vllm_service_vector_mla.h
+index 44a3bd8e7..4fd64562e 100644
+--- a/csrc/attention/kv_quant_sparse_flash_attention_vllm/op_kernel/arch35/kv_quant_sparse_flash_attention_vllm_service_vector_mla.h
++++ b/csrc/attention/kv_quant_sparse_flash_attention_vllm/op_kernel/arch35/kv_quant_sparse_flash_attention_vllm_service_vector_mla.h
+@@ -76,7 +76,7 @@ public:
+     // 初始化LocalTensor
+     __aicore__ inline void InitLocalBuffer(TPipe *pipe, ConstInfo &constInfo);
+     // 初始化attentionOutGM
+-    __aicore__ inline void CleanOutput(__gm__ uint8_t *attentionOut, ConstInfo &constInfo);
++    __aicore__ inline void CleanOutput(__gm__ uint8_t *attentionOut, __gm__ uint8_t *softmaxMax, __gm__ uint8_t *softmaxSum, ConstInfo &constInfo);
+     __aicore__ inline void InitGlobalBuffer(__gm__ uint8_t *key, __gm__ uint8_t *value, __gm__ uint8_t *sparseIndices,
+         __gm__ uint8_t *blockTable);
+     __aicore__ inline void InitOutputSingleCore(ConstInfo &constInfo);
+@@ -135,6 +135,9 @@ private:
+     const KvQuantSparseFlashAttentionVllmTilingDataMla *__restrict tilingData;
+ 
+     GlobalTensor<OUTPUT_T> attentionOutGm;
++    GlobalTensor<float> softmaxMaxGm;
++    GlobalTensor<float> softmaxSumGm;
++    bool returnSoftmaxLse = false;
+     GlobalTensor<KV_T> keyGm;
+     GlobalTensor<int32_t> SparseIndicesGm;
+     GlobalTensor<int32_t> blockTableGm;
+@@ -679,6 +682,19 @@ __aicore__ inline void QSFAVectorService<TEMPLATE_ARGS>::ProcessVec2(
+         }
+ 
+         this->CopyOutAttentionOut(runInfo, constInfo, vec2ResUb, 0, qsfaVec2CalcSize);
++        if (returnSoftmaxLse) {
++            // A5 MLA has one KV head. LSE is [N2=1, T, query_heads].
++            const uint64_t offset = runInfo.attentionOutOffset / constInfo.dSizeV;
++            LocalTensor<float> maxUb = softmaxMaxBuf[runInfo.multiCoreIdxMod2].template Get<float>();
++            LocalTensor<float> sumUb = softmaxSumBuf[runInfo.multiCoreIdxMod2].template Get<float>();
++            SetFlag<HardEvent::V_MTE3>(vToMte3Id[1]);
++            WaitFlag<HardEvent::V_MTE3>(vToMte3Id[1]);
++            DataCopyExtParams statsCopy{1, static_cast<uint32_t>(runInfo.vec2MRealSize * sizeof(float)), 0, 0, 0};
++            DataCopyPad(softmaxMaxGm[offset], maxUb, statsCopy);
++            DataCopyPad(softmaxSumGm[offset], sumUb, statsCopy);
++            SetFlag<HardEvent::MTE3_V>(mte3ToVId[1]);
++            WaitFlag<HardEvent::MTE3_V>(mte3ToVId[1]);
++        }
+     }
+     SetFlag<HardEvent::MTE3_V>(mte3ToVId[0]);
+ }
+@@ -739,11 +755,27 @@ __aicore__ inline void QSFAVectorService<TEMPLATE_ARGS>::InitOutputSingleCore(Co
+ }
+ 
+ TEMPLATES_DEF_NO_DEFAULT
+-__aicore__ inline void QSFAVectorService<TEMPLATE_ARGS>::CleanOutput(__gm__ uint8_t *attentionOut, ConstInfo &constInfo)
++__aicore__ inline void QSFAVectorService<TEMPLATE_ARGS>::CleanOutput(__gm__ uint8_t *attentionOut, __gm__ uint8_t *softmaxMax, __gm__ uint8_t *softmaxSum, ConstInfo &constInfo)
+ {
+     if ASCEND_IS_AIV {
+         this->attentionOutGm.SetGlobalBuffer((__gm__ OUTPUT_T *)attentionOut);
+-        if (constInfo.needInit == 1) {
++        returnSoftmaxLse = this->tilingData->baseParams.returnSoftmaxLse;
++        if (returnSoftmaxLse) {
++            softmaxMaxGm.SetGlobalBuffer((__gm__ float *)softmaxMax);
++            softmaxSumGm.SetGlobalBuffer((__gm__ float *)softmaxSum);
++            uint64_t total = constInfo.s1Size * constInfo.gSize;
++            if constexpr (LAYOUT_T == QSFA_LAYOUT::BSND) { total *= constInfo.bSize; }
++            const uint64_t count = (total + GetBlockNum() * CV_RATIO - 1) / (GetBlockNum() * CV_RATIO);
++            const uint64_t begin = constInfo.aivIdx * count;
++            if (begin < total) {
++                const uint64_t size = (total - begin < count) ? total - begin : count;
++                matmul::InitOutput<float>(softmaxMaxGm[begin], size, -3.402823466e38F);
++                matmul::InitOutput<float>(softmaxSumGm[begin], size, 0);
++                matmul::InitOutput<OUTPUT_T>(attentionOutGm[begin * constInfo.dSizeV], size * constInfo.dSizeV, 0);
++            }
++            SyncAll();
++        }
++        if (constInfo.needInit == 1 && !returnSoftmaxLse) {
+             InitOutputSingleCore(constInfo);
+         }
+     }
+@@ -808,6 +840,7 @@ TEMPLATES_DEF_NO_DEFAULT __aicore__ inline void QSFAVectorService<TEMPLATE_ARGS>
+ 
+     sharedParams.sparseBlockCount = sparseAttnSharedkvBaseParams.sparseBlockCount;
+     sharedParams.oriMaskMode = sparseAttnSharedkvBaseParams.sparseMode;
++    sharedParams.returnSoftmaxLse = sparseAttnSharedkvBaseParams.returnSoftmaxLse;
+     sharedParams.layoutType = sparseAttnSharedkvBaseParams.outputLayout;
+     sharedParams.dSizeRope = 64; // 64: 编码维度
+     sharedParams.softmaxScale = sparseAttnSharedkvBaseParams.scaleValue;
+@@ -884,7 +917,7 @@ TEMPLATES_DEF_NO_DEFAULT __aicore__ inline void QSFAVectorService<TEMPLATE_ARGS>
+ TEMPLATES_DEF class QSFAVectorServiceDummy {
+ public:
+     __aicore__ inline QSFAVectorServiceDummy() {};
+-    __aicore__ inline void CleanOutput(__gm__ uint8_t *attentionOut, ConstInfo &constInfo) {}
++    __aicore__ inline void CleanOutput(__gm__ uint8_t *attentionOut, __gm__ uint8_t *softmaxMax, __gm__ uint8_t *softmaxSum, ConstInfo &constInfo) {}
+     __aicore__ inline void InitGlobalBuffer(__gm__ uint8_t *key, __gm__ uint8_t *value, __gm__ uint8_t *sparseIndices,
+         __gm__ uint8_t *blockTable) {}
+     __aicore__ inline void InitVecBlock(TPipe *pipe, const KvQuantSparseFlashAttentionVllmTilingDataMla *__restrict tiling,
+diff --git a/csrc/attention/kv_quant_sparse_flash_attention_vllm/op_kernel/kv_quant_sparse_flash_attention_vllm.cpp b/csrc/attention/kv_quant_sparse_flash_attention_vllm/op_kernel/kv_quant_sparse_flash_attention_vllm.cpp
+index d99fdc3e6..74d2c34d4 100644
+--- a/csrc/attention/kv_quant_sparse_flash_attention_vllm/op_kernel/kv_quant_sparse_flash_attention_vllm.cpp
++++ b/csrc/attention/kv_quant_sparse_flash_attention_vllm/op_kernel/kv_quant_sparse_flash_attention_vllm.cpp
+@@ -34,7 +34,7 @@ using namespace AscendC;
+         templateClass<CubeBlockType, VecBlockType> op;                                                    \
+         op.Init(query, key, value, sparseIndices, keyScale, valueScale, blocktable,                       \
+             actualSeqLengthsQuery, actualSeqLengthsKV,                                                    \
+-	    attentionOut, user, nullptr, &tPipe);                                                             \
++	    attentionOut, softmaxMax, softmaxSum, user, nullptr, &tPipe);                                                             \
+         op.Process();                                                                                     \
+     } while (0)
+ #else
+@@ -49,7 +49,7 @@ using namespace AscendC;
+         const tilingdataClass *__restrict tilingData = &tilingDataIn;                                     \
+         op.Init(query, key, value, sparseIndices, keyScale, valueScale, blocktable,                       \
+             actualSeqLengthsQuery, actualSeqLengthsKV,                                                    \
+-	    attentionOut, user, tilingData, &tPipe);                                                          \
++	    attentionOut, softmaxMax, softmaxSum, user, tilingData, &tPipe);                                                          \
+         op.Process();                                                                                     \
+     } while (0)
+ #endif
+@@ -73,7 +73,7 @@ __aicore__ inline void DispatchKernelDtype310(
+     __gm__ uint8_t *sparseIndices, __gm__ uint8_t *keyScale, __gm__ uint8_t *valueScale,
+     __gm__ uint8_t *blocktable, __gm__ uint8_t *actualSeqLengthsQuery,
+     __gm__ uint8_t *actualSeqLengthsKV, __gm__ uint8_t *attentionOut,
+-    __gm__ uint8_t *user, __gm__ uint8_t *tiling, TPipe &tPipe)
++    __gm__ uint8_t *softmaxMax, __gm__ uint8_t *softmaxSum, __gm__ uint8_t *user, __gm__ uint8_t *tiling, TPipe &tPipe)
+ {
+     if constexpr (ORIG_DTYPE_QUERY == DT_BF16 && ORIG_DTYPE_KEY == DT_FLOAT8_E4M3FN &&
+                   ORIG_DTYPE_ATTENTION_OUT == DT_BF16) {
+@@ -131,7 +131,7 @@ kv_quant_sparse_flash_attention_vllm(__gm__ uint8_t *query, __gm__ uint8_t *key,
+ #if (__CCE_AICORE__ == 310)
+     DispatchKernelDtype310<FLASH_DECODE, PAGE_ATTENTION, LAYOUT_T, KV_LAYOUT_T, TEMPLATE_MODE, IS_SPLIT_G>(
+         query, key, value, sparseIndices, keyScale, valueScale, blocktable,
+-        actualSeqLengthsQuery, actualSeqLengthsKV, attentionOut, user, tiling, tPipe);
++        actualSeqLengthsQuery, actualSeqLengthsKV, attentionOut, softmaxMax, softmaxSum, user, tiling, tPipe);
+ #else
+     if constexpr (ORIG_DTYPE_QUERY == DT_FLOAT16 && ORIG_DTYPE_KEY == DT_INT8 &&
+                   ORIG_DTYPE_ATTENTION_OUT == DT_FLOAT16) {
+diff --git a/tests/e2e/nightly/single_node/ops/singlecard_ops/test_kv_quant_sparse_flash_attention_vllm.py b/tests/e2e/nightly/single_node/ops/singlecard_ops/test_kv_quant_sparse_flash_attention_vllm.py
+index 52375e14b..563dc3aea 100644
+--- a/tests/e2e/nightly/single_node/ops/singlecard_ops/test_kv_quant_sparse_flash_attention_vllm.py
++++ b/tests/e2e/nightly/single_node/ops/singlecard_ops/test_kv_quant_sparse_flash_attention_vllm.py
+@@ -1,8 +1,12 @@
+ import gc
++from importlib import import_module
+ 
++import pytest
+ import torch
+ import torch_npu
+ 
++from vllm_ascend.device.device_config import get_ascend_device_type
++from vllm_ascend.device.hardware import AscendDeviceType
+ from vllm_ascend.utils import enable_custom_op
+ 
+ torch_npu.npu.config.allow_internal_format = True
+@@ -188,6 +192,8 @@ def _reference_attention(inputs):
+ 
+ 
+ def _run_custom_op(inputs, return_softmax_lse=False):
++    if get_ascend_device_type() == AscendDeviceType.A5:
++        import_module("vllm_ascend.vllm_ascend_C")
+     return torch.ops._C_ascend.npu_kv_quant_sparse_flash_attention_vllm(
+         inputs["query"],
+         inputs["key"],
+@@ -241,3 +247,63 @@ def test_kv_quant_sparse_flash_attention_vllm():
+     gc.collect()
+     torch.npu.empty_cache()
+     torch.npu.reset_peak_memory_stats()
++
++
++@pytest.mark.skipif(get_ascend_device_type() != AscendDeviceType.A5, reason="Requires the A5 packed FP8 kernel.")
++@pytest.mark.parametrize("length,count", [(4096, 2048), (1024, 512), (128, 32), (128, 0)])
++@pytest.mark.parametrize("heads", [16, 32, 64])
++def test_a5_c8_lse(length, count, heads):
++    torch.manual_seed(16656)
++    page_size, nope_dim, rope_dim, tile_size = 128, 512, 64, 128
++    query = torch.randn(1, heads, nope_dim + rope_dim).to(torch.bfloat16)
++    key_nope = (torch.randn(length, 1, nope_dim) * 2).to(torch.float8_e4m3fn)
++    key_rope = torch.randn(length, 1, rope_dim).to(torch.bfloat16)
++    scales = torch.rand(length, 1, nope_dim // tile_size) * 0.1 + 0.05
++    cache = (
++        torch.cat([key_nope.view(torch.uint8), key_rope.view(torch.uint8), scales.view(torch.uint8)], -1)
++        .reshape(length // page_size, page_size, 1, -1)
++        .view(torch.float8_e4m3fn)
++    )
++    indices = torch.full((1, 1, 2048), -1, dtype=torch.int32)
++    indices[0, 0, :count] = torch.randperm(length)[:count].to(torch.int32)
++    scale = (nope_dim + rope_dim) ** -0.5
++    kwargs = dict(
++        query=query.npu(),
++        key=cache.npu(),
++        value=cache.npu(),
++        sparse_indices=indices.npu(),
++        scale_value=scale,
++        sparse_block_size=1,
++        block_table=torch.arange(length // page_size, dtype=torch.int32).view(1, -1).npu(),
++        actual_seq_lengths_query=torch.tensor([1], dtype=torch.int32).npu(),
++        actual_seq_lengths_kv=torch.tensor([length], dtype=torch.int32).npu(),
++        layout_query="TND",
++        layout_kv="PA_BSND",
++        sparse_mode=3,
++        attention_mode=2,
++        quant_scale_repo_mode=1,
++        tile_size=tile_size,
++        key_quant_mode=2,
++        value_quant_mode=2,
++        rope_head_dim=rope_dim,
++    )
++    output, max_value, exp_sum = _run_custom_op(kwargs, return_softmax_lse=True)
++    output, max_value, exp_sum = output.cpu().float(), max_value.cpu().float(), exp_sum.cpu().float()
++    assert torch.isfinite(output).all()
++    if count == 0:
++        assert torch.count_nonzero(output) == 0
++        assert torch.count_nonzero(exp_sum) == 0
++        assert torch.isneginf(max_value + exp_sum.log()).all()
++        return
++    selected = indices[0, 0, :count].long()
++    dequant = (key_nope.float() * scales.repeat_interleave(tile_size, -1)).to(torch.bfloat16)
++    key = torch.cat([dequant, key_rope], -1)[selected, 0].float()
++    scores = query[0].float() @ key.T * scale
++    reference = torch.softmax(scores, -1) @ dequant[selected, 0].float()
++    torch.testing.assert_close(output[0], reference, atol=1e-3, rtol=1e-2)
++    torch.testing.assert_close(
++        (max_value + exp_sum.log()).reshape(-1), torch.logsumexp(scores, -1), atol=1e-5, rtol=1e-5
++    )
++    if count == 2048:
++        builtin = torch_npu.npu_kv_quant_sparse_flash_attention(**kwargs).cpu().float()
++        torch.testing.assert_close(output, builtin, atol=0, rtol=0)
+diff --git a/tests/ut/device/test_hardware_profile.py b/tests/ut/device/test_hardware_profile.py
+index 19008298a..74962d816 100644
+--- a/tests/ut/device/test_hardware_profile.py
++++ b/tests/ut/device/test_hardware_profile.py
+@@ -45,7 +45,6 @@ _STANDARD_CAPABILITIES = frozenset(
+         HardwareCapability.RUNTIME_CUSTOM_OPS,
+         HardwareCapability.SCATTER_ND_CACHE_STORE,
+         HardwareCapability.SCATTER_ND_STRIDED_CACHE_STORE,
+-        HardwareCapability.SFA_C8_DCP_REPLICATED_INDEXER,
+         HardwareCapability.STANDARD_MAMBA_PATCH,
+         HardwareCapability.STANDARD_WORKER_PATCHES,
+         HardwareCapability.TRITON_BATCH_MEMCPY,
+diff --git a/tests/ut/test_platform.py b/tests/ut/test_platform.py
+index 2711aaf23..198b47e5e 100644
+--- a/tests/ut/test_platform.py
++++ b/tests/ut/test_platform.py
+@@ -298,11 +298,7 @@ def test_sfa_dcp_c8_hardware_validation(device_type, enable_sfa_c8):
+         patch("vllm_ascend.platform.enable_sfa_dcp_replicated_indexer", return_value=True),
+         patch("vllm_ascend.platform.get_current_hardware_profile", return_value=get_hardware_profile(device_type)),
+     ):
+-        if device_type == AscendDeviceType.A5 and enable_sfa_c8:
+-            with pytest.raises(NotImplementedError, match="SFA C8 DCP"):
+-                _validate_parallel_config(config)
+-        else:
+-            _validate_parallel_config(config)
++        _validate_parallel_config(config)
+ 
+ 
+ @pytest.mark.parametrize(
+diff --git a/vllm_ascend/attention/context_parallel/sfa_cp.py b/vllm_ascend/attention/context_parallel/sfa_cp.py
+index 4654ef647..a131a19ac 100644
+--- a/vllm_ascend/attention/context_parallel/sfa_cp.py
++++ b/vllm_ascend/attention/context_parallel/sfa_cp.py
+@@ -378,6 +378,18 @@ class AscendSFAPCPImpl(OProjWeightSwitchMixin, AscendSFAImpl):
+         return super().exec_kv(kv_no_split, cos, sin, kv_cache, slots, attn_metadata)
+ 
+ 
++def as_byte_view(x: torch.Tensor) -> torch.Tensor:
++    """Return a byte view for FP8 tensors, preserving their bit patterns."""
++    if x.dtype in (torch.float8_e4m3fn, torch.float8_e5m2):
++        return x.view(torch.uint8)
++    return x
++
++
++def _index_select_kv_blocks(cache: torch.Tensor, indices: torch.Tensor) -> torch.Tensor:
++    # FP8 block movement must preserve bytes, including NaN bit patterns.
++    return torch.index_select(as_byte_view(cache), 0, indices).view(cache.dtype)
++
++
+ @dataclass
+ class DSACPContext:
+     num_tokens: int
+@@ -1421,7 +1433,7 @@ class AscendSFADCPImpl(DCPImplMixin, AscendSFAImpl):
+         valid_block_ids = attn_metadata.dcp_context.kv_gather_block_ids
+         block_table = attn_metadata.dcp_context.kv_gather_block_table
+         assert valid_block_ids is not None and block_table is not None
+-        kv = torch.index_select(kv_cache[0], 0, valid_block_ids)
++        kv = _index_select_kv_blocks(kv_cache[0], valid_block_ids)
+         split_sizes: tuple[int, ...]
+         if self.uses_packed_sfa_main_cache:
+             # Packed SFA formats store nope, rope, and quantization data in one
+@@ -1432,7 +1444,7 @@ class AscendSFADCPImpl(DCPImplMixin, AscendSFAImpl):
+         else:
+             if len(kv_cache) < 2:
+                 raise RuntimeError("DCP SFA KV all-gather requires nope and rope KV caches.")
+-            key_rope = torch.index_select(kv_cache[1], 0, valid_block_ids)
++            key_rope = _index_select_kv_blocks(kv_cache[1], valid_block_ids)
+             if kv.shape[:-1] != key_rope.shape[:-1] or kv.dtype != key_rope.dtype:
+                 raise RuntimeError(
+                     "Cannot fuse DCP KV gather for KV/nope and KV/rope caches with "
+@@ -1452,7 +1464,11 @@ class AscendSFADCPImpl(DCPImplMixin, AscendSFAImpl):
+         dim: int,
+         split_sizes: tuple[int, ...],
+     ) -> DCPGatherContext:
+-        gathered, handle, restore_perm = self._all_gather_dim_async(x, dim)
++        # HCCL does not transport FP8 directly; gather the packed cache as bytes.
++        transport = as_byte_view(x)
++        gathered, handle, restore_perm = self._all_gather_dim_async(transport, dim)
++        if transport.dtype != x.dtype:
++            gathered = gathered.view(x.dtype)
+         return DCPGatherContext(
+             gathered=gathered,
+             handle=handle,
+diff --git a/vllm_ascend/device/device_op.py b/vllm_ascend/device/device_op.py
+index 14c19f8e4..57a5931a6 100644
+--- a/vllm_ascend/device/device_op.py
++++ b/vllm_ascend/device/device_op.py
+@@ -1099,12 +1099,13 @@ class A5DeviceAdaptor(BaseDeviceAdaptor):
+         sparse_mode: int = 3,
+         return_lse: bool = False,
+     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+-        if getattr(sfa_impl, "qk_rope_head_dim", q_pe.shape[-1]) == 0:
++        if return_lse or getattr(sfa_impl, "qk_rope_head_dim", q_pe.shape[-1]) == 0:
+             # RoPE0 packed C8 is implemented by the vllm-ascend custom operator
+             # (csrc/attention/kv_quant_sparse_flash_attention_vllm). The torch_npu
+             # built-in aclnn op has no RoPE0 contract: it sizes its outputs from
+             # rope_head_dim=64 and faults while registering them. Route RoPE0 to
+-            # the custom operator and keep RoPE64 on the built-in one.
++            # the custom operator. LSE requests also require the custom operator;
++            # keep RoPE64 without LSE on the built-in one.
+             return BaseDeviceAdaptor._execute_kv_quant_sparse_flash_attention_vllm(
+                 sfa_impl,
+                 ql_nope,
+diff --git a/vllm_ascend/device/hardware_profile.py b/vllm_ascend/device/hardware_profile.py
+index c104e0b2c..9f59d530f 100644
+--- a/vllm_ascend/device/hardware_profile.py
++++ b/vllm_ascend/device/hardware_profile.py
+@@ -151,8 +151,6 @@ class HardwareCapability(Enum):
+     # Import and register the compiled vLLM-Ascend custom-op library at runtime.
+     # This is independent of whether custom ops are enabled by default.
+     RUNTIME_CUSTOM_OPS = auto()
+-    # Allow C8 SFA decode-context parallelism with a replicated indexer.
+-    SFA_C8_DCP_REPLICATED_INDEXER = auto()
+     # Legacy implementation selector: install the standard worker patch bundle.
+     STANDARD_WORKER_PATCHES = auto()
+     # Legacy implementation selector: install the standard Mamba platform patch.
+@@ -280,7 +278,6 @@ _STANDARD_CAPABILITIES = frozenset(
+         HardwareCapability.RUNTIME_CUSTOM_OPS,
+         HardwareCapability.SCATTER_ND_CACHE_STORE,
+         HardwareCapability.SCATTER_ND_STRIDED_CACHE_STORE,
+-        HardwareCapability.SFA_C8_DCP_REPLICATED_INDEXER,
+         HardwareCapability.STANDARD_MAMBA_PATCH,
+         HardwareCapability.STANDARD_WORKER_PATCHES,
+         HardwareCapability.TRITON_BATCH_MEMCPY,
+diff --git a/vllm_ascend/platform.py b/vllm_ascend/platform.py
+index de2f00d9e..d3f618592 100644
+--- a/vllm_ascend/platform.py
++++ b/vllm_ascend/platform.py
+@@ -1768,15 +1768,6 @@ def _validate_parallel_config(vllm_config: VllmConfig) -> None:
+                 f"is pcp_size({pcp_size}) or tp_size({parallel_config.tensor_parallel_size}) "
+                 f"* pcp_size({pcp_size}) ({full_dcp_size})."
+             )
+-        # A5 supports non-C8 SFA DCP, but its SFA C8 operator does not yet
+-        # support DCP with a replicated indexer. Reject that combination early.
+-        if vllm_config.additional_config.get("enable_sparse_sfa_c8", False) and not (
+-            get_current_hardware_profile().supports(HardwareCapability.SFA_C8_DCP_REPLICATED_INDEXER)
+-        ):
+-            raise NotImplementedError(
+-                "SFA C8 DCP with replicated indexer is not supported by the current hardware profile. "
+-                "Disable enable_sparse_sfa_c8 to use non-C8 SFA DCP."
+-            )
+ 
+ 
+ def _validate_model_pcp_dcp_config(

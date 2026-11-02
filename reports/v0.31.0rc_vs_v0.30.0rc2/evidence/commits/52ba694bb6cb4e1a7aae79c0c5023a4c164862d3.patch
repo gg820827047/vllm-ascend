@@ -1,0 +1,159 @@
+commit 52ba694bb6cb4e1a7aae79c0c5023a4c164862d3
+Author:     ZT-AIA <1028681969@qq.com>
+AuthorDate: Thu Oct 15 22:14:10 2026 +0800
+Commit:     GitHub <noreply@github.com>
+CommitDate: Thu Oct 15 22:14:10 2026 +0800
+
+    [Bugfix] Gate fused GDN prefill paths on bfloat16 to fix fp16 models (ColQwen3.5) crash (#18522)
+    
+    This is a recurrence of #14456: the earlier fix did not add a dtype gate
+    at the dispatch layer.
+    
+    ## Fix
+    
+    Gate both fused prefill dispatches in `vllm_ascend/ops/gdn.py` on
+    `query_non_spec.dtype == torch.bfloat16`, so fp16 models fall back to
+    the Triton `chunk_gated_delta_rule` pipeline, which supports fp16 and
+    consumes the same prebuilt metadata.
+    
+    ## Impact
+    
+    - fp16 models (ColQwen3.5): prefill falls back to the Triton path
+    instead of crashing
+    - bf16 models (Qwen3.5 / Qwen3-Next mainline): unchanged behavior
+    - Decode path untouched (`recurrent_gated_delta_rule` supports
+    fp16/bf16/fp32)
+    
+    - vLLM main:
+    https://github.com/vllm-project/vllm/commit/8cc9aa5ad350f6f80cf3bebb298d410803ff75a9
+    
+    ---------
+    
+    Signed-off-by: ZT-AIA <1028681969@qq.com>
+
+diff --git a/tests/ut/ops/test_gdn_layerwise_kv.py b/tests/ut/ops/test_gdn_layerwise_kv.py
+index 3e1bc17c1..0b01ca919 100644
+--- a/tests/ut/ops/test_gdn_layerwise_kv.py
++++ b/tests/ut/ops/test_gdn_layerwise_kv.py
+@@ -172,7 +172,9 @@ def test_fla_prefill_uses_host_metadata_with_strided_ssm_cache():
+         attn_metadata={model.prefix: metadata},
+         slot_mapping={},
+     )
+-    mixed_qkv = torch.arange(4, dtype=torch.float32).reshape(2, 2)
++    # Fused prefill paths are gated on bfloat16 inputs; use bf16 so the
++    # request keeps dispatching to the fused FLA prefill path.
++    mixed_qkv = torch.arange(4, dtype=torch.bfloat16).reshape(2, 2)
+     core_attn_out = torch.empty(2, 1, 2)
+     gating = (
+         torch.zeros(1, 2, 1),
+@@ -229,6 +231,80 @@ def test_fla_prefill_uses_host_metadata_with_strided_ssm_cache():
+     torch.testing.assert_close(model.ssm_state[1], torch.full_like(model.ssm_state[1], 3))
+ 
+ 
++def test_non_bf16_prefill_falls_back_to_triton_pipeline_with_strided_ssm_cache():
++    # Non-bf16 models (e.g. fp16 ColQwen3.5) must skip the fused prefill
++    # paths (bf16-only) and dispatch to the Triton pipeline instead.
++    model = _GDNForwardWrapper()
++    ssm_storage = torch.zeros(16)
++    model.ssm_state = torch.as_strided(
++        ssm_storage,
++        size=(2, 1, 2, 2),
++        stride=(8, 4, 2, 1),
++    )
++    model.ssm_state[1].fill_(2)
++    assert not model.ssm_state.is_contiguous()
++
++    metadata = _make_prefill_metadata()
++    metadata.prefill_state_indices = torch.tensor([1], dtype=torch.int64)
++    chunk_metadata = _build_non_spec_chunked_prefill_metadata(
++        SimpleNamespace(),
++        metadata.prefill_query_start_loc,
++        torch.device("cpu"),
++        build_device_metadata=False,
++    )
++    metadata.non_spec_prefill_metadata.chunk = chunk_metadata
++
++    forward_context = ForwardContext(
++        no_compile_layers={model.prefix: model},
++        attn_metadata={model.prefix: metadata},
++        slot_mapping={},
++    )
++    mixed_qkv = torch.arange(4, dtype=torch.float32).reshape(2, 2)
++    core_attn_out = torch.empty(2, 1, 2)
++    gating = (
++        torch.zeros(1, 2, 1),
++        torch.ones(1, 2, 1),
++    )
++
++    def fla_prefill(**kwargs):
++        raise AssertionError("fused FLA prefill must not run for non-bf16 inputs")
++
++    def triton_prefill(**kwargs):
++        assert kwargs["prebuilt_meta"] is chunk_metadata
++        assert kwargs["initial_state"].shape == (1, 1, 2, 2)
++        return kwargs["v"].clone(), kwargs["initial_state"] + 1
++
++    with (
++        override_forward_context(forward_context),
++        patch("vllm_ascend.ops.gdn.get_pcp_group", return_value=SimpleNamespace(world_size=1)),
++        patch(
++            "vllm_ascend.ops.gdn.get_current_hardware_profile",
++            return_value=SimpleNamespace(supports=lambda _: True),
++        ),
++        patch("vllm_ascend.ops.gdn._get_fla_gdn_prefill_op", return_value=object()),
++        patch("vllm_ascend.ops.gdn.DeviceOperator.fused_gdn_gating", return_value=gating),
++        patch("vllm_ascend.ops.gdn.DeviceOperator.fla_gdn_prefill", side_effect=fla_prefill),
++        patch("vllm_ascend.ops.gdn.chunk_gated_delta_rule", side_effect=triton_prefill) as triton_fallback,
++        patch("vllm_ascend.ops.gdn.clear_ssm_states") as clear_mock,
++        patch("vllm_ascend.ops.gdn.causal_conv1d_fn", side_effect=lambda x, *a, **k: x.clone()),
++        patch("vllm_ascend.ops.gdn.wait_for_kv_layer_from_connector"),
++        patch("vllm_ascend.ops.gdn.record_attention_compute_start"),
++        patch("vllm_ascend.ops.gdn.maybe_save_kv_layer_to_connector"),
++    ):
++        AscendGatedDeltaNetAttention._forward_core(
++            model,
++            mixed_qkv,
++            torch.zeros(2, 1),
++            torch.zeros(2, 1),
++            core_attn_out,
++        )
++
++    clear_mock.assert_called_once()
++    triton_fallback.assert_called_once()
++    torch.testing.assert_close(model.ssm_state[0], torch.zeros_like(model.ssm_state[0]))
++    torch.testing.assert_close(model.ssm_state[1], torch.full_like(model.ssm_state[1], 3))
++
++
+ def test_connector_observes_updated_gdn_state_for_each_compiled_call():
+     # vLLM registers this production dispatcher for NPU only. Keep a CPU
+     # registration alive for this test so Inductor sees the same custom op.
+diff --git a/vllm_ascend/ops/gdn.py b/vllm_ascend/ops/gdn.py
+index a79e4ff1f..5d11c47d7 100644
+--- a/vllm_ascend/ops/gdn.py
++++ b/vllm_ascend/ops/gdn.py
+@@ -726,8 +726,15 @@ class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
+                 g_non_spec = g_non_spec[:, num_decode_tokens:]
+                 beta_non_spec = beta_non_spec[:, num_decode_tokens:]
+ 
+-            use_fla_gdn_prefill = get_pcp_group().world_size == 1 and get_current_hardware_profile().supports(
+-                HardwareCapability.FLA_GDN_PREFILL
++            # Both fused prefill kernels (torch_npu.npu_chunk_gated_delta_rule and
++            # fla_npu's chunk_gated_delta_rule_fwd) only support bfloat16 inputs.
++            # Gate on the model dtype so fp16 models (e.g. ColQwen3.5) fall back
++            # to the Triton pipeline instead of hitting an aclnn dtype error.
++            supports_fused_dtype = query_non_spec.dtype == torch.bfloat16
++            use_fla_gdn_prefill = (
++                supports_fused_dtype
++                and get_pcp_group().world_size == 1
++                and get_current_hardware_profile().supports(HardwareCapability.FLA_GDN_PREFILL)
+             )
+             fla_gdn_prefill_op = _get_fla_gdn_prefill_op() if use_fla_gdn_prefill else None
+             # The built-in fused operator is NPU-only. Keep CPU/unit-test
+@@ -735,6 +742,7 @@ class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
+             # probe was cached globally.
+             use_fused_chunk = (
+                 fla_gdn_prefill_op is None
++                and supports_fused_dtype
+                 and query_non_spec.device.type != "cpu"
+                 and AscendGatedDeltaNetAttention._probe_fused_chunk()
+                 and get_pcp_group().world_size == 1

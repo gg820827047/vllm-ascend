@@ -1,0 +1,416 @@
+commit 469318b1fbd5800f0ade2e48d8ec829f8546e1ea
+Author:     wenshanchao <86364879+wenshanchao@users.noreply.github.com>
+AuthorDate: Mon Oct 19 09:23:03 2026 +0800
+Commit:     GitHub <noreply@github.com>
+CommitDate: Mon Oct 19 09:23:03 2026 +0800
+
+    [bugfix] preserve configured parameters across level-2 sleep on Ascend (#18838)
+    
+    ### What this PR does / why we need it?
+    
+    The Ascend worker overrides the upstream sleep and wake-up lifecycle but
+    does not preserve parameters configured by
+    sleep_preserve_parameter_names. When level-2 sleep discards the weights
+    and the sender only reloads the remaining parameters, the omitted
+    parameters are not restored, causing incorrect inference results.
+    
+    Back up the configured parameters to CPU before level-2 sleep and
+    restore them into their existing storage when weights wake up. Keep
+    these backups intact for KV-only wake-up and preserve the existing
+    level-1 behavior. Reject unmatched parameter patterns and remain
+    compatible with upstream versions that do not expose the retention
+    option.
+    
+    ### Does this PR introduce *any* user-facing change?
+    
+    Configured parameters are now preserved across level-2 sleep on Ascend.
+    No new Ascend-specific API or command-line options are introduced.
+    
+    ### How was this patch tested?
+    
+    - Passed 91 related Worker unit tests covering parameter selection,
+    selective wake-up, storage preservation, and repeated sleep cycles.
+    - Passed Ruff lint, formatting, and diff checks.
+    - Reproduced the original parameter loss on a real Ascend NPU.
+    - Validated Qwen3-0.6B with single-card eager inference: after level-2
+    sleep, reloaded the original checkpoint while omitting one preserved
+    parameter; all 1,024 values and output tokens matched the pre-sleep
+    reference.
+    - Validated the online HTTP sleep/wake-up path with two consecutive
+    partial-reload cycles, a full-reload control, and a level-1 control.
+    Verified the actual CPU backup and exact parameter, token, and logprob
+    agreement after recovery.
+    - Multi-card and graph modes were not tested.
+    - Upstream vLLM: https://github.com/vllm-project/vllm/pull/57891
+    ---
+    
+    ### Checklist
+    
+    #### Testing
+    
+    - [x] **Boundary / edge-case coverage**: I reviewed whether this change
+    involves
+    boundary conditions (e.g. empty input, single/zero element, min/max
+    values,
+    off-by-one, sequence-length limits, integer overflow). Where applicable,
+    I
+    added unit tests covering these edge cases in `tests/ut/` or
+    `tests/e2e/`.
+    - [x] **Regression test**: If this PR fixes a bug, I added a regression
+    test
+      that would fail without the fix.
+    - [x] **Error / failure path coverage**: I covered abnormal paths
+    (exceptions,
+    timeouts, out-of-range, division by zero) in addition to the happy path.
+    - [x] **Meaningful & reliable tests**: New tests assert real behavior
+    and are
+      not written merely to satisfy CI.
+    - [ ] **Performance impact**: If this PR touches a performance-sensitive
+    path,
+      I attached benchmark results and added performance regression tests.
+    
+    **Performance benchmarks were not run. This change affects sleep/wake-up
+    parameter backup and restoration, not the per-token inference path.**
+    
+    
+    - vLLM main:
+    https://github.com/vllm-project/vllm/commit/c4df37dfcc7f72ca41cd43801a468526ecf99a2b
+    
+    Signed-off-by: wenshanchao <wenshanchao@huawei.com>
+
+diff --git a/tests/e2e/pull_request/one_card/rlhf/state_transitions/test_npu_device_synchronize.py b/tests/e2e/pull_request/one_card/rlhf/state_transitions/test_npu_device_synchronize.py
+index 6a17ff488..7aa89e420 100644
+--- a/tests/e2e/pull_request/one_card/rlhf/state_transitions/test_npu_device_synchronize.py
++++ b/tests/e2e/pull_request/one_card/rlhf/state_transitions/test_npu_device_synchronize.py
+@@ -84,6 +84,7 @@ def test_wake_up_does_not_return_before_npu_work_is_done():
+         worker = NPUWorker.__new__(NPUWorker)
+         worker.model_runner = SimpleNamespace(model=MagicMock())
+         worker._sleep_saved_buffers = {}
++        worker._sleep_saved_parameters = {}
+ 
+         enqueue_npu_busy_work()
+         assert not npu_stream_idle(), "helper failed to leave device work in flight"
+diff --git a/tests/ut/worker/test_kv_cache_allocation_scope.py b/tests/ut/worker/test_kv_cache_allocation_scope.py
+index dd51b36d3..877ba5e84 100644
+--- a/tests/ut/worker/test_kv_cache_allocation_scope.py
++++ b/tests/ut/worker/test_kv_cache_allocation_scope.py
+@@ -140,6 +140,7 @@ def test_kv_wake_does_not_run_model_runner_recovery() -> None:
+ def _make_sleep_worker(model: torch.nn.Module) -> NPUWorker:
+     with patch.object(NPUWorker, "__init__", lambda *_args, **_kwargs: None):
+         worker = NPUWorker()
++    worker.model_config = SimpleNamespace(sleep_preserve_parameter_names=[])
+     worker.model_runner = SimpleNamespace(model=model)
+     worker._sleep_saved_buffers = {}
+     worker.sleep_wakeup_manager = MagicMock()
+diff --git a/tests/ut/worker/test_sleep_parameter_retention.py b/tests/ut/worker/test_sleep_parameter_retention.py
+new file mode 100644
+index 000000000..899a9852e
+--- /dev/null
++++ b/tests/ut/worker/test_sleep_parameter_retention.py
+@@ -0,0 +1,179 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++
++from types import SimpleNamespace
++from unittest.mock import MagicMock
++
++import pytest
++import torch
++
++
++@pytest.fixture
++def worker(monkeypatch):
++    from vllm_ascend.worker import worker as worker_module
++
++    worker = worker_module.NPUWorker.__new__(worker_module.NPUWorker)
++    worker.model_config = SimpleNamespace(sleep_preserve_parameter_names=["weight"])
++    worker.model_runner = SimpleNamespace(model=torch.nn.Linear(2, 2))
++    worker.model_runner.model.register_buffer("scale", torch.tensor([2.0]))
++    worker._sleep_saved_parameters = {}
++    worker._sleep_saved_buffers = {}
++    worker.sleep_wakeup_manager = MagicMock()
++    worker.allocator = MagicMock()
++    monkeypatch.setattr(worker, "synchronize_device", MagicMock())
++    monkeypatch.setattr(worker_module.CaMemAllocator, "get_instance", lambda: worker.allocator)
++    monkeypatch.setattr(
++        worker_module.torch.npu,
++        "mem_get_info",
++        MagicMock(side_effect=[(100, 200), (150, 200)]),
++    )
++    monkeypatch.setattr(
++        worker_module,
++        "get_ascend_config",
++        lambda: SimpleNamespace(
++            weight_nz_mode=0,
++            rl_config=SimpleNamespace(enabled=False, sleep_mode_extra_cleanup=False),
++        ),
++    )
++    return worker
++
++
++def device_parameters(model, monkeypatch):
++    # CPU UTs simulate only the device-to-CPU boundary; comparisons/copies use real tensors.
++    parameters = list(model.named_parameters())
++    mocks = []
++    for name, parameter in parameters:
++        mock = MagicMock()
++        mock.is_cpu = False
++        mock.detach.return_value.to.side_effect = lambda _, parameter=parameter: parameter.detach().clone()
++        mocks.append((name, mock))
++    monkeypatch.setattr(model, "named_parameters", lambda: iter(mocks))
++    return dict(mocks)
++
++
++def test_save_matches_globs_and_deduplicates_parameters(worker, monkeypatch):
++    model = worker.model_runner.model
++    parameters = device_parameters(model, monkeypatch)
++    worker.model_config.sleep_preserve_parameter_names = ["w*", "weight"]
++
++    worker._save_sleep_parameters(model)
++
++    assert set(worker._sleep_saved_parameters) == {"weight"}
++    assert torch.equal(worker._sleep_saved_parameters["weight"], model.weight)
++    assert worker._sleep_saved_parameters["weight"].data_ptr() != model.weight.data_ptr()
++    parameters["weight"].detach.return_value.to.assert_called_once_with("cpu")
++    parameters["bias"].detach.assert_not_called()
++
++
++def test_cpu_parameters_need_no_backup(worker):
++    worker._save_sleep_parameters(worker.model_runner.model)
++
++    assert worker._sleep_saved_parameters == {}
++
++
++@pytest.mark.parametrize("config", [SimpleNamespace(), SimpleNamespace(sleep_preserve_parameter_names=[])])
++def test_empty_or_older_configuration_clears_saved_parameters(worker, config):
++    worker.model_config = config
++    worker._sleep_saved_parameters = {"stale": torch.ones(1)}
++
++    worker._save_sleep_parameters(worker.model_runner.model)
++
++    assert worker._sleep_saved_parameters == {}
++
++
++def test_unmatched_pattern_fails_before_discarding_memory(worker):
++    worker.model_config.sleep_preserve_parameter_names = ["missing.*"]
++
++    with pytest.raises(ValueError, match="No parameter matches sleep retention: missing"):
++        worker.sleep(level=2)
++
++    worker.allocator.sleep.assert_not_called()
++
++
++def test_level_two_retains_parameters_before_allocator_discards_them(worker, monkeypatch):
++    model = worker.model_runner.model
++    expected = model.weight.detach().clone()
++    device_parameters(model, monkeypatch)
++
++    def discard(offload_tags):
++        assert offload_tags == ()
++        assert torch.equal(worker._sleep_saved_parameters["weight"], expected)
++        with torch.no_grad():
++            model.weight.zero_()
++            model.scale.zero_()
++
++    worker.allocator.sleep.side_effect = discard
++    worker.sleep(level=2)
++    worker.wake_up(tags=["weights"])
++
++    assert torch.equal(model.weight, expected)
++    assert torch.equal(model.scale, torch.tensor([2.0]))
++    assert worker._sleep_saved_parameters == {}
++    assert worker._sleep_saved_buffers == {}
++    assert worker.synchronize_device.call_count == 3
++
++
++def test_level_one_keeps_allocator_offload_and_clears_old_backups(worker, monkeypatch):
++    worker._sleep_saved_parameters = {"weight": torch.ones(2, 2)}
++    worker._sleep_saved_buffers = {"scale": torch.ones(1)}
++    save = MagicMock()
++    monkeypatch.setattr(worker, "_save_sleep_parameters", save)
++
++    worker.sleep(level=1)
++
++    save.assert_not_called()
++    worker.allocator.sleep.assert_called_once_with(offload_tags=("weights",))
++    assert worker._sleep_saved_parameters == {}
++    assert worker._sleep_saved_buffers == {}
++
++
++@pytest.mark.parametrize("tags", [None, ["weights"], ["weights", "kv_cache"]])
++def test_weight_wake_restores_in_place_after_mapping(worker, tags):
++    model = worker.model_runner.model
++    pointer = model.weight.data_ptr()
++    expected = torch.full_like(model.weight, 3.0)
++    worker._sleep_saved_parameters = {"weight": expected.clone()}
++    worker._sleep_saved_buffers = {"scale": torch.tensor([4.0])}
++    worker.allocator.wake_up.side_effect = lambda tags: model.weight.data.zero_()
++
++    worker.wake_up(tags=tags)
++
++    assert model.weight.data_ptr() == pointer
++    assert model.weight.requires_grad
++    assert torch.equal(model.weight, expected)
++    assert torch.equal(model.scale, torch.tensor([4.0]))
++    assert worker._sleep_saved_parameters == {}
++    assert worker._sleep_saved_buffers == {}
++    worker.allocator.wake_up.assert_called_once_with(tags=tags)
++    worker.synchronize_device.assert_called_once_with()
++
++
++@pytest.mark.parametrize("tags", [[], ["kv_cache"], ["other"]])
++def test_non_weight_wake_preserves_backups_without_touching_parameters(worker, tags):
++    model = worker.model_runner.model
++    original = model.weight.detach().clone()
++    backup = torch.full_like(model.weight, 3.0)
++    worker._sleep_saved_parameters = {"weight": backup}
++    worker._sleep_saved_buffers = {"scale": torch.tensor([4.0])}
++
++    worker.wake_up(tags=tags)
++
++    assert torch.equal(model.weight, original)
++    assert worker._sleep_saved_parameters["weight"] is backup
++    assert set(worker._sleep_saved_buffers) == {"scale"}
++
++
++def test_repeated_sleep_uses_latest_parameter_values(worker, monkeypatch):
++    model = worker.model_runner.model
++    device_parameters(model, monkeypatch)
++
++    for value in (3.0, 7.0):
++        with torch.no_grad():
++            model.weight.fill_(value)
++        worker._save_sleep_parameters(model)
++        with torch.no_grad():
++            model.weight.zero_()
++        worker._restore_sleep_parameters(model)
++
++        assert torch.equal(model.weight, torch.full_like(model.weight, value))
++        assert worker._sleep_saved_parameters == {}
+diff --git a/tests/ut/worker/test_worker_v1.py b/tests/ut/worker/test_worker_v1.py
+index c03f4820b..49e0c8f29 100644
+--- a/tests/ut/worker/test_worker_v1.py
++++ b/tests/ut/worker/test_worker_v1.py
+@@ -428,6 +428,7 @@ class TestNPUWorker(TestBase):
+     ):
+         """Test NPUWorker normal initialization"""
+         # Setup mock behavior
++        self.model_config_mock.enable_sleep_mode = False
+         mock_ops.register_dummy_fusion_op.return_value = None
+         mock_ascend_config = MagicMock()
+         mock_ascend_config.enable_cpu_binding = True
+@@ -454,6 +455,8 @@ class TestNPUWorker(TestBase):
+ 
+         # Verify cache_dtype setting
+         self.assertEqual(worker.cache_dtype, torch.float16)
++        self.assertEqual(worker._sleep_saved_buffers, {})
++        self.assertEqual(worker._sleep_saved_parameters, {})
+         # Profiler is lazily initialized - not created during __init__ (RFC #6954)
+         mock_profiler_wrapper.assert_not_called()
+ 
+@@ -527,6 +530,7 @@ class TestNPUWorker(TestBase):
+         """Test NPUWorker initialization with custom cache_dtype"""
+         # Set custom cache_dtype
+         self.cache_config_mock.cache_dtype = "float32"
++        self.model_config_mock.enable_sleep_mode = True
+         mock_ops.register_dummy_fusion_op.return_value = None
+         mock_ascend_config = MagicMock()
+         mock_ascend_config.enable_cpu_binding = True
+@@ -546,6 +550,8 @@ class TestNPUWorker(TestBase):
+ 
+         # Verify cache_dtype is set to custom value
+         self.assertEqual(worker.cache_dtype, torch.float32)
++        self.assertEqual(worker._sleep_saved_buffers, {})
++        self.assertEqual(worker._sleep_saved_parameters, {})
+ 
+     def test_initialize_cache(self):
+         """Test initialize_cache method"""
+@@ -743,6 +749,7 @@ class TestNPUWorker(TestBase):
+             speculative_config=SimpleNamespace(method="mtp"),
+         )
+         worker._sleep_saved_buffers = {}
++        worker._sleep_saved_parameters = {}
+ 
+         worker.wake_up(tags=["weights"])
+ 
+diff --git a/vllm_ascend/worker/worker.py b/vllm_ascend/worker/worker.py
+index 901bf29ba..00588fe03 100644
+--- a/vllm_ascend/worker/worker.py
++++ b/vllm_ascend/worker/worker.py
+@@ -21,6 +21,7 @@ import copy
+ import gc
+ import logging
+ from contextlib import AbstractContextManager, nullcontext
++from fnmatch import filter as fnmatch_filter
+ from types import NoneType
+ from typing import Any
+ 
+@@ -186,9 +187,9 @@ class NPUWorker(WorkerBase):
+         self.profiler_config = vllm_config.profiler_config
+         self.profiler: TorchNPUProfilerWrapper | None = None
+         self.npugraph_memory_bytes = 0
+-        if vllm_config.model_config and vllm_config.model_config.enable_sleep_mode:
+-            # Buffers saved before sleep
+-            self._sleep_saved_buffers: dict[str, torch.Tensor] = {}
++        # Buffers and parameters saved before sleep.
++        self._sleep_saved_buffers: dict[str, torch.Tensor] = {}
++        self._sleep_saved_parameters: dict[str, torch.Tensor] = {}
+         self.sleep_wakeup_manager = SleepWakeupManager(vllm_config, self, lambda: getattr(self, "model_runner", None))
+ 
+         # Weight transfer engine is created in `load_model` once the model
+@@ -256,6 +257,29 @@ class NPUWorker(WorkerBase):
+                 except Exception:
+                     return
+ 
++    def _save_sleep_parameters(self, model: nn.Module) -> None:
++        # Older supported vLLM versions do not expose the retention option.
++        patterns = getattr(self.model_config, "sleep_preserve_parameter_names", [])
++        if not patterns:
++            self._sleep_saved_parameters = {}
++            return
++        parameters = dict(model.named_parameters())
++        names: set[str] = set()
++        for pattern in patterns:
++            matches = fnmatch_filter(parameters, pattern)
++            if not matches:
++                raise ValueError(f"No parameter matches sleep retention: {pattern}")
++            names.update(matches)
++        self._sleep_saved_parameters = {
++            name: param.detach().to("cpu") for name, param in parameters.items() if name in names and not param.is_cpu
++        }
++
++    @torch.no_grad()
++    def _restore_sleep_parameters(self, model: nn.Module) -> None:
++        for name, value in self._sleep_saved_parameters.items():
++            model.get_parameter(name).copy_(value)
++        self._sleep_saved_parameters.clear()
++
+     def sleep(self, level: int = 1) -> None:
+         self.synchronize_device()
+         free_bytes_before_sleep = torch.npu.mem_get_info()[0]
+@@ -264,8 +288,11 @@ class NPUWorker(WorkerBase):
+         # stays resident and does not need a CPU backup.
+         if level == 1:
+             self._sleep_saved_buffers = {}
++            self._sleep_saved_parameters = {}
+         else:
+             model = self.model_runner.model
++            # Level-2 discards the weights pool; retain parameters the sender omits.
++            self._save_sleep_parameters(model)
+             self._sleep_saved_buffers = {name: buffer.cpu().clone() for name, buffer in model.named_buffers()}
+ 
+         rl_config = get_ascend_config().rl_config
+@@ -300,8 +327,12 @@ class NPUWorker(WorkerBase):
+         allocator = CaMemAllocator.get_instance()
+         allocator.wake_up(tags=tags)
+ 
++        # Do not access or consume saved weights when only the KV pool wakes.
++        wake_weights = tags is None or "weights" in tags
++        if wake_weights and self._sleep_saved_parameters:
++            self._restore_sleep_parameters(self.model_runner.model)
+         # Restore the buffers after level 2 sleep
+-        if len(self._sleep_saved_buffers):
++        if wake_weights and len(self._sleep_saved_buffers):
+             model = self.model_runner.model
+             for name, buffer in model.named_buffers():
+                 if name in self._sleep_saved_buffers:

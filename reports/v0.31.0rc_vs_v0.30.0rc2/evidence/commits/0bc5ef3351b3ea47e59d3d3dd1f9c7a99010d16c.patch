@@ -1,0 +1,359 @@
+commit 0bc5ef3351b3ea47e59d3d3dd1f9c7a99010d16c
+Author:     yyang <101913017+yangyao827@users.noreply.github.com>
+AuthorDate: Wed Oct 14 17:02:37 2026 +0800
+Commit:     GitHub <noreply@github.com>
+CommitDate: Wed Oct 14 17:02:37 2026 +0800
+
+    [BugFix]: handle MemCache allocation sentinel values (#18501)
+    
+    Treat zero as an SSD hit and filter UINT64_MAX allocation failures
+    before signed GVA conversion and copy. Cover full blocks, partial
+    blocks, and DSpark prefix saves.
+    
+    ### What this PR does / why we need it?
+    
+    Adapt MemCache layerwise saves to its allocation return values:
+    
+    - `0`: allocation failure.
+    - `UINT64_MAX`: readable SSD-only hit; skip writing.
+    - Normal GVA: proceed with writing.
+    
+    Filter both sentinel values before conversion to `np.int64`, copying,
+    and write-finish notification. This prevents integer overflow and
+    invalid writes when an existing key has only an SSD replica.
+    
+    The change covers full blocks, partial blocks, and DSpark prefix saves,
+    with corresponding UT coverage.
+    
+    ### Does this PR introduce any user-facing change?
+    
+    Yes. MemCache SSD hits are skipped without being treated as allocation
+    failures. Existing allocation failure handling is preserved.
+    
+    No API signatures or configuration options are changed. This requires
+    the corresponding MemCache allocation sentinel support.
+    
+    ### How was this patch tested?
+    
+    - Ran `test_pool_worker.py` and `test_dspark_prefix_cache.py` in the
+    `memcache-yy-service` container using CPU mocks: **154 passed, 0 failed,
+    0 skipped**.
+    - All six sentinel-related regression cases passed, covering full
+    blocks, partial blocks, SSD-only hits, and mixed SSD/memory allocation
+    results.
+    
+    
+    - vLLM main:
+    https://github.com/vllm-project/vllm/commit/8cc9aa5ad350f6f80cf3bebb298d410803ff75a9
+    
+    Signed-off-by: yyang728 <2533623867@qq.com>
+
+diff --git a/tests/ut/distributed/ascend_store/test_dspark_prefix_cache.py b/tests/ut/distributed/ascend_store/test_dspark_prefix_cache.py
+index 64bbadac2..eb1855098 100644
+--- a/tests/ut/distributed/ascend_store/test_dspark_prefix_cache.py
++++ b/tests/ut/distributed/ascend_store/test_dspark_prefix_cache.py
+@@ -10,6 +10,7 @@ import pytest
+ import torch
+ 
+ from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.dspark_prefix_cache import (
++    _SSD_HIT_GVA,
+     DSparkPrefixCache,
+     DSparkPrefixKeys,
+ )
+@@ -57,7 +58,7 @@ class _ByteBackend:
+         addresses = []
+         for key, size in zip(keys, sizes, strict=True):
+             if key in self.buffers:
+-                addresses.append(-1)
++                addresses.append(0)
+                 continue
+             self.buffers[key] = np.zeros(size, dtype=np.uint8)
+             self.leases.add(key)
+@@ -199,6 +200,53 @@ def test_readable_prefix_evicted_after_probe_does_not_fail_save_or_reallocate():
+     assert not backend.leases
+ 
+ 
++@pytest.mark.parametrize("gva", [0, _SSD_HIT_GVA])
++def test_allocation_failure_and_ssd_hit_never_copy_or_publish(gva):
++    cache, backend, _, request = _cache_case()
++    backend.batch_alloc = Mock(return_value=[gva])
++    backend.exists = Mock(return_value=[0])
++    cache.copy_fn = Mock(return_value=0)
++
++    if gva == 0:
++        with pytest.raises(RuntimeError, match="allocation failed"):
++            cache.save(request, 4, {0: (0,), 1: (0,)})
++        backend.exists.assert_called_once()
++    else:
++        assert cache.save(request, 4, {0: (0,), 1: (0,)}) is None
++        backend.exists.assert_not_called()
++
++    cache.copy_fn.assert_not_called()
++    assert not backend.calls
++    assert not backend.leases
++
++
++@pytest.mark.parametrize("ssd_index", [0, 1])
++def test_mixed_ssd_hit_only_copies_and_publishes_owned_memory(ssd_index):
++    cache, backend, _, request = _cache_case()
++    allocate = backend.batch_alloc
++    memory_index = 1 - ssd_index
++    keys = [cache.keys.make_key(f"h{index}", 2) for index in range(2)]
++
++    def allocate_mixed(requested, sizes, ttl):
++        assert requested == keys
++        gvas = [_SSD_HIT_GVA] * len(requested)
++        gvas[memory_index] = allocate([requested[memory_index]], [sizes[memory_index]], ttl)[0]
++        return gvas
++
++    backend.batch_alloc = allocate_mixed
++    backend.exists = Mock(side_effect=AssertionError("SSD hits need no existence query"))
++    assert cache.save(request, 8, {0: (0, 1), 1: (0, 1)}) is None
++    assert backend.readable == {keys[memory_index]}
++    assert set(backend.buffers) == {keys[memory_index]}
++    assert backend.calls == [
++        ("alloc", (keys[memory_index],)),
++        ("copy", 0),
++        ("finish", (0,)),
++        ("release", (keys[memory_index],)),
++    ]
++    assert not backend.leases
++
++
+ def test_failed_draft_copy_is_not_published_and_releases_only_owned_write_lease():
+     cache, backend, _, request = _cache_case()
+     cache.copy_fn = Mock(return_value=-1)
+diff --git a/tests/ut/distributed/ascend_store/test_pool_worker.py b/tests/ut/distributed/ascend_store/test_pool_worker.py
+index 128bc44c1..2c7008ca8 100644
+--- a/tests/ut/distributed/ascend_store/test_pool_worker.py
++++ b/tests/ut/distributed/ascend_store/test_pool_worker.py
+@@ -2384,54 +2384,74 @@ class TestKVPoolWorkerProcessLayerData(unittest.TestCase):
+         worker.m_store.batch_alloc.assert_called_once_with([key0, key1], [64, 64], LAYERWISE_READ_LEASE_TTL_MS)
+         self.assertEqual(request.block_gvas_by_group_np[0].tolist(), [202, 203])
+ 
+-    def test_failed_allocations_are_clamped_to_zero(self):
+-        worker = self._make_gva_worker()
+-        worker.m_store.batch_alloc.return_value = [-3102, 0]
+-        request = ReqMeta(
+-            req_id="r1",
+-            token_len_chunk=32,
+-            save_start_token=0,
+-            save_end_token=32,
+-            target_token_len=32,
+-            num_prompt_tokens=32,
+-            block_ids=[7, 8],
+-            block_ids_by_group=[[7, 8]],
+-            block_hashes=["h0", "h1"],
+-            can_save=True,
+-            block_ids_np=np.asarray([7, 8], dtype=np.int64),
+-            block_ids_by_group_np=[np.asarray([7, 8], dtype=np.int64)],
+-        )
+-
+-        worker._alloc_gvas_for_save([request])
+-
+-        # Failed allocations (negative error codes / zero) surface as 0, the
+-        # same "invalid GVA" representation as skipped blocks; only positive
+-        # GVAs enter save_keys.
+-        self.assertEqual(request.block_gvas_by_group_np[0].tolist(), [0, 0])
+-        self.assertEqual(request.save_keys, [])
++    def test_allocation_sentinels_are_filtered_before_int64_conversion(self):
++        from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.pool_worker import MEMCACHE_SSD_HIT_GVA
++
++        cases = (
++            ([-3102, 0], [0, 0], True),
++            ([0, MEMCACHE_SSD_HIT_GVA], [0, 0], True),
++            ([MEMCACHE_SSD_HIT_GVA, MEMCACHE_SSD_HIT_GVA], [0, 0], False),
++            ([202, MEMCACHE_SSD_HIT_GVA], [202, 0], False),
++            ([MEMCACHE_SSD_HIT_GVA, 203], [0, 203], False),
++        )
++        for gvas, expected, has_failure in cases:
++            with self.subTest(gvas=gvas):
++                worker = self._make_gva_worker()
++                worker.m_store.batch_alloc.return_value = gvas
++                request = ReqMeta(
++                    req_id="r1",
++                    token_len_chunk=32,
++                    save_start_token=0,
++                    save_end_token=32,
++                    target_token_len=32,
++                    num_prompt_tokens=32,
++                    block_ids=[7, 8],
++                    block_ids_by_group=[[7, 8]],
++                    block_hashes=["h0", "h1"],
++                    can_save=True,
++                    block_ids_np=np.asarray([7, 8], dtype=np.int64),
++                    block_ids_by_group_np=[np.asarray([7, 8], dtype=np.int64)],
++                )
+ 
+-    def test_failed_partial_allocation_is_clamped_to_zero(self):
+-        worker = self._make_gva_worker()
+-        worker.m_store.batch_alloc.return_value = [-3102]
+-        request = ReqMeta(
+-            req_id="r1",
+-            token_len_chunk=16,
+-            save_start_token=16,
+-            save_end_token=16,
+-            target_token_len=20,
+-            num_prompt_tokens=32,
+-            block_ids=[0, 1],
+-            block_ids_by_group=[[0, 1]],
+-            block_hashes=["h0"],
+-            can_save=True,
+-            block_ids_np=np.asarray([0, 1], dtype=np.int64),
+-            block_ids_by_group_np=[np.asarray([0, 1], dtype=np.int64)],
+-        )
++                with patch("vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.pool_worker.logger") as logger:
++                    worker._alloc_gvas_for_save([request])
++
++                self.assertEqual(request.block_gvas_by_group_np[0].dtype, np.dtype(np.int64))
++                self.assertEqual(request.block_gvas_by_group_np[0].tolist(), expected)
++                expected_keys = [
++                    worker._make_layerwise_full_key(0, f"h{index}") for index, gva in enumerate(expected) if gva
++                ]
++                self.assertEqual(request.save_keys, expected_keys)
++                self.assertEqual(logger.error.called, has_failure)
++
++    def test_partial_allocation_sentinels_are_filtered(self):
++        from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.pool_worker import MEMCACHE_SSD_HIT_GVA
++
++        for gva in (-3102, 0, MEMCACHE_SSD_HIT_GVA):
++            with self.subTest(gva=gva):
++                worker = self._make_gva_worker()
++                worker.m_store.batch_alloc.return_value = [gva]
++                request = ReqMeta(
++                    req_id="r1",
++                    token_len_chunk=16,
++                    save_start_token=16,
++                    save_end_token=16,
++                    target_token_len=20,
++                    num_prompt_tokens=32,
++                    block_ids=[0, 1],
++                    block_ids_by_group=[[0, 1]],
++                    block_hashes=["h0"],
++                    can_save=True,
++                    block_ids_np=np.asarray([0, 1], dtype=np.int64),
++                    block_ids_by_group_np=[np.asarray([0, 1], dtype=np.int64)],
++                )
+ 
+-        worker._alloc_gvas_for_save([request])
++                with patch("vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.pool_worker.logger") as logger:
++                    worker._alloc_gvas_for_save([request])
+ 
+-        self.assertEqual(request.partial_save_gva_per_group, [0])
+-        self.assertEqual(request.save_keys, [])
++                self.assertEqual(request.partial_save_gva_per_group, [0])
++                self.assertEqual(logger.error.called, gva <= 0)
++                self.assertEqual(request.save_keys, [])
+ 
+     def test_partial_decode_is_saved_and_loaded_for_reused_layer(self):
+         worker = self._make_worker()
+diff --git a/vllm_ascend/distributed/kv_transfer/kv_pool/ascend_store/backend/memcache_backend.py b/vllm_ascend/distributed/kv_transfer/kv_pool/ascend_store/backend/memcache_backend.py
+index 266c82b38..3a856a01b 100644
+--- a/vllm_ascend/distributed/kv_transfer/kv_pool/ascend_store/backend/memcache_backend.py
++++ b/vllm_ascend/distributed/kv_transfer/kv_pool/ascend_store/backend/memcache_backend.py
+@@ -427,6 +427,7 @@ class MemcacheBackend(Backend):
+         return readable
+ 
+     def batch_alloc(self, keys: list[str], sizes: list[int], lease_ttl_ms: int = 0) -> list[int]:
++        """Return GVAs, 0 for allocation failures, and UINT64_MAX for SSD hits."""
+         self.ensure_initialized()
+         assert self.store is not None
+         return self.store.batch_alloc(keys, sizes, 1, lease_ttl_ms)
+diff --git a/vllm_ascend/distributed/kv_transfer/kv_pool/ascend_store/dspark_prefix_cache.py b/vllm_ascend/distributed/kv_transfer/kv_pool/ascend_store/dspark_prefix_cache.py
+index f934313cb..00728f8c4 100644
+--- a/vllm_ascend/distributed/kv_transfer/kv_pool/ascend_store/dspark_prefix_cache.py
++++ b/vllm_ascend/distributed/kv_transfer/kv_pool/ascend_store/dspark_prefix_cache.py
+@@ -20,6 +20,7 @@ from vllm_ascend.spec_decode.dspark_utils import get_dspark_aux_layer_ids
+ 
+ _RPC_BLOCKS = 128
+ _LEASE_TTL_MS = 5 * 60 * 1000
++_SSD_HIT_GVA = (1 << 64) - 1
+ 
+ 
+ def _model_identity(model: Any) -> dict[str, Any]:
+@@ -247,7 +248,7 @@ class DSparkPrefixCache:
+                         key
+                         for key, address in zip(missing, gvas)
+                         if type(address) is int or isinstance(address, np.integer)
+-                        if address > 0
++                        if 0 < address < _SSD_HIT_GVA
+                     ]
+                 if (
+                     gvas is None
+@@ -262,8 +263,10 @@ class DSparkPrefixCache:
+                         raise RuntimeError("DSpark prefix allocation failed")
+                     # Another DP writer owns these objects, possibly still WRITING.
+                     # Joint prefix lookup will remain a miss until they are readable.
+-                owned_indices = [index for index, address in zip(indices, gvas, strict=True) if address > 0]
+-                owned_gvas = [address for address in gvas if address > 0]
++                owned_indices = [
++                    index for index, address in zip(indices, gvas, strict=True) if 0 < address < _SSD_HIT_GVA
++                ]
++                owned_gvas = [address for address in gvas if 0 < address < _SSD_HIT_GVA]
+                 if not allocated:
+                     continue
+                 # WRITING objects need not expose readable metadata until publication.
+diff --git a/vllm_ascend/distributed/kv_transfer/kv_pool/ascend_store/pool_worker.py b/vllm_ascend/distributed/kv_transfer/kv_pool/ascend_store/pool_worker.py
+index c91ecfba3..a9b85507d 100644
+--- a/vllm_ascend/distributed/kv_transfer/kv_pool/ascend_store/pool_worker.py
++++ b/vllm_ascend/distributed/kv_transfer/kv_pool/ascend_store/pool_worker.py
+@@ -118,6 +118,7 @@ _LW_DEFER_LAST_SAVE = os.environ.get("VLLM_ASCEND_LW_DEFER_LAST_SAVE", "0") == "
+ # read lease before batch_copy(G2L); the lease must cover the asynchronous
+ # multi-layer load time.
+ LAYERWISE_READ_LEASE_TTL_MS = 5 * 60 * 1000
++MEMCACHE_SSD_HIT_GVA = (1 << 64) - 1
+ 
+ # A partial snapshot can be visible to readers before the rank responsible for
+ # saving it has published its final layer.
+@@ -1807,7 +1808,7 @@ class KVPoolWorker:
+                         )
+                     if any(gva <= 0 for gva in transfer_gvas):
+                         logger.error(
+-                            "alloc_gvas FAIL: req=%s group=%d alloc_size=%d alloc_keys=%d gvas_sample=%s zero_count=%d",
++                            "alloc_gvas FAIL: req=%s group=%d alloc_size=%d alloc_keys=%d gvas_sample=%s fail_count=%d",
+                             request.req_id,
+                             group_id,
+                             alloc_size,
+@@ -1815,12 +1816,10 @@ class KVPoolWorker:
+                             transfer_gvas[:5],
+                             sum(1 for g in transfer_gvas if g <= 0),
+                         )
+-                    # Clamp failed allocations (0 or negative error codes) to
+-                    # 0: block_gvas_by_group_np keeps a single "invalid"
+-                    # representation, matching skipped blocks; the raw error
+-                    # codes stay in the error log above.
+-                    block_gvas = [gva if gva > 0 else 0 for gva in transfer_gvas]
+-                    for key, gva in zip(transfer_keys, transfer_gvas):
++                    # 0 means allocation failed; UINT64_MAX means a readable
++                    # SSD hit. Filter both before converting GVAs to np.int64.
++                    block_gvas = [gva if 0 < gva < MEMCACHE_SSD_HIT_GVA else 0 for gva in transfer_gvas]
++                    for key, gva in zip(transfer_keys, block_gvas):
+                         if gva > 0:
+                             all_group_save_keys.append(key)
+ 
+@@ -1844,9 +1843,9 @@ class KVPoolWorker:
+                         LAYERWISE_READ_LEASE_TTL_MS,
+                     )
+                     partial_gva = allocated[0] if allocated else 0
+-                    if partial_gva > 0:
++                    if 0 < partial_gva < MEMCACHE_SSD_HIT_GVA:
+                         all_group_save_keys.append(partial_key)
+-                    else:
++                    elif partial_gva <= 0:
+                         logger.error(
+                             "alloc_gvas: partial allocation failed req=%s group=%d block=%d gva=%d",
+                             request.req_id,
+@@ -1854,10 +1853,9 @@ class KVPoolWorker:
+                             partial_block_index,
+                             partial_gva,
+                         )
+-                    # Clamp negative error codes to 0 so downstream consumers
+-                    # only ever see a valid GVA or 0; the raw code is logged
+-                    # above.
+-                    request.partial_save_gva_per_group[group_id] = max(0, partial_gva)
++                    request.partial_save_gva_per_group[group_id] = (
++                        partial_gva if 0 < partial_gva < MEMCACHE_SSD_HIT_GVA else 0
++                    )
+ 
+                 logger.debug(
+                     "alloc_gvas: req=%s group=%d eff_bs=%d save_blocks=[%d,%d) "

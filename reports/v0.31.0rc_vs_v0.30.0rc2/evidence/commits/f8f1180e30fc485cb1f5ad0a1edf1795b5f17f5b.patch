@@ -1,0 +1,155 @@
+commit f8f1180e30fc485cb1f5ad0a1edf1795b5f17f5b
+Author:     YanpengDing <dingyanpeng18@163.com>
+AuthorDate: Sun Oct 11 00:08:05 2026 +0800
+Commit:     GitHub <noreply@github.com>
+CommitDate: Sun Oct 11 00:08:05 2026 +0800
+
+    [BugFix][Worker][v0.30.0] Preserve decode graphs for hybrid PD recompute tails (#18152)
+    
+    ### What this PR does / why we need it?
+    
+    Backport #18136 (`9ec81715c85ed6677ddcc9e015df48b1997cad5b`) to
+    `releases/v0.30.0`. The commit applies without conflicts or
+    release-specific code changes and includes the original regression
+    tests.
+    
+    Hybrid PD decode requests with `recompute_scheduler_enable=true` start
+    from transferred state at `N-1` prompt tokens. The existing MRV1 guard
+    rejects their decode graph even when the scheduled query has the uniform
+    decode width. For example, a 4096-token prompt with 5 MTP drafts has
+    4095 computed tokens and a padded 6-token query, but incorrectly falls
+    back to eager execution.
+    
+    Allow the exact `N-1` boundary for non-DCP hybrid requests on a pure KV
+    consumer with recompute enabled, using the helper already present on the
+    release branch. Preserve the nonzero-state requirement, uniform
+    query-width checks, ordinary hybrid prefill protection, and DCP guard.
+    Input preparation and prefill flags are unchanged.
+    
+    ### Does this PR introduce _any_ user-facing change?
+    
+    Yes. Eligible hybrid PD prompt-tail recompute batches can replay the
+    existing decode graph, reducing first-token latency. No new
+    configuration options are introduced.
+    
+    ### How was this patch tested?
+    
+    - Passed `ruff check`, `ruff format --check`, and `python -m py_compile`
+    for both changed files, plus `git diff --check`.
+    - Ran all 4 methods of the unchanged `TestGlm5MtpGraphMetadata` class in
+    a CPU-only AST-isolated harness: **4 passed**, including the 11
+    backported regression subcases. The harness executes the complete
+    production dispatch method, `use_dcp` property, and existing role helper
+    with real NumPy and unittest; graph enum/runtime dependencies are
+    stubbed. This is a focused logic check, not full runtime integration
+    testing.
+    - Ran 7 additional checks of the existing role helper covering
+    consumer/recompute on and off, producer, combined roles, neither role,
+    missing connector, and missing config fields: **all passed**.
+    - Verified AST equivalence of the complete dispatch method and focused
+    test class against #18136. As a negative control, the pre-backport
+    release method fails the 3 eligible-tail regression subcases, with no
+    test errors.
+    - `bash format.sh ci` was attempted but blocked while installing
+    actionlint on Windows: `Could not find a version matching your system
+    requirements (os=windows; arch=)`.
+    - The full repository suite and Ascend NPU serving tests were not rerun
+    for this backport because the local Windows environment lacks PyTorch
+    and an Ascend runtime. Linux CI/runtime validation remains required. The
+    source PR records the original Ascend serving validation.
+    
+    AI assistance was used for this backport and local validation.
+    
+    - vLLM main:
+    https://github.com/vllm-project/vllm/commit/ced6857afa0ea7b2e3f0846a62e1394e90f15607
+    
+    ---------
+    
+    Signed-off-by: YanpengDing <dingyanpeng18@163.com>
+    Co-authored-by: Codex <noreply@openai.com>
+
+diff --git a/tests/ut/worker/test_model_runner_v1.py b/tests/ut/worker/test_model_runner_v1.py
+index c3545462d..ce6803fc3 100644
+--- a/tests/ut/worker/test_model_runner_v1.py
++++ b/tests/ut/worker/test_model_runner_v1.py
+@@ -167,6 +167,44 @@ class TestGlm5MtpGraphMetadata(unittest.TestCase):
+                     )
+                 self.assertEqual(runner.cudagraph_dispatcher.dispatch.call_args.kwargs["uniform_decode"], expected)
+ 
++    def test_pd_recompute_hybrid_tail_dispatches_decode_graph(self):
++        cases = [
++            ([4095], [4096], True, False, 6, 6, True),
++            ([4095], [4096], False, False, 6, 6, False),
++            ([4092], [4096], True, False, 6, 6, False),  # incomplete prompt
++            ([0], [4096], True, False, 6, 6, False),  # no initial state
++            ([0], [1], True, False, 6, 6, False),  # N-1 still needs state
++            ([4096], [4096], False, False, 6, 6, True),
++            ([4100, 4095], [4096, 4096], True, False, 6, 6, True),
++            ([4095, 4092], [4096, 4096], True, False, 6, 6, False),
++            ([4095], [4096], True, True, 6, 6, False),  # retain DCP guard
++            ([4095], [4096], True, False, 6, 1, False),  # unpadded MTP tail
++            ([4095], [4096], True, False, 1, 1, True),  # non-spec decode
++        ]
++        for computed, prompts, enabled, dcp, graph_width, query_width, expected in cases:
++            with self.subTest(computed=computed, enabled=enabled, dcp=dcp, query_width=query_width):
++                runner = self._build_dispatch_runner(speculative=graph_width > 1)
++                runner.model_config.is_hybrid = True
++                runner.dcp_size = 2 if dcp else 1
++                runner.uniform_decode_query_len = graph_width
++                runner.input_batch.num_computed_tokens_cpu = np.array(computed + [0])
++                runner.input_batch.num_prompt_tokens = np.array(prompts + [999])
++                with (
++                    patch("vllm_ascend.worker.model_runner_v1.enable_sp", return_value=False),
++                    patch(
++                        "vllm_ascend.worker.model_runner_v1.is_pd_decode_recompute_scheduler_enabled",
++                        return_value=enabled,
++                    ),
++                ):
++                    runner._determine_batch_execution_and_padding(
++                        num_tokens=query_width * len(computed),
++                        num_reqs=len(computed),
++                        num_scheduled_tokens_np=np.full(len(computed), query_width),
++                        max_num_scheduled_tokens=query_width,
++                        use_cascade_attn=False,
++                    )
++                self.assertEqual(runner.cudagraph_dispatcher.dispatch.call_args.kwargs["uniform_decode"], expected)
++
+ 
+ class TestDPPaddingPolicy(unittest.TestCase):
+     @staticmethod
+diff --git a/vllm_ascend/worker/model_runner_v1.py b/vllm_ascend/worker/model_runner_v1.py
+index 986f9d6e6..d85376027 100644
+--- a/vllm_ascend/worker/model_runner_v1.py
++++ b/vllm_ascend/worker/model_runner_v1.py
+@@ -213,6 +213,7 @@ from vllm_ascend.utils import (
+     global_stream,
+     is_c8_mxfp_kv_quant,
+     is_hidden_state_cache_spec,
++    is_pd_decode_recompute_scheduler_enabled,
+     is_score_encoder_cache_manager,
+     kv_cache_spec_uses_packed_sfa_main_cache,
+     kv_cache_spec_uses_sparse_sfa_c8,
+@@ -3341,11 +3342,18 @@ class NPUModelRunner(GPUModelRunner):
+         has_initial_state = np.all(self.input_batch.num_computed_tokens_cpu[:num_reqs] > 0)
+         if self.use_dcp or self.model_config.is_hybrid:
+             # Mamba prompt chunks must retain prefill state semantics even when
+-            # their width matches the speculative decode graph. DCP also
+-            # requires the full prompt to be computed before uniform decode.
+-            has_initial_state = has_initial_state and np.all(
+-                self.input_batch.num_computed_tokens_cpu[:num_reqs] >= self.input_batch.num_prompt_tokens[:num_reqs]
+-            )
++            # their width matches the speculative decode graph. PD recompute
++            # starts from transferred state at N-1 and recomputes the last token.
++            num_computed_tokens = self.input_batch.num_computed_tokens_cpu[:num_reqs]
++            num_prompt_tokens = self.input_batch.num_prompt_tokens[:num_reqs]
++            done_prefilling = num_computed_tokens >= num_prompt_tokens
++            if (
++                not self.use_dcp
++                and self.model_config.is_hybrid
++                and is_pd_decode_recompute_scheduler_enabled(self.vllm_config)
++            ):
++                done_prefilling |= num_computed_tokens == num_prompt_tokens - 1
++            has_initial_state = has_initial_state and np.all(done_prefilling)
+         uniform_decode = (
+             (
+                 has_initial_state

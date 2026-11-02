@@ -1,0 +1,250 @@
+commit f1709a7a852e08f90fad70ecc5ad04af9ef35979
+Author:     iKeybot <92210799+iKeybot-code@users.noreply.github.com>
+AuthorDate: Mon Oct 12 19:37:05 2026 +0800
+Commit:     GitHub <noreply@github.com>
+CommitDate: Mon Oct 12 19:37:05 2026 +0800
+
+    [BugFix][Worker] Preserve graph eligibility on P/D decode nodes (#18308)
+    
+    ### What this PR does / why we need it?
+    
+    Apply the existing prompt-tail batch reclassification to pure P/D decode
+    nodes (`kv_consumer` without `kv_producer`), independently of whether
+    the recompute scheduler is enabled.
+    
+    After KV transfer, a newly admitted decode request can still be marked
+    as prefilling on its first verification step. When that step finishes
+    the prompt tail and schedules exactly `decode_query_len` tokens, the
+    batch can have a uniform decode shape, but `has_prefill` prevents
+    uniform-token classification and graph replay. With data parallelism,
+    one rank falling back to eager can force the other ranks to do the same.
+    
+    This change only replaces the role gate of the existing reclassification
+    block. The per-request eligibility checks and scheduling behavior are
+    unchanged. Regression tests cover KV roles, single-token and speculative
+    decode, incomplete prompt tails, remaining prefill requests, and dummy
+    batches.
+    
+    ### Does this PR introduce _any_ user-facing change?
+    
+    Eligible decode-shaped prompt-tail batches on pure P/D decode nodes can
+    use captured graphs even when the recompute scheduler is disabled. No
+    API, CLI, or configuration changes are introduced.
+    
+    ### How was this patch tested?
+    
+    - Updated `tests/ut/worker/test_model_runner_v2.py` with regression
+    coverage for consumer-only, producer-only, dual-role, and non-P/D
+    configurations; query lengths 1, 2, and 4; unfinished prefill; and dummy
+    batches. The existing prompt-tail input preparation regression now uses
+    a consumer configuration.
+    - Local isolated execution of the production `gather_batch_req_state`
+    method against the repository regression tests: 10 cases passed. The
+    upstream batch-state method and uniform-token helper were mocked; this
+    validates the local reclassification logic only.
+    - Ruff lint, Ruff format checks, and `git diff --check` passed for the
+    changed files.
+    - Standard pytest collection was blocked because the local Windows
+    environment does not have `vllm` installed. The full `format.sh ci`
+    check was blocked by missing `pre-commit`. Full UT and NPU integration
+    validation remain for CI; no new hardware benchmark was run for these
+    commits.
+    
+    Previously reported hardware measurements for the same role-gate change
+    used MiniMax-M3 W8A8, Mooncake P/D transfer, a DP4 x TP4 decode node,
+    the v2 runner with `FULL_DECODE_ONLY`, and EAGLE3 with three speculative
+    tokens. The workload used streaming arrivals with 2048-token GSM8K
+    inputs. These are historical measurements from the original experiment,
+    not a benchmark of this commit; the tested variant also included
+    eager-fallback diagnostic logging.
+    
+    | Metric | Baseline (120 samples) | Role-gate change (40 samples) |
+    | --- | --- | --- |
+    | Median TPOT | 44.5 ms | 20.7 ms |
+    | Median ITL | 80.1 ms | 67.2 ms |
+    | P90 ITL | 633.1 ms | 72.8 ms |
+    | Mean ITL | 157.2 ms | 68.1 ms |
+    
+    The original experiment also reported three passing deterministic
+    correctness spot checks, no eager-fallback warnings, and no runtime
+    graph captures. The unequal sample counts and small correctness sample
+    limit the conclusions.
+    
+    - vLLM main:
+    https://github.com/vllm-project/vllm/commit/8cc9aa5ad350f6f80cf3bebb298d410803ff75a9
+    
+    ---------
+    
+    Signed-off-by: likailong <likailong5@huawei.com>
+
+diff --git a/tests/ut/worker/test_model_runner_v2.py b/tests/ut/worker/test_model_runner_v2.py
+index f5162dca6..a490dd776 100644
+--- a/tests/ut/worker/test_model_runner_v2.py
++++ b/tests/ut/worker/test_model_runner_v2.py
+@@ -25,7 +25,9 @@ def _make_runner(need_timing: bool = True):
+         scheduler_config=SimpleNamespace(profiling_chunk_config=SimpleNamespace(need_timing=need_timing)),
+         sparse_kv_offload_config=SimpleNamespace(enabled=False),
+     )
+-    runner.vllm_config = SimpleNamespace(parallel_config=SimpleNamespace(prefill_context_parallel_size=1))
++    runner.vllm_config = SimpleNamespace(
++        parallel_config=SimpleNamespace(prefill_context_parallel_size=1), kv_transfer_config=None
++    )
+     runner.max_num_tokens = 16
+     runner.model_config = SimpleNamespace(hf_config=SimpleNamespace(model_type="other_model"))
+     runner.kv_cache_config = KVCacheConfig(num_blocks=0, kv_cache_tensors=[], kv_cache_groups=[])
+@@ -128,18 +130,13 @@ def _make_batch_state(computed: list[int], scheduled: list[int], prefill_lens: l
+     )
+ 
+ 
+-def test_recompute_scheduler_reclassifies_pd_tail_in_mixed_decode_batch():
++def test_pd_decode_reclassifies_pd_tail_in_mixed_decode_batch():
+     runner = _make_runner()
+     runner.decode_query_len = 1
++    runner.vllm_config.kv_transfer_config = SimpleNamespace(is_kv_consumer=True, is_kv_producer=False)
+     batch_state = _make_batch_state([127, 64], [1, 1], [128, 64])
+ 
+-    with (
+-        patch.object(GPUModelRunner, "gather_batch_req_state", return_value=(batch_state, None)),
+-        patch(
+-            "vllm_ascend.worker.v2.model_runner.is_pd_decode_recompute_scheduler_enabled",
+-            return_value=True,
+-        ),
+-    ):
++    with patch.object(GPUModelRunner, "gather_batch_req_state", return_value=(batch_state, None)):
+         gathered, uniform = runner.gather_batch_req_state(SimpleNamespace(), False)
+ 
+     np.testing.assert_array_equal(gathered.is_prefilling_np, [False, False])
+@@ -148,21 +145,20 @@ def test_recompute_scheduler_reclassifies_pd_tail_in_mixed_decode_batch():
+ 
+ 
+ @pytest.mark.parametrize(
+-    ("computed", "scheduled", "enabled"),
+-    [(64, 8, True), (127, 1, False)],
++    ("computed", "scheduled", "kv_role"),
++    [(64, 8, "consumer"), (0, 1, "consumer"), (127, 1, None), (127, 1, "producer"), (127, 1, "both")],
+ )
+-def test_recompute_scheduler_keeps_non_matching_prefill(computed, scheduled, enabled):
++def test_pd_decode_keeps_non_matching_prefill(computed, scheduled, kv_role):
+     runner = _make_runner()
++    if kv_role is not None:
++        runner.vllm_config.kv_transfer_config = SimpleNamespace(
++            is_kv_consumer=kv_role in ("consumer", "both"),
++            is_kv_producer=kv_role in ("producer", "both"),
++        )
+     runner.decode_query_len = 1
+     batch_state = _make_batch_state([computed, 64], [scheduled, 1], [128, 64])
+ 
+-    with (
+-        patch.object(GPUModelRunner, "gather_batch_req_state", return_value=(batch_state, None)),
+-        patch(
+-            "vllm_ascend.worker.v2.model_runner.is_pd_decode_recompute_scheduler_enabled",
+-            return_value=enabled,
+-        ),
+-    ):
++    with patch.object(GPUModelRunner, "gather_batch_req_state", return_value=(batch_state, None)):
+         gathered, uniform = runner.gather_batch_req_state(SimpleNamespace(), False)
+ 
+     np.testing.assert_array_equal(gathered.is_prefilling_np, [True, False])
+@@ -170,23 +166,38 @@ def test_recompute_scheduler_keeps_non_matching_prefill(computed, scheduled, ena
+     assert uniform is None
+ 
+ 
+-def test_recompute_scheduler_supports_multi_token_decode_query():
++@pytest.mark.parametrize("query_len", [2, 4])
++def test_pd_decode_supports_multi_token_decode_query(query_len):
+     runner = _make_runner()
+-    runner.decode_query_len = 2
+-    batch_state = _make_batch_state([126, 64], [2, 2], [128, 64])
++    runner.decode_query_len = query_len
++    runner.vllm_config.kv_transfer_config = SimpleNamespace(is_kv_consumer=True, is_kv_producer=False)
++    batch_state = _make_batch_state([128 - query_len, 64], [query_len, query_len], [128, 64])
+ 
+-    with (
+-        patch.object(GPUModelRunner, "gather_batch_req_state", return_value=(batch_state, None)),
+-        patch(
+-            "vllm_ascend.worker.v2.model_runner.is_pd_decode_recompute_scheduler_enabled",
+-            return_value=True,
+-        ),
+-    ):
++    with patch.object(GPUModelRunner, "gather_batch_req_state", return_value=(batch_state, None)):
+         gathered, uniform = runner.gather_batch_req_state(SimpleNamespace(), False)
+ 
+     np.testing.assert_array_equal(gathered.is_prefilling_np, [False, False])
+     assert gathered.has_prefill is False
+-    assert uniform == 2
++    assert uniform == query_len
++
++
++def test_pd_decode_preserves_remaining_prefill():
++    runner = _make_runner()
++    runner.decode_query_len = 4
++    runner.vllm_config.kv_transfer_config = SimpleNamespace(is_kv_consumer=True, is_kv_producer=False)
++    batch_state = _make_batch_state([124, 64], [4, 4], [128, 128])
++    with patch.object(GPUModelRunner, "gather_batch_req_state", return_value=(batch_state, None)):
++        gathered, uniform = runner.gather_batch_req_state(SimpleNamespace(), False)
++    np.testing.assert_array_equal(gathered.is_prefilling_np, [False, True])
++    assert gathered.has_prefill is True
++    assert uniform is None
++
++
++def test_pd_decode_preserves_dummy_batch():
++    runner = _make_runner()
++    runner.vllm_config.kv_transfer_config = SimpleNamespace(is_kv_consumer=True, is_kv_producer=False)
++    with patch.object(GPUModelRunner, "gather_batch_req_state", return_value=(None, 4)):
++        assert runner.gather_batch_req_state(SimpleNamespace(), True) == (None, 4)
+ 
+ 
+ def test_execute_model_records_profiling_time():
+@@ -1144,7 +1155,11 @@ def test_pd_tail_input_survives_decode_reclassification(num_spec_tokens, full_cg
+ 
+     with (
+         patch.object(GPUModelRunner, "gather_batch_req_state", return_value=(batch_state, None)),
+-        patch("vllm_ascend.worker.v2.model_runner.is_pd_decode_recompute_scheduler_enabled", return_value=True),
++        patch.object(
++            runner.vllm_config,
++            "kv_transfer_config",
++            SimpleNamespace(is_kv_consumer=True, is_kv_producer=False),
++        ),
+     ):
+         gathered, uniform = runner.gather_batch_req_state(scheduler_output, False)
+     assert not gathered.has_prefill
+diff --git a/tests/ut/worker/test_v2_dummy_padding.py b/tests/ut/worker/test_v2_dummy_padding.py
+index 50b6b5f06..66574cc3c 100644
+--- a/tests/ut/worker/test_v2_dummy_padding.py
++++ b/tests/ut/worker/test_v2_dummy_padding.py
+@@ -25,6 +25,7 @@ def buffers():
+ @pytest.fixture
+ def runner(buffers):
+     runner = NPUModelRunner.__new__(NPUModelRunner)
++    runner.vllm_config = SimpleNamespace(kv_transfer_config=None)
+     runner.input_buffers = buffers
+     runner.compilation_config = SimpleNamespace(cudagraph_mode=CUDAGraphMode.PIECEWISE)
+     runner.decode_query_len = 2
+diff --git a/vllm_ascend/worker/v2/model_runner.py b/vllm_ascend/worker/v2/model_runner.py
+index 285be7f08..ea68ee465 100644
+--- a/vllm_ascend/worker/v2/model_runner.py
++++ b/vllm_ascend/worker/v2/model_runner.py
+@@ -94,7 +94,6 @@ from vllm_ascend.observability.runtime_guard.processor import RuntimeGuardProces
+ from vllm_ascend.ops.rotary_embedding import set_cos_and_sin, update_cos_sin
+ from vllm_ascend.utils import (
+     is_deepseek_v41,
+-    is_pd_decode_recompute_scheduler_enabled,
+     lmhead_tp_enable,
+     lmhead_tp_max_num_logits,
+     lmhead_tp_pad_rows,
+@@ -626,7 +625,14 @@ class NPUModelRunner(GPUModelRunner):
+ 
+     def gather_batch_req_state(self, scheduler_output: SchedulerOutput, dummy_run: bool):
+         batch_state, uniform_token_count = super().gather_batch_req_state(scheduler_output, dummy_run)
+-        if batch_state is not None and is_pd_decode_recompute_scheduler_enabled(self.vllm_config):
++        kv_cfg = self.vllm_config.kv_transfer_config
++        is_pd_decode_node = kv_cfg is not None and kv_cfg.is_kv_consumer and not kv_cfg.is_kv_producer
++        # TODO: has_prefill describes prompt progress, not decode-graph eligibility.
++        # Decode-like prompt tails can therefore incorrectly disable FULL graphs
++        # for the entire batch; see https://github.com/vllm-project/vllm/pull/58400.
++        # This PD-only reclassification is a temporary workaround. Replace it with
++        # a dedicated graph-eligibility check once the upstream semantics are aligned.
++        if batch_state is not None and is_pd_decode_node:
+             pd_decode_recompute = (
+                 batch_state.is_prefilling_np
+                 & (batch_state.num_computed_prefill_tokens_np > 0)

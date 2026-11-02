@@ -1,0 +1,696 @@
+commit f558b58c177916424ae9dcf9bb8e66c0b9031236
+Author:     SeaAsters <keine214@qq.com>
+AuthorDate: Thu Oct 15 11:19:23 2026 +0800
+Commit:     GitHub <noreply@github.com>
+CommitDate: Thu Oct 15 11:19:23 2026 +0800
+
+    [Bugfix] Synchronize NPU worker device (#17666)
+    
+    ### What this PR does / why we need it?
+    
+    Ports the Ascend backend requirement from vLLM
+    [#52914](https://github.com/vllm-project/vllm/pull/52914): a resolved
+    pause
+    promises an idle device, and backends outside `torch.accelerator` must
+    provide
+    their own wait.
+    
+    Ascend provided none. `pause_generation()` could return while the last
+    dummy
+    batch a DP rank launched was still executing, and `wake_up()` left its
+    tail work
+    (the level-2 buffer restores and the sleep-mode cleanup) unwaited -- so
+    a caller
+    starting a weight sync right after wake-up raced it.
+    
+    This adds `NPUWorker.synchronize_device()`, which blocks on
+    `torch.npu.synchronize()`, and ends `wake_up()` with it. The method
+    stays on the
+    worker rather than relying on inheritance because `wake_up` calls it
+    unconditionally, while vLLM releases predating #52914 define
+    no `WorkerBase.synchronize_device`.
+    
+    Verified against the vLLM tree (`vllm/v1/worker/worker_base.py`): the
+    method is
+    **absent in v0.28.0** and **present from v0.29.0 onward**. v0.28.0 is in
+    the
+    support matrix, so on that line the override is the only barrier that
+    exists --
+    there is nothing to inherit, and `wake_up()` would otherwise raise
+    `AttributeError`.
+    
+    `sleep()` gets the same treatment, bracketing the memory transition with
+    a
+    barrier on each side: one before the baseline `mem_get_info()` snapshot
+    that the
+    freed-bytes assertion depends on, and one after the optional RL extra
+    cleanup --
+    whose `destroy_hccl()`/aclgraph work is the last thing that can touch
+    memory
+    before the allocator unmaps it. Without them, `sleep()` racing an
+    in-flight
+    dummy batch fails inside `CaMemAllocator.sleep()`'s `empty_cache()`
+    (`AclrtSynchronizeDeviceWithTimeout`, `507011`/`507015`) -- the same
+    failure the
+    `releases/v0.30.0` fix in #18338 addresses.
+    
+    ### Does this PR introduce _any_ user-facing change?
+    
+    No. Control-plane only; no effect on model output.
+    
+    ### How was this patch tested?
+    
+    Unit tests (`tests/ut/worker/test_worker_v1.py`): every `wake_up` test
+    now patches
+    the barrier and asserts it is reached, `synchronize_device()` delegates
+    to
+    `torch.npu.synchronize()`, and the method is asserted to live on
+    `NPUWorker`
+    itself.
+    
+    Unit tests (`tests/ut/worker/test_kv_cache_allocation_scope.py`) and
+    `test_sleep_uses_rl_extra_cleanup`: the sleep tests now patch the
+    barrier and
+    assert both sleep barriers fire, covering the cleanup-enabled and
+    cleanup-disabled paths. They also stop executing a real
+    `torch.npu.synchronize()`
+    on NPU hosts, which previously made these specs behave differently on
+    hardware
+    versus CPU runners.
+    
+    NPU system tests:
+    
+    -
+    `tests/e2e/pull_request/one_card/rlhf/state_transitions/test_npu_device_synchronize.py`
+    -- on real hardware, `synchronize_device()` and `wake_up()` must leave
+    the NPU
+      stream idle.
+    -
+    `tests/e2e/pull_request/two_card/rlhf/state_transitions/test_pause_device_idle.py`
+    -- the Ascend port of upstream's
+    `test_dp_pause_completion_implies_device_idle`.
+    In DPLB the pause path itself launches the dummy batch whose completion
+    the pause
+    promise covers, so the test inflates the dummy batches the pause
+    consensus
+    manufactures and requires an idle device the moment `pause_generation()`
+    returns.
+    It skips (rather than passing vacuously) on vLLM without the #52914
+    barrier.
+    -
+    `tests/e2e/pull_request/one_card/rlhf/state_transitions/npu_stream_busy.py`
+      -- the device-busy helper both files share.
+    
+    `torch.cuda._sleep(200_000_000)`, which the upstream test uses to keep a
+    CUDA
+    stream busy, cannot run on NPU: `torch.npu` exposes no `_sleep`, and
+    `torch.cuda._sleep` raises `AttributeError: module 'torch._C' has no
+    attribute
+    '_cuda_sleep'`. `enqueue_npu_busy_work()` queues real matmuls without
+    waiting
+    instead, and `torch.npu.current_stream().query()` reports the same "is
+    the stream
+    quiet" fact as `torch.cuda.current_stream().query()`.
+    
+    Re-verified on Ascend 910B3 (2 chips) against the vLLM main lane
+    (`0.30.0`, the pinned `.github/vllm-main-verified.commit`), i.e. after
+    the sleep
+    barriers were added -- 84 passed:
+    
+    | suite | result |
+    |---|---|
+    | `tests/ut/worker/test_worker_v1.py` +
+    `tests/ut/worker/test_kv_cache_allocation_scope.py` | 81 passed |
+    |
+    `tests/e2e/pull_request/one_card/rlhf/state_transitions/test_npu_device_synchronize.py`
+    | 2 passed |
+    |
+    `tests/e2e/pull_request/two_card/rlhf/state_transitions/test_pause_device_idle.py`
+    | 1 passed (DP=2 engine, not skipped) |
+    
+    The DP pause test uses `Qwen/Qwen2.5-0.5B-Instruct`, a small text-only
+    checkpoint
+    the a3 runners already pre-download. CI runs with
+    `VLLM_USE_MODELSCOPE=1` and
+    `HF_HUB_OFFLINE=1`, so an unlisted checkpoint cannot be fetched on the
+    runners.
+    
+    An earlier A/B check of the pause barrier itself, run on the vLLM 0.29.0
+    line
+    before the sleep barriers were added, kept a DP=2 engine busy for ~200
+    ms and then
+    called `pause_generation()`:
+    
+    | | fixed | barrier neutralised |
+    |---|---|---|
+    | `pause_generation()` wall time | 0.229 s | 0.036 s |
+    | device idle when it returned | True | **False** |
+    
+    ### Upstream context
+    
+    Ports the Ascend backend requirement from vLLM
+    [#52914](https://github.com/vllm-project/vllm/pull/52914).
+    
+    - vLLM main:
+    https://github.com/vllm-project/vllm/commit/8cc9aa5ad350f6f80cf3bebb298d410803ff75a9
+    
+    Signed-off-by: SeaAsters <keine214@qq.com>
+    Co-authored-by: OpenAI Codex <codex@openai.com>
+
+diff --git a/.github/workflows/scripts/estimated_times.yaml b/.github/workflows/scripts/estimated_times.yaml
+index 5eb97f629..06c8a8e6a 100644
+--- a/.github/workflows/scripts/estimated_times.yaml
++++ b/.github/workflows/scripts/estimated_times.yaml
+@@ -70,12 +70,14 @@ estimated_times:
+   tests/e2e/pull_request/one_card/test_minimax_qknorm_rope_cache.py: 600
+   tests/e2e/pull_request/one_card/test_multi_instance.py: 160
+   tests/e2e/pull_request/one_card/test_multistream_overlap_shared_expert.py: 360
++  tests/e2e/pull_request/one_card/rlhf/state_transitions/test_npu_device_synchronize.py: 60
+   tests/e2e/pull_request/one_card/rlhf/state_transitions/test_npu_ipc_weight_transfer.py: 1050
+   tests/e2e/pull_request/one_card/test_qwen3_0_6b.py: 260
+   tests/e2e/pull_request/one_card/test_qwen3_5_0_8b.py: 460
+   tests/e2e/pull_request/one_card/test_qwen3_8b_w8a8.py: 440
+   tests/e2e/pull_request/one_card/test_qwen3_embedding_0_6b.py: 190
+   tests/e2e/pull_request/one_card/rlhf/state_transitions/test_pause_resume.py: 260
++  tests/e2e/pull_request/two_card/rlhf/state_transitions/test_pause_device_idle.py: 300
+   tests/e2e/pull_request/one_card/rlhf/state_transitions/test_sleep_wake.py: 790
+   tests/e2e/pull_request/one_card/test_sampler.py: 190
+   tests/e2e/pull_request/one_card/test_simple_cpu_offload.py: 240
+diff --git a/tests/e2e/pull_request/one_card/rlhf/state_transitions/npu_stream_busy.py b/tests/e2e/pull_request/one_card/rlhf/state_transitions/npu_stream_busy.py
+new file mode 100644
+index 000000000..9b9fbde9a
+--- /dev/null
++++ b/tests/e2e/pull_request/one_card/rlhf/state_transitions/npu_stream_busy.py
+@@ -0,0 +1,65 @@
++#
++# Copyright (c) 2026 Huawei Technologies Co., Ltd. All Rights Reserved.
++# This file is a part of the vllm-ascend project.
++# Adapted from vllm-project/vllm tests/v1/distributed/test_async_llm_dp.py
++#
++# Licensed under the Apache License, Version 2.0 (the "License");
++# you may not use this file except in compliance with the License.
++# You may obtain a copy of the License at
++#
++#     http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS,
++# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++# See the License for the specific language governing permissions and
++# limitations under the License.
++#
++
++"""Device-busy helpers for the "a completed pause implies an idle device" contract.
++
++Upstream vLLM proves that contract in ``tests/v1/distributed/test_async_llm_dp.py``
++(vllm-project/vllm#52914) by keeping a CUDA stream busy *after* the work has been
++launched and then requiring a quiet stream as soon as ``pause_generation()``
++returns. It keeps the stream busy with ``torch.cuda._sleep(200_000_000)``, which
++is CUDA-only: on an Ascend host ``torch.cuda`` is unusable and ``torch.npu``
++exposes no ``_sleep``, so the call fails with
++``AttributeError: module 'torch._C' has no attribute '_cuda_sleep'``.
++
++The NPU equivalent is to queue real kernels and never wait for them, which
++leaves the device in exactly the state the upstream test manufactures: the host
++has returned while the stream still owns queued work. ``npu_stream_idle()``
++reports the same fact as ``torch.cuda.current_stream().query()``.
++"""
++
++import torch
++
++# A 4096x4096 fp16 matmul drains in ~0.43 ms on Atlas A2/A3 (measured on
++# Ascend910_9382), so this queues roughly 110 ms of device work -- the same
++# order of magnitude as the ~110 ms the upstream CUDA test simulates with
++# torch.cuda._sleep(200_000_000).
++NPU_BUSY_MATMUL_SIZE = 4096
++NPU_BUSY_MATMUL_ITERATIONS = 256
++
++
++def enqueue_npu_busy_work(
++    iterations: int = NPU_BUSY_MATMUL_ITERATIONS,
++    size: int = NPU_BUSY_MATMUL_SIZE,
++) -> None:
++    """Queue device work on the current NPU stream without waiting for it.
++
++    Returns while the work is still executing, mirroring the observable effect
++    of ``torch.cuda._sleep()`` on a CUDA stream.
++    """
++    lhs = torch.randn(size, size, dtype=torch.float16, device="npu")
++    rhs = torch.randn(size, size, dtype=torch.float16, device="npu")
++    out = torch.empty_like(lhs)
++    for _ in range(iterations):
++        # torch.mm is asynchronous. Never call .cpu()/.item()/synchronize() in
++        # this loop: the host would drain the queue and leave the device idle.
++        torch.mm(lhs, rhs, out=out)
++
++
++def npu_stream_idle() -> bool:
++    """True when every kernel queued on the current NPU stream has finished."""
++    return bool(torch.npu.current_stream().query())
+diff --git a/tests/e2e/pull_request/one_card/rlhf/state_transitions/test_npu_device_synchronize.py b/tests/e2e/pull_request/one_card/rlhf/state_transitions/test_npu_device_synchronize.py
+new file mode 100644
+index 000000000..6a17ff488
+--- /dev/null
++++ b/tests/e2e/pull_request/one_card/rlhf/state_transitions/test_npu_device_synchronize.py
+@@ -0,0 +1,93 @@
++#
++# Copyright (c) 2026 Huawei Technologies Co., Ltd. All Rights Reserved.
++# This file is a part of the vllm-ascend project.
++# Adapted from vllm-project/vllm PR #52914
++#   (vllm/v1/worker/worker_base.py, vllm/v1/engine/core.py)
++#
++# Licensed under the Apache License, Version 2.0 (the "License");
++# you may not use this file except in compliance with the License.
++# You may obtain a copy of the License at
++#
++#     http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS,
++# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++# See the License for the specific language governing permissions and
++# limitations under the License.
++#
++
++"""Ascend guards for the device barrier on the RL pause / wake path.
++
++vLLM #52914 makes a completed pause promise an *idle device* and mirrors the
++contract on the wake transition: ``wake_up`` now ends with a device barrier, so
++an RL caller may start same-device work (e.g. weight sync) as soon as it
++returns. The engine reaches that barrier through
++``collective_rpc("synchronize_device")``, which on Ascend waits with
++``torch.npu.synchronize()``.
++
++These tests run on real hardware and assert the observable half of that
++contract -- the NPU stream owns no queued work once the barrier has run -- using
++the NPU substitute for ``torch.cuda._sleep`` described in ``npu_stream_busy``.
++"""
++
++from types import SimpleNamespace
++from unittest.mock import MagicMock, patch
++
++import pytest
++import torch
++
++from tests.e2e.pull_request.one_card.rlhf.state_transitions.npu_stream_busy import (
++    enqueue_npu_busy_work,
++    npu_stream_idle,
++)
++
++
++@pytest.fixture(autouse=True)
++def npu_device():
++    """Select an NPU for the test process, skipping the module when there is none."""
++    if not torch.npu.is_available():
++        pytest.skip("requires an Ascend NPU")
++    torch.npu.set_device(0)
++    torch.npu.synchronize()
++    yield
++    torch.npu.synchronize()
++
++
++def test_synchronize_device_drains_inflight_npu_work():
++    """``synchronize_device()`` must not return before the NPU stream is idle."""
++    from vllm_ascend.worker.worker import NPUWorker
++
++    worker = NPUWorker.__new__(NPUWorker)
++
++    enqueue_npu_busy_work()
++    assert not npu_stream_idle(), "helper failed to leave device work in flight"
++
++    worker.synchronize_device()
++
++    assert npu_stream_idle()
++
++
++def test_wake_up_does_not_return_before_npu_work_is_done():
++    """``wake_up()`` leaves the device idle for a caller syncing weights next."""
++    from vllm_ascend.worker.worker import NPUWorker
++
++    ascend_config = SimpleNamespace(
++        weight_nz_mode=0,
++        rl_config=SimpleNamespace(enabled=False, sleep_mode_extra_cleanup=False),
++    )
++
++    with (
++        patch("vllm_ascend.worker.worker.get_ascend_config", return_value=ascend_config),
++        patch("vllm_ascend.worker.worker.CaMemAllocator"),
++    ):
++        worker = NPUWorker.__new__(NPUWorker)
++        worker.model_runner = SimpleNamespace(model=MagicMock())
++        worker._sleep_saved_buffers = {}
++
++        enqueue_npu_busy_work()
++        assert not npu_stream_idle(), "helper failed to leave device work in flight"
++
++        worker.wake_up(tags=["weights"])
++
++        assert npu_stream_idle(), "wake_up() returned while NPU work was still in flight"
+diff --git a/tests/e2e/pull_request/two_card/rlhf/state_transitions/test_pause_device_idle.py b/tests/e2e/pull_request/two_card/rlhf/state_transitions/test_pause_device_idle.py
+new file mode 100644
+index 000000000..49d0cb79e
+--- /dev/null
++++ b/tests/e2e/pull_request/two_card/rlhf/state_transitions/test_pause_device_idle.py
+@@ -0,0 +1,130 @@
++#
++# Copyright (c) 2026 Huawei Technologies Co., Ltd. All Rights Reserved.
++# This file is a part of the vllm-ascend project.
++# Adapted from vllm-project/vllm PR #52914
++#   (tests/v1/distributed/test_async_llm_dp.py::test_dp_pause_completion_implies_device_idle)
++#
++# Licensed under the Apache License, Version 2.0 (the "License");
++# you may not use this file except in compliance with the License.
++# You may obtain a copy of the License at
++#
++#     http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS,
++# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++# See the License for the specific language governing permissions and
++# limitations under the License.
++#
++
++"""NPU guard for "a resolved pause promise means an idle device" (vLLM #52914).
++
++In data parallel the pause path itself launches work: ``_pause_complete`` forces
++the every-N-steps dummy-batch burst so every rank reaches the pause consensus,
++and the last dummy batch is launched inside the consensus iteration, where
++``has_work()`` cannot see it. Upstream therefore puts a device barrier in
++``EngineCoreProc._finish_pause`` before the caches are reset and the pause future
++resolves. Ascend only gets that barrier if ``NPUWorker.synchronize_device()``
++really waits, which is what this test checks end to end.
++
++The upstream test inflates the dummy batches with ``torch.cuda._sleep``; that
++call does not exist on NPU, so ``npu_stream_busy`` queues real matmuls instead.
++"""
++
++import asyncio
++import os
++from contextlib import ExitStack
++
++import pytest
++from vllm import SamplingParams
++from vllm.engine.arg_utils import AsyncEngineArgs
++from vllm.v1.engine.async_llm import AsyncLLM
++
++from tests.e2e.pull_request.one_card.rlhf.state_transitions.npu_stream_busy import (
++    enqueue_npu_busy_work,
++    npu_stream_idle,
++)
++
++DP_SIZE = 2
++# This test exercises the pause/DP machinery, not model quality, so any small
++# text-only checkpoint works. It has to be one the a3 runners already have
++# pre-downloaded (see .github/workflows/misc/model_dataset_list.json): CI runs
++# with VLLM_USE_MODELSCOPE=1 and HF_HUB_OFFLINE=1, so an unlisted checkpoint
++# cannot be fetched. VLLM_TEST_MODEL overrides it, as in
++# tests/e2e/pull_request/one_card/rlhf/conftest.py.
++DP_PAUSE_MODEL = os.environ.get("VLLM_TEST_MODEL", "Qwen/Qwen2.5-0.5B-Instruct")
++DP_PAUSE_PROMPT = "This is a test of data parallel pause"
++
++
++def _has_pause_device_barrier() -> bool:
++    """Whether the installed vLLM carries the #52914 pause device barrier."""
++    try:
++        from vllm.v1.engine.core import EngineCoreProc
++    except ImportError:  # pragma: no cover - vLLM is a hard dependency of the plugin
++        return False
++    return hasattr(EngineCoreProc, "_finish_pause")
++
++
++def _get_dp_pause_engine_args() -> AsyncEngineArgs:
++    return AsyncEngineArgs(
++        model=DP_PAUSE_MODEL,
++        enforce_eager=True,
++        data_parallel_size=DP_SIZE,
++        data_parallel_backend="mp",
++        max_model_len=512,
++        gpu_memory_utilization=0.5,
++    )
++
++
++async def _pause_an_inflated_dp_engine(monkeypatch: pytest.MonkeyPatch) -> None:
++    with ExitStack() as after:
++        # The probes below ship functions through collective_rpc.
++        monkeypatch.setenv("VLLM_ALLOW_INSECURE_SERIALIZATION", "1")
++        engine = AsyncLLM.from_engine_args(_get_dp_pause_engine_args())
++        after.callback(engine.shutdown)
++
++        async for _ in engine.generate(
++            request_id="warmup",
++            prompt=DP_PAUSE_PROMPT,
++            sampling_params=SamplingParams(max_tokens=5),
++        ):
++            pass
++
++        def inflate_dummy_batches(worker) -> bool:
++            inner = worker.execute_dummy_batch
++
++            def slow_dummy_batch() -> None:
++                inner()
++                # Keep the stream busy after launch, like a large-MoE forward.
++                # NPU stand-in for the upstream torch.cuda._sleep(200_000_000):
++                # torch.npu has no _sleep and torch.cuda is unusable on NPU.
++                enqueue_npu_busy_work()
++
++            worker.execute_dummy_batch = slow_dummy_batch
++            return True
++
++        assert all(await engine.engine_core.collective_rpc_async(inflate_dummy_batches))
++
++        await asyncio.wait_for(engine.pause_generation(mode="abort"), timeout=60)
++
++        def device_idle(worker) -> bool:
++            return npu_stream_idle()
++
++        idle = await engine.engine_core.collective_rpc_async(device_idle)
++        assert all(idle), "pause_generation() returned while NPU work was still in flight"
++
++
++@pytest.mark.skipif(
++    not _has_pause_device_barrier(),
++    reason="requires a vLLM with the #52914 pause device barrier (EngineCoreProc._finish_pause)",
++)
++def test_dp_pause_completion_implies_npu_idle(monkeypatch: pytest.MonkeyPatch):
++    """A resolved pause future promises an idle device. Inflate the dummy
++    batches the pause consensus manufactures so any work the pause fails to wait
++    on stays visible, then require a quiet NPU stream the moment
++    ``pause_generation()`` returns.
++
++    Driven through ``asyncio.run`` on purpose: the repository does not depend on
++    pytest-asyncio, and a bare async test would silently skip.
++    """
++    asyncio.run(_pause_an_inflated_dp_engine(monkeypatch))
+diff --git a/tests/ut/worker/test_kv_cache_allocation_scope.py b/tests/ut/worker/test_kv_cache_allocation_scope.py
+index b55d6c6eb..dd51b36d3 100644
+--- a/tests/ut/worker/test_kv_cache_allocation_scope.py
++++ b/tests/ut/worker/test_kv_cache_allocation_scope.py
+@@ -118,6 +118,9 @@ def test_kv_wake_does_not_run_model_runner_recovery() -> None:
+     worker.sleep_wakeup_manager = MagicMock()
+ 
+     with (
++        # wake_up ends with a device barrier; this UT runs on a CPU runner, so the
++        # barrier must be mocked or torch.npu.synchronize() would try to init NPU.
++        patch("vllm_ascend.worker.worker.NPUWorker.synchronize_device") as mock_synchronize,
+         patch("vllm_ascend.worker.worker.CaMemAllocator") as mock_allocator_class,
+         patch("vllm_ascend.worker.worker.get_ascend_config") as mock_get_config,
+     ):
+@@ -131,6 +134,7 @@ def test_kv_wake_does_not_run_model_runner_recovery() -> None:
+     assert runner.recovery_calls == 0
+     assert model.get_buffer("_k_scale").item() == 0.5
+     assert model.get_buffer("_v_scale").item() == 0.25
++    mock_synchronize.assert_called_once_with()
+ 
+ 
+ def _make_sleep_worker(model: torch.nn.Module) -> NPUWorker:
+@@ -142,10 +146,13 @@ def _make_sleep_worker(model: torch.nn.Module) -> NPUWorker:
+     return worker
+ 
+ 
++@patch("vllm_ascend.worker.worker.NPUWorker.synchronize_device")
+ @patch("vllm_ascend.worker.worker.torch.npu.mem_get_info", side_effect=[(100, 200), (150, 200)])
+ @patch("vllm_ascend.worker.worker.CaMemAllocator")
+ @patch("vllm_ascend.worker.worker.get_ascend_config")
+-def test_level1_sleep_does_not_cpu_backup_hadamard(mock_get_config, mock_allocator_class, _mock_mem_get_info) -> None:
++def test_level1_sleep_does_not_cpu_backup_hadamard(
++    mock_get_config, mock_allocator_class, _mock_mem_get_info, mock_synchronize_device
++) -> None:
+     mock_get_config.return_value = SimpleNamespace(
+         rl_config=SimpleNamespace(enabled=False, sleep_mode_extra_cleanup=False)
+     )
+@@ -160,13 +167,16 @@ def test_level1_sleep_does_not_cpu_backup_hadamard(mock_get_config, mock_allocat
+ 
+     assert worker._sleep_saved_buffers == {}
+     assert torch.equal(model.get_buffer("_dsa_hadamard"), hadamard)
++    # Both sleep barriers fire on the cleanup-disabled path too.
++    assert mock_synchronize_device.call_count == 2
+ 
+ 
++@patch("vllm_ascend.worker.worker.NPUWorker.synchronize_device")
+ @patch("vllm_ascend.worker.worker.torch.npu.mem_get_info", side_effect=[(100, 200), (150, 200)])
+ @patch("vllm_ascend.worker.worker.CaMemAllocator")
+ @patch("vllm_ascend.worker.worker.get_ascend_config")
+ def test_level2_sleep_still_cpu_backups_named_buffers(
+-    mock_get_config, mock_allocator_class, _mock_mem_get_info
++    mock_get_config, mock_allocator_class, _mock_mem_get_info, mock_synchronize_device
+ ) -> None:
+     mock_get_config.return_value = SimpleNamespace(
+         rl_config=SimpleNamespace(enabled=False, sleep_mode_extra_cleanup=False)
+@@ -183,3 +193,4 @@ def test_level2_sleep_still_cpu_backups_named_buffers(
+     assert "_dsa_hadamard" in worker._sleep_saved_buffers
+     assert worker._sleep_saved_buffers["_dsa_hadamard"].device.type == "cpu"
+     assert torch.equal(worker._sleep_saved_buffers["_dsa_hadamard"], hadamard)
++    assert mock_synchronize_device.call_count == 2
+diff --git a/tests/ut/worker/test_worker_v1.py b/tests/ut/worker/test_worker_v1.py
+index a76efd244..c03f4820b 100644
+--- a/tests/ut/worker/test_worker_v1.py
++++ b/tests/ut/worker/test_worker_v1.py
+@@ -563,10 +563,13 @@ class TestNPUWorker(TestBase):
+             self.assertEqual(worker.cache_config.num_gpu_blocks, 100)
+             self.assertEqual(worker.cache_config.num_cpu_blocks, 50)
+ 
++    @patch("vllm_ascend.worker.worker.NPUWorker.synchronize_device")
+     @patch("vllm_ascend.worker.worker.torch.npu.mem_get_info", side_effect=[(100, 200), (150, 200)])
+     @patch("vllm_ascend.worker.worker.CaMemAllocator")
+     @patch("vllm_ascend.worker.worker.get_ascend_config")
+-    def test_sleep_uses_rl_extra_cleanup(self, mock_get_config, mock_allocator_class, mock_mem_get_info):
++    def test_sleep_uses_rl_extra_cleanup(
++        self, mock_get_config, mock_allocator_class, mock_mem_get_info, mock_synchronize_device
++    ):
+         from vllm_ascend.worker.worker import NPUWorker
+ 
+         mock_get_config.return_value = SimpleNamespace(
+@@ -583,10 +586,14 @@ class TestNPUWorker(TestBase):
+         worker.sleep_wakeup_manager.sleep.assert_called_once_with()
+         mock_allocator_class.get_instance.return_value.sleep.assert_called_once_with(offload_tags=("weights",))
+         self.assertEqual(mock_mem_get_info.call_count, 2)
++        # sleep() brackets the transition: one barrier before the baseline memory
++        # snapshot, one after the optional RL extra cleanup and before the unmap.
++        self.assertEqual(mock_synchronize_device.call_count, 2)
+ 
++    @patch("vllm_ascend.worker.worker.NPUWorker.synchronize_device")
+     @patch("vllm_ascend.worker.worker.CaMemAllocator")
+     @patch("vllm_ascend.worker.worker.get_ascend_config")
+-    def test_wake_up_mode_enabled(self, mock_get_config, mock_allocator_class):
++    def test_wake_up_mode_enabled(self, mock_get_config, mock_allocator_class, mock_synchronize_device):
+         mock_config = MagicMock()
+         mock_config.weight_nz_mode = 0
+         mock_config.rl_config.enabled = True
+@@ -624,12 +631,16 @@ class TestNPUWorker(TestBase):
+             worker.sleep_wakeup_manager.wakeup.assert_called_once_with(["test_tag"])
+             mock_model_runner.post_kv_cache_wake_up.assert_not_called()
+ 
++            mock_synchronize_device.assert_called_once_with()
++
+             worker.wake_up(tags=["kv_cache"])
+             mock_model_runner.post_kv_cache_wake_up.assert_not_called()
++            self.assertEqual(mock_synchronize_device.call_count, 2)
+ 
++    @patch("vllm_ascend.worker.worker.NPUWorker.synchronize_device")
+     @patch("vllm_ascend.worker.worker.CaMemAllocator")
+     @patch("vllm_ascend.worker.worker.get_ascend_config")
+-    def test_wake_up_without_post_kv_cache_hook(self, mock_get_config, mock_allocator_class):
++    def test_wake_up_without_post_kv_cache_hook(self, mock_get_config, mock_allocator_class, mock_synchronize_device):
+         from vllm_ascend.worker.worker import NPUWorker
+ 
+         mock_get_config.return_value = SimpleNamespace(
+@@ -650,6 +661,38 @@ class TestNPUWorker(TestBase):
+         worker.wake_up(tags=["kv_cache"])
+ 
+         mock_allocator.wake_up.assert_called_once_with(tags=["kv_cache"])
++        mock_synchronize_device.assert_called_once_with()
++
++    def test_synchronize_device_waits_for_npu_work(self):
++        """The barrier must delegate to the NPU synchronize primitive.
++
++        ``torch.npu`` is swapped out whole rather than patching its nested
++        ``synchronize``: on some torch_npu builds ``torch.npu`` resolves to a
++        lazily built proxy, so a nested patch never reaches the call site and the
++        assertion silently sees zero calls.
++        """
++        from vllm_ascend.worker.worker import NPUWorker
++
++        calls: list[str] = []
++        fake_npu = SimpleNamespace(synchronize=lambda: calls.append("sync"))
++
++        worker = NPUWorker.__new__(NPUWorker)
++        with patch.object(torch, "npu", fake_npu, create=True):
++            worker.synchronize_device()
++
++        self.assertEqual(calls, ["sync"])
++
++    def test_synchronize_device_is_defined_on_the_npu_worker(self):
++        """Ascend must carry the barrier itself on vLLM releases without it.
++
++        vLLM #52914 added ``WorkerBase.synchronize_device``, but ``wake_up`` calls
++        the barrier unconditionally while vLLM releases predating #52914 (v0.28.0
++        among them) define no ``WorkerBase.synchronize_device``, so the wake path
++        cannot be left to inheritance.
++        """
++        from vllm_ascend.worker.worker import NPUWorker
++
++        self.assertIn("synchronize_device", NPUWorker.__dict__)
+ 
+     @staticmethod
+     def _make_unquantized_moe_model():
+@@ -664,9 +707,12 @@ class TestNPUWorker(TestBase):
+         routed_experts.w2_weight.weight_loader = MagicMock()
+         return model
+ 
++    @patch("vllm_ascend.worker.worker.NPUWorker.synchronize_device")
+     @patch("vllm_ascend.worker.worker.CaMemAllocator")
+     @patch("vllm_ascend.worker.worker.get_ascend_config")
+-    def test_wake_up_does_not_transpose_moe_weights(self, mock_get_config, mock_allocator_class):
++    def test_wake_up_does_not_transpose_moe_weights(
++        self, mock_get_config, mock_allocator_class, mock_synchronize_device
++    ):
+         """Level-2 reload uses reload_weights; wake_up must not transpose MoE layout."""
+         from vllm_ascend.worker.worker import NPUWorker
+ 
+@@ -708,6 +754,7 @@ class TestNPUWorker(TestBase):
+             self.assertIs(routed_experts.w13_weight.weight_loader, w13_loader)
+             self.assertIs(routed_experts.w2_weight.weight_loader, w2_loader)
+         mock_allocator_class.get_instance.return_value.wake_up.assert_called_once_with(tags=["weights"])
++        mock_synchronize_device.assert_called_once_with()
+ 
+     @patch("vllm_ascend.worker.worker.current_platform")
+     @patch("vllm_ascend.worker.worker.MemorySnapshot")
+diff --git a/vllm_ascend/worker/worker.py b/vllm_ascend/worker/worker.py
+index f4d4664ce..3d27074ee 100644
+--- a/vllm_ascend/worker/worker.py
++++ b/vllm_ascend/worker/worker.py
+@@ -248,6 +248,7 @@ class NPUWorker(WorkerBase):
+                     return
+ 
+     def sleep(self, level: int = 1) -> None:
++        self.synchronize_device()
+         free_bytes_before_sleep = torch.npu.mem_get_info()[0]
+         # Level-1 only offloads the weights pool. Persistent metadata such as
+         # the DSA Hadamard matrix is allocated outside the kv_cache pool, so it
+@@ -262,6 +263,7 @@ class NPUWorker(WorkerBase):
+         cleanup_enabled = rl_config.enabled and rl_config.sleep_mode_extra_cleanup
+         if cleanup_enabled:
+             self.sleep_wakeup_manager.sleep()
++        self.synchronize_device()
+ 
+         allocator = CaMemAllocator.get_instance()
+         allocator.sleep(offload_tags=("weights",) if level == 1 else tuple())
+@@ -301,6 +303,7 @@ class NPUWorker(WorkerBase):
+         cleanup_enabled = rl_config.enabled and rl_config.sleep_mode_extra_cleanup
+         if cleanup_enabled:
+             self.sleep_wakeup_manager.wakeup(tags)
++        self.synchronize_device()
+ 
+     def _check_weight_transfer_engine(self) -> None:
+         if self.weight_transfer_engine is None:
+@@ -1264,6 +1267,9 @@ class NPUWorker(WorkerBase):
+     def reset_encoder_cache(self) -> None:
+         self.model_runner.reset_encoder_cache()
+ 
++    def synchronize_device(self) -> None:
++        torch.npu.synchronize()
++
+     def get_encoder_cudagraph_stats(self) -> dict[str, Any] | None:
+         """Return serializable encoder graph state for diagnostics.
+ 

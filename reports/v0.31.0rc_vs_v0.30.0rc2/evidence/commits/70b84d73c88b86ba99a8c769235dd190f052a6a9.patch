@@ -1,0 +1,932 @@
+commit 70b84d73c88b86ba99a8c769235dd190f052a6a9
+Author:     chenxi-hh <32731611+chenxi-hh@users.noreply.github.com>
+AuthorDate: Tue Oct 13 20:01:59 2026 +0800
+Commit:     GitHub <noreply@github.com>
+CommitDate: Tue Oct 13 20:01:59 2026 +0800
+
+    [Performance][Model] Offload Qwen3.5-VL image preprocessing to NPU (#16996)
+    
+    ### What this PR does / why we need it?
+    
+    Qwen3.5-VL image preprocessing (resize, patchify, rescale+normalize)
+    runs on the front-end CPU and saturates the API-server process under
+    multimodal load, slowing down the engine loop.
+    
+    Add Ascend subclasses of Qwen3.5-VL (dense and MoE) that move the whole
+    pipeline onto the NPU worker: the front-end emits flat raw uint8 plus
+    the original (H, W) and the target grid; the model performs resize
+    (bicubic+antialias, matching HF/PIL), patchify, and normalization (via
+    FusedInputNorm) on the device. The front-end-to-worker payload drops ~8x
+    (uint8, no temporal replication). smart_resize stays on the CPU so
+    placeholder accounting and prompt lengths are unchanged.
+    
+    Video keeps the CPU patchify path; only rescale+normalize move to the
+    device via the native supports_mm_device_do_normalize mechanism.
+    
+    Registered through ModelRegistry (architecture overwrite, same pattern
+    as AscendDeepseekV4ForConditionalGeneration in #15457); no vllm or
+    transformers class is monkey-patched.
+    
+    ### Does this PR introduce _any_ user-facing change?
+    
+    Yes. On Ascend, Qwen3.5-VL images are preprocessed on the NPU instead of
+    the front-end CPU. No config change required; outputs are numerically
+    equivalent.
+    
+    ### How was this patch tested?
+    
+    - NPU e2e on Qwen3.5-VL 27B BF16: image-text requests succeed with
+    correct outputs.
+    - Numerical comparison with stock path: ViT output cosine similarity
+    ~0.999996 (bicubic+antialias reproduces HF/PIL resize).
+    - Non-Qwen3.5 model regression: qwen2.5-vl routes to the native vllm
+    class, behavior unchanged.
+    - Front-end CPU utilization significantly reduced under multimodal load.
+    
+    ### How was this patch tested?
+    
+    accuracy :
+    GPQA_diamond：85.35
+    MMMU：81.11
+    
+    10K input, 300 output with images
+    performance :
+    Output token throughput (tok/s)：104 -> 116
+    TTFT: 2221ms-> 1914ms
+    
+    
+    - vLLM main:
+    https://github.com/vllm-project/vllm/commit/8cc9aa5ad350f6f80cf3bebb298d410803ff75a9
+    
+    ---------
+    
+    Signed-off-by: daixinning <daixinning@huawei.com>
+    Signed-off-by: chenxi-hh <chen464822955@163.com>
+    Co-authored-by: Agent <agent@example.com>
+
+diff --git a/tests/ut/models/test_qwen3_5_vl_preprocess.py b/tests/ut/models/test_qwen3_5_vl_preprocess.py
+new file mode 100644
+index 000000000..7e0a66042
+--- /dev/null
++++ b/tests/ut/models/test_qwen3_5_vl_preprocess.py
+@@ -0,0 +1,430 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""Regression tests for the Ascend Qwen3.5-VL NPU preprocessing offload.
++
++Covers the review-critical configurations:
++- fallback to the stock CPU pipeline when mm_device_do_normalize is disabled
++  or non-default processor settings (do_resize/resample) are requested;
++- encoder graph path: raw payloads are sliced BEFORE preprocessing so each
++  item is preprocessed exactly once, and nested re-selection (DP re-packing)
++  never normalizes twice (images and videos).
++"""
++
++from types import SimpleNamespace
++
++import numpy as np
++import pytest
++import torch
++from PIL import Image
++from vllm.model_executor.models.qwen3_vl import Qwen3VLMultiModalProcessor
++
++try:
++    from vllm.model_executor.layers.fusion.mm_input_norm import build_mm_input_norm  # noqa: F401
++
++    from vllm_ascend.models.qwen3_5_vl import (
++        _DEVICE_PREPROCESS_DONE,
++        AscendQwen2VLImageProcessor,
++        AscendQwen3_5VLProcessor,
++        _AscendVLPreprocessMixin,
++    )
++
++    _MM_INPUT_NORM_AVAILABLE = True
++except ImportError:
++    # vllm release wheels do not ship mm_input_norm and the model module
++    # imports it unconditionally; the release line is covered by the
++    # releases/v0.30.0 branch instead.
++    _AscendVLPreprocessMixin = object
++    _MM_INPUT_NORM_AVAILABLE = False
++
++pytestmark = pytest.mark.skipif(
++    not _MM_INPUT_NORM_AVAILABLE,
++    reason="requires vllm.model_executor.layers.fusion.mm_input_norm (vllm main)",
++)
++
++C, PS, TPS, MS = 3, 14, 2, 2
++PATCH_DIM = C * TPS * PS * PS  # 1176
++
++# With mm_device_do_normalize enabled vLLM merges do_rescale=False /
++# do_normalize=False into the processor kwargs, so the raw-pixel path is
++# exercised with those flags.
++RAW_KWARGS = {"do_rescale": False, "do_normalize": False}
++
++
++# ---------------------------------------------------------------------------
++# Image processor: raw path vs stock fallback
++# ---------------------------------------------------------------------------
++
++
++def _make_image_processor(**overrides):
++    kwargs = dict(
++        do_resize=True,
++        size={"shortest_edge": 4 * 28 * 28, "longest_edge": 16384 * 28 * 28},
++        resample=Image.Resampling.BICUBIC,
++        do_rescale=True,
++        rescale_factor=1 / 255,
++        do_normalize=True,
++        image_mean=[0.48145466, 0.4578275, 0.40821073],
++        image_std=[0.26862954, 0.26130258, 0.27577711],
++        patch_size=PS,
++        temporal_patch_size=TPS,
++        merge_size=MS,
++    )
++    kwargs.update(overrides)
++    return AscendQwen2VLImageProcessor(**kwargs)
++
++
++def _pil_image(h, w, seed=0):
++    torch.manual_seed(seed)
++    arr = torch.randint(0, 256, (h, w, 3), dtype=torch.uint8).numpy()
++    return Image.fromarray(arr)
++
++
++def test_raw_preprocess_emits_flat_payload():
++    """Default resize settings + device normalize (do_rescale/do_normalize
++    disabled): flat raw values + original (H, W) + smart_resize grid."""
++    proc = _make_image_processor()
++    out = proc(images=[_pil_image(56, 56)], return_tensors="pt", **RAW_KWARGS)
++    assert "image_hw" in out
++    assert out["pixel_values"].ndim == 1
++    assert out["pixel_values"].numel() == C * 56 * 56
++    assert float(out["pixel_values"].max()) <= 255.0
++    torch.testing.assert_close(out["image_hw"], torch.tensor([[56, 56]]))
++    torch.testing.assert_close(out["image_grid_thw"], torch.tensor([[1, 4, 4]]))
++
++
++def test_do_resize_false_keeps_stock_grid():
++    """do_resize=False must keep the stock grid (review example: 224x224 with
++    max_pixels=56*56 keeps [1, 16, 16] instead of shrinking to [1, 4, 4])."""
++    proc = _make_image_processor(size={"shortest_edge": 56 * 56, "longest_edge": 56 * 56})
++    out = proc(
++        images=[_pil_image(224, 224)],
++        return_tensors="pt",
++        do_resize=False,
++        **RAW_KWARGS,
++    )
++    # Stock CPU pipeline: no raw marker, patchified 2-D output.
++    assert "image_hw" not in out
++    assert out["pixel_values"].ndim == 2
++    assert out["pixel_values"].shape == (16 * 16, PATCH_DIM)
++    torch.testing.assert_close(out["image_grid_thw"], torch.tensor([[1, 16, 16]]))
++
++
++def test_non_bicubic_resample_falls_back_to_stock():
++    """A non-bicubic resample filter must keep the stock CPU pipeline."""
++    proc = _make_image_processor()
++    out = proc(
++        images=[_pil_image(56, 56)],
++        return_tensors="pt",
++        resample=Image.Resampling.BILINEAR,
++        **RAW_KWARGS,
++    )
++    assert "image_hw" not in out
++    assert out["pixel_values"].ndim == 2
++    assert out["pixel_values"].shape == (16, PATCH_DIM)
++
++
++def test_device_normalize_disabled_keeps_stock_pipeline():
++    """mm_device_do_normalize disabled leaves do_rescale/do_normalize enabled:
++    the CPU must run the complete stock pipeline (no raw [0, 255] payload)."""
++    proc = _make_image_processor()
++    out = proc(images=[_pil_image(56, 56)], return_tensors="pt")
++    assert "image_hw" not in out
++    assert out["pixel_values"].ndim == 2
++    assert out["pixel_values"].shape == (16, PATCH_DIM)
++    # Stock output is rescaled+normalized, i.e. far away from [0, 255].
++    assert float(out["pixel_values"].abs().max()) < 10.0
++
++
++def test_float32_input_keeps_stock_pipeline():
++    """Floating-point pixels must not be quantized by the raw device path
++    (review example: a constant 128.4 image must survive, not round to 128)."""
++    proc = _make_image_processor()
++    img = np.full((56, 56, 3), 128.4, dtype=np.float32)
++    out = proc(images=[img], return_tensors="pt", **RAW_KWARGS)
++    assert "image_hw" not in out
++    assert out["pixel_values"].shape == (16, PATCH_DIM)
++    torch.testing.assert_close(out["pixel_values"], torch.full((16, PATCH_DIM), 128.4))
++
++
++# ---------------------------------------------------------------------------
++# Field config gating
++# ---------------------------------------------------------------------------
++
++
++def test_field_config_follows_emitted_keys(monkeypatch):
++    """pixel_values/image_hw overrides must only apply to raw outputs."""
++    base = {"pixel_values": object()}
++    monkeypatch.setattr(
++        Qwen3VLMultiModalProcessor,
++        "_get_mm_fields_config",
++        lambda self, hf_inputs, hf_processor_mm_kwargs: base,
++    )
++    proc = object.__new__(AscendQwen3_5VLProcessor)
++
++    # Stock output (no image_hw): base mapping returned untouched.
++    stock_cfg = proc._get_mm_fields_config({"pixel_values": torch.zeros(16, PATCH_DIM)}, {})
++    assert stock_cfg["pixel_values"] is base["pixel_values"]
++    assert "image_hw" not in stock_cfg
++
++    # Raw output: pixel_values is remapped and image_hw is batched on CPU.
++    proc.info = SimpleNamespace(get_hf_config=lambda: SimpleNamespace(vision_config=SimpleNamespace(in_channels=C)))
++    raw_cfg = proc._get_mm_fields_config({"image_hw": torch.tensor([[56, 56], [28, 56]])}, {})
++    assert raw_cfg["pixel_values"] is not base["pixel_values"]
++    assert "image_hw" in raw_cfg
++
++
++# ---------------------------------------------------------------------------
++# Encoder graph path: slice first, preprocess exactly once
++# ---------------------------------------------------------------------------
++
++
++def _affine_norm(x, dtype):
++    """Plain-torch stand-in for the fused input norm (same (x / rescale -
++    mean) / std semantics, uniform per channel). The tests verify the model's
++    orchestration (exactly-once slicing/normalization); the real normalizer
++    is upstream code exercised by the e2e tests. Constructing the real
++    CustomOp here would also require a vllm config context."""
++    return ((x / 255.0 - 0.5) / 0.25).to(dtype)
++
++
++class _CountingNorm:
++    def __init__(self):
++        self.inner = _affine_norm
++        self.calls = 0
++
++    def __call__(self, x, dtype):
++        self.calls += 1
++        return self.inner(x, dtype)
++
++
++class _StubVLModel(_AscendVLPreprocessMixin):
++    """CPU stub exposing only the machinery the mixin methods rely on."""
++
++    def __init__(self, device_do_normalize=True):
++        self._c, self._ps, self._tps, self._ms = C, PS, TPS, MS
++        self.model_config = SimpleNamespace(
++            multimodal_config=SimpleNamespace(mm_device_do_normalize=device_do_normalize)
++        )
++        self.visual = SimpleNamespace(device=torch.device("cpu"), dtype=torch.float32)
++        self.use_data_parallel = False
++        self.counting_norm = _CountingNorm()
++        self.input_norm = self.counting_norm
++
++    def get_input_modality(self, mm_kwargs):
++        if "image_grid_thw" in mm_kwargs:
++            return "image"
++        if "video_grid_thw" in mm_kwargs:
++            return "video"
++        raise AssertionError("This line should be unreachable.")
++
++    def _get_grid_thw_by_modality(self, mm_kwargs):
++        grid_thw = mm_kwargs[f"{self.get_input_modality(mm_kwargs)}_grid_thw"]
++        if not isinstance(grid_thw, list):
++            grid_thw = grid_thw.tolist()
++        return grid_thw
++
++
++def _raw_image_mm_kwargs():
++    """Two raw images: 56x56 (grid [1,4,4]) and 28x56 (grid [1,2,4])."""
++    torch.manual_seed(0)
++    hw = [(56, 56), (28, 56)]
++    flat = torch.randint(0, 256, (sum(C * h * w for h, w in hw),), dtype=torch.uint8)
++    return {
++        "pixel_values": flat,
++        "image_grid_thw": torch.tensor([[1, 4, 4], [1, 2, 4]]),
++        "image_hw": torch.tensor(hw),
++    }
++
++
++def _instrument_preprocess(stub):
++    calls = []
++    orig = stub._resize_and_patchify
++
++    def wrapped(image_input, grid_thw):
++        calls.append(image_input["pixel_values"].numel())
++        return orig(image_input, grid_thw)
++
++    stub._resize_and_patchify = wrapped
++    return calls
++
++
++def test_select_slices_raw_payload_before_preprocess():
++    """Each sub-batch selection must preprocess only its own items, not the
++    whole batch (two images split into two sub-batches -> two resizes)."""
++    stub = _StubVLModel()
++    seen = _instrument_preprocess(stub)
++    mm_kwargs = _raw_image_mm_kwargs()
++
++    first = stub.select_encoder_cudagraph_items(mm_kwargs, [0])
++    assert seen == [C * 56 * 56]  # only image 0
++    assert first["pixel_values"].shape == (4 * 4, PATCH_DIM)
++    assert first[_DEVICE_PREPROCESS_DONE]
++
++    second = stub.select_encoder_cudagraph_items(mm_kwargs, [1])
++    assert seen == [C * 56 * 56, C * 28 * 56]  # only image 1
++    assert second["pixel_values"].shape == (2 * 4, PATCH_DIM)
++
++
++def test_select_raw_empty_indices():
++    stub = _StubVLModel()
++    seen = _instrument_preprocess(stub)
++    out = stub.select_encoder_cudagraph_items(_raw_image_mm_kwargs(), [])
++    assert seen == []
++    assert out["pixel_values"].shape == (0, PATCH_DIM)
++    assert out["image_grid_thw"] == []
++
++
++def test_select_repack_never_renormalizes():
++    """The DP path re-selects from an already-selected dict: the raw branch is
++    not retried and normalization is applied exactly once."""
++    stub = _StubVLModel()
++    mm_kwargs = _raw_image_mm_kwargs()
++
++    selected = stub.select_encoder_cudagraph_items(mm_kwargs, [0, 1])
++    assert stub.counting_norm.calls == 1
++
++    # Repack the already-processed sub-batch (image-format dict, marker set).
++    repacked = stub.select_encoder_cudagraph_items(selected, [1])
++    assert stub.counting_norm.calls == 1  # no second normalization
++    torch.testing.assert_close(
++        repacked["pixel_values"],
++        selected["pixel_values"][16:],  # image 1 occupies patches 16..23
++    )
++
++
++def test_select_stock_images_normalized_exactly_once():
++    """Stock patchified inputs (e.g. do_resize=False fallback) arrive
++    unnormalized when mm_device_do_normalize is enabled; the selector
++    normalizes once and re-packing does not normalize again."""
++    torch.manual_seed(0)
++    stub = _StubVLModel(device_do_normalize=True)
++    raw = torch.randint(0, 256, (24, PATCH_DIM), dtype=torch.float32)
++    mm_kwargs = {
++        "pixel_values": raw,
++        "image_grid_thw": torch.tensor([[1, 4, 4], [1, 2, 4]]),
++    }
++    selected = stub.select_encoder_cudagraph_items(mm_kwargs, [0])
++    assert stub.counting_norm.calls == 1
++    expected = stub.counting_norm.inner(raw[:16], torch.float32)
++    torch.testing.assert_close(selected["pixel_values"], expected)
++    assert selected[_DEVICE_PREPROCESS_DONE]
++
++    repacked = stub.select_encoder_cudagraph_items(selected, [0])
++    assert stub.counting_norm.calls == 1
++    torch.testing.assert_close(repacked["pixel_values"], selected["pixel_values"])
++
++
++def test_select_stock_images_flag_off_skips_normalization():
++    """mm_device_do_normalize disabled: CPU already normalized; the selector
++    must pass the patches through untouched."""
++    torch.manual_seed(0)
++    stub = _StubVLModel(device_do_normalize=False)
++    raw = torch.randn(24, PATCH_DIM)
++    mm_kwargs = {
++        "pixel_values": raw,
++        "image_grid_thw": torch.tensor([[1, 4, 4], [1, 2, 4]]),
++    }
++    selected = stub.select_encoder_cudagraph_items(mm_kwargs, [1])
++    assert stub.counting_norm.calls == 0
++    torch.testing.assert_close(selected["pixel_values"], raw[16:])
++
++
++def test_select_videos_normalized_exactly_once():
++    """Video patches are normalized exactly once across selection and
++    re-packing (graph replay and eager fallback reuse the selected dict)."""
++    torch.manual_seed(0)
++    stub = _StubVLModel(device_do_normalize=True)
++    raw = torch.randint(0, 256, (24, PATCH_DIM), dtype=torch.float32)
++    mm_kwargs = {
++        "pixel_values_videos": raw,
++        "video_grid_thw": torch.tensor([[1, 4, 4], [1, 2, 4]]),
++    }
++    selected = stub.select_encoder_cudagraph_items(mm_kwargs, [0, 1])
++    assert stub.counting_norm.calls == 1
++    expected = stub.counting_norm.inner(raw, torch.float32)
++    torch.testing.assert_close(selected["pixel_values_videos"], expected)
++
++    # Nested selection (replay buffers / eager fallback / DP re-pack).
++    repacked = stub.select_encoder_cudagraph_items(selected, [1])
++    assert stub.counting_norm.calls == 1
++    torch.testing.assert_close(repacked["pixel_values_videos"], selected["pixel_values_videos"][16:])
++
++
++def test_select_videos_flag_off_skips_normalization():
++    torch.manual_seed(0)
++    stub = _StubVLModel(device_do_normalize=False)
++    raw = torch.randn(24, PATCH_DIM)
++    mm_kwargs = {
++        "pixel_values_videos": raw,
++        "video_grid_thw": torch.tensor([[1, 2, 4]]),
++    }
++    selected = stub.select_encoder_cudagraph_items(mm_kwargs, [0])
++    assert stub.counting_norm.calls == 0
++    torch.testing.assert_close(selected["pixel_values_videos"], raw[: 2 * 4])
++
++
++# ---------------------------------------------------------------------------
++# Eager path: normalize exactly once in every configuration
++# ---------------------------------------------------------------------------
++
++
++def test_process_image_input_raw_path_normalizes_once():
++    stub = _StubVLModel()
++    stub._run_visual = lambda pixel_values, grid_thw: pixel_values
++    seen = _instrument_preprocess(stub)
++    out = stub._process_image_input(
++        {
++            "type": "pixel_values",
++            "pixel_values": torch.randint(0, 256, (C * 56 * 56,), dtype=torch.uint8),
++            "image_grid_thw": torch.tensor([[1, 4, 4]]),
++            "image_hw": torch.tensor([[56, 56]]),
++        }
++    )
++    assert seen == [C * 56 * 56]
++    assert stub.counting_norm.calls == 1
++    assert out.shape == (16, PATCH_DIM)
++
++
++def test_process_image_input_stock_path_normalizes_once():
++    """Stock patches (device normalize on -> CPU skipped rescale/normalize):
++    the model-side normalizer must run exactly once."""
++    stub = _StubVLModel(device_do_normalize=True)
++    stub._run_visual = lambda pixel_values, grid_thw: pixel_values
++    raw = torch.randint(0, 256, (16, PATCH_DIM), dtype=torch.float32)
++    out = stub._process_image_input(
++        {
++            "type": "pixel_values",
++            "pixel_values": raw,
++            "image_grid_thw": torch.tensor([[1, 4, 4]]),
++            "image_hw": None,
++        }
++    )
++    assert stub.counting_norm.calls == 1
++    expected = stub.counting_norm.inner(raw, torch.float32)
++    torch.testing.assert_close(out, expected)
++
++
++def test_process_video_input_normalizes_once():
++    stub = _StubVLModel()
++    stub._run_visual = lambda pixel_values, grid_thw: pixel_values
++    raw = torch.randint(0, 256, (8, PATCH_DIM), dtype=torch.float32)
++    stub._process_video_input(
++        {
++            "type": "pixel_values_videos",
++            "pixel_values_videos": raw,
++            "video_grid_thw": torch.tensor([[1, 2, 4]]),
++        }
++    )
++    assert stub.counting_norm.calls == 1
++
++
++def test_resize_and_patchify_empty_input():
++    stub = _StubVLModel()
++    out = stub._resize_and_patchify(
++        {
++            "pixel_values": torch.zeros(0, dtype=torch.uint8),
++            "image_hw": torch.zeros((0, 2), dtype=torch.long),
++        },
++        torch.zeros((0, 3), dtype=torch.long),
++    )
++    assert out.shape == (0, PATCH_DIM)
+diff --git a/vllm_ascend/models/__init__.py b/vllm_ascend/models/__init__.py
+index 955c0261d..2289b838e 100644
+--- a/vllm_ascend/models/__init__.py
++++ b/vllm_ascend/models/__init__.py
+@@ -72,6 +72,17 @@ def register_model():
+     ModelRegistry.register_model("DeepSeekMTPModel", "vllm_ascend.models.deepseek_mtp:AscendDeepSeekMTP")
+     ModelRegistry.register_model("DeepseekV32MTPModel", "vllm_ascend.models.deepseek_mtp:AscendDeepSeekMTP")
+     ModelRegistry.register_model("GlmMoeDsaForCausalLM", "vllm_ascend.models.deepseek_mtp:AscendGlmMoeDsaForCausalLM")
++    # Ascend Qwen3.5-VL: NPU-side image preprocessing (resize/patchify +
++    # fused rescale/normalize); overwrites the upstream architecture mapping,
++    # same pattern as AscendDeepseekV4ForConditionalGeneration (see PR #15457).
++    ModelRegistry.register_model(
++        "Qwen3_5ForConditionalGeneration",
++        "vllm_ascend.models.qwen3_5_vl:AscendQwen3_5ForConditionalGeneration",
++    )
++    ModelRegistry.register_model(
++        "Qwen3_5MoeForConditionalGeneration",
++        "vllm_ascend.models.qwen3_5_vl:AscendQwen3_5MoeForConditionalGeneration",
++    )
+     ModelRegistry.register_model(
+         "Eagle3LlamaForCausalLM", "vllm_ascend.models.llama_eagle3:AscendEagle3LlamaForCausalLM"
+     )
+diff --git a/vllm_ascend/models/qwen3_5_vl.py b/vllm_ascend/models/qwen3_5_vl.py
+new file mode 100644
+index 000000000..a08c4e89c
+--- /dev/null
++++ b/vllm_ascend/models/qwen3_5_vl.py
+@@ -0,0 +1,402 @@
++#
++# Copyright (c) 2026 Huawei Technologies Co., Ltd. All Rights Reserved.
++# This file is a part of the vllm-ascend project.
++#
++# Licensed under the Apache License, Version 2.0 (the "License");
++# you may not use this file except in compliance with the License.
++# You may obtain a copy of the License at
++#
++#     http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS,
++# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++# See the License for the specific language governing permissions and
++# limitations under the License.
++# mypy: ignore-errors
++"""Ascend Qwen3.5-VL: offload image preprocessing to the NPU.
++
++When active, the front-end emits flat raw uint8 plus the original (H, W) and
++the target grid; resize, patchify and rescale+normalize all run on the device.
++Normalize reuses vLLM's fused mm input norm. smart_resize stays on the CPU so
++placeholder accounting is unchanged. Payload drops ~8x (uint8, no temporal
++replication).
++
++The raw-pixel path is only taken when the effective processor settings match
++what the device pipeline implements (resize enabled, bicubic resample,
++uint8-only input, and mm_device_do_normalize enabled so the CPU skips
++rescale/normalize). Any other configuration -- device normalization disabled
++(e.g. --multimodal-config mm_device_do_normalize=false), do_resize=False, a
++non-bicubic resample filter, or non-uint8 (floating-point) pixels -- falls
++back to the complete stock CPU pipeline, and the emitted keys (no
++``image_hw``) tell the field config and the model to keep the stock
++behaviour as well, so rescale+normalize is applied exactly once in every
++configuration.
++
++Encoder ACL graph path: sub-batch selection slices the raw payloads first and
++preprocesses only the selected items, so resize/patchify/normalize run exactly
++once per item no matter how many sub-batches or capture paths consume it.
++"""
++
++import torch
++import torch.nn.functional as F
++from PIL import Image
++from transformers.image_processing_utils import BatchFeature
++from transformers.models.qwen2_vl.image_processing_qwen2_vl import (
++    Qwen2VLImageProcessor,
++    smart_resize,
++)
++from vllm.model_executor.layers.fusion.mm_input_norm import build_mm_input_norm
++from vllm.model_executor.models.qwen3_5 import (
++    Qwen3_5ForConditionalGeneration,
++    Qwen3_5MoeForConditionalGeneration,
++    Qwen3_5MoeProcessingInfo,
++    Qwen3_5ProcessingInfo,
++)
++from vllm.model_executor.models.qwen3_vl import (
++    Qwen3VLDummyInputsBuilder,
++    Qwen3VLMultiModalProcessor,
++)
++from vllm.model_executor.models.vision import run_dp_sharded_mrope_vision_model
++from vllm.multimodal import MULTIMODAL_REGISTRY
++from vllm.multimodal.inputs import MultiModalFieldConfig
++
++# Marker stored in the mm_kwargs dicts produced by select_encoder_cudagraph_items
++# once device-side preprocessing has been applied. The graph manager re-packs
++# sub-batches (and the DP path re-selects rank-local subsets), so without this
++# marker a nested selection would normalize the patches a second time.
++_DEVICE_PREPROCESS_DONE = "_ascend_device_preprocess_done"
++
++
++def _all_uint8(images) -> bool:
++    """The device pipeline quantizes pixels with clamp+round, which would
++    alter valid floating-point values (e.g. 128.4 -> 128); only uint8 inputs
++    may take the raw path, everything else keeps the stock CPU pipeline."""
++    for image in images:
++        dtype = image.dtype
++        if torch.is_tensor(image):
++            if dtype != torch.uint8:
++                return False
++        elif str(dtype) != "uint8":  # numpy arrays
++            return False
++    return True
++
++
++class AscendQwen2VLImageProcessor(Qwen2VLImageProcessor):
++    """Emit flat raw uint8 + original (H, W) + target grid; skip everything else.
++
++    Falls back to the stock CPU pipeline whenever the effective settings are
++    not what the device pipeline implements (see the class docstring above).
++    """
++
++    def _preprocess(
++        self,
++        images,
++        do_resize,
++        size,
++        resample,
++        do_rescale,
++        rescale_factor,
++        do_normalize,
++        image_mean,
++        image_std,
++        patch_size,
++        temporal_patch_size,
++        merge_size,
++        disable_grouping,
++        return_tensors,
++        **kwargs,
++    ):
++        if (
++            not do_resize
++            or do_rescale
++            or do_normalize
++            or resample != Image.Resampling.BICUBIC
++            or not _all_uint8(images)
++        ):
++            # Unsupported or non-default settings: do_resize disabled (the
++            # grid must come from the original resolution), a non-bicubic
++            # resample filter (the device path hardcodes bicubic+antialias),
++            # device normalization disabled (mm_device_do_normalize off
++            # leaves do_rescale/do_normalize enabled, so the CPU must run the
++            # full pipeline), or non-uint8 (floating-point) pixels that the
++            # device path's clamp+round quantization would alter. Keep the
++            # stock behaviour so grids, values and token counts match
++            # upstream exactly.
++            return Qwen2VLImageProcessor._preprocess(
++                self,
++                images,
++                do_resize,
++                size,
++                resample,
++                do_rescale,
++                rescale_factor,
++                do_normalize,
++                image_mean,
++                image_std,
++                patch_size,
++                temporal_patch_size,
++                merge_size,
++                disable_grouping,
++                return_tensors,
++                **kwargs,
++            )
++        flats, grids, hws = [], [], []
++        for image in images:  # (C, H, W) uint8 at original resolution
++            _, h, w = image.shape
++            rh, rw = smart_resize(
++                h, w, factor=patch_size * merge_size, min_pixels=size.shortest_edge, max_pixels=size.longest_edge
++            )
++            grids.append([1, rh // patch_size, rw // patch_size])
++            hws.append([h, w])
++            flats.append(image.reshape(-1).contiguous())
++        return BatchFeature(
++            data={
++                "pixel_values": torch.cat(flats),
++                "image_grid_thw": torch.tensor(grids, dtype=torch.long),
++                "image_hw": torch.tensor(hws, dtype=torch.long),
++            },
++            tensor_type=return_tensors,
++        )
++
++
++class _AscendProcessorMixin:
++    def get_hf_processor(self, **kwargs):
++        # Install the raw-pixel image processor unconditionally: its
++        # _preprocess falls back to the stock pipeline per call whenever the
++        # effective settings are not supported (mm_device_do_normalize off,
++        # do_resize=False, non-bicubic resample, non-uint8 pixels), so the
++        # swap is inert there. mm_device_do_normalize=false (per-engine,
++        # shared by processor and worker) restores the complete stock CPU
++        # pipeline; the worker follows the emitted keys.
++        processor = super().get_hf_processor(**kwargs)
++        if processor.image_processor.__class__ is not AscendQwen2VLImageProcessor:
++            processor.image_processor.__class__ = AscendQwen2VLImageProcessor
++        return processor
++
++
++class AscendQwen3_5ProcessingInfo(_AscendProcessorMixin, Qwen3_5ProcessingInfo):
++    pass
++
++
++class AscendQwen3_5MoeProcessingInfo(_AscendProcessorMixin, Qwen3_5MoeProcessingInfo):
++    pass
++
++
++class AscendQwen3_5VLProcessor(Qwen3VLMultiModalProcessor):
++    def _get_mm_fields_config(self, hf_inputs, hf_processor_mm_kwargs):
++        config = dict(super()._get_mm_fields_config(hf_inputs, hf_processor_mm_kwargs))
++        if "image_hw" not in hf_inputs:
++            # Stock CPU pipeline (offload disabled, or unsupported processor
++            # settings): keep the stock field mapping.
++            return config
++        channel = self.info.get_hf_config().vision_config.in_channels
++        image_hw = hf_inputs["image_hw"]
++        config["pixel_values"] = MultiModalFieldConfig.flat_from_sizes("image", image_hw.prod(-1) * channel)
++        config["image_hw"] = MultiModalFieldConfig.batched("image", keep_on_cpu=True)
++        return config
++
++
++class _AscendVLPreprocessMixin:
++    """Device-side resize/patchify + normalize for Qwen3.5-VL."""
++
++    supports_mm_device_do_normalize = True
++
++    def __init__(self, *, vllm_config, prefix="model"):
++        super().__init__(vllm_config=vllm_config, prefix=prefix)
++        self.input_norm = build_mm_input_norm(self.model_config)
++        vc = self.config.vision_config
++        self._c = vc.in_channels
++        self._ps = vc.patch_size
++        self._tps = vc.temporal_patch_size
++        self._ms = vc.spatial_merge_size
++
++    @property
++    def _device_do_normalize(self) -> bool:
++        return bool(self.model_config.multimodal_config.mm_device_do_normalize)
++
++    def _resize_and_patchify(self, image_input, grid_thw):
++        """Flat raw uint8 -> per-image resize -> patchify -> concat patches."""
++        # Upload the uint8 payload once and upcast in a single vectorized op:
++        # CANN's antialias bicubic kernel rejects uint8 anyway (the float
++        # kernel differs slightly from the HF/PIL one), and one cast kernel
++        # beats one per image inside the loop.
++        flat = image_input["pixel_values"].to(self.visual.device, non_blocking=True).float()
++        hw_list = image_input["image_hw"].tolist()
++        c, ps, tps, ms = self._c, self._ps, self._tps, self._ms
++        sizes = [c * h * w for h, w in hw_list]
++        chunks = flat.split(sizes) if sizes else []
++        patches = []
++        for chunk, (h, w), (_, gh, gw) in zip(chunks, hw_list, grid_thw.tolist()):
++            img = chunk.reshape(1, c, h, w)
++            # bicubic + antialias reproduces HF/PIL resize (cosine sim
++            # 0.999996); clamp+round replicate the original uint8
++            # quantization.
++            img = F.interpolate(img, size=[gh * ps, gw * ps], mode="bicubic", align_corners=False, antialias=True)
++            img = img.clamp(0, 255).round().squeeze(0)
++            # patchify: (C, rh, rw) -> (gh*gw, C*tps*ps*ps), HF layout.
++            # Drop the batch dim before unsqueeze/expand: keeping it (as HF's
++            # batched patchify does) creates a 9-D tensor, which CANN rejects
++            # ("self tensor cannot be larger than 8 dimensions").
++            x = img.reshape(c, gh // ms, ms, ps, gw // ms, ms, ps)
++            x = x.permute(1, 4, 2, 5, 0, 3, 6)
++            x = x.unsqueeze(5).expand(-1, -1, -1, -1, -1, tps, -1, -1)
++            patches.append(x.reshape(gh * gw, c * tps * ps * ps))
++        if not patches:
++            # Empty batch (e.g. profiling with no images): torch.cat([]) raises.
++            return flat.new_empty((0, c * tps * ps * ps))
++        return torch.cat(patches)
++
++    def _parse_and_validate_image_input(self, **kwargs):
++        pixel_values = kwargs.pop("pixel_values", None)
++        image_embeds = kwargs.pop("image_embeds", None)
++        image_grid_thw = kwargs.pop("image_grid_thw", None)
++        if pixel_values is None and image_embeds is None:
++            return None
++        if pixel_values is not None:
++            return {
++                "type": "pixel_values",
++                "pixel_values": pixel_values,
++                "image_grid_thw": image_grid_thw,
++                "image_hw": kwargs.pop("image_hw", None),
++            }
++        return {
++            "type": "image_embeds",
++            "image_embeds": image_embeds,
++            "image_grid_thw": image_grid_thw,
++        }
++
++    def _run_visual(self, pixel_values, grid_thw):
++        """Shared tail: optional DP sharding, then ViT forward, then split."""
++        if self.use_data_parallel:
++            return run_dp_sharded_mrope_vision_model(self.visual, pixel_values, grid_thw.tolist(), rope_type="rope_3d")
++        embeds = self.visual(pixel_values, grid_thw=grid_thw)
++        sizes = (grid_thw.prod(-1) // self._ms // self._ms).tolist()
++        return embeds.split(sizes)
++
++    def select_encoder_cudagraph_items(self, mm_kwargs, indices):
++        """Slice the raw payloads BEFORE preprocessing.
++
++        With cudagraph_mm_encoder enabled, the graph manager packs sub-batches
++        (and the DP path re-selects rank-local subsets), calling this hook once
++        per sub-batch. Preprocessing inside _get_pixel_values_by_modality would
++        re-run resize/patchify/normalize on the whole batch for every
++        sub-batch. Instead, slice first and preprocess only the selected items,
++        then mark the result so nested selections pass it through unchanged.
++        Downstream consumers (replay buffers, eager forward) receive
++        graph-ready patches, exactly like the stock selector's output.
++        """
++        if "image_hw" in mm_kwargs:
++            # Raw flat uint8: element offsets are (C*H*W) per item, not patch
++            # counts, so the stock slicing logic does not apply.
++            flat = mm_kwargs["pixel_values"]
++            hw_list = mm_kwargs["image_hw"].tolist()
++            grid_thw = self._get_grid_thw_by_modality(mm_kwargs)
++            selected_hw = [hw_list[i] for i in indices]
++            selected_grid = [grid_thw[i] for i in indices]
++            if not indices:
++                # Nothing selected: skip preprocessing entirely.
++                return {
++                    "pixel_values": torch.empty(
++                        (0, self._c * self._tps * self._ps * self._ps),
++                        dtype=self.visual.dtype,
++                        device=self.visual.device,
++                    ),
++                    "image_grid_thw": [],
++                    _DEVICE_PREPROCESS_DONE: True,
++                }
++            c = self._c
++            sizes = [c * h * w for h, w in hw_list]
++            cum = [0]
++            for s in sizes:
++                cum.append(cum[-1] + s)
++            selected_flat = torch.cat([flat[cum[i] : cum[i + 1]] for i in indices])
++            image_input = {
++                "type": "pixel_values",
++                "pixel_values": selected_flat,
++                "image_grid_thw": torch.tensor(selected_grid, dtype=torch.long),
++                "image_hw": torch.tensor(selected_hw, dtype=torch.long),
++            }
++            patches = self._resize_and_patchify(image_input, image_input["image_grid_thw"])
++            pixel_values = self.input_norm(patches, self.visual.dtype)
++            return {
++                "pixel_values": pixel_values,
++                "image_grid_thw": selected_grid,
++                _DEVICE_PREPROCESS_DONE: True,
++            }
++        # Stock image patches / video patches: slice by patch counts exactly
++        # like the upstream selector, then apply device-side normalization
++        # once (with mm_device_do_normalize enabled the CPU processor ran
++        # with do_rescale/do_normalize disabled).
++        modality = self.get_input_modality(mm_kwargs)
++        pv_key, grid_key = (
++            ("pixel_values", "image_grid_thw") if modality == "image" else ("pixel_values_videos", "video_grid_thw")
++        )
++        pixel_values = mm_kwargs[pv_key]
++        grid_thw = self._get_grid_thw_by_modality(mm_kwargs)
++        patches_per_item = [t * h * w for t, h, w in grid_thw]
++        cum_patches = [0]
++        for p in patches_per_item:
++            cum_patches.append(cum_patches[-1] + p)
++        selected_pv = (
++            torch.cat([pixel_values[cum_patches[i] : cum_patches[i + 1]] for i in indices])
++            if indices
++            else pixel_values[:0]
++        )
++        selected_grid = [grid_thw[i] for i in indices]
++        if indices and not mm_kwargs.get(_DEVICE_PREPROCESS_DONE) and self._device_do_normalize:
++            selected_pv = self.input_norm(selected_pv, self.visual.dtype)
++        return {
++            pv_key: selected_pv,
++            grid_key: selected_grid,
++            _DEVICE_PREPROCESS_DONE: True,
++        }
++
++    def _process_image_input(self, image_input):
++        grid_thw = image_input["image_grid_thw"]
++        if image_input["type"] == "image_embeds":
++            embeds = image_input["image_embeds"].type(self.visual.dtype)
++            sizes = (grid_thw.prod(-1) // self._ms // self._ms).tolist()
++            return embeds.split(sizes)
++        if image_input.get("image_hw") is not None:
++            # Raw uint8 payload from the Ascend processor: resize, patchify
++            # and normalize on device (exactly once).
++            patches = self._resize_and_patchify(image_input, grid_thw)
++            pixel_values = self.input_norm(patches, self.visual.dtype)
++        else:
++            # Stock patchified input. When mm_device_do_normalize is enabled
++            # the CPU processor ran with do_rescale/do_normalize disabled, so
++            # the normalizer (identity when the feature is off) runs here
++            # instead -- rescale+normalize happens exactly once either way.
++            pixel_values = self.input_norm(image_input["pixel_values"], self.visual.dtype)
++        return self._run_visual(pixel_values, grid_thw)
++
++    def _process_video_input(self, video_input):
++        grid_thw = video_input["video_grid_thw"]
++        if video_input["type"] == "video_embeds":
++            embeds = video_input["video_embeds"].type(self.visual.dtype)
++            sizes = (grid_thw.prod(-1) // self._ms // self._ms).tolist()
++            return embeds.split(sizes)
++        # With mm_device_do_normalize enabled the CPU video processor ran
++        # with do_rescale/do_normalize disabled; the normalizer (identity
++        # when the feature is off) runs here exactly once.
++        pixel_values = self.input_norm(video_input["pixel_values_videos"], self.visual.dtype)
++        return self._run_visual(pixel_values, grid_thw)
++
++
++@MULTIMODAL_REGISTRY.register_processor(
++    AscendQwen3_5VLProcessor,
++    info=AscendQwen3_5ProcessingInfo,
++    dummy_inputs=Qwen3VLDummyInputsBuilder,
++)
++class AscendQwen3_5ForConditionalGeneration(_AscendVLPreprocessMixin, Qwen3_5ForConditionalGeneration):
++    pass
++
++
++@MULTIMODAL_REGISTRY.register_processor(
++    AscendQwen3_5VLProcessor,
++    info=AscendQwen3_5MoeProcessingInfo,
++    dummy_inputs=Qwen3VLDummyInputsBuilder,
++)
++class AscendQwen3_5MoeForConditionalGeneration(_AscendVLPreprocessMixin, Qwen3_5MoeForConditionalGeneration):
++    pass

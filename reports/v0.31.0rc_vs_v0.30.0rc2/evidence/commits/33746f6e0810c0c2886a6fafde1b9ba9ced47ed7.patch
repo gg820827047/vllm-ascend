@@ -1,0 +1,202 @@
+commit 33746f6e0810c0c2886a6fafde1b9ba9ced47ed7
+Author:     ckeyever <ckey_ever@163.com>
+AuthorDate: Wed Oct 21 11:07:20 2026 +0800
+Commit:     GitHub <noreply@github.com>
+CommitDate: Wed Oct 21 11:07:20 2026 +0800
+
+    [BugFix][KV Pool] Log actual Mooncake SSD directories and cover multi-DP startup (#19167)
+    
+    ### What this PR does / why we need it?
+    
+    With Mooncake SSD offload enabled, each worker passes a rank-specific
+    directory to `store.setup()`, but the initialization log prints only the
+    configured root. Multiple DP workers therefore appear to use the same
+    directory, obscuring which path to inspect when diagnosing `storage_path
+    already held by another live client`.
+    
+    Log the actual `rank_<global_rank>` directory, document local SSD
+    ownership and client-side lock diagnostics, and add a DP=2 startup
+    regression covering shared TransferEngine, Fabric Memory, and
+    independent TransferEngine paths. The test checks worker directory
+    isolation, scheduler exclusion, tenant forwarding, and actual-path logs
+    with a backend double that rejects duplicate owners.
+    
+    The scheduler SSD registration guard is already on main through #18238.
+    This PR preserves that guard and adds the remaining logging,
+    diagnostics, and multi-client coverage.
+    
+    ### Does this PR introduce _any_ user-facing change?
+    
+    Yes. The SSD initialization log includes the worker's actual rank
+    subdirectory instead of only the configured root. No configuration
+    changes are required.
+    
+    ### How was this patch tested?
+    
+    - `python -m unittest tests.ut.distributed.ascend_store.test_backend
+    -q`: **131 tests passed** on a CPU host with the repository's mocked
+    NPU/Mooncake dependencies.
+    - Restoring the previous root-only log in memory makes the new
+    regression fail in all three setup modes; the changed implementation
+    passes.
+    - Ruff check and Ruff format check passed for both changed Python files.
+    - `git diff --check` passed.
+    - `bash format.sh ci` could not run because `pre-commit` is not
+    installed locally. Full repository lint remains for CI.
+    - A live Mooncake/NPU service startup was not run locally.
+    
+    ---
+    
+    ### Checklist
+    
+    #### Testing
+    
+    - [x] **Boundary / edge-case coverage**: Two co-located DP replicas,
+    scheduler-only clients, worker directories, tenant forwarding, and all
+    three setup paths.
+    - [x] **Regression test**: The test fails with the previous root-only
+    SSD log.
+    - [ ] **Error / failure path coverage**: No new exception handling is
+    introduced; the backend double rejects duplicate directory ownership.
+    - [x] **Meaningful & reliable tests**: Assert setup arguments, actual
+    directories, directory ownership, and emitted paths.
+    - [ ] **Performance impact**: No hot-path or performance change; no
+    benchmark was run.
+    
+    - vLLM main:
+    https://github.com/vllm-project/vllm/commit/a98247ab4db686ee03c66d5feb3c761e52a2f8ab
+    
+    ---------
+    
+    Signed-off-by: ckey_Dou <ckey.chengbin@huawei.com>
+    Co-authored-by: ckey_Dou <ckey.chengbin@huawei.com>
+
+diff --git a/docs/source/user_guide/feature_guide/kv_cache_pool_ascend_store.md b/docs/source/user_guide/feature_guide/kv_cache_pool_ascend_store.md
+index 6daa43d82..2fd7e3edc 100644
+--- a/docs/source/user_guide/feature_guide/kv_cache_pool_ascend_store.md
++++ b/docs/source/user_guide/feature_guide/kv_cache_pool_ascend_store.md
+@@ -494,6 +494,10 @@ mooncake_master \
+ 
+ `offload_on_evict` defaults to `false`. When enabled, eviction queues objects without a `LOCAL_DISK` replica for offload and pins one memory replica while offload is pending. Keep `offload_force_evict=false` to defer eviction when offload cannot be queued. On Mooncake builds that expose `offloading_queue_limit`, increase the pending-object limit per local disk segment as needed (for example, `--offloading_queue_limit=200000`), and leave DRAM headroom for pending writes.
+ 
++Only worker clients own local SSD storage. Each worker uses `ssd_offload_path/rank_<global_rank>/`, where the global rank includes the DP offset and TP/PP/CP ranks. Scheduler clients do not enable local SSD offload. In a single-node DP=2 deployment, both replicas can use the same `mooncake.json`: their workers use distinct rank subdirectories and their schedulers do not claim the shared root directory. Separate vLLM services whose global ranks overlap must use different `ssd_offload_path` roots.
++
++If startup reports `storage_path already held by another live client`, another client holds the local directory lock. This message comes from Mooncake's client-side bucket backend. Check the Mooncake package and native libraries loaded by vLLM and the live clients using the reported directory; the `mooncake_master` version alone does not identify the client's locking implementation. The `Mooncake SSD offload enabled` log reports the actual worker subdirectory. See the [Mooncake SSD ownership contract](https://kvcache-ai.github.io/Mooncake/design/store/ssd-offload.html#bucketstoragebackend-default).
++
+ SSD disk usage control environment variables:
+ 
+ ```shell
+diff --git a/tests/ut/distributed/ascend_store/test_backend.py b/tests/ut/distributed/ascend_store/test_backend.py
+index f4204cbf5..7a04d1212 100644
+--- a/tests/ut/distributed/ascend_store/test_backend.py
++++ b/tests/ut/distributed/ascend_store/test_backend.py
+@@ -22,6 +22,7 @@ import tempfile
+ import unittest
+ from contextlib import ExitStack
+ from types import SimpleNamespace
++from typing import Any
+ from unittest.mock import MagicMock, call, patch
+ 
+ import tests.ut.distributed.ascend_store._mock_deps  # noqa: F401, E402
+@@ -383,7 +384,7 @@ class TestMooncakeBackendSetup(unittest.TestCase):
+         backend._contribute_memory = contribute_memory
+         return backend
+ 
+-    def _setup_store(self, backend: MooncakeBackend, store: MagicMock):
++    def _setup_store(self, backend: MooncakeBackend, store: MagicMock, global_rank: int = 3):
+         transfer_engine = MagicMock()
+         transfer_engine.get_rpc_port.return_value = 50052
+         fake_store_module = sys.modules["mooncake.store"]
+@@ -396,7 +397,7 @@ class TestMooncakeBackendSetup(unittest.TestCase):
+             ),
+             patch(f"{self._MODULE_PATH}.get_ip", return_value="10.0.0.7"),
+             patch(f"{self._MODULE_PATH}.global_te") as mock_global_te,
+-            patch(f"{self._MODULE_PATH}.get_global_rank", return_value=3),
++            patch(f"{self._MODULE_PATH}.get_global_rank", return_value=global_rank),
+             patch(
+                 f"{self._MODULE_PATH}._mooncake_setup_supports_ssd_offload",
+                 return_value=True,
+@@ -405,6 +406,70 @@ class TestMooncakeBackendSetup(unittest.TestCase):
+             mock_global_te.get_transfer_engine.return_value = transfer_engine
+             return backend._setup_store()
+ 
++    def test_dp_clients_use_distinct_ssd_paths_and_log_actual_directories(self):
++        for use_fabric_mem, use_store_independent_te in ((False, False), (True, False), (False, True)):
++            with (
++                self.subTest(use_fabric_mem=use_fabric_mem, use_store_independent_te=use_store_independent_te),
++                tempfile.TemporaryDirectory(prefix="mooncake_ssd_ut_") as ssd_path,
++                patch(f"{self._MODULE_PATH}.logger") as mock_logger,
++            ):
++                config = _make_mooncake_store_config(
++                    tenant_id="tenant-a",
++                    enable_ssd_offload=True,
++                    ssd_offload_path=ssd_path,
++                )
++                setup_calls: list[dict[str, Any]] = []
++                owned_paths: set[str] = set()
++
++                def setup(setup_calls=setup_calls, owned_paths=owned_paths, **kwargs):
++                    setup_calls.append(kwargs)
++                    if kwargs.get("enable_ssd_offload", False):
++                        path = kwargs["ssd_offload_path"]
++                        if path in owned_paths:
++                            return -1  # Mooncake rejects a second live owner.
++                        owned_paths.add(path)
++                    return 0
++
++                for dp_rank in range(2):
++                    for contribute_memory in (False, True):
++                        backend = self._make_backend(
++                            config=config,
++                            use_fabric_mem=use_fabric_mem,
++                            contribute_memory=contribute_memory,
++                        )
++                        backend._use_store_independent_te = use_store_independent_te
++                        store = MagicMock()
++                        store.setup.side_effect = setup
++                        self.assertIs(self._setup_store(backend, store, global_rank=dp_rank), store)
++
++                self.assertEqual(len(setup_calls), 4)
++                for scheduler_setup in setup_calls[::2]:
++                    self.assertEqual(scheduler_setup["global_segment_size"], 0)
++                    self.assertEqual(scheduler_setup["local_buffer_size"], 0)
++                    self.assertNotIn("enable_ssd_offload", scheduler_setup)
++                    self.assertNotIn("ssd_offload_path", scheduler_setup)
++                for rank, worker_setup in enumerate(setup_calls[1::2]):
++                    rank_path = os.path.join(ssd_path, f"rank_{rank}")
++                    self.assertTrue(worker_setup["enable_ssd_offload"])
++                    self.assertEqual(worker_setup["ssd_offload_path"], rank_path)
++                    self.assertGreater(worker_setup["global_segment_size"], 0)
++                    self.assertTrue(os.path.isdir(rank_path))
++                self.assertTrue(all(kwargs["tenant_id"] == "tenant-a" for kwargs in setup_calls))
++                self.assertEqual(owned_paths, {os.path.join(ssd_path, f"rank_{rank}") for rank in range(2)})
++                self.assertEqual(config.ssd_offload_path, ssd_path)
++                ssd_logs = [
++                    _format_log_call(log_call)
++                    for log_call in mock_logger.info.call_args_list
++                    if log_call.args[0] == "Mooncake SSD offload enabled (Mode A): path=%s"
++                ]
++                self.assertEqual(
++                    ssd_logs,
++                    [
++                        f"Mooncake SSD offload enabled (Mode A): path={os.path.join(ssd_path, f'rank_{rank}')}"
++                        for rank in range(2)
++                    ],
++                )
++
+     def test_setup_omits_default_tenant_for_all_memory_paths(self):
+         for use_fabric_mem in (False, True):
+             with self.subTest(use_fabric_mem=use_fabric_mem):
+diff --git a/vllm_ascend/distributed/kv_transfer/kv_pool/ascend_store/backend/mooncake_backend.py b/vllm_ascend/distributed/kv_transfer/kv_pool/ascend_store/backend/mooncake_backend.py
+index ce01249af..289bb1994 100644
+--- a/vllm_ascend/distributed/kv_transfer/kv_pool/ascend_store/backend/mooncake_backend.py
++++ b/vllm_ascend/distributed/kv_transfer/kv_pool/ascend_store/backend/mooncake_backend.py
+@@ -298,7 +298,7 @@ class MooncakeBackend(Backend):
+         if ssd_kwargs:
+             logger.info(
+                 "Mooncake SSD offload enabled (Mode A): path=%s",
+-                self.config.ssd_offload_path,
++                ssd_kwargs["ssd_offload_path"],
+             )
+         logger.info("Mooncake tenant_id=%s", self.config.tenant_id)
+         return store

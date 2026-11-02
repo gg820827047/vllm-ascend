@@ -1,0 +1,922 @@
+commit 432a3ddc54472fc78a4aead9482c333f765c4738
+Author:     z00995494 <1090005996@qq.com>
+AuthorDate: Mon Oct 12 19:35:15 2026 +0800
+Commit:     GitHub <noreply@github.com>
+CommitDate: Mon Oct 12 19:35:15 2026 +0800
+
+    [Feature][Compile] Fuse SP matmul with reduce-scatter (#18074)
+    
+    This PR restores the matmul + reduce-scatter (MMRS) fusion removed
+    during the FlashComm refactor, using standard FX `PatternMatcherPass`
+    passes.
+    
+    ## Native MMRS operator call
+    
+    The fusion replacements call `DeviceOperator.npu_mm_reduce_scatter_base`
+    directly. The native TorchNPU operator already supports FakeTensor/FX
+    shape propagation, so this PR does not register an additional
+    `torch.ops.vllm.npu_matmul_reduce_scatter` custom operator.
+    
+    The direct-call update was validated with 17 targeted unit tests. A
+    fresh TP=2 end-to-end run completed all 34 ACL Graph captures; health,
+    model listing, chat completion, and profiler endpoints returned HTTP
+    200. Both TP-rank traces contained 40 `npu_mm_reduce_scatter_base` /
+    `MatmulReduceScatterV2` calls.
+    ## Unit tests
+    
+    The six affected test files were run on CPU without requiring an NPU:
+    
+    ```text
+    188 passed, 1 skipped
+    ```
+    
+    ## End-to-end and profiler validation
+    
+    The fused path was validated on Ascend NPU with CANN 9.2 and
+    `torch-npu==2.10.0.post4` using:
+    
+    - Model: `Qwen3.5-35B-A3B`
+    - TP=2 with expert parallelism and FlashComm1 enabled
+    - `fuse_gemm_comms=true`
+    - `sp_min_token_num=1`
+    - `HCCL_BUFFSIZE=512`
+    - `HCCL_BUFFSIZE_EP=512`
+    
+    ACL Graph capture completed in the default `GLOBAL` mode. `/health`,
+    `/v1/chat/completions`, `/start_profile`, and `/stop_profile` returned
+    HTTP 200, including a long-context request with approximately 8K prompt
+    tokens.
+    
+    Torch profiler and `msprof op_summary` reported 5,120
+    `MatmulReduceScatterV2` events on each TP rank, confirming that the
+    fused operator executed. With `fuse_gemm_comms=false`, the SP-only
+    control profile contained standalone `hcom_reduceScatter` events and no
+    `MatmulReduceScatterV2` events.
+    
+    The exact `/mnt/weight/Qwen3.6-35B-A3B` path was not present in this
+    CANN 9.2 validation environment, so the functional and profiler
+    validation used `Qwen3.5-35B-A3B`.
+    
+    ## Accuracy test
+    
+    Accuracy was evaluated on GPQA Diamond using the same evaluation
+    settings for the SP-only baseline and MMRS fusion:
+    
+    | Configuration | GPQA Diamond accuracy |
+    |---|---:|
+    | SP-only baseline | 77.78 |
+    | MMRS fusion | 76.77 |
+    
+    The MMRS result is **1.01 percentage points lower** than the SP-only
+    baseline.
+    
+    ## Throughput test
+    
+    The end-to-end throughput comparison used:
+    
+    - Model: `Qwen3.6-35B-A3B`
+    - 8 Ascend NPUs with TP=8
+    - Input sequence length: 65,536
+    - Output sequence length: 64
+    - Concurrency: 64
+    
+    Compared with the SP-only configuration using separate GEMM and
+    ReduceScatter operations, MMRS fusion improved end-to-end throughput by
+    approximately **9%**.
+    
+    ## CANN software-stack compatibility
+    
+    The supported and validated stack for this PR is CANN 9.2 with
+    `torch-npu==2.10.0.post4`. On this stack, `MatmulReduceScatterV2` can be
+    captured in the default `GLOBAL` mode without prior MMRS warmup, a
+    capture-mode override, or additional communication-resource
+    initialization.
+    
+    On CANN 9.1, `MatmulReduceScatterV2` performs a synchronous `rtMemcpy`
+    on every invocation. `GLOBAL` ACL Graph capture rejects this operation
+    with:
+    
+    ```text
+    Synchronous memory copy failed.
+    This operation is supported only in RELAXED mode.
+    The mode set by aclmdlRICaptureBegin is GLOBAL(0).
+    ```
+    
+    Same-shape eager warmup does not resolve the failure because the
+    synchronous copy is still performed during capture. This is therefore
+    not a one-time communication-resource initialization issue.
+    
+    | CANN version | MMRS warmup | Capture mode | Result |
+    |---|---|---|---|
+    | 9.1 | None | `GLOBAL` | Failed |
+    | 9.1 | Same-shape eager warmup | `GLOBAL` | Failed |
+    | 9.1 | None | `RELAXED` | Capture and replay passed |
+    | 9.2 | None | `GLOBAL` | Capture and replay passed |
+    
+    For CANN 9.1, users should upgrade to CANN 9.2 or later, disable MMRS
+    fusion with `fuse_gemm_comms=false`, or use `RELAXED` capture for graphs
+    containing MMRS.
+    
+    
+    
+    - vLLM main:
+    https://github.com/vllm-project/vllm/commit/8cc9aa5ad350f6f80cf3bebb298d410803ff75a9
+    
+    ---------
+    
+    Signed-off-by: zengzihang <z00995494@china.huawei.com>
+    Signed-off-by: z00995494 <1090005996@qq.com>
+    Co-authored-by: zengzihang <z00995494@china.huawei.com>
+
+diff --git a/docs/source/user_guide/feature_guide/sequence_parallelism.md b/docs/source/user_guide/feature_guide/sequence_parallelism.md
+index 70ac8aec2..44ca8f3f6 100644
+--- a/docs/source/user_guide/feature_guide/sequence_parallelism.md
++++ b/docs/source/user_guide/feature_guide/sequence_parallelism.md
+@@ -48,6 +48,17 @@ Steps to follow to enable SP currently:
+ > [!NOTE]
+ > **Difference from upstream.** Upstream vLLM enables MoE sequence parallelism only when `data_parallel_size > 1`, together with a supported all2all backend, expert parallelism, and `tensor_parallel_size > 1`. On vLLM Ascend, `data_parallel_size > 1` is not part of the enablement condition. Ascend FlashComm also supports the TP/EP topology with `data_parallel_size = 1`, so SP MoE can be enabled when DP is 1 as long as the conditions above are met. `data_parallel_size > 1` remains supported.
+ 
++### Matmul reduce-scatter fusion
++
++On supported Ascend devices, enable `fuse_gemm_comms` to fuse a
++sequence-parallel, bias-free row-parallel projection with its token-dimension
++reduce-scatter. The fused implementation supports BF16/FP16 with TP size 2,
++4, or 8; unmatched graphs continue to use the unfused path.
++
++```bash
++--compilation-config '{"pass_config":{"fuse_gemm_comms":true}}'
++```
++
+ ### FlashComm switch (Ascend only)
+ 
+ vLLM Ascend enables SP MoE through the FlashComm switch. The switch is still
+diff --git a/tests/ut/compilation/test_graph_fusion_pass_manager.py b/tests/ut/compilation/test_graph_fusion_pass_manager.py
+index 43d6c5ff0..58d6beec3 100644
+--- a/tests/ut/compilation/test_graph_fusion_pass_manager.py
++++ b/tests/ut/compilation/test_graph_fusion_pass_manager.py
+@@ -1,5 +1,6 @@
+-from unittest.mock import patch
++from unittest.mock import MagicMock, patch
+ 
++import torch
+ from vllm.config import VllmConfig
+ 
+ from tests.ut.base import TestBase
+@@ -30,3 +31,38 @@ class TestGraphFusionPassManagerConfig(TestBase):
+         self.assertFalse(manager.ascend_compilation_config.fuse_qknorm_rope)
+         self.assertFalse(manager.ascend_compilation_config.fuse_muls_add)
+         self.assertEqual(manager.passes, [])
++
++    @patch("vllm_ascend.platform.NPUPlatform.check_and_update_config")
++    def test_fuse_gemm_comms_registers_pattern_matcher_pass(self, mock_platform):
++        vllm_config = VllmConfig()
++        vllm_config.model_config = MagicMock(dtype=torch.bfloat16)
++        vllm_config.compilation_config.pass_config.fuse_gemm_comms = True
++        vllm_config.additional_config = {
++            "ascend_compilation_config": {
++                "fuse_norm_quant": "false",
++                "fuse_qknorm_rope": "false",
++                "fuse_muls_add": "false",
++            }
++        }
++        init_ascend_config(vllm_config)
++
++        profile = MagicMock()
++        profile.supports.side_effect = lambda capability: capability.name == "GRAPH_MM_REDUCE_SCATTER_FUSION"
++        with (
++            patch(
++                "vllm_ascend.compilation.graph_fusion_pass_manager.get_current_hardware_profile",
++                return_value=profile,
++            ),
++            patch(
++                "vllm_ascend.compilation.passes.mm_reduce_scatter_fusion_pass.get_tensor_model_parallel_world_size",
++                return_value=2,
++            ),
++            patch(
++                "vllm_ascend.compilation.passes.mm_reduce_scatter_fusion_pass.get_tp_group",
++                return_value=MagicMock(unique_name="tp:0"),
++            ),
++        ):
++            manager = GraphFusionPassManager()
++            manager.configure(vllm_config)
++
++        self.assertEqual(len(manager.passes), 1)
+diff --git a/tests/ut/compilation/test_mm_reduce_scatter_fusion_pass.py b/tests/ut/compilation/test_mm_reduce_scatter_fusion_pass.py
+new file mode 100644
+index 000000000..0d379f2ae
+--- /dev/null
++++ b/tests/ut/compilation/test_mm_reduce_scatter_fusion_pass.py
+@@ -0,0 +1,259 @@
++# SPDX-License-Identifier: Apache-2.0
++
++import importlib.util
++import sys
++from unittest.mock import MagicMock, patch
++
++import torch
++import torch._inductor.pattern_matcher as pm
++import torch.fx as fx
++from torch._subclasses.fake_tensor import FakeTensorMode
++from vllm.config import VllmConfig
++
++from tests.ut.base import TestBase
++
++
++@torch.library.custom_op("mmrs_test::npu_mm_reduce_scatter_base", mutates_args=())
++def _fake_mm_reduce_scatter(
++    x1: torch.Tensor,
++    x2: torch.Tensor,
++    hcom: str,
++    world_size: int,
++    *,
++    reduce_op: str = "sum",
++) -> torch.Tensor:
++    return x1.new_empty((x1.shape[0] // world_size, x2.shape[1]))
++
++
++@_fake_mm_reduce_scatter.register_fake
++def _fake_mm_reduce_scatter_fake(
++    x1: torch.Tensor, x2: torch.Tensor, hcom: str, world_size: int, *, reduce_op: str = "sum"
++) -> torch.Tensor:
++    return x1.new_empty((x1.shape[0] // world_size, x2.shape[1]))
++
++
++_stubbed_nge = importlib.util.find_spec("npugraph_ex") is None and importlib.util.find_spec("torchair") is None
++if _stubbed_nge:
++    sys.modules["npugraph_ex"] = MagicMock()
++try:
++    from vllm_ascend.compilation.passes.mm_reduce_scatter_fusion_pass import (
++        MatmulReduceScatterFusionPass,
++    )
++finally:
++    if _stubbed_nge:
++        del sys.modules["npugraph_ex"]
++
++TP_SIZE = 2
++TP_GROUP_NAME = "tp:0"
++HCOM_NAME = "test_hcom"
++REDUCE_DIM = 512
++OUTPUT_DIM = 256
++
++GEMM_OP = torch.ops.vllm.unquantized_gemm.default
++REDUCE_SCATTER_OP = torch.ops.vllm.reduce_scatter.default
++PAD_OP = torch.ops.aten.constant_pad_nd.default
++CAT_OP = torch.ops.aten.cat.default
++FULL_OP = torch.ops.aten.full.default
++FUSED_OP = torch.ops.mmrs_test.npu_mm_reduce_scatter_base.default
++
++
++def _build_graph(
++    *,
++    num_tokens: int = 8,
++    pad_rows: int | None = 2,
++    bias: bool = False,
++    dim: int = 0,
++    reduce_dim: int = REDUCE_DIM,
++    extra_gemm_user: bool = False,
++    dtype: torch.dtype = torch.bfloat16,
++    world_size: int = TP_SIZE,
++    group_name: str = TP_GROUP_NAME,
++    cat_dim: int = 0,
++    reverse_cat_inputs: bool = False,
++    valid_zeros_shape: bool = True,
++    use_constant_pad: bool = False,
++    pad_value: float = 0.0,
++    valid_padding: bool = True,
++) -> fx.GraphModule:
++    graph = fx.Graph()
++    fake_mode = FakeTensorMode()
++
++    def placeholder(name: str, *shape: int) -> fx.Node:
++        node = graph.placeholder(name)
++        with fake_mode:
++            node.meta["val"] = torch.empty(shape, dtype=dtype)
++        return node
++
++    def call(target, args, *shape: int) -> fx.Node:
++        node = graph.call_function(target, args=args)
++        with fake_mode:
++            node.meta["val"] = torch.empty(shape, dtype=dtype)
++        return node
++
++    x = placeholder("x", num_tokens, reduce_dim)
++    weight = placeholder("weight", OUTPUT_DIM, reduce_dim)
++    bias_node = placeholder("bias", OUTPUT_DIM) if bias else None
++    gemm_args = (x, weight, bias_node) if bias else (x, weight)
++    gemm = call(GEMM_OP, gemm_args, num_tokens, OUTPUT_DIM)
++    scattered = gemm
++    reduced_rows = num_tokens
++    if pad_rows is not None:
++        reduced_rows += pad_rows
++        if use_constant_pad:
++            widths = [0, 0, 0, pad_rows] if valid_padding else [0, 1, 0, pad_rows]
++            scattered = call(PAD_OP, (gemm, widths, pad_value), reduced_rows, OUTPUT_DIM)
++        else:
++            zeros_columns = OUTPUT_DIM if valid_zeros_shape else OUTPUT_DIM + 1
++            zeros = graph.call_function(
++                FULL_OP,
++                args=([pad_rows, zeros_columns], 0),
++                kwargs={"dtype": dtype, "layout": torch.strided, "device": torch.device("cpu"), "pin_memory": False},
++            )
++            with fake_mode:
++                zeros.meta["val"] = torch.empty((pad_rows, zeros_columns), dtype=dtype)
++            cat_inputs = [zeros, gemm] if reverse_cat_inputs else [gemm, zeros]
++            cat_args = (cat_inputs,) if cat_dim == 0 else (cat_inputs, cat_dim)
++            scattered = call(CAT_OP, cat_args, reduced_rows, OUTPUT_DIM)
++    reduce_scatter = call(
++        REDUCE_SCATTER_OP,
++        (scattered, dim, world_size, group_name),
++        reduced_rows // TP_SIZE,
++        OUTPUT_DIM,
++    )
++    outputs = [reduce_scatter]
++    if extra_gemm_user:
++        outputs.append(call(torch.ops.aten.clone.default, (gemm,), num_tokens, OUTPUT_DIM))
++    graph.output(tuple(outputs))
++    return fx.GraphModule(torch.nn.Module(), graph)
++
++
++def _targets(graph_module: fx.GraphModule) -> list:
++    return [node.target for node in graph_module.graph.nodes if node.op == "call_function"]
++
++
++@patch(
++    "vllm_ascend.compilation.passes.mm_reduce_scatter_fusion_pass.DeviceOperator.npu_mm_reduce_scatter_base",
++    new=_fake_mm_reduce_scatter,
++)
++class TestMatmulReduceScatterFusionPass(TestBase):
++    def _make_pass(self) -> MatmulReduceScatterFusionPass:
++        tp_group = MagicMock()
++        tp_group.unique_name = TP_GROUP_NAME
++        tp_group.device_group._get_backend.return_value.get_hccl_comm_name.return_value = HCOM_NAME
++        module = "vllm_ascend.compilation.passes.mm_reduce_scatter_fusion_pass"
++        with (
++            patch(f"{module}.get_tp_group", return_value=tp_group),
++            patch(f"{module}.get_tensor_model_parallel_world_size", return_value=TP_SIZE),
++        ):
++            config = VllmConfig()
++            config.model_config = MagicMock(dtype=torch.bfloat16)
++            return MatmulReduceScatterFusionPass(config)
++
++    def _apply(self, graph_module: fx.GraphModule) -> None:
++        tp_group = MagicMock()
++        tp_group.unique_name = TP_GROUP_NAME
++        tp_group.device_group._get_backend.return_value.get_hccl_comm_name.return_value = HCOM_NAME
++        module = "vllm_ascend.compilation.passes.mm_reduce_scatter_fusion_pass"
++        with (
++            patch(f"{module}.get_tp_group", return_value=tp_group),
++            patch(f"{module}.get_tensor_model_parallel_world_size", return_value=TP_SIZE),
++        ):
++            self._make_pass()(graph_module)
++
++    def test_padded_pattern_is_fused_and_padding_moves_to_input(self):
++        graph_module = _build_graph()
++        self._apply(graph_module)
++
++        self.assertEqual(_targets(graph_module).count(FUSED_OP), 1)
++        self.assertNotIn(GEMM_OP, _targets(graph_module))
++        self.assertNotIn(CAT_OP, _targets(graph_module))
++        self.assertNotIn(FULL_OP, _targets(graph_module))
++        fused = next(node for node in graph_module.graph.nodes if node.target is FUSED_OP)
++        padded_input = fused.args[0]
++        self.assertIs(padded_input.target, PAD_OP)
++        self.assertIs(fused.args[1].target, torch.ops.aten.permute.default)
++        self.assertEqual(fused.args[1].args[1], [1, 0])
++        self.assertEqual(fused.args[2:4], (HCOM_NAME, TP_SIZE))
++        self.assertEqual(padded_input.args[0].op, "placeholder")
++        self.assertEqual(padded_input.meta["val"].shape, (10, REDUCE_DIM))
++
++    def test_unpadded_pattern_is_fused(self):
++        graph_module = _build_graph(pad_rows=None)
++        self._apply(graph_module)
++        self.assertEqual(_targets(graph_module).count(FUSED_OP), 1)
++        self.assertNotIn(PAD_OP, _targets(graph_module))
++
++    def test_legacy_constant_pad_pattern_is_fused(self):
++        graph_module = _build_graph(use_constant_pad=True)
++        self._apply(graph_module)
++
++        self.assertEqual(_targets(graph_module).count(FUSED_OP), 1)
++        fused = next(node for node in graph_module.graph.nodes if node.target is FUSED_OP)
++        self.assertIs(fused.args[0].target, PAD_OP)
++        self.assertEqual(fused.args[0].args[1], [0, 0, 0, 2])
++        self.assertEqual(fused.args[0].args[0].op, "placeholder")
++
++    def test_nge_registration_preserves_padding_scalar(self):
++        # Exercise the arguments sent to NGE using its underlying matcher,
++        # without importing an NPU backend in CPU-only unit tests.
++        backend_pass = pm.PatternMatcherPass()
++
++        def register_backend(**kwargs):
++            pm.register_replacement(**kwargs, trace_fn=pm.fwd_only, pass_dicts=backend_pass)
++
++        module = "vllm_ascend.compilation.passes.base_pattern"
++        with (
++            patch(f"{module}._registered_patterns", set()),
++            patch(f"{module}.nge.register_replacement", side_effect=register_backend),
++        ):
++            self._make_pass()
++
++        for pad_rows in (None, 1, 2, 7):
++            with self.subTest(pad_rows=pad_rows):
++                graph_module = _build_graph(num_tokens=7 if pad_rows in (1, 7) else 8, pad_rows=pad_rows)
++                expected = next(
++                    node.meta["val"].shape for node in graph_module.graph.nodes if node.target is REDUCE_SCATTER_OP
++                )
++                self.assertEqual(backend_pass.apply(graph_module.graph), 1)
++                fused = next(node for node in graph_module.graph.nodes if node.target is FUSED_OP)
++                self.assertEqual(fused.meta["val"].shape, expected)
++                if pad_rows is None:
++                    self.assertNotIn(PAD_OP, _targets(graph_module))
++                else:
++                    padded_input = fused.args[0]
++                    self.assertIs(padded_input.target, PAD_OP)
++                    self.assertEqual(padded_input.args[1], [0, 0, 0, pad_rows])
++                    self.assertEqual(padded_input.args[0].op, "placeholder")
++
++    def test_fused_output_shape_is_preserved(self):
++        graph_module = _build_graph()
++        expected = next(node.meta["val"].shape for node in graph_module.graph.nodes if node.target is REDUCE_SCATTER_OP)
++        self._apply(graph_module)
++        fused = next(node for node in graph_module.graph.nodes if node.target is FUSED_OP)
++        self.assertEqual(fused.meta["val"].shape, expected)
++
++    def test_unsupported_patterns_are_not_fused(self):
++        for kwargs in (
++            {"bias": True},
++            {"extra_gemm_user": True},
++            {"dim": 1},
++            {"world_size": 4},
++            {"group_name": "tp:1"},
++            {"reduce_dim": 128},
++            {"dtype": torch.float32},
++            {"cat_dim": 1},
++            {"reverse_cat_inputs": True},
++            {"valid_zeros_shape": False},
++            {"use_constant_pad": True, "pad_value": 1.0},
++            {"use_constant_pad": True, "valid_padding": False},
++        ):
++            with self.subTest(**kwargs):
++                graph_module = _build_graph(**kwargs)
++                self._apply(graph_module)
++                self.assertNotIn(FUSED_OP, _targets(graph_module))
++
++    def test_unsupported_world_size_skips_the_pass(self):
++        module = "vllm_ascend.compilation.passes.mm_reduce_scatter_fusion_pass"
++        with patch(f"{module}.get_tensor_model_parallel_world_size", return_value=16):
++            fusion_pass = MatmulReduceScatterFusionPass(VllmConfig())
++            self.assertFalse(fusion_pass.is_applicable_for_range(MagicMock()))
+diff --git a/tests/ut/device/test_hardware_profile.py b/tests/ut/device/test_hardware_profile.py
+index 28e243f4c..19008298a 100644
+--- a/tests/ut/device/test_hardware_profile.py
++++ b/tests/ut/device/test_hardware_profile.py
+@@ -31,6 +31,7 @@ _STANDARD_CAPABILITIES = frozenset(
+         HardwareCapability.FLA_GDN_PREFILL,
+         HardwareCapability.FUSED_ROTARY_MUL_INTERLEAVE,
+         HardwareCapability.FUSED_SWIGLU_TUNING_ARGS,
++        HardwareCapability.GRAPH_MM_REDUCE_SCATTER_FUSION,
+         HardwareCapability.GRAPH_MULS_ADD_FUSION,
+         HardwareCapability.GRAPH_NORM_QUANT_FUSION,
+         HardwareCapability.GRAPH_QKV_NORM_ROPE_FUSION,
+@@ -95,6 +96,7 @@ _EXPECTED_CAPABILITIES = {
+             HardwareCapability.FLA_GDN_PREFILL,
+             HardwareCapability.FP8_ATTENTION,
+             HardwareCapability.FUSED_ROTARY_MUL_INTERLEAVE,
++            HardwareCapability.GRAPH_MM_REDUCE_SCATTER_FUSION,
+             HardwareCapability.GRAPH_MULS_ADD_FUSION,
+             HardwareCapability.GRAPH_NORM_QUANT_FUSION,
+             HardwareCapability.LOCAL_KV_COMM_RESOURCE,
+diff --git a/tests/ut/ops/test_sequence_parallel.py b/tests/ut/ops/test_sequence_parallel.py
+index 913a08303..9506b7ba4 100644
+--- a/tests/ut/ops/test_sequence_parallel.py
++++ b/tests/ut/ops/test_sequence_parallel.py
+@@ -60,6 +60,28 @@ def test_sp_shard_fake_derives_cdiv_rows(set_tp):
+     assert _ascend_sp_shard_fake(x).shape == (2, 4)
+ 
+ 
++def test_sp_reduce_scatter_appends_zero_rows_with_cat(set_tp, monkeypatch: pytest.MonkeyPatch):
++    set_tp(2, 0)
++    monkeypatch.setattr(sp_module, "_custom_collective", lambda name, value: value)
++    original_cat = torch.cat
++    cat_calls = []
++
++    def record_cat(tensors, dim=0):
++        cat_calls.append((tensors, dim))
++        return original_cat(tensors, dim=dim)
++
++    monkeypatch.setattr(sp_module.torch, "cat", record_cat)
++    x = torch.arange(3 * 4, dtype=torch.float32).reshape(3, 4)
++
++    out = sp_module._ascend_sp_reduce_scatter_impl(x)
++
++    assert out.shape == (4, 4)
++    assert torch.equal(out[:3], x)
++    assert torch.equal(out[3], torch.zeros(4))
++    assert len(cat_calls) == 1
++    assert cat_calls[0][1] == 0
++
++
+ def test_sp_padding_mask_pads_true_rows(set_tp):
+     set_tp(4, 3)
+     is_padding = torch.tensor([False, True, False])
+diff --git a/tests/ut/test_platform.py b/tests/ut/test_platform.py
+index 91120daa6..13c4288dc 100644
+--- a/tests/ut/test_platform.py
++++ b/tests/ut/test_platform.py
+@@ -789,6 +789,28 @@ class TestNPUPlatform(TestBase):
+         self.assertIsNone(vllm_config.compilation_config.max_cudagraph_capture_size)
+         self.assertEqual(vllm_config.compilation_config.cudagraph_capture_sizes, [1, 2, 4])
+ 
++    def test_apply_config_platform_defaults_sets_sp_threshold(self):
++        for enabled_option in ("enable_sp", "fuse_gemm_comms"):
++            with self.subTest(enabled_option=enabled_option):
++                pass_config = SimpleNamespace(
++                    enable_sp=False,
++                    fuse_gemm_comms=False,
++                    sp_min_token_num=None,
++                )
++                setattr(pass_config, enabled_option, True)
++                vllm_config = SimpleNamespace(compilation_config=SimpleNamespace(pass_config=pass_config))
++
++                with patch("vllm_ascend.platform._get_reduced_cg_cap", return_value=None):
++                    self.platform.apply_config_platform_defaults(vllm_config)
++
++                self.assertEqual(pass_config.sp_min_token_num, 1)
++
++                pass_config.sp_min_token_num = 512
++                with patch("vllm_ascend.platform._get_reduced_cg_cap", return_value=None):
++                    self.platform.apply_config_platform_defaults(vllm_config)
++
++                self.assertEqual(pass_config.sp_min_token_num, 512)
++
+     def test_check_ascend_config_oproj_tp_requires_offload_connector(self):
+         from vllm_ascend.platform import _check_ascend_config
+ 
+diff --git a/vllm_ascend/compilation/graph_fusion_pass_manager.py b/vllm_ascend/compilation/graph_fusion_pass_manager.py
+index dfcdd19bc..93ce096c1 100644
+--- a/vllm_ascend/compilation/graph_fusion_pass_manager.py
++++ b/vllm_ascend/compilation/graph_fusion_pass_manager.py
+@@ -71,3 +71,10 @@ class GraphFusionPassManager:
+             from .passes.muls_add_pass import MulsAddFusionPass
+ 
+             self.passes.append(MulsAddFusionPass(config))
++
++        if config.compilation_config.pass_config.fuse_gemm_comms and profile.supports(
++            HardwareCapability.GRAPH_MM_REDUCE_SCATTER_FUSION
++        ):
++            from .passes.mm_reduce_scatter_fusion_pass import MatmulReduceScatterFusionPass
++
++            self.passes.append(MatmulReduceScatterFusionPass(config))
+diff --git a/vllm_ascend/compilation/passes/mm_reduce_scatter_fusion_pass.py b/vllm_ascend/compilation/passes/mm_reduce_scatter_fusion_pass.py
+new file mode 100644
+index 000000000..076d38aef
+--- /dev/null
++++ b/vllm_ascend/compilation/passes/mm_reduce_scatter_fusion_pass.py
+@@ -0,0 +1,300 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""Fuse row-parallel GEMM with sequence-parallel reduce-scatter on Ascend."""
++
++from __future__ import annotations
++
++from typing import Any
++
++import torch
++import torch._inductor.pattern_matcher as pm
++import torch.fx as fx
++from torch._inductor.pattern_matcher import Match, PatternMatcherPass
++from vllm.compilation.passes.inductor_pass import enable_fake_mode
++from vllm.compilation.passes.vllm_inductor_pass import VllmInductorPass
++from vllm.config import VllmConfig
++from vllm.config.utils import Range
++from vllm.distributed import get_tensor_model_parallel_world_size, get_tp_group
++from vllm.logger import logger
++
++from vllm_ascend.compilation.passes import base_pattern
++from vllm_ascend.compilation.passes.base_pattern import BasePattern
++from vllm_ascend.device.device_op import DeviceOperator
++
++_MIN_REDUCE_DIM = 256
++_MAX_REDUCE_DIM_EXCLUSIVE = 65535
++_SUPPORTED_WORLD_SIZES = (2, 4, 8)
++_SUPPORTED_DTYPES = (torch.bfloat16, torch.float16)
++
++_GEMM_OP = torch.ops.vllm.unquantized_gemm.default
++_REDUCE_SCATTER_OP = torch.ops.vllm.reduce_scatter.default
++_PAD_OP = torch.ops.aten.constant_pad_nd.default
++_CAT_OP = torch.ops.aten.cat.default
++_FULL_OP = torch.ops.aten.full.default
++
++
++def _static_int(value: Any) -> int | None:
++    return value if isinstance(value, int) else None
++
++
++def _arg(node: fx.Node, index: int, name: str, default=None):
++    return node.args[index] if len(node.args) > index else node.kwargs.get(name, default)
++
++
++class _MatmulReduceScatterPattern(BasePattern):
++    def __init__(self, vllm_config: VllmConfig, tp_size: int, group_name: str, hcom_name: str):
++        super().__init__(vllm_config)
++        self.tp_size = tp_size
++        self.group_name = group_name
++        self.hcom_name = hcom_name
++
++    def _empty(self, *shape: int) -> torch.Tensor:
++        dtype = self.dtype if self.dtype in _SUPPORTED_DTYPES else torch.bfloat16
++        device = self.vllm_config.device_config.device if self.vllm_config.device_config else "cpu"
++        return torch.empty(shape, device=device, dtype=dtype)
++
++    def get_inputs(self) -> list[torch.Tensor]:
++        return [self._empty(8, 512), self._empty(256, 512)]
++
++    @enable_fake_mode
++    def register(self, pm_pass: PatternMatcherPass) -> None:
++        pattern_id = self.pattern_key()
++        pattern_fn = self.get_pattern()
++        replacement_fn = self.get_replacement()
++        example_inputs = self.get_inputs()
++        extra_check = self._get_extra_check()
++        scalar_workaround = self._get_scalar_workaround()
++
++        pm.register_replacement(
++            pattern_fn,
++            replacement_fn,
++            example_inputs,
++            pm.fwd_only,
++            pm_pass,
++            extra_check=extra_check,
++            scalar_workaround=scalar_workaround,
++        )
++
++        if pattern_id in base_pattern._registered_patterns:
++            return
++
++        stream_check = self.get_extra_stream_scope_check()
++        base_pattern.nge.register_replacement(
++            search_fn=pattern_fn,
++            replace_fn=replacement_fn,
++            example_inputs=example_inputs,
++            extra_check=lambda match: stream_check(match) and extra_check(match),
++            scalar_workaround=scalar_workaround,
++        )
++        base_pattern._registered_patterns.add(pattern_id)
++
++    def _get_extra_check(self):
++        def supported(match: Match) -> bool:
++            gemm = next((node for node in match.nodes if node.target is _GEMM_OP), None)
++            reduce_scatter = next((node for node in match.nodes if node.target is _REDUCE_SCATTER_OP), None)
++            if gemm is None or reduce_scatter is None:
++                return False
++            if _arg(gemm, 2, "bias") is not None:
++                return False
++            if _arg(reduce_scatter, 1, "dim") != 0:
++                return False
++            if _arg(reduce_scatter, 2, "world_size") != self.tp_size:
++                return False
++            if _arg(reduce_scatter, 3, "group_name") != self.group_name:
++                return False
++            x, weight = gemm.args[0], gemm.args[1]
++            if not isinstance(x, fx.Node) or not isinstance(weight, fx.Node):
++                return False
++            x_val, weight_val = x.meta.get("val"), weight.meta.get("val")
++            if x_val is None or weight_val is None or x_val.dim() != 2 or weight_val.dim() != 2:
++                return False
++            if x_val.dtype not in _SUPPORTED_DTYPES or x_val.dtype != weight_val.dtype:
++                return False
++            reduce_dim = _static_int(x_val.shape[1])
++            return reduce_dim is not None and _MIN_REDUCE_DIM <= reduce_dim < _MAX_REDUCE_DIM_EXCLUSIVE
++
++        return supported
++
++    def _get_scalar_workaround(self) -> dict[str, float | int] | None:
++        return None
++
++    def pattern_key(self) -> str:
++        return f"{self.__class__.__name__}_{self.tp_size}_{self.group_name}"
++
++
++class MatmulReduceScatterPattern(_MatmulReduceScatterPattern):
++    """Match ``gemm -> reduce_scatter``."""
++
++    def get_pattern(self):
++        def pattern(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
++            gemm = torch.ops.vllm.unquantized_gemm.default(x, weight, None)
++            return torch.ops.vllm.reduce_scatter.default(
++                gemm,
++                dim=0,
++                world_size=self.tp_size,
++                group_name=self.group_name,
++            )
++
++        return pattern
++
++    def get_replacement(self):
++        def replacement(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
++            return DeviceOperator.npu_mm_reduce_scatter_base(
++                x, weight.t(), self.hcom_name, self.tp_size, reduce_op="sum"
++            )
++
++        return replacement
++
++
++class CatPaddedMatmulReduceScatterPattern(_MatmulReduceScatterPattern):
++    """Match ``gemm -> cat(gemm, zeros) -> reduce_scatter``.
++
++    Padding the bias-free GEMM input is equivalent to appending zero rows to
++    its output, and avoids materializing padding for the much larger output.
++    """
++
++    def _get_scalar_workaround(self) -> dict[str, float | int] | None:
++        return {"pad_rows": 13}
++
++    def _get_extra_check(self):
++        base_check = super()._get_extra_check()
++
++        def supported(match: Match) -> bool:
++            if not base_check(match):
++                return False
++            gemm = next((node for node in match.nodes if node.target is _GEMM_OP), None)
++            cat = next((node for node in match.nodes if node.target is _CAT_OP), None)
++            zeros = next((node for node in match.nodes if node.target is _FULL_OP), None)
++            if gemm is None or cat is None or zeros is None:
++                return False
++
++            tensors = _arg(cat, 0, "tensors")
++            cat_dim = _arg(cat, 1, "dim", 0)
++            zeros_shape = _arg(zeros, 0, "size")
++            fill_value = _arg(zeros, 1, "fill_value")
++            gemm_val = gemm.meta.get("val")
++            zeros_val = zeros.meta.get("val")
++            return (
++                isinstance(tensors, (list, tuple))
++                and list(tensors) == [gemm, zeros]
++                and cat_dim == 0
++                and fill_value in (0, 0.0)
++                and isinstance(zeros_shape, (list, tuple))
++                and len(zeros_shape) == 2
++                and gemm_val is not None
++                and zeros_val is not None
++                and zeros_val.dim() == 2
++                and zeros_val.dtype == gemm_val.dtype
++                and zeros_val.device == gemm_val.device
++                and zeros_val.shape[1] == gemm_val.shape[1]
++            )
++
++        return supported
++
++    def get_pattern(self):
++        def pattern(x: torch.Tensor, weight: torch.Tensor, pad_rows: int) -> torch.Tensor:
++            gemm = torch.ops.vllm.unquantized_gemm.default(x, weight, None)
++            zeros = torch.ops.aten.new_zeros.default(gemm, [pad_rows, gemm.shape[1]])
++            padded = torch.ops.aten.cat.default([gemm, zeros], 0)
++            return torch.ops.vllm.reduce_scatter.default(
++                padded,
++                dim=0,
++                world_size=self.tp_size,
++                group_name=self.group_name,
++            )
++
++        return pattern
++
++    def get_replacement(self):
++        def replacement(x: torch.Tensor, weight: torch.Tensor, pad_rows: int) -> torch.Tensor:
++            padded = torch.ops.aten.constant_pad_nd.default(x, [0, 0, 0, pad_rows], 0.0)
++            return DeviceOperator.npu_mm_reduce_scatter_base(
++                padded, weight.t(), self.hcom_name, self.tp_size, reduce_op="sum"
++            )
++
++        return replacement
++
++
++class ConstantPaddedMatmulReduceScatterPattern(_MatmulReduceScatterPattern):
++    """Match legacy ``gemm -> constant_pad_nd -> reduce_scatter`` graphs."""
++
++    def _get_scalar_workaround(self) -> dict[str, float | int] | None:
++        return {"pad_rows": 13}
++
++    def _get_extra_check(self):
++        base_check = super()._get_extra_check()
++
++        def supported(match: Match) -> bool:
++            if not base_check(match):
++                return False
++            pad = next((node for node in match.nodes if node.target is _PAD_OP), None)
++            if pad is None or _arg(pad, 2, "value", 0) not in (0, 0.0):
++                return False
++            widths = _arg(pad, 1, "pad")
++            pad_val = pad.meta.get("val")
++            return (
++                isinstance(widths, (list, tuple))
++                and len(widths) == 4
++                and all(width == 0 for width in widths[:3])
++                and pad_val is not None
++                and pad_val.dim() == 2
++            )
++
++        return supported
++
++    def get_pattern(self):
++        def pattern(x: torch.Tensor, weight: torch.Tensor, pad_rows: int) -> torch.Tensor:
++            gemm = torch.ops.vllm.unquantized_gemm.default(x, weight, None)
++            padded = torch.ops.aten.constant_pad_nd.default(gemm, [0, 0, 0, pad_rows], 0.0)
++            return torch.ops.vllm.reduce_scatter.default(
++                padded,
++                dim=0,
++                world_size=self.tp_size,
++                group_name=self.group_name,
++            )
++
++        return pattern
++
++    def get_replacement(self):
++        def replacement(x: torch.Tensor, weight: torch.Tensor, pad_rows: int) -> torch.Tensor:
++            padded = torch.ops.aten.constant_pad_nd.default(x, [0, 0, 0, pad_rows], 0.0)
++            return DeviceOperator.npu_mm_reduce_scatter_base(
++                padded, weight.t(), self.hcom_name, self.tp_size, reduce_op="sum"
++            )
++
++        return replacement
++
++
++class MatmulReduceScatterFusionPass(VllmInductorPass):
++    """Apply the padded and unpadded MMRS pattern replacements."""
++
++    def __init__(self, config: VllmConfig):
++        super().__init__(config)
++        self.tp_size = get_tensor_model_parallel_world_size()
++        self.pattern_match_passes = PatternMatcherPass(pass_name="matmul_reduce_scatter_fusion_pass")
++
++        if self.tp_size not in _SUPPORTED_WORLD_SIZES:
++            return
++
++        tp_group = get_tp_group()
++        self.group_name = tp_group.unique_name
++        backend = tp_group.device_group._get_backend(torch.device("npu"))
++        self.hcom_name = backend.get_hccl_comm_name(tp_group.rank_in_group)
++        MatmulReduceScatterPattern(config, self.tp_size, self.group_name, self.hcom_name).register(
++            self.pattern_match_passes
++        )
++        CatPaddedMatmulReduceScatterPattern(config, self.tp_size, self.group_name, self.hcom_name).register(
++            self.pattern_match_passes
++        )
++        ConstantPaddedMatmulReduceScatterPattern(config, self.tp_size, self.group_name, self.hcom_name).register(
++            self.pattern_match_passes
++        )
++
++    def __call__(self, graph: torch.fx.Graph) -> None:
++        self.begin()
++        self.matched_count = self.pattern_match_passes.apply(graph)
++        logger.debug("Fused %s matmul-reduce-scatter patterns", self.matched_count)
++        self.end_and_log()
++
++    def is_applicable_for_range(self, compile_range: Range) -> bool:
++        return self.tp_size in _SUPPORTED_WORLD_SIZES
+diff --git a/vllm_ascend/device/hardware_profile.py b/vllm_ascend/device/hardware_profile.py
+index 9518ff7e4..e62f1d9db 100644
+--- a/vllm_ascend/device/hardware_profile.py
++++ b/vllm_ascend/device/hardware_profile.py
+@@ -106,6 +106,8 @@ class HardwareCapability(Enum):
+     # Fuse non-MX INT8/INT4 grouped matmul, dequantization, SiTU, and per-token
+     # quantization through the ACLNN GmmDequantSituQuant operator.
+     GMM_DEQUANT_SITU_QUANT = auto()
++    # Register the FX graph rewrite that fuses a supported matmul/reduce-scatter pattern.
++    GRAPH_MM_REDUCE_SCATTER_FUSION = auto()
+     # Register the FX graph rewrite that fuses the supported muls-plus-add pattern.
+     GRAPH_MULS_ADD_FUSION = auto()
+     # Register the FX graph rewrites for supported RMSNorm-plus-quant patterns.
+@@ -255,6 +257,7 @@ _STANDARD_CAPABILITIES = frozenset(
+         HardwareCapability.FLA_GDN_PREFILL,
+         HardwareCapability.FUSED_ROTARY_MUL_INTERLEAVE,
+         HardwareCapability.FUSED_SWIGLU_TUNING_ARGS,
++        HardwareCapability.GRAPH_MM_REDUCE_SCATTER_FUSION,
+         HardwareCapability.GRAPH_MULS_ADD_FUSION,
+         HardwareCapability.GRAPH_NORM_QUANT_FUSION,
+         HardwareCapability.GRAPH_QKV_NORM_ROPE_FUSION,
+@@ -365,6 +368,7 @@ _HARDWARE_PROFILES: Mapping[AscendDeviceType, HardwareProfile] = MappingProxyTyp
+                     HardwareCapability.FLA_GDN_PREFILL,
+                     HardwareCapability.FP8_ATTENTION,
+                     HardwareCapability.FUSED_ROTARY_MUL_INTERLEAVE,
++                    HardwareCapability.GRAPH_MM_REDUCE_SCATTER_FUSION,
+                     HardwareCapability.GRAPH_MULS_ADD_FUSION,
+                     HardwareCapability.GRAPH_NORM_QUANT_FUSION,
+                     HardwareCapability.LOCAL_KV_COMM_RESOURCE,
+diff --git a/vllm_ascend/platform.py b/vllm_ascend/platform.py
+index 6ffa60a61..094fb7fdb 100644
+--- a/vllm_ascend/platform.py
++++ b/vllm_ascend/platform.py
+@@ -358,6 +358,13 @@ class NPUPlatform(Platform):
+     def apply_config_platform_defaults(cls, vllm_config: VllmConfig) -> None:
+         """Apply Ascend-specific defaults."""
+ 
++        # Upstream derives this threshold only for CUDA/XPU. Without an Ascend
++        # default, an explicit SP/MMRS request is disabled during VllmConfig
++        # validation before the graph fusion pass can observe it.
++        pass_config = vllm_config.compilation_config.pass_config
++        if (pass_config.enable_sp or pass_config.fuse_gemm_comms) and pass_config.sp_min_token_num is None:
++            pass_config.sp_min_token_num = 1
++
+         # TODO: Remove this memory-saving capture-size override and its ceiling
+         # restoration once MC2 is no longer used.
+         reduced_cg_cap = _get_reduced_cg_cap(vllm_config)

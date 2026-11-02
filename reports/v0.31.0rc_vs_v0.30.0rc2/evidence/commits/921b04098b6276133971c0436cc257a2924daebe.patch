@@ -1,0 +1,394 @@
+commit 921b04098b6276133971c0436cc257a2924daebe
+Author:     XiaoxinWang <963372609@qq.com>
+AuthorDate: Mon Oct 12 11:55:34 2026 +0800
+Commit:     GitHub <noreply@github.com>
+CommitDate: Mon Oct 12 11:55:34 2026 +0800
+
+    [Feature]add trace decode replay support for Ascend (#15604)
+    
+    ### What this PR does / why we need it?
+    fllower
+    [vllm/pull/46701](https://github.com/vllm-project/vllm/pull/46701)
+    - Adds trace replay support for Ascend Model Runner V2.
+    - Patches `apply_trace_tokens` to skip empty batches, avoiding invalid
+    Triton launches with `coreDim=0`, while reusing the upstream Triton
+    kernel.
+    - Adds operator and end-to-end tests, along with trace replay usage
+    documentation.
+    
+    ### Does this PR introduce _any_ user-facing change?
+    
+    Yes. Users can enable trace replay with `--enable-trace-replay` and
+    force decoding to follow the provided `trace_decode_token_ids`.
+    
+    ### How was this patch tested?
+    
+    - Verified trace replay on Ascend using Qwen3-8B through
+    `/inference/v1/generate`.
+    - Confirmed forced token output and real model logprobs.
+    - Added coverage for empty batches and the Model Runner V2 trace replay
+    path.
+    
+    
+    - vLLM main:
+    https://github.com/vllm-project/vllm/commit/ced6857afa0ea7b2e3f0846a62e1394e90f15607
+    
+    Signed-off-by: wangxiaoxin-sherie <wangxiaoxin7@huawei.com>
+    Co-authored-by: wangxiaoxin-sherie <wangxiaoxin7@huawei.com>
+
+diff --git a/.github/workflows/scripts/estimated_times.yaml b/.github/workflows/scripts/estimated_times.yaml
+index f24f73086..edf6d1507 100644
+--- a/.github/workflows/scripts/estimated_times.yaml
++++ b/.github/workflows/scripts/estimated_times.yaml
+@@ -57,6 +57,7 @@ estimated_times:
+   tests/e2e/pull_request/one_card/spec_decode/test_ngram_npu.py: 250
+   tests/e2e/pull_request/one_card/spec_decode/test_suffix.py: 220
+   tests/e2e/pull_request/one_card/rlhf/consistency/test_attention_fa3.py: 30
++  tests/e2e/pull_request/one_card/rlhf/test_trace_replay.py: 30
+   tests/e2e/pull_request/one_card/test_completion_with_prompt_embeds.py: 200
+   tests/e2e/pull_request/one_card/test_cpu_offloading.py: 250
+   tests/e2e/pull_request/one_card/test_cpu_weight_offload.py: 530
+diff --git a/docs/source/user_guide/feature_guide/rl.md b/docs/source/user_guide/feature_guide/rl.md
+index 4e79cd5ca..71ab7e237 100644
+--- a/docs/source/user_guide/feature_guide/rl.md
++++ b/docs/source/user_guide/feature_guide/rl.md
+@@ -348,6 +348,43 @@ an external router separately. See upstream
+ [Data Parallel Deployment](https://docs.vllm.ai/en/latest/serving/data_parallel_deployment/)
+ for the supported load-balancing modes.
+ 
++## Trace Replay
++
++Trace replay forces the engine to emit a predetermined token sequence during
++decoding while computing real logprobs from the model's unmodified logit
++distribution. It is only supported by model runner V2. When using the normal
++`vllm serve` command with the token-in/token-out endpoint, explicitly enable
++model runner V2 and the scale-out endpoints:
++
++```bash
++VLLM_USE_V2_MODEL_RUNNER=1 \
++VLLM_ENABLE_SCALE_OUT_ENDPOINTS=1 \
++vllm serve Qwen/Qwen3-8B \
++    --enable-trace-replay
++```
++
++`VLLM_USE_V2_MODEL_RUNNER=1` prevents the server from falling back to model
++runner V1, which is incompatible with trace replay.
++`VLLM_ENABLE_SCALE_OUT_ENDPOINTS=1` registers the
++`/inference/v1/generate` endpoint for a normal serving process.
++
++Send requests to `/inference/v1/generate`:
++
++```bash
++curl http://127.0.0.1:8000/inference/v1/generate \
++    -H "Content-Type: application/json" \
++    -d '{
++        "request_id": "rollout-001",
++        "token_ids": [151644, 8948, 198],
++        "sampling_params": {
++            "trace_decode_token_ids": [15, 284, 1026, 374],
++            "logprobs": 1
++        }
++    }'
++```
++
++The output tokens will always be `[15, 284, 1026, 374]`. The logprobs reflect the model's true probability for each forced token under the current inference configuration.
++
+ ## Configuration checklist
+ 
+ | Setting | When to use it | Purpose |
+@@ -361,6 +398,9 @@ for the supported load-balancing modes.
+ | `--weight-transfer-config '{"backend": "hccl"}'` | Cross-NPU weight transfer | Register the Ascend HCCL transfer engine |
+ | `--weight-transfer-config '{"backend": "ipc"}'` | Same-NPU weight transfer | Select the Ascend NPU IPC transfer engine |
+ | `--enable-return-routed-experts` | MoE router replay | Return encoded expert routing decisions |
++| `VLLM_USE_V2_MODEL_RUNNER=1` | Trace replay | Select the required model runner V2 implementation |
++| `VLLM_ENABLE_SCALE_OUT_ENDPOINTS=1` | Token-in/token-out requests on a normal server | Register `/inference/v1/generate` |
++| `--enable-trace-replay` | trace replay | Forces decoding to follow a predetermined token sequence |
+ 
+ For the Ascend-specific option definitions, see
+ [Additional Configuration](../configuration/additional_config.md) and
+diff --git a/tests/e2e/nightly/single_node/ops/singlecard_ops/triton/test_trace_replay.py b/tests/e2e/nightly/single_node/ops/singlecard_ops/triton/test_trace_replay.py
+new file mode 100644
+index 000000000..ffad1b544
+--- /dev/null
++++ b/tests/e2e/nightly/single_node/ops/singlecard_ops/triton/test_trace_replay.py
+@@ -0,0 +1,111 @@
++import pytest
++
++torch = pytest.importorskip("torch")
++pytest.importorskip("vllm")
++pytest.importorskip("torch_npu")
++pytest.importorskip("triton")
++
++if not hasattr(torch, "npu") or not torch.npu.is_available():
++    pytest.skip("Trace replay kernel test requires an available Ascend NPU", allow_module_level=True)
++
++from vllm.v1.worker.gpu.sample import trace_replay as upstream_trace_replay  # noqa: E402
++
++upstream_apply_trace_tokens = upstream_trace_replay.apply_trace_tokens
++upstream_trace_replay_kernel = upstream_trace_replay._trace_replay_kernel
++
++import vllm_ascend.patch.worker  # noqa: E402,F401
++from vllm_ascend.worker.v2.sample.trace_replay import (  # noqa: E402
++    apply_trace_tokens,
++)
++
++DEVICE = "npu"
++
++
++def _tensor(values, dtype):
++    return torch.tensor(values, dtype=dtype, device=DEVICE)
++
++
++def test_trace_replay_patches_only_outer_call():
++    assert upstream_trace_replay.apply_trace_tokens is apply_trace_tokens
++    assert upstream_trace_replay.apply_trace_tokens is not upstream_apply_trace_tokens
++    assert upstream_trace_replay._trace_replay_kernel is upstream_trace_replay_kernel
++
++
++def test_trace_replay_empty_batch_is_a_noop():
++    sampled = torch.empty(0, dtype=torch.int64, device=DEVICE)
++    idx_mapping = torch.empty(0, dtype=torch.int32, device=DEVICE)
++    trace_token_ids = torch.empty((0, 1), dtype=torch.int32, device=DEVICE)
++    trace_len = torch.empty(0, dtype=torch.int32, device=DEVICE)
++    total_len = torch.empty(0, dtype=torch.int32, device=DEVICE)
++    prompt_len = torch.empty(0, dtype=torch.int32, device=DEVICE)
++
++    apply_trace_tokens(
++        sampled,
++        idx_mapping,
++        trace_token_ids,
++        trace_len,
++        total_len,
++        prompt_len,
++    )
++    torch.npu.synchronize()
++
++    assert sampled.numel() == 0
++
++
++def test_trace_replay_uses_request_state_step_and_idx_mapping():
++    sampled = _tensor([99, 98], torch.int64)
++    idx_mapping = _tensor([1, 0], torch.int32)
++    trace_token_ids = _tensor(
++        [
++            [11, 12, 13, 14],
++            [21, 22, 23, 24],
++        ],
++        torch.int32,
++    )
++    trace_len = _tensor([4, 4], torch.int32)
++    total_len = _tensor([5, 3], torch.int32)
++    prompt_len = _tensor([4, 1], torch.int32)
++
++    apply_trace_tokens(
++        sampled,
++        idx_mapping,
++        trace_token_ids,
++        trace_len,
++        total_len,
++        prompt_len,
++    )
++    torch.npu.synchronize()
++
++    # Batch row 0 maps to state 1, step 2 -> 23; row 1 maps to state 0,
++    # step 1 -> 12.
++    assert torch.equal(sampled.cpu(), torch.tensor([23, 12], dtype=torch.int64))
++
++
++def test_trace_replay_guards_padding_empty_and_finished_rows():
++    sampled = _tensor([90, 91, 92, 93, 94], torch.int64)
++    idx_mapping = _tensor([0, 1, -1, 2, 1], torch.int32)
++    trace_token_ids = _tensor(
++        [
++            [10, 11],
++            [20, 21],
++            [30, 31],
++        ],
++        torch.int32,
++    )
++    trace_len = _tensor([2, 0, 2], torch.int32)
++    total_len = _tensor([2, 5, 3], torch.int32)
++    prompt_len = _tensor([0, 5, 1], torch.int32)
++
++    apply_trace_tokens(
++        sampled,
++        idx_mapping,
++        trace_token_ids,
++        trace_len,
++        total_len,
++        prompt_len,
++    )
++    torch.npu.synchronize()
++
++    # State 0 is past the trace, state 1 has no trace, row 2 is padding, and
++    # state 2 is also past the trace. Every row must remain untouched.
++    assert torch.equal(sampled.cpu(), torch.tensor([90, 91, 92, 93, 94], dtype=torch.int64))
+diff --git a/tests/e2e/pull_request/one_card/rlhf/test_trace_replay.py b/tests/e2e/pull_request/one_card/rlhf/test_trace_replay.py
+new file mode 100644
+index 000000000..004023d5b
+--- /dev/null
++++ b/tests/e2e/pull_request/one_card/rlhf/test_trace_replay.py
+@@ -0,0 +1,61 @@
++#
++# Copyright (c) 2026 Huawei Technologies Co., Ltd. All Rights Reserved.
++# This file is a part of the vllm-ascend project.
++#
++# Licensed under the Apache License, Version 2.0 (the "License");
++# you may not use this file except in compliance with the License.
++# You may obtain a copy of the License at
++#
++#     http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS,
++# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++# See the License for the specific language governing permissions and
++# limitations under the License.
++#
++
++"""End-to-end trace replay coverage for the Ascend Model Runner V2 path."""
++
++import math
++import os
++from unittest.mock import patch
++
++from vllm import SamplingParams
++
++from tests.e2e.conftest import VllmRunner
++
++MODEL_NAME = "Qwen/Qwen3-0.6B"
++PROMPT = "Hello, my name is"
++TRACE_TOKEN_IDS = [444, 2210, 13, 358, 2776, 264, 220, 17]
++
++
++@patch.dict(os.environ, {"VLLM_USE_V2_MODEL_RUNNER": "1"})
++def test_trace_replay_outputs_requested_tokens_and_scores() -> None:
++    """Replay a fixed response and return scores from the real logits."""
++    sampling_params = SamplingParams(
++        trace_decode_token_ids=TRACE_TOKEN_IDS,
++        logprobs=5,
++    )
++
++    with VllmRunner(
++        MODEL_NAME,
++        max_model_len=512,
++        max_num_seqs=4,
++        gpu_memory_utilization=0.7,
++        enforce_eager=True,
++        enable_trace_replay=True,
++    ) as runner:
++        outputs = runner.generate_w_logprobs([PROMPT], sampling_params)
++
++    output_ids, _, output_logprobs = outputs[0]
++    assert output_ids == TRACE_TOKEN_IDS
++    assert output_logprobs is not None
++    assert len(output_logprobs) == len(TRACE_TOKEN_IDS)
++
++    for token_id, step_logprobs in zip(TRACE_TOKEN_IDS, output_logprobs):
++        assert step_logprobs is not None
++        assert token_id in step_logprobs
++        token_logprob = step_logprobs[token_id]
++        assert math.isfinite(token_logprob.logprob)
++        assert token_logprob.rank is not None
+diff --git a/vllm_ascend/patch/__init__.py b/vllm_ascend/patch/__init__.py
+index 3cf15866e..d9e55aab7 100644
+--- a/vllm_ascend/patch/__init__.py
++++ b/vllm_ascend/patch/__init__.py
+@@ -1307,7 +1307,6 @@
+ #       Native FP8 serving of zai-org/GLM-5.3-Flash on Ascend 950.
+ #    Future Plan:
+ #       Remove this patch when vLLM Triton ops dispatch to the Ascend backend.
+-#
+ # ** 22. File: worker/patch_v2/patch_attn_utils.py**
+ # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+ #   1. `vllm.v1.worker.gpu.attn_utils.get_kv_cache_spec`
+@@ -1476,6 +1475,15 @@
+ #       Remove the `_load_effective_token` patch after the new Q4
+ #       Triton-Ascend release is available. Remove the marker-cache kernel
+ #       patch when Triton-Ascend 3.6.0 is the minimum supported version.
++#   4. `vllm.v1.worker.gpu.sample.trace_replay.apply_trace_tokens`
++#    Why:
++#       Ascend rejects an empty Triton launch grid because it produces
++#       `coreDim=0`.
++#    How:
++#       Replace the outer caller with an equivalent implementation that returns
++#       before launching the unchanged upstream kernel when the batch is empty.
++#    Future Plan:
++#       Remove this patch when upstream guards empty launch grids.
+ #
+ #   4. `vllm.v1.worker.gpu.sample.output.SamplingMaskTensors.from_logits`
+ #    Why:
+diff --git a/vllm_ascend/patch/worker/patch_v2/patch_triton.py b/vllm_ascend/patch/worker/patch_v2/patch_triton.py
+index 8f2ac5db8..908f774b9 100644
+--- a/vllm_ascend/patch/worker/patch_v2/patch_triton.py
++++ b/vllm_ascend/patch/worker/patch_v2/patch_triton.py
+@@ -12,6 +12,7 @@ from vllm.v1.worker.gpu.sample import (
+     sampler,
+     states,
+     thinking_budget,
++    trace_replay,
+ )
+ from vllm.v1.worker.gpu.spec_decode import rejection_sampler, rejection_sampler_utils
+ from vllm.v1.worker.gpu.spec_decode.dspark import speculator as dspark_speculator
+@@ -33,6 +34,7 @@ from vllm_ascend.worker.v2.sample.gumbel import apply_temperature
+ from vllm_ascend.worker.v2.sample.logprob import compute_token_logprobs, compute_topk_logprobs
+ from vllm_ascend.worker.v2.sample.min_p import apply_min_p
+ from vllm_ascend.worker.v2.sample.penalties import apply_penalties, bincount
++from vllm_ascend.worker.v2.sample.trace_replay import apply_trace_tokens
+ from vllm_ascend.worker.v2.spec_decode.rejection_sampler_utils import (
+     rejection_sample as npu_rejection_sample,
+ )
+@@ -75,3 +77,4 @@ output.SamplingMaskTensors.from_logits = classmethod(sampling_mask_from_logits_n
+ thinking_budget._load_effective_token = _load_effective_token_ascend
+ # TODO: Remove after Triton-Ascend 3.6.0 is the minimum supported version.
+ thinking_budget._update_committed_marker_cache_kernel = _update_committed_marker_cache_kernel_ascend
++trace_replay.apply_trace_tokens = apply_trace_tokens
+diff --git a/vllm_ascend/worker/v2/sample/trace_replay.py b/vllm_ascend/worker/v2/sample/trace_replay.py
+new file mode 100644
+index 000000000..2d33c8ac4
+--- /dev/null
++++ b/vllm_ascend/worker/v2/sample/trace_replay.py
+@@ -0,0 +1,43 @@
++# Adapt from https://github.com/vllm-project/vllm/blob/main/vllm/v1/worker/gpu/sample/trace_replay.py.
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++#
++# Copyright (c) 2026 Huawei Technologies Co., Ltd. All Rights Reserved.
++#
++# Licensed under the Apache License, Version 2.0 (the "License");
++# you may not use this file except in compliance with the License.
++# You may obtain a copy of the License at
++#
++#     http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS,
++# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++# See the License for the specific language governing permissions and
++# limitations under the License.
++# This file is a part of the vllm-ascend project.
++
++from vllm.v1.worker.gpu.sample import trace_replay
++
++
++def apply_trace_tokens(
++    sampled,
++    idx_mapping,
++    trace_token_ids,
++    trace_len,
++    total_len,
++    prompt_len,
++):
++    num_reqs = idx_mapping.shape[0]
++    if num_reqs == 0:
++        return
++
++    trace_replay._trace_replay_kernel[(num_reqs,)](
++        sampled,
++        idx_mapping,
++        trace_token_ids,
++        trace_token_ids.stride(0),
++        trace_len,
++        total_len,
++        prompt_len,
++    )

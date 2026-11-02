@@ -1,0 +1,226 @@
+commit 12dfa3e7715c446b3a0940a53cb2cfbf34dbf940
+Author:     tyy0829 <87685049+tyy0829@users.noreply.github.com>
+AuthorDate: Mon Oct 12 17:22:24 2026 +0800
+Commit:     GitHub <noreply@github.com>
+CommitDate: Mon Oct 12 17:22:24 2026 +0800
+
+    [main][Performance][KV Pool] Cache layer-invariant masked_block_runs across layers (#17739)
+    
+    ### What this PR does / why we need it?
+    
+    `masked_block_runs` is a pure-Python O(block-count) scan called from
+    `_process_save_for_layer_batch` / `_process_load_for_layer_batch`.
+    Within one scheduling step its inputs — the per-group reachability mask
+    and the save/load block range — are **layer-invariant**, but the layer
+    loop in `process_layer_data` recomputes it for every local layer (e.g.
+    61x on a 61-layer model).
+    
+    Profiling the layerwise path shows the calls are bimodal: ~8.8us for
+    decode-step ranges vs up to ~13.2ms for long-prompt prefills (thousands
+    of blocks scanned one by one). Multiplied by the layer count, the
+    redundant rescans cost hundreds of milliseconds of pure Python on the
+    forward critical path.
+    
+    This PR memoizes the runs per step, keyed by `(path, req_id, group_id,
+    start_block, end_block)`:
+    
+    - save path: fully layer-invariant → scanned once, reused by all layers
+    - load path: `load_start_block` varies for independent layers
+    (MTP/draft) → they keep distinct cache entries
+    - the cache is cleared at the top of `process_layer_data`, before the
+    layer loop
+    
+    No behavior change; the per-layer `LayerTransferTask` construction is
+    untouched.
+    
+    ### Does this PR introduce _any_ user-facing change?
+    
+    No.
+    
+    ### How was this patch tested?
+    
+    - Unit test added: `test_masked_block_runs_cached_across_layers` in
+    `tests/ut/distributed/ascend_store/test_pool_worker.py` — asserts
+    identical runs across two layers with a holey mask, a single cache
+    entry, and per-step cache clearing.
+    - `pytest tests/ut/distributed/ascend_store/test_pool_worker.py` (mocked
+    CPU UTs): all `TestKVPoolWorkerProcessLayerData` cases pass;
+    `test_mooncake_layerwise.py` / `test_kv_transfer.py` /
+    `test_pool_scheduler.py` suites pass unchanged.
+    - NPU verification and CI runs still to be done (draft).
+    
+    - vLLM main:
+    https://github.com/vllm-project/vllm/commit/ced6857afa0ea7b2e3f0846a62e1394e90f15607
+    
+    ---------
+    
+    Signed-off-by: tyy0829 <1455207791@qq.com>
+
+diff --git a/tests/ut/distributed/ascend_store/test_pool_worker.py b/tests/ut/distributed/ascend_store/test_pool_worker.py
+index 2c8c314e6..d51480e3f 100644
+--- a/tests/ut/distributed/ascend_store/test_pool_worker.py
++++ b/tests/ut/distributed/ascend_store/test_pool_worker.py
+@@ -1954,6 +1954,31 @@ class TestKVPoolWorkerProcessLayerData(unittest.TestCase):
+         worker._process_save_for_layer_batch([req], 0)
+         self.assertEqual(len(worker.layer_save_tasks[0]), 0)
+ 
++    def test_masked_block_runs_cached_across_layers(self):
++        worker = self._make_worker()
++        req = ReqMeta(
++            req_id="r1",
++            token_len_chunk=48,
++            block_ids=[0, 1, 2],
++            block_hashes=["h0", "h1", "h2"],
++            can_save=True,
++            save_start_token=0,
++            save_end_token=48,
++        )
++        req.store_masks = ([True, False, True],)
++
++        worker._process_save_for_layer_batch([req], 0)
++        worker._process_save_for_layer_batch([req], 1)
++
++        expected_runs = [(0, 1), (2, 3)]
++        for layer in (0, 1):
++            runs = [(r.start_block, r.end_block) for r in worker.layer_save_tasks[layer][0].block_ranges]
++            self.assertEqual(runs, expected_runs)
++        self.assertEqual(len(worker._masked_runs_cache), 1)
++
++        worker.process_layer_data([])
++        self.assertEqual(worker._masked_runs_cache, {})
++
+     def test_process_load_for_layer_batch_skips(self):
+         for load_spec in (None, LoadSpec(0, 0, can_load=False, token_len=0)):
+             with self.subTest(load_spec=load_spec):
+diff --git a/tests/ut/kv_offload/test_pool_worker_pp_layer_count.py b/tests/ut/kv_offload/test_pool_worker_pp_layer_count.py
+index 253db5293..a4d8c0e05 100644
+--- a/tests/ut/kv_offload/test_pool_worker_pp_layer_count.py
++++ b/tests/ut/kv_offload/test_pool_worker_pp_layer_count.py
+@@ -111,6 +111,9 @@ def test_pp_stage_maps_multiple_cache_groups_to_local_layers(pp_rank, is_save):
+     # Supply backend allocation results; keep task and address construction real.
+     worker._prepare_load_gvas = Mock()
+     worker._alloc_gvas_for_save = Mock()
++    # The worker is built via __new__ (no __init__), so the per-step memo
++    # cache that process_layer_data clears must be seeded manually.
++    worker._masked_runs_cache = {}
+     request = ReqMeta(
+         req_id="pp-layer",
+         token_len_chunk=16,
+diff --git a/vllm_ascend/distributed/kv_transfer/kv_pool/ascend_store/metadata.py b/vllm_ascend/distributed/kv_transfer/kv_pool/ascend_store/metadata.py
+index 1b1b1d945..5182f1732 100644
+--- a/vllm_ascend/distributed/kv_transfer/kv_pool/ascend_store/metadata.py
++++ b/vllm_ascend/distributed/kv_transfer/kv_pool/ascend_store/metadata.py
+@@ -749,18 +749,30 @@ def masked_block_runs(
+         return []
+     if mask is None:
+         return [(start_block, end_block)]
++    mask_len = len(mask)
++    if start_block >= mask_len:
++        return [(start_block, end_block)]
++    scan_end = min(end_block, mask_len)
++    # True/False map to b"\x01"/b"\x00"; bytes.find scans at C speed and
++    # never raises (unlike list.index), so both dense and holey masks skip
++    # the per-block Python loop.
++    bits = bytes(mask[start_block:scan_end])
+     runs: list[tuple[int, int]] = []
+-    run_start: int | None = None
+-    for block_idx in range(start_block, end_block):
+-        allowed = block_idx >= len(mask) or mask[block_idx]
+-        if allowed and run_start is None:
+-            run_start = block_idx
+-        elif not allowed and run_start is not None:
+-            runs.append((run_start, block_idx))
+-            run_start = None
+-    if run_start is not None:
+-        runs.append((run_start, end_block))
+-    return runs
++    pos = 0
++    while True:
++        hole = bits.find(b"\x00", pos)
++        if hole == -1:
++            runs.append((start_block + pos, end_block))
++            return runs
++        if hole > pos:
++            runs.append((start_block + pos, start_block + hole))
++        pos = bits.find(b"\x01", hole + 1)
++        if pos == -1:
++            # Remaining mask blocks are all disallowed, but blocks at or
++            # beyond mask_len stay allowed.
++            if end_block > mask_len:
++                runs.append((mask_len, end_block))
++            return runs
+ 
+ 
+ class _LazyGroupedBlockHashList(Sequence[BlockHash | str]):
+diff --git a/vllm_ascend/distributed/kv_transfer/kv_pool/ascend_store/pool_worker.py b/vllm_ascend/distributed/kv_transfer/kv_pool/ascend_store/pool_worker.py
+index 505ec5a80..1553f12e2 100644
+--- a/vllm_ascend/distributed/kv_transfer/kv_pool/ascend_store/pool_worker.py
++++ b/vllm_ascend/distributed/kv_transfer/kv_pool/ascend_store/pool_worker.py
+@@ -480,6 +480,10 @@ class KVPoolWorker:
+         self._layerwise_session_tracker = LayerwiseSessionTracker()
+         self._current_layerwise_request_ids: set[str] = set()
+         self._current_layerwise_last_chunk_req_ids: set[str] = set()
++        # (tag, req_id, group_id, start_block, end_block) -> runs, cleared per
++        # step in process_layer_data(). masked_block_runs inputs are
++        # layer-invariant, so only the first layer pays the O(blocks) scan.
++        self._masked_runs_cache: dict[tuple[str, str, int, int, int], list[tuple[int, int]]] = {}
+         # PERF-TUNE(4): per-step RPC result caches. Defined once here so
+         # mypy does not flag repeated attribute definitions; they are reset
+         # per step via .clear() in process_layer_data().
+@@ -1424,6 +1428,26 @@ class KVPoolWorker:
+             return True
+         return self.tp_rank == min(peers)
+ 
++    def _masked_block_runs_cached(
++        self,
++        tag: str,
++        request: ReqMeta,
++        group_id: int,
++        start_block: int,
++        end_block: int,
++        mask: Sequence[bool] | None,
++    ) -> list[tuple[int, int]]:
++        # masked_block_runs is O(end_block - start_block); the layer loop
++        # calls it with identical (mask, range) for every layer, so memoize
++        # per step. start_block/end_block stay in the key: the load path
++        # varies them across independent layers.
++        key = (tag, request.req_id, group_id, start_block, end_block)
++        runs = self._masked_runs_cache.get(key)
++        if runs is None:
++            runs = masked_block_runs(mask, start_block, end_block)
++            self._masked_runs_cache[key] = runs
++        return runs
++
+     def _process_save_for_layer_batch(
+         self,
+         requests: list[ReqMeta],
+@@ -1470,7 +1494,9 @@ class KVPoolWorker:
+                 if request.store_masks is not None and group_id < len(request.store_masks)
+                 else None
+             )
+-            block_runs = masked_block_runs(group_store_mask, save_start_block, save_end_block)
++            block_runs = self._masked_block_runs_cached(
++                "save", request, group_id, save_start_block, save_end_block, group_store_mask
++            )
+             if not block_runs and partial_block_index is None:
+                 continue
+             for run_idx, (run_start_block, run_end_block) in enumerate(block_runs):
+@@ -1582,7 +1608,9 @@ class KVPoolWorker:
+                 if request.load_masks is not None and group_id < len(request.load_masks)
+                 else None
+             )
+-            block_runs = masked_block_runs(group_load_mask, load_start_block, full_blocks)
++            block_runs = self._masked_block_runs_cached(
++                "load", request, group_id, load_start_block, full_blocks, group_load_mask
++            )
+             if not block_runs and partial_block_index is None:
+                 continue
+             for run_idx, (run_start_block, run_end_block) in enumerate(block_runs):
+@@ -2617,6 +2645,7 @@ class KVPoolWorker:
+         self._wait_for_final_layer_save(num_local, self.kv_send_thread)
+ 
+     def process_layer_data(self, requests: list[ReqMeta]) -> None:
++        self._masked_runs_cache.clear()
+         # Keep this method safe for direct callers as well as metadata binding.
+         # Worker threads may still own the lists from the preceding step.
+         self.layer_save_tasks = [[] for _ in range(self.num_layers)]

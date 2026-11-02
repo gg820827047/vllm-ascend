@@ -1,0 +1,1784 @@
+commit 83050631dcebf5d9302bf4917a40a0f2cc0c6127
+Author:     weiguihua2 <984323595@qq.com>
+AuthorDate: Fri Oct 9 15:27:02 2026 +0800
+Commit:     GitHub <noreply@github.com>
+CommitDate: Fri Oct 9 15:27:02 2026 +0800
+
+    [Feature][Attention] Support GQA PCP and DCP stacking (#18065)
+    
+    ### What this PR does / why we need it?
+    
+    GQA/MQA previously rejected simultaneous prefill and decode context
+    parallelism. Enable MRV2 stacking for equal PCP and DCP sizes, retaining
+    each rank's TP-local heads.
+    
+    Prefill computes current dense K/V attention for local query fragments
+    and historical attention on DCP-owned KV shards separately. Current K/V
+    is gathered across PCP; historical queries are gathered and restored by
+    token order; historical KV remains sharded. Merge partial outputs and
+    LSE, select local queries and add the current contribution once. Share
+    history metadata construction and remove redundant history masks while
+    preserving decode graph-padding behavior.
+    
+    ### Does this PR introduce _any_ user-facing change?
+    
+    Yes. GQA/MQA target and draft models can use PCP+DCP only when
+    `prefill_context_parallel_size == decode_context_parallel_size`. For
+    example, Qwen3-30B-A3B supports TP8/PCP2/DCP2. The same-size path does
+    not gather query heads. The constraint is enforced in platform
+    validation.
+    
+    This PR targets `main`.
+    
+    ### How was this patch tested?
+    
+    - Isolated Ascend container validation of this branch's exact source:
+    **937 passed, 5 skipped** across 18 attention, platform, graph, PCP and
+    speculative-metadata unit test files. Runtime: vLLM `releases/v0.30.0`
+    (`ced6857afa`), torch 2.10.0 / torch-npu 2.10.0.post4.
+    - Added/strengthened coverage for both PCP query-fragment ranks, all
+    DCP2/DCP4 ranks, uneven/empty history, causal/noncausal KV ordering,
+    decode/prefill padding, actual FIA Q/K/V inputs and cache-write error
+    recovery.
+    - Qwen3-30B-A3B-Instruct-2507 + EAGLE3, MRV2 TP8/PCP2/DCP2
+    FULL_DECODE_ONLY: GSM8K test first 500, zero-shot CoT, temperature 0,
+    seed 1024, max output 4096, concurrency 32: **97.00% (485/500)** with
+    zero request failures. This model run used the remote feature source
+    before import-only formatting; the exact PR source was rerun through the
+    unit matrix above.
+    - Shared-path smoke: DeepSeek-V3.1-w4a8-mtp-QuaRot + MTP3, the same
+    PCP/DCP topology and graph mode: GSM8K first 500 **96.20% (481/500)**,
+    zero request failures.
+    - Repository `format.sh ci` hooks executed, including secret scan and
+    shell checks. Workflow lint uses pinned actionlint 1.7.7 and ShellCheck
+    0.11.0 on Linux with verified identical input hashes because the Windows
+    integration stalls.
+    
+    Known validation limits: no performance benchmark or full GSM8K baseline
+    comparison. Earlier deterministic no-speculation PCP+DCP versus TP
+    logprobs had maximum difference 0.013416, outside atol=rtol=0.01; the
+    old and reviewed implementations matched each other exactly in that
+    comparison. Task accuracy does not resolve that cross-topology numeric
+    gate.
+    
+    - vLLM main:
+    https://github.com/vllm-project/vllm/commit/ced6857afa0ea7b2e3f0846a62e1394e90f15607
+    
+    ---------
+    
+    Signed-off-by: weiguihua2 <984323595@qq.com>
+
+diff --git a/docs/source/user_guide/feature_guide/context_parallel.md b/docs/source/user_guide/feature_guide/context_parallel.md
+index d3fc84c37..b3839195a 100644
+--- a/docs/source/user_guide/feature_guide/context_parallel.md
++++ b/docs/source/user_guide/feature_guide/context_parallel.md
+@@ -120,7 +120,9 @@ For either method, remove `--enforce-eager` and add the following option to use
+ - Full graph execution with PCP is limited to `FULL_DECODE_ONLY`.
+ - Pipeline parallelism, encoder-decoder models, multimodal inputs, and LoRA are not supported with MRV2 PCP.
+ - SFA draft attention is not supported with PCP speculative decoding.
+-- PCP and DCP cannot be enabled simultaneously.
++- PCP and DCP can be stacked for MLA, SFA, and GQA. MLA and SFA support DCP
++  equal to PCP or TP x PCP. GQA stacking supports only equal
++  prefill_context_parallel_size and decode_context_parallel_size.
+ - Adaptive verification is not supported with PCP speculative decoding.
+ - Dynamic draft lengths are outside the currently validated scope.
+ - PCP and [DSA-CP](#dsa-cp) cannot be enabled simultaneously with the DSA backend.
+diff --git a/tests/ut/attention/test_attention_cp.py b/tests/ut/attention/test_attention_cp.py
+index b2b21c798..28935ef11 100644
+--- a/tests/ut/attention/test_attention_cp.py
++++ b/tests/ut/attention/test_attention_cp.py
+@@ -1,7 +1,8 @@
+ # SPDX-License-Identifier: Apache-2.0
+ 
++from contextlib import nullcontext
+ from types import SimpleNamespace
+-from unittest.mock import patch
++from unittest.mock import Mock, patch
+ 
+ import numpy as np
+ import pytest
+@@ -17,10 +18,9 @@ from vllm_ascend.attention.context_parallel.attention_cp import (
+     AscendAttentionDCPMetadata,
+     AscendAttentionDCPMetadataBuilder,
+     AscendMetadataForDecode,
++    AscendMetadataForPrefill,
+ )
+-from vllm_ascend.attention.context_parallel.common_cp import (
+-    _update_out_and_lse,
+-)
++from vllm_ascend.attention.context_parallel.common_cp import _update_out_and_lse
+ 
+ 
+ def test_gqa_dcp_extends_v1_backend_without_polluting_base_metadata() -> None:
+@@ -34,30 +34,355 @@ def test_gqa_dcp_extends_v1_backend_without_polluting_base_metadata() -> None:
+     assert not hasattr(AscendMetadata(), "prefill")
+ 
+ 
+-def test_dcp_chunked_request_mask_marks_nonempty_contexts() -> None:
+-    local_context_lens = torch.tensor([0, 4, 7], dtype=torch.int32)
++def test_gqa_dcp_builder_consumes_pcp_context() -> None:
++    assert AscendAttentionDCPMetadataBuilder.consumes_pcp_context
+ 
+-    assert AscendAttentionDCPMetadataBuilder._get_chunked_req_mask(local_context_lens) == [
+-        False,
+-        True,
+-        True,
+-    ]
+ 
++def test_gqa_tp_only_dcp_still_gathers_heads() -> None:
++    impl = AscendAttentionDCPImpl.__new__(AscendAttentionDCPImpl)
++    impl.pcp_group = SimpleNamespace(world_size=1)
++    query = torch.arange(8).view(1, 4, 2)
++    gathered = torch.cat((query, query + 100), dim=1)
++    impl._dcp_all_gather = Mock(return_value=gathered)
++    (actual,) = impl._dcp_all_gather_fragments(query, dim=1)
++    torch.testing.assert_close(actual, gathered)
++    impl._dcp_all_gather.assert_called_once()
+ 
+-@pytest.mark.parametrize("size", [2, 4])
+-@pytest.mark.parametrize("rank", [0, 1])
++
++@pytest.mark.parametrize("kv_heads", [1, 2])
++def test_gqa_pcp_dcp_preserves_tp_local_heads_and_merges_pcp_shards(kv_heads) -> None:
++    impl = AscendAttentionDCPImpl.__new__(AscendAttentionDCPImpl)
++    impl.num_kv_heads = kv_heads
++    impl.dcp_size = 2
++    impl.pcp_group = SimpleNamespace(world_size=2, unique_name="pcp-kv-shards")
++    impl.dcp_group = SimpleNamespace(unique_name="dcp-kv-shards")
++    impl.tp_group = SimpleNamespace(world_size=8, unique_name="tp-heads", all_gather=Mock())
++    impl._dcp_all_gather = Mock(side_effect=AssertionError("Identical TP heads must not be gathered"))
++    query = torch.randn(3, kv_heads * 4, 2)
++    (gathered,) = impl._dcp_all_gather_fragments(query, dim=1)
++    assert gathered is query
++    impl._dcp_all_gather.assert_not_called()
++    impl.tp_group.all_gather.assert_not_called()
++    lse = torch.zeros(*query.shape[:2], 1)
++    with patch("torch.ops.vllm.dcp_a2a_fused", return_value=query) as combine:
++        actual = impl._merge_dcp_attention_output(query, lse)
++    assert actual is query
++    combine.assert_called_once_with(query, lse, 1, 1, "tp-heads", "pcp-kv-shards", defer_combine=False)
++
++
++def test_gqa_dcp_capture_forwards_pcp_context() -> None:
++    builder = AscendAttentionDCPMetadataBuilder.__new__(AscendAttentionDCPMetadataBuilder)
++    builder.build = Mock(return_value="metadata")
++    common = object()
++    context = object()
++
++    assert builder.build_for_cudagraph_capture(common, pcp_context=context, pcp_cache_group_idx=2) == "metadata"
++    builder.build.assert_called_once_with(
++        common_prefix_len=0, common_attn_metadata=common, pcp_context=context, pcp_cache_group_idx=2
++    )
++
++
++@pytest.mark.parametrize("rank", [0, 1], ids=["head-tail", "middle"])
++@pytest.mark.parametrize("history", [0, 101], ids=["first-chunk", "uneven-history"])
++@pytest.mark.parametrize("causal", [False, True])
++@pytest.mark.parametrize("chunked_prefill_enabled", [False, True])
++def test_gqa_pcp_dcp_metadata_separates_current_prefix_and_dcp_history(
++    history, chunked_prefill_enabled, causal, rank
++) -> None:
++    builder = AscendAttentionDCPMetadataBuilder.__new__(AscendAttentionDCPMetadataBuilder)
++    builder.pcp_group = SimpleNamespace(world_size=2, rank_in_group=rank)
++    builder.pcp_enabled = True
++    builder.chunked_prefill_enabled = chunked_prefill_enabled
++    builder.dcp_size = 2
++    builder.dcp_rank = rank
++    builder.device = torch.device("cpu")
++    builder.vllm_config = SimpleNamespace(parallel_config=SimpleNamespace(cp_kv_cache_interleave_size=1))
++    builder._pcp_cache_group_idx = 0
++    global_table = torch.tensor([[3]], dtype=torch.int32)
++    builder._pcp_context = SimpleNamespace(
++        global_batch=SimpleNamespace(
++            num_reqs=1,
++            is_prefilling_np=np.array([True]),
++            num_computed_tokens_np=np.array([history]),
++            query_start_loc_np=np.array([0, 8]),
++        ),
++        local_to_global_req_indices=(0, 0) if rank == 0 else (0,),
++        hidden_restore_idx=torch.tensor([0, 1, 4, 5, 6, 7, 2, 3]),
++        padded_gather_idx=torch.tensor([0, 1, 6, 7, 2, 3, 4, 5]),
++        global_block_tables=(global_table,),
++    )
++    common = SimpleNamespace(slot_mapping=torch.zeros(8, dtype=torch.int64), num_actual_tokens=4, causal=causal)
++    query_lens = [2, 2] if rank == 0 else [4]
++    current_ends = [2, 8] if rank == 0 else [6]
++    prefill = builder._build_pcp_prefill_metadata(
++        common,
++        global_table.expand(len(query_lens), -1),
++        torch.tensor(query_lens),
++        torch.tensor([history + end for end in current_ends]),
++        0,
++        len(query_lens),
++    )
++    ordered = [0, 1, 4, 5, 6, 7, 2, 3]
++    expected_indices = ([0, 1] + ordered if rank == 0 else ordered[:6]) if causal else ordered * len(query_lens)
++    expected_kv_ends = ([2, 10] if rank == 0 else [6]) if causal else ([8, 16] if rank == 0 else [8])
++    assert prefill.pcp_current_kv_indices.tolist() == expected_indices
++    assert prefill.pcp_actual_seq_lengths_kv == expected_kv_ends
++    assert prefill.actual_seq_lengths_q == ([2, 4] if rank == 0 else [4])
++    if history:
++        assert prefill.block_tables.shape[0] == 1
++        expected_history = [sum(position % 2 == rank for position in range(history))]
++        assert prefill.chunked_context.local_context_lens.tolist() == expected_history
++        assert prefill.chunked_context.actual_seq_lengths_kv == expected_history
++        assert prefill.chunked_context.actual_chunk_seq_lengths == [8]
++        assert prefill.chunked_context.pcp_query_restore_idx.tolist() == [0, 1, 4, 5, 6, 7, 2, 3]
++        assert prefill.chunked_context.pcp_local_query_indices.tolist() == ([0, 1, 6, 7] if rank == 0 else [2, 3, 4, 5])
++        impl = AscendAttentionDCPImpl.__new__(AscendAttentionDCPImpl)
++        impl.pcp_enabled = True
++        gathered_query = torch.tensor([0, 1, 6, 7, 2, 3, 4, 5]).view(8, 1, 1)
++        impl.pcp_group = SimpleNamespace(all_gather=Mock(return_value=gathered_query))
++        impl._dcp_all_gather_fragments = Mock(side_effect=lambda query, dim: (query,))
++        restored_query = impl._prefill_query_all_gather(
++            SimpleNamespace(prefill=prefill), gathered_query[rank * 4 : (rank + 1) * 4]
++        )
++        torch.testing.assert_close(restored_query, torch.arange(8).view(8, 1, 1))
++        local_query = gathered_query[rank * 4 : (rank + 1) * 4]
++        impl.pcp_group.all_gather.assert_called_once()
++        torch.testing.assert_close(impl.pcp_group.all_gather.call_args.args[0], local_query)
++        assert impl.pcp_group.all_gather.call_args.kwargs["dim"] == 0
++    else:
++        assert prefill.chunked_context is None
++
++
++def test_gqa_first_prefill_uses_current_kv_prefixes_without_cache_tables() -> None:
++    builder = AscendAttentionDCPMetadataBuilder.__new__(AscendAttentionDCPMetadataBuilder)
++    builder.pcp_enabled = True
++    builder.pcp_group = SimpleNamespace(world_size=2)
++    builder.chunked_prefill_enabled = True
++    builder._pcp_context = SimpleNamespace(
++        global_batch=SimpleNamespace(
++            num_reqs=2,
++            is_prefilling_np=np.array([False, True]),
++            num_computed_tokens_np=np.array([10, 0]),
++            query_start_loc_np=np.array([0, 1, 9]),
++        ),
++        local_to_global_req_indices=(0, 1, 1),
++        hidden_restore_idx=torch.tensor([0, 1, 2, 6, 7, 8, 9, 3, 4]),
++    )
++    query_lens = torch.tensor([1, 2, 2], dtype=torch.int32)
++    seq_lens = torch.tensor([11, 2, 8], dtype=torch.int32)
++    common = SimpleNamespace(slot_mapping=torch.zeros(10, dtype=torch.int64), dcp_local_seq_lens_cpu=None, causal=True)
++    # Avoid decode construction here; directly verify the mixed-batch prefix map.
++    prefill = builder._build_pcp_prefill_metadata(
++        common, torch.zeros(3, 1, dtype=torch.int32), query_lens, seq_lens, 1, 2
++    )
++    indices = prefill.pcp_current_kv_indices
++    assert indices.tolist() == [1, 2, 1, 2, 5, 6, 7, 8, 3, 4]
++    cache_order_tokens = torch.tensor([-1, 0, 1, 6, 7, 2, 3, 4, 5])
++    assert cache_order_tokens[indices].tolist() == [0, 1, 0, 1, 2, 3, 4, 5, 6, 7]
++
++
++@pytest.mark.parametrize("pcp_enabled", [False, True], ids=["dcp-only", "pcp-dcp"])
++@pytest.mark.parametrize("causal", [False, True], ids=["noncausal", "causal"])
++def test_gqa_current_attention_routes_local_q_and_ordered_kv(pcp_enabled, causal) -> None:
++    impl = AscendAttentionDCPImpl.__new__(AscendAttentionDCPImpl)
++    impl.pcp_enabled = pcp_enabled
++    impl.num_heads, impl.num_kv_heads = 4, 1
++    impl.scale = 0.5
++    ordered = [1, 2, 5, 6, 7, 8, 3, 4]
++    kv_rows = [1, 2] + ordered if causal else ordered * 2
++    kv_ends = [2, 10] if causal else [8, 16]
++    prefill = AscendMetadataForPrefill(
++        actual_seq_lengths_q=[2, 4],
++        pcp_current_kv_indices=torch.tensor(kv_rows),
++        pcp_actual_seq_lengths_kv=kv_ends,
++    )
++    metadata = AscendAttentionDCPMetadata(
++        num_decode_tokens=1,
++        num_actual_tokens=5,
++        causal=causal,
++        attn_mask=torch.ones(4, 4, dtype=torch.bool),
++        prefill=prefill,
++    )
++    query = torch.arange(7 * 4 * 2).float().view(7, 4, 2)
++    key = torch.arange(9 * 2).float().view(9, 1, 2)
++    value = key + 1000
++    expected_query = query[1:5]
++    lse = torch.zeros(4, 4, 1)
++    module = "vllm_ascend.attention.context_parallel.attention_cp"
++    with (
++        patch(module + ".record_attention_compute_start"),
++        patch(module + ".torch_npu.npu_fused_infer_attention_score", return_value=(expected_query, lse)) as attention,
++    ):
++        actual, actual_lse = impl._forward_prefill_current_kv(query, key, value, metadata)
++    attention.assert_called_once()
++    sent_query, sent_key, sent_value = attention.call_args.args
++    torch.testing.assert_close(sent_query, expected_query)
++    expected_rows = kv_rows if pcp_enabled else [1, 2, 3, 4]
++    torch.testing.assert_close(sent_key, key[expected_rows])
++    torch.testing.assert_close(sent_value, value[expected_rows])
++    torch.testing.assert_close(actual, expected_query)
++    assert actual_lse is lse
++    assert attention.call_args.kwargs["actual_seq_lengths"] is prefill.actual_seq_lengths_q
++    assert attention.call_args.kwargs["actual_seq_lengths_kv"] == (kv_ends if pcp_enabled else [2, 4])
++    assert attention.call_args.kwargs["sparse_mode"] == (3 if causal else 0)
++    assert attention.call_args.kwargs["atten_mask"] is (metadata.attn_mask if causal else None)
++
++
++@pytest.mark.parametrize("has_history", [False, True])
++@pytest.mark.parametrize("decode_tokens", [0, 1])
++@pytest.mark.parametrize("padding", [0, 2])
++def test_gqa_pcp_dcp_merges_history_only_for_local_query_fragments(has_history, decode_tokens, padding) -> None:
++    from vllm_ascend.attention.context_parallel import attention_cp
++
++    impl = AscendAttentionDCPImpl.__new__(AscendAttentionDCPImpl)
++    impl.head_size = 2
++    impl.pcp_enabled = True
++    impl._forward_decode_dcp = Mock(return_value=torch.full((decode_tokens, 1, 2), 9.0))
++    current_output = torch.ones(4, 1, 2)
++    current_lse = torch.zeros(4, 1, 1)
++    impl._forward_prefill_current_kv = Mock(return_value=(current_output, current_lse))
++    impl._prefill_query_all_gather = Mock(return_value=torch.zeros(8, 1, 2))
++    impl._compute_prefill_context = Mock(return_value=(torch.zeros(8, 1, 2), torch.zeros(8, 1, 1)))
++    recv = torch.arange(2 * 8 * 3).view(2, 1, 8, 3)
++    impl._merge_dcp_attention_output = Mock(return_value=recv)
++    prefill = AscendMetadataForPrefill()
++    if has_history:
++        prefill.chunked_context = AscendMetadataForPrefill.ChunkedContextMetadata(
++            actual_chunk_seq_lengths=[8],
++            actual_seq_lengths_kv=[2],
++            starts=torch.zeros(1, dtype=torch.int32),
++            pcp_local_query_indices=torch.tensor([0, 1, 6, 7]),
++        )
++    metadata = AscendAttentionDCPMetadata(
++        num_decodes=decode_tokens,
++        num_prefills=2,
++        num_decode_tokens=decode_tokens,
++        num_actual_tokens=decode_tokens + 4,
++        pcp_local_num_input_tokens=decode_tokens + 4 + padding,
++        prefill=prefill,
++        decode=AscendMetadataForDecode(actual_seq_lengths_q=list(range(1, decode_tokens + 1)))
++        if decode_tokens
++        else None,
++    )
++    query = torch.arange((decode_tokens + 4 + padding) * 2).float().reshape(-1, 1, 2)
++    output = torch.full_like(query, -99)
++    stream = Mock()
++    with (
++        patch.object(attention_cp, "cp_chunkedprefill_comm_stream", return_value=stream),
++        patch.object(torch.npu, "current_stream", return_value=stream),
++        patch.object(attention_cp.torch_npu.npu, "stream", side_effect=lambda *_: nullcontext()),
++        patch.object(attention_cp, "fused_dcp_lse_combine", return_value=current_output) as combine,
++    ):
++        actual = impl.forward_impl(query, query, query, (), metadata, output)
++    assert actual is output
++    torch.testing.assert_close(actual[decode_tokens : decode_tokens + 4], current_output)
++    if decode_tokens:
++        torch.testing.assert_close(actual[:decode_tokens], torch.full((decode_tokens, 1, 2), 9.0))
++        impl._forward_decode_dcp.assert_called_once()
++        torch.testing.assert_close(impl._forward_decode_dcp.call_args.args[0], query[:decode_tokens])
++    else:
++        impl._forward_decode_dcp.assert_not_called()
++    if padding:
++        torch.testing.assert_close(actual[-padding:], torch.full((padding, 1, 2), -99.0))
++    if has_history:
++        torch.testing.assert_close(impl._prefill_query_all_gather.call_args.args[1], query[decode_tokens:])
++        selected = recv[:, :, [0, 1, 6, 7]]
++        torch.testing.assert_close(combine.call_args.args[0], selected)
++        assert combine.call_args.kwargs["local_output"] is current_output
++        assert combine.call_args.kwargs["local_lse"] is current_lse
++        impl._merge_dcp_attention_output.assert_called_once()
++    else:
++        impl._prefill_query_all_gather.assert_not_called()
++        impl._compute_prefill_context.assert_not_called()
++        impl._merge_dcp_attention_output.assert_not_called()
++        combine.assert_not_called()
++
++
++def test_gqa_chunked_prefill_uses_shared_dcp_merge_for_pcp_overlap() -> None:
++    impl = AscendAttentionDCPImpl.__new__(AscendAttentionDCPImpl)
++    impl.pcp_enabled = False
++    impl.num_heads = 4
++    impl.num_kv_heads = 1
++    impl.head_size = 2
++    impl.scale = 0.5
++
++    chunked = AscendMetadataForPrefill.ChunkedContextMetadata(
++        actual_chunk_seq_lengths=[3],
++        actual_seq_lengths_kv=[5],
++        starts=torch.zeros(1, dtype=torch.int32),
++    )
++    metadata = AscendAttentionDCPMetadata(
++        num_decodes=0,
++        num_prefills=1,
++        num_decode_tokens=0,
++        num_actual_tokens=3,
++        causal=True,
++        attn_mask=torch.ones(3, 3, dtype=torch.bool),
++        prefill=AscendMetadataForPrefill(
++            chunked_context=chunked,
++            actual_seq_lengths_q=[3],
++        ),
++    )
++    query = torch.arange(24, dtype=torch.float32).view(3, 4, 2)
++    key = value = torch.arange(6, dtype=torch.float32).view(3, 1, 2)
++    output = torch.zeros_like(query)
++    current_output = torch.full_like(query, 1)
++    current_lse = torch.zeros(3, 4, 1)
++    history_output = torch.full_like(query, 2)
++    history_lse = torch.ones(3, 4, 1)
++    packed_history = object()
++    merged = torch.full_like(query, 3)
++    impl._prefill_query_all_gather = Mock(return_value=query)
++    impl._compute_prefill_context = Mock(return_value=(history_output, history_lse))
++    impl._merge_dcp_attention_output = Mock(return_value=packed_history)
++    stream = Mock()
++
++    module = "vllm_ascend.attention.context_parallel.attention_cp"
++    with (
++        patch(module + ".cp_chunkedprefill_comm_stream", return_value=stream),
++        patch(module + ".torch.npu.current_stream", return_value=stream),
++        patch(module + ".torch_npu.npu.stream", return_value=nullcontext()),
++        patch(module + ".record_attention_compute_start"),
++        patch(
++            module + ".torch_npu.npu_fused_infer_attention_score",
++            return_value=(current_output, current_lse),
++        ),
++        patch(module + ".fused_dcp_lse_combine", return_value=merged) as combine,
++    ):
++        actual = impl.forward_impl(query, key, value, (object(), object()), metadata, output)
++
++    impl._merge_dcp_attention_output.assert_called_once_with(
++        history_output,
++        history_lse,
++        defer_combine=True,
++    )
++    combine.assert_called_once()
++    assert combine.call_args.args == (packed_history, 2)
++    assert combine.call_args.kwargs["scatter_dim"] == 1
++    torch.testing.assert_close(combine.call_args.kwargs["local_output"], current_output)
++    torch.testing.assert_close(combine.call_args.kwargs["local_lse"], current_lse)
++    torch.testing.assert_close(actual, merged)
++
++
++@pytest.mark.parametrize("size,rank", [(2, 0), (2, 1), (4, 0), (4, 1), (4, 2), (4, 3)])
+ @pytest.mark.parametrize("interleave", [1, 8])
+-def test_dcp_chunked_prefill_keeps_host_parameters_and_device_history_separate(size, rank, interleave):
++@pytest.mark.parametrize("device_context_offset", [0, 3])
++def test_dcp_chunked_prefill_keeps_host_parameters_and_device_history_separate(
++    size, rank, interleave, device_context_offset
++):
+     builder = object.__new__(AscendAttentionDCPMetadataBuilder)
+     builder.chunked_prefill_enabled = True
++    builder.pcp_enabled = False
+     builder.dcp_size, builder.dcp_rank = size, rank
+     builder.device = torch.device("cpu")
+     builder.vllm_config = SimpleNamespace(parallel_config=SimpleNamespace(cp_kv_cache_interleave_size=interleave))
+     # Include a decode request and a prefill request with no cached history.
+     seq_lens = torch.tensor([11, 20, 5, 14], dtype=torch.int32)
+     query_lens = torch.tensor([1, 3, 5, 6], dtype=torch.int32)
++    device_seq_lens = seq_lens.clone()
++    device_seq_lens[[1, 3]] += device_context_offset
+     common = SimpleNamespace(
+-        seq_lens=seq_lens.clone(),
++        seq_lens=device_seq_lens,
+         query_start_loc=torch.cat([torch.zeros(1, dtype=torch.int32), query_lens.cumsum(0)]),
+         dcp_local_seq_lens_cpu=torch.tensor(
+             [
+@@ -82,13 +407,16 @@ def test_dcp_chunked_prefill_keeps_host_parameters_and_device_history_separate(s
+             num_decodes=1,
+             num_prefills=3,
+         )
++    assert metadata["prefill"].actual_seq_lengths_q == [3, 8, 14]
+     chunked = metadata["prefill"].chunked_context
+     expected = [sum((position // interleave) % size == rank for position in range(length)) for length in [17, 0, 8]]
+-    torch.testing.assert_close(chunked.local_context_lens, torch.tensor(expected, dtype=torch.int32))
++    expected_device = [
++        sum((position // interleave) % size == rank for position in range(length))
++        for length in [17 + device_context_offset, 0, 8 + device_context_offset]
++    ]
++    torch.testing.assert_close(chunked.local_context_lens, torch.tensor(expected_device, dtype=torch.int32))
+     assert chunked.actual_seq_lengths_kv == np.cumsum(expected).tolist()
+-    assert chunked.chunked_req_mask == [True, False, True]
+     assert chunked.local_total_toks == sum(expected)
+-    assert chunked.chunk_seq_mask_filtered_indices.tolist() == [0, 1, 2, 8, 9, 10, 11, 12, 13]
+     assert chunked.starts.tolist() == [0, 0, 0]
+ 
+ 
+@@ -145,7 +473,10 @@ def test_dcp_partial_attention_merge_matches_weighted_reference() -> None:
+     "is_consumer,is_producer,recompute", [(True, False, True), (True, False, False), (False, True, True)]
+ )
+ @pytest.mark.parametrize("query_lens", [[1, 1], [3, 3], [3, 5]])
+-def test_dcp_split_uses_builder_config_without_current_context(is_consumer, is_producer, recompute, query_lens):
++@pytest.mark.parametrize("pcp_enabled", [False, True])
++def test_dcp_split_uses_builder_config_without_current_context(
++    is_consumer, is_producer, recompute, query_lens, pcp_enabled
++):
+     config = SimpleNamespace(
+         kv_transfer_config=SimpleNamespace(is_kv_consumer=is_consumer, is_kv_producer=is_producer),
+     )
+@@ -154,10 +485,17 @@ def test_dcp_split_uses_builder_config_without_current_context(is_consumer, is_p
+             "vllm_ascend.attention.context_parallel.attention_cp.DCPMetadataBuilderMixin.__init__", return_value=None
+         ),
+         patch("vllm_ascend.attention.context_parallel.attention_cp.enable_dcp", return_value=True) as dcp,
++        patch(
++            "vllm_ascend.attention.context_parallel.attention_cp.get_pcp_group",
++            return_value=SimpleNamespace(world_size=1, rank_in_group=0),
++        ) as pcp_group,
+     ):
+         builder = AscendAttentionDCPMetadataBuilder()
+     dcp.assert_called_once_with()
++    pcp_group.assert_called_once_with()
++    assert builder.pcp_group is pcp_group.return_value
+     builder.vllm_config = config
++    builder.pcp_enabled = pcp_enabled
+     builder.decode_threshold = 3
+     builder.speculative_config = None
+     query_start_loc = torch.tensor([0, query_lens[0], sum(query_lens)], dtype=torch.int32)
+@@ -181,6 +519,8 @@ def test_dcp_split_uses_builder_config_without_current_context(is_consumer, is_p
+         ),
+     ):
+         actual = builder._split_decodes_and_prefills(common)
+-    num_decodes = sum(q <= 3 for q in query_lens) if is_consumer and not is_producer and recompute else 0
++    num_decodes = (
++        sum(q <= 3 for q in query_lens) if not pcp_enabled and is_consumer and not is_producer and recompute else 0
++    )
+     num_decode_tokens = sum(query_lens[:num_decodes])
+     assert actual == (num_decodes, 2 - num_decodes, num_decode_tokens, sum(query_lens) - num_decode_tokens)
+diff --git a/tests/ut/attention/test_attention_v1.py b/tests/ut/attention/test_attention_v1.py
+index b936c4737..3691d991c 100644
+--- a/tests/ut/attention/test_attention_v1.py
++++ b/tests/ut/attention/test_attention_v1.py
+@@ -1,6 +1,7 @@
+ from types import SimpleNamespace
+ from unittest.mock import MagicMock, patch
+ 
++import pytest
+ import torch
+ from vllm.config.compilation import CUDAGraphMode
+ from vllm.v1.kv_cache_interface import FullAttentionSpec
+@@ -149,6 +150,8 @@ class TestAscendAttentionBackend(TestBase):
+     def test_supports_pcp_only_for_main_implementation(self):
+         with patch("vllm_ascend.attention.attention_v1.enable_dcp", return_value=False):
+             self.assertTrue(AscendAttentionBackend.supports_pcp())
++        with patch("vllm_ascend.attention.attention_v1.enable_dcp", return_value=True):
++            self.assertTrue(AscendAttentionBackend.supports_pcp())
+ 
+         class OtherAttentionBackend(AscendAttentionBackend):
+             @staticmethod
+@@ -302,7 +305,8 @@ def test_pcp_metadata_keeps_expanded_slot_mapping() -> None:
+     assert metadata.attn_state == AscendAttentionState.ChunkedPrefill
+ 
+ 
+-def test_pcp_cache_write_uses_gathered_inputs() -> None:
++@pytest.mark.parametrize("cache_write_error", [False, True], ids=["success", "cache-write-error"])
++def test_pcp_cache_write_uses_gathered_inputs_and_restores_metadata(cache_write_error) -> None:
+     impl = AscendAttentionBackendImpl.__new__(AscendAttentionBackendImpl)
+     impl.is_pcp_decode_sharded = False
+     impl.attn_type = attn_module.AttentionType.DECODER
+@@ -340,14 +344,16 @@ def test_pcp_cache_write_uses_gathered_inputs() -> None:
+         patch("vllm_ascend.attention.attention_v1.DeviceOperator.reshape_and_cache") as reshape_and_cache,
+         patch("vllm_ascend.attention.attention_v1.notify_kv_cache_written"),
+     ):
+-        result = impl._reshape_and_cache_pcp(
+-            query,
+-            key,
+-            value,
+-            (key_cache, value_cache),
+-            metadata,
+-            output,
+-        )
++
++        def write_cache():
++            return impl._reshape_and_cache_pcp(query, key, value, (key_cache, value_cache), metadata, output)
++
++        if cache_write_error:
++            reshape_and_cache.side_effect = RuntimeError("cache write failed")
++            with pytest.raises(RuntimeError, match="cache write failed"):
++                write_cache()
++        else:
++            result = write_cache()
+ 
+     local_inputs, actual_slots, num_decode_tokens = gather_inputs.call_args.args
+     torch.testing.assert_close(local_inputs[0], key)
+@@ -361,10 +367,12 @@ def test_pcp_cache_write_uses_gathered_inputs() -> None:
+     torch.testing.assert_close(cache_args["slot_mapping"], gathered_slots)
+     assert metadata.slot_mapping is slot_mapping
+     assert metadata.num_actual_tokens == 3
+-    assert result[0] is query
+-    assert result[1] is key
+-    assert result[2] is value
+-    assert result[3] is output
++    reshape_and_cache.assert_called_once()
++    if not cache_write_error:
++        assert result[0] is query
++        assert result[1] is gathered_key
++        assert result[2] is gathered_value
++        assert result[3] is output
+ 
+ 
+ def test_pcp_builder_keeps_short_extend_in_prefill() -> None:
+diff --git a/tests/ut/attention/test_gqa_dcp_split.py b/tests/ut/attention/test_gqa_dcp_split.py
+index 764b5aeb0..2da85423a 100644
+--- a/tests/ut/attention/test_gqa_dcp_split.py
++++ b/tests/ut/attention/test_gqa_dcp_split.py
+@@ -15,13 +15,12 @@ from vllm_ascend.attention.context_parallel.attention_cp import (
+     build_dcp_fia_params,
+ )
+ from vllm_ascend.attention.context_parallel.common_cp import CPKVScope, use_history_current_split_decode
+-from vllm_ascend.compilation.updatable_graph import ContextSource, SharedSource
++from vllm_ascend.compilation.updatable_graph import ContextSource, GraphUpdateTask, SharedSource, UpdatableGraph
+ from vllm_ascend.worker.v2.spec_decode.autoregressive.speculator import AscendAutoRegressiveSpeculator
+ 
+ 
+-@pytest.mark.parametrize("size", [2, 4])
++@pytest.mark.parametrize("size,rank", [(2, 0), (2, 1), (4, 0), (4, 1), (4, 2), (4, 3)])
+ @pytest.mark.parametrize("interleave", [1, 8, 16])
+-@pytest.mark.parametrize("rank", [0, 1])
+ def test_history_is_partitioned_after_removing_global_current_chunk(size, interleave, rank):
+     total = torch.tensor([0, 1, 9, 16, 33, 69], dtype=torch.int32)
+     query = torch.tensor([1, 1, 4, 3, 2, 4], dtype=torch.int32)
+@@ -66,7 +65,7 @@ def make_metadata(total=(13, 23), query=(4, 2), rank=1, interleave=1):
+     )
+ 
+ 
+-@pytest.mark.parametrize("num_reqs", [1, 3])
++@pytest.mark.parametrize("num_reqs", [1, 2, 3, 5])
+ def test_plain_eager_paged_fia_uses_inner_precise_without_padding(monkeypatch, num_reqs):
+     from vllm_ascend.attention.context_parallel import attention_cp
+ 
+@@ -336,6 +335,80 @@ def test_v2_draft_steps_update_history_and_current_independently(interleave):
+     assert metadata.decode.num_computed_tokens_of_dcp[:, 1].tolist() == expected_local.tolist()
+ 
+ 
++@pytest.mark.parametrize("is_prefill", [False, True])
++@pytest.mark.parametrize("causal", [False, True])
++@pytest.mark.parametrize("rank", [0, 1])
++@pytest.mark.parametrize("interleave", [1, 8])
++def test_v2_graph_shared_source_preserves_steps_layers_and_padding(is_prefill, causal, rank, interleave):
++    speculator = object.__new__(AscendAutoRegressiveSpeculator)
++    speculator.use_dcp = True
++    speculator.attn_architecture = "GQA"
++    speculator.dcp_manager = SimpleNamespace(dcp_world_rank=rank)
++    speculator.draft_vllm_config = SimpleNamespace(
++        parallel_config=SimpleNamespace(
++            decode_context_parallel_size=2,
++            cp_kv_cache_interleave_size=interleave,
++        )
++    )
++    speculator.input_batch = SimpleNamespace(num_reqs=2, seq_lens_np=[13, 31])
++    speculator.num_speculative_steps = 3
++    speculator.max_model_len = 32
++    query = (4, 2, 1) if is_prefill else (1, 1, 1)
++    steps = [
++        {
++            layer: make_metadata(total=(14 + step, 32, 0), query=query, rank=rank, interleave=interleave)
++            for layer in ("layer", "other_layer")
++        }
++        for step in range(1 if is_prefill else 2)
++    ]
++    speculator.draft_attn_layer_names = set(steps[0])
++    for step_index, metadata in enumerate(steps):
++        for layer_index, (layer, item) in enumerate(metadata.items()):
++            item.causal = causal
++            # Draft steps share each layer's block table, as in the metadata builder.
++            if step_index == 0:
++                item.decode.block_tables = item.decode.block_tables + 10 * layer_index
++            else:
++                item.decode.block_tables = steps[0][layer].decode.block_tables
++            if not is_prefill:
++                # Decode lengths come from the common seq_lens loop, not cached metadata.
++                item.decode.cp_history_seq_len = [-1, -1, -1]
++                item.decode.num_computed_tokens_of_dcp.fill(-1)
++    kinds = (CPKVScope.HISTORY, CPKVScope.CURRENT) if is_prefill and causal else (CPKVScope.FULL,)
++    providers = [DCPFIAParamProvider(layer, rank, kind) for layer in steps[0] for kind in kinds]
++    tasks = [
++        GraphUpdateTask(MagicMock(), {"step": step}, provider, step, None, None)
++        for step in range(len(steps))
++        for provider in providers
++    ]
++    graph = SimpleNamespace(tasks=tasks, provider_sizes={provider: len(steps) for provider in providers})
++    with patch.object(
++        AscendMetadataForDecode,
++        "update_dcp_seq_lens_cpu",
++        side_effect=AssertionError("FIA parameters must not mutate attention metadata"),
++    ):
++        params = speculator.build_fia_params(3, steps[0], is_prefill)
++        source = SharedSource(params)
++        resolved = UpdatableGraph.resolve_tasks(graph, source)
++
++    for task in resolved:
++        layer_metadata = steps[task.provider_index][task.provider.metadata_layer_name]
++        assert task.kwargs["actual_seq_lengths"] == layer_metadata.decode.actual_seq_lengths_q
++        if task.provider.attention_kind == CPKVScope.CURRENT:
++            assert task.kwargs["actual_seq_lengths_kv"] == layer_metadata.decode.actual_seq_lengths_q
++            assert task.kwargs["block_table"] is None
++        else:
++            lengths = layer_metadata.decode.seq_lens_list
++            if task.provider.attention_kind == CPKVScope.HISTORY:
++                lengths = [max(total - current, 0) for total, current in zip(lengths, query)]
++            expected = [sum((position // interleave) % 2 == rank for position in range(length)) for length in lengths]
++            assert task.kwargs["actual_seq_lengths_kv"] == expected
++            assert task.kwargs["actual_seq_lengths_kv"][-1] == 0
++            assert task.kwargs["block_table"] is layer_metadata.decode.block_tables
++        assert "layer_name" not in task.kwargs
++    assert all(task.kwargs == {"step": task.provider_index} for task in tasks)
++
++
+ def test_v2_draft_metadata_does_not_alias_history_between_steps():
+     speculator = object.__new__(AscendAutoRegressiveSpeculator)
+     speculator.attn_architecture = "GQA"
+diff --git a/tests/ut/attention/test_mla_cp.py b/tests/ut/attention/test_mla_cp.py
+index 4150fafea..67b05ce42 100644
+--- a/tests/ut/attention/test_mla_cp.py
++++ b/tests/ut/attention/test_mla_cp.py
+@@ -346,17 +346,20 @@ def test_mla_dcp_uses_native_global_query_heads_for_fia(mock_fia) -> None:
+ 
+ 
+ @pytest.mark.parametrize(
+-    "use_spec_decode,is_draft,is_prefill,expected",
++    "use_spec_decode,is_draft,is_prefill,query_ends,expected",
+     [
+-        pytest.param(True, False, False, True, id="speculative-target"),
+-        pytest.param(True, True, False, False, id="draft-decode"),
+-        pytest.param(False, True, True, True, id="draft-prefill"),
++        pytest.param(True, False, False, [1, 2], True, id="speculative-target"),
++        pytest.param(True, True, False, [1, 2], False, id="draft-decode"),
++        pytest.param(True, True, False, [2, 3], True, id="multi-token-draft"),
++        pytest.param(False, True, True, [1, 2], True, id="draft-prefill"),
++        pytest.param(False, False, False, [1, 2], False, id="decode"),
++        pytest.param(False, False, False, [1, 4], True, id="multi-token-decode"),
+     ],
+ )
+-def test_mla_split_selection_matches_shared_policy(use_spec_decode, is_draft, is_prefill, expected):
++def test_mla_split_selection_matches_shared_policy(use_spec_decode, is_draft, is_prefill, query_ends, expected):
+     impl = AscendMlaDCPImpl.__new__(AscendMlaDCPImpl)
+     impl.speculative_config = object() if use_spec_decode else None
+-    metadata = SimpleNamespace(causal=True, decode=SimpleNamespace(actual_seq_lengths_q=[1, 2]))
++    metadata = SimpleNamespace(causal=True, decode=SimpleNamespace(actual_seq_lengths_q=query_ends))
+     with patch(
+         "vllm_ascend.attention.context_parallel.mla_cp._EXTRA_CTX",
+         SimpleNamespace(is_draft_model=is_draft, is_draft_model_prefill=is_prefill, capturing=True),
+diff --git a/tests/ut/conftest.py b/tests/ut/conftest.py
+index 7f710adc0..e723b539d 100644
+--- a/tests/ut/conftest.py
++++ b/tests/ut/conftest.py
+@@ -142,6 +142,8 @@ if not _npu_available:
+     _default_npu_stream = _NpuStreamStub()
+ 
+     torch.npu = MagicMock()
++    # Use the mock class so NPUGraph subclasses retain their Python methods.
++    torch.npu.NPUGraph = MagicMock
+     torch.npu.is_available = MagicMock(return_value=False)
+     torch.npu.Stream = _NpuStreamStub
+     torch.npu.Event = MagicMock
+diff --git a/tests/ut/patch/platform/test_patch_speculative_config_dspark.py b/tests/ut/patch/platform/test_patch_speculative_config_dspark.py
+index 2a17f322b..74536bd28 100644
+--- a/tests/ut/patch/platform/test_patch_speculative_config_dspark.py
++++ b/tests/ut/patch/platform/test_patch_speculative_config_dspark.py
+@@ -8,6 +8,7 @@ from vllm.config.speculative import SpeculativeConfig
+ 
+ from vllm_ascend.patch.platform import patch_speculative_config
+ from vllm_ascend.patch.platform.patch_speculative_config import (
++    _ascend_verify_with_parallel_config,
+     _normalize_deepseek_dspark_draft,
+ )
+ 
+@@ -177,6 +178,81 @@ def test_non_dcp_dspark_config_is_not_replaced_during_validation(
+     assert config.target_parallel_config is original_parallel_config
+ 
+ 
++def test_gqa_pcp_dcp_preserves_other_upstream_checks(monkeypatch):
++    model_config = SimpleNamespace(use_mla=False, is_moe=True, runner_type="generate")
++    parallel_config = SimpleNamespace(
++        enable_expert_parallel=True,
++        tensor_parallel_size=8,
++        prefill_context_parallel_size=2,
++        decode_context_parallel_size=2,
++    )
++    validated = []
++
++    def validate_config(model, config):
++        validated.append((model, config))
++        assert config is not parallel_config
++        assert config.enable_expert_parallel is True
++        assert config.decode_context_parallel_size == 1
++
++    monkeypatch.setattr(patch_speculative_config, "_orig_verify_with_parallel_config", validate_config)
++    _ascend_verify_with_parallel_config(model_config, parallel_config)
++    assert len(validated) == 1
++    assert validated[0][0] is model_config
++    assert parallel_config.decode_context_parallel_size == 2
++
++
++def test_non_moe_draft_keeps_original_parallel_validation_bypass(monkeypatch):
++    model_config = SimpleNamespace(use_mla=False, is_moe=False, runner_type="draft")
++    parallel_config = SimpleNamespace(enable_expert_parallel=True)
++    validated = []
++    monkeypatch.setattr(
++        patch_speculative_config, "_orig_verify_with_parallel_config", lambda *args: validated.append(args)
++    )
++    assert _ascend_verify_with_parallel_config(model_config, parallel_config) is None
++    assert not validated
++
++
++def test_ascend_parallel_validation_preserves_original_config_on_error(monkeypatch):
++    model_config = SimpleNamespace(use_mla=False, is_moe=True, runner_type="generate")
++    parallel_config = SimpleNamespace(
++        enable_expert_parallel=True,
++        tensor_parallel_size=8,
++        prefill_context_parallel_size=2,
++        decode_context_parallel_size=2,
++    )
++
++    def fail(model, config):
++        assert config.enable_expert_parallel is True
++        assert config.decode_context_parallel_size == 1
++        raise ValueError("other upstream validation failed")
++
++    monkeypatch.setattr(patch_speculative_config, "_orig_verify_with_parallel_config", fail)
++    with pytest.raises(ValueError, match="other upstream validation failed"):
++        _ascend_verify_with_parallel_config(model_config, parallel_config)
++
++    assert parallel_config.enable_expert_parallel is True
++    assert parallel_config.decode_context_parallel_size == 2
++
++
++def test_gqa_tp_only_dcp_keeps_upstream_validation(monkeypatch):
++    model_config = SimpleNamespace(use_mla=False, is_moe=True, runner_type="generate")
++    parallel_config = SimpleNamespace(
++        enable_expert_parallel=True,
++        tensor_parallel_size=8,
++        prefill_context_parallel_size=1,
++        decode_context_parallel_size=2,
++    )
++    validated = []
++
++    def validate_config(model, config):
++        validated.append((model, config))
++
++    monkeypatch.setattr(patch_speculative_config, "_orig_verify_with_parallel_config", validate_config)
++
++    _ascend_verify_with_parallel_config(model_config, parallel_config)
++    assert validated == [(model_config, parallel_config)]
++
++
+ @pytest.mark.parametrize("flattened", [False, True])
+ def test_deepseek_v41_dspark_selects_v41_drafter_and_expert_shape(flattened):
+     text_config = SimpleNamespace(
+diff --git a/tests/ut/test_platform.py b/tests/ut/test_platform.py
+index 7f6e1ac9f..2a2d6b9ba 100644
+--- a/tests/ut/test_platform.py
++++ b/tests/ut/test_platform.py
+@@ -17,8 +17,10 @@ from vllm_ascend.device.hardware_profile import get_hardware_profile
+ from vllm_ascend.platform import (
+     NPUPlatform,
+     _setup_compile_backend,
++    _validate_draft_decode_context_parallel_config,
+     _validate_eplb_config,
+     _validate_parallel_config,
++    _validate_pcp_dcp_config,
+     _validate_routing_replay_config,
+     _validate_sfa_dcp_kv_sp,
+ )
+@@ -123,6 +125,129 @@ def test_ascend_sequence_parallel_moe_supports_dp1(dp_size, tp_size, enable_ep,
+     assert config.use_sequence_parallel_moe is expected
+ 
+ 
++@pytest.mark.parametrize(
++    "use_mla,pcp_size,dcp_size",
++    [
++        pytest.param(True, 2, 2, id="mla-equal"),
++        pytest.param(True, 2, 16, id="mla-full-tp-pcp"),
++        pytest.param(False, 2, 2, id="gqa-equal-2"),
++        pytest.param(False, 4, 4, id="gqa-equal-4"),
++        pytest.param(False, 1, 2, id="dcp-only"),
++        pytest.param(False, 2, 1, id="pcp-only"),
++        pytest.param(False, 1, 1, id="tp-only"),
++    ],
++)
++def test_validate_pcp_dcp_config_accepts_supported_sizes(use_mla, pcp_size, dcp_size):
++    # This guard owns PCP/DCP equality; Q/KV head geometry is validated elsewhere.
++    config = SimpleNamespace(
++        model_config=SimpleNamespace(use_mla=use_mla),
++        parallel_config=SimpleNamespace(
++            prefill_context_parallel_size=pcp_size,
++            decode_context_parallel_size=dcp_size,
++        ),
++    )
++    _validate_pcp_dcp_config(config)
++
++
++@pytest.mark.parametrize(
++    "pcp_size,dcp_size",
++    [
++        pytest.param(2, 4, id="dcp-larger"),
++        pytest.param(4, 2, id="pcp-larger"),
++        pytest.param(2, 16, id="full-tp-pcp-rejected-for-gqa"),
++    ],
++)
++def test_validate_pcp_dcp_config_rejects_unsupported_sizes(pcp_size, dcp_size):
++    config = SimpleNamespace(
++        model_config=SimpleNamespace(use_mla=False),
++        parallel_config=SimpleNamespace(
++            prefill_context_parallel_size=pcp_size,
++            decode_context_parallel_size=dcp_size,
++        ),
++    )
++    with pytest.raises(ValueError, match=rf"PCP\+DCP.*PCP={pcp_size}, DCP={dcp_size}"):
++        _validate_pcp_dcp_config(config)
++
++
++@pytest.mark.parametrize("dcp_size", [2, 16])
++def test_parallel_config_preserves_upstream_pcp_dcp_sizes(dcp_size):
++    from vllm.config.parallel import ParallelConfig
++
++    import vllm_ascend.patch.platform.patch_parallel_config  # noqa: F401
++
++    config = ParallelConfig(
++        tensor_parallel_size=8,
++        prefill_context_parallel_size=2,
++        decode_context_parallel_size=dcp_size,
++    )
++    assert config.decode_context_parallel_size == dcp_size
++
++
++@pytest.mark.parametrize("dcp_size", [4, 8])
++def test_parallel_config_rejects_partial_tp_pcp_groups(dcp_size):
++    from vllm.config.parallel import ParallelConfig
++
++    with pytest.raises(ValueError, match="valid DCP sizes"):
++        ParallelConfig(
++            tensor_parallel_size=8,
++            prefill_context_parallel_size=2,
++            decode_context_parallel_size=dcp_size,
++        )
++
++
++def test_pcp_dcp_rejects_unequal_sizes_for_gqa_draft():
++    config = SimpleNamespace(
++        parallel_config=SimpleNamespace(
++            tensor_parallel_size=8,
++            prefill_context_parallel_size=2,
++            decode_context_parallel_size=16,
++        ),
++        model_config=SimpleNamespace(
++            use_mla=True,
++            model_arch_config=SimpleNamespace(total_num_attention_heads=32),
++            get_total_num_kv_heads=lambda: 4,
++        ),
++        speculative_config=SimpleNamespace(
++            num_speculative_tokens_per_batch_size=None,
++            draft_model_config=SimpleNamespace(
++                use_mla=False,
++                model_arch_config=SimpleNamespace(total_num_attention_heads=32),
++                get_total_num_kv_heads=lambda: 8,
++            ),
++            draft_parallel_config=None,
++            draft_tensor_parallel_size=None,
++        ),
++    )
++    # MLA target validation is unchanged; its GQA draft must obey equal sizes.
++    _validate_pcp_dcp_config(config)
++    with pytest.raises(ValueError, match="to equal decode_context_parallel_size"):
++        _validate_draft_decode_context_parallel_config(config)
++
++
++def test_eagle3_gqa_pcp_dcp_skips_tp_only_head_limit():
++    draft_model_config = SimpleNamespace(
++        use_mla=False,
++        model_arch_config=SimpleNamespace(total_num_attention_heads=32),
++        get_total_num_kv_heads=lambda: 4,
++    )
++    speculative_config = SimpleNamespace(
++        num_speculative_tokens_per_batch_size=None,
++        draft_model_config=draft_model_config,
++        draft_parallel_config=None,
++        draft_tensor_parallel_size=None,
++    )
++    vllm_config = SimpleNamespace(
++        speculative_config=speculative_config,
++        parallel_config=SimpleNamespace(
++            tensor_parallel_size=4,
++            prefill_context_parallel_size=2,
++            decode_context_parallel_size=2,
++        ),
++    )
++
++    _validate_draft_decode_context_parallel_config(vllm_config)
++
++
+ @pytest.mark.parametrize("model_role", ["target", "draft", "alias", "non_speculative"])
+ def test_sfa_dcp_validation_only_bypasses_separate_draft(model_role):
+     target = object()
+diff --git a/tests/ut/worker/test_attn_utils_v2.py b/tests/ut/worker/test_attn_utils_v2.py
+index 370ddbec7..4bb77fe4d 100644
+--- a/tests/ut/worker/test_attn_utils_v2.py
++++ b/tests/ut/worker/test_attn_utils_v2.py
+@@ -631,6 +631,46 @@ def test_build_attn_metadata_factory_applies_state(monkeypatch, state_kwargs, fa
+     assert captured_kwargs["copy_sfa_draft_index"] == 2
+ 
+ 
++@pytest.mark.parametrize("dcp_size", [2])
++def test_gqa_pcp_dcp_cache_keeps_tp_local_kv_heads(monkeypatch, dcp_size):
++    source_spec = FullAttentionSpec(
++        block_size=128,
++        num_kv_heads=1,
++        head_size=128,
++        dtype=torch.bfloat16,
++    )
++    layer = SimpleNamespace(
++        kv_sharing_target_layer_name=None,
++        align_kv_cache_with_mamba=True,
++        get_kv_cache_spec=lambda _config: source_spec,
++    )
++    model_config = SimpleNamespace(
++        use_mla=False,
++        dtype=torch.bfloat16,
++        get_total_num_kv_heads=lambda: 4,
++    )
++    vllm_config = SimpleNamespace(
++        model_config=model_config,
++        parallel_config=SimpleNamespace(
++            tensor_parallel_size=8,
++            prefill_context_parallel_size=2,
++            decode_context_parallel_size=dcp_size,
++        ),
++        attention_config=SimpleNamespace(indexer_kv_dtype="auto"),
++        cache_config=SimpleNamespace(cache_dtype="auto", block_size=128),
++    )
++    monkeypatch.setattr(
++        attn_utils,
++        "get_layers_from_vllm_config",
++        lambda *_args, **_kwargs: {"model.layers.0.self_attn.attn": layer},
++    )
++    monkeypatch.setattr(attn_utils, "enable_sfa_dcp_replicated_indexer", lambda _config: False)
++
++    specs = attn_utils.get_kv_cache_spec(vllm_config)
++
++    assert specs["model.layers.0.self_attn.attn"].num_kv_heads == 1
++
++
+ @pytest.mark.parametrize(
+     ("replicated_indexer", "expected_size"),
+     [(False, 1), (True, 4)],
+diff --git a/vllm_ascend/attention/attention_v1.py b/vllm_ascend/attention/attention_v1.py
+index ed32975f9..a2ae7ade2 100644
+--- a/vllm_ascend/attention/attention_v1.py
++++ b/vllm_ascend/attention/attention_v1.py
+@@ -99,9 +99,10 @@ class AscendAttentionBackend(AttentionBackend):
+     @classmethod
+     def supports_pcp(cls) -> bool:
+         # vLLM checks this capability before any instance-level PCP dispatch.
+-        # Only the main GQA implementation owns the PCP path; exact identity
+-        # prevents backends such as 310P from inheriting unsupported capability.
+-        return cls.get_impl_cls() is AscendAttentionBackendImpl
++        # The main backend owns both the ordinary GQA implementation and its
++        # DCP specialization. Keep derived backends such as 310P and C8 opted
++        # out unless they declare support themselves.
++        return cls is AscendAttentionBackend
+ 
+     @staticmethod
+     def get_kv_cache_shape(
+@@ -1240,7 +1241,7 @@ class AscendAttentionBackendImpl(AttentionImpl):
+             attn_metadata.slot_mapping = expanded_slot_mapping
+             attn_metadata.num_actual_tokens = local_num_actual_tokens
+ 
+-        return query, key, value, output
++        return query, cache_key, cache_value, output
+ 
+     def forward_impl(
+         self,
+diff --git a/vllm_ascend/attention/context_parallel/attention_cp.py b/vllm_ascend/attention/context_parallel/attention_cp.py
+index e3d5fc86f..bb3e321fc 100644
+--- a/vllm_ascend/attention/context_parallel/attention_cp.py
++++ b/vllm_ascend/attention/context_parallel/attention_cp.py
+@@ -16,11 +16,12 @@
+ #
+ 
+ from dataclasses import dataclass
++from typing import TYPE_CHECKING
+ 
+ import numpy as np
+ import torch
+-import torch.distributed as dist
+ import torch_npu
++from vllm.distributed import get_pcp_group
+ from vllm.v1.attention.backends.utils import get_dcp_local_seq_lens
+ 
+ from vllm_ascend.ascend_forward_context import _EXTRA_CTX
+@@ -33,14 +34,11 @@ from vllm_ascend.attention.context_parallel.common_cp import (
+     CPKVScope,
+     DCPImplMixin,
+     DCPMetadataBuilderMixin,
+-    _npu_attn_out_lse_update,
+-    _update_out_and_lse,
+     use_history_current_split_decode,
+ )
+ from vllm_ascend.attention.utils import (
+     AscendCommonAttentionMetadata,
+     enable_dcp,
+-    filter_chunked_req_indices,
+     split_decodes_and_prefills,
+ )
+ from vllm_ascend.compilation.updatable_graph import get_capture_resource, register_task
+@@ -53,6 +51,9 @@ from vllm_ascend.utils import (
+     is_pd_decode_recompute_scheduler_enabled,
+ )
+ 
++if TYPE_CHECKING:
++    from vllm_ascend.worker.v2.pcp_manager import AscendPCPAttentionContext
++
+ 
+ @dataclass
+ class AscendMetadataForPrefill:
+@@ -60,17 +61,19 @@ class AscendMetadataForPrefill:
+ 
+     @dataclass
+     class ChunkedContextMetadata:
+-        actual_chunk_seq_lengths: torch.Tensor
+-        actual_seq_lengths_kv: torch.Tensor
++        actual_chunk_seq_lengths: list[int]
++        actual_seq_lengths_kv: list[int]
+         starts: torch.Tensor
+-        chunk_seq_mask_filtered_indices: torch.Tensor
+-        chunked_req_mask: list[bool] | None = None
+         local_context_lens: torch.Tensor | None = None
+         local_total_toks: int | None = None
++        pcp_query_restore_idx: torch.Tensor | None = None
++        pcp_local_query_indices: torch.Tensor | None = None
+ 
+     chunked_context: ChunkedContextMetadata | None = None
+     block_tables: torch.Tensor = None
+-    actual_seq_lengths_q: torch.Tensor = None
++    actual_seq_lengths_q: list[int] | None = None
++    pcp_current_kv_indices: torch.Tensor | None = None
++    pcp_actual_seq_lengths_kv: list[int] | None = None
+ 
+ 
+ @dataclass
+@@ -125,10 +128,36 @@ class AscendAttentionDCPMetadataBuilder(
+     """Build attention metadata for decode context parallelism."""
+ 
+     metadata_cls = AscendAttentionDCPMetadata
++    consumes_pcp_context = True
+ 
+     def __init__(self, *args, **kwargs) -> None:
+         super().__init__(*args, **kwargs)
+         self.dcp_enabled = enable_dcp()
++        self.pcp_group = get_pcp_group()
++        self._pcp_context: AscendPCPAttentionContext | None = None
++        self._pcp_cache_group_idx: int | None = None
++
++    def build(
++        self,
++        common_prefix_len: int,
++        common_attn_metadata: AscendCommonAttentionMetadata,
++        fast_build: bool = False,
++        *,
++        pcp_context: "AscendPCPAttentionContext | None" = None,
++        pcp_cache_group_idx: int | None = None,
++    ) -> AscendAttentionDCPMetadata:
++        self._pcp_context = pcp_context
++        self._pcp_cache_group_idx = pcp_cache_group_idx
++        metadata = super().build(common_prefix_len, common_attn_metadata, fast_build)
++        assert isinstance(metadata, AscendAttentionDCPMetadata)
++        return metadata
++
++    def build_for_cudagraph_capture(
++        self,
++        common_attn_metadata: AscendCommonAttentionMetadata,
++        **kwargs,
++    ) -> AscendAttentionDCPMetadata:
++        return self.build(common_prefix_len=0, common_attn_metadata=common_attn_metadata, **kwargs)
+ 
+     def _split_decodes_and_prefills(
+         self,
+@@ -138,14 +167,128 @@ class AscendAttentionDCPMetadataBuilder(
+             common_attn_metadata,
+             decode_threshold=self.decode_threshold,
+             treat_short_extends_as_decodes=(
+-                self.speculative_config is not None
+-                or (self.dcp_enabled and is_pd_decode_recompute_scheduler_enabled(self.vllm_config))
++                not self.pcp_enabled
++                and (
++                    self.speculative_config is not None
++                    or (self.dcp_enabled and is_pd_decode_recompute_scheduler_enabled(self.vllm_config))
++                )
+             ),
+         )
+ 
+-    @staticmethod
+-    def _get_chunked_req_mask(context_lens_cpu: torch.Tensor) -> list[bool]:
+-        return (context_lens_cpu > 0).tolist()
++    def _build_pcp_prefill_metadata(
++        self,
++        common_attn_metadata: AscendCommonAttentionMetadata,
++        block_table: torch.Tensor,
++        query_lens: torch.Tensor,
++        seq_lens: torch.Tensor,
++        num_decodes: int,
++        num_prefills: int,
++    ) -> AscendMetadataForPrefill:
++        """Build current KV prefixes for local Q fragments and separate history metadata."""
++        context = self._pcp_context
++        if context is None or context.local_to_global_req_indices is None:
++            raise RuntimeError("GQA PCP+DCP prefill requires the global request view and local request mapping.")
++        batch = context.global_batch
++        global_num_decodes = int((~batch.is_prefilling_np[: batch.num_reqs]).sum())
++        global_decode_tokens = int(batch.query_start_loc_np[global_num_decodes])
++        global_num_tokens = int(batch.query_start_loc_np[batch.num_reqs])
++        local_tokens = common_attn_metadata.slot_mapping.numel() // self.pcp_group.world_size
++        local_decode_tokens = int(query_lens[:num_decodes].sum())
++
++        # Compress [decode, prefill] per rank into the prefill-only Q gather layout.
++        restore_idx = context.hidden_restore_idx[global_decode_tokens:global_num_tokens]
++        query_restore_idx = (
++            (restore_idx // local_tokens) * (local_tokens - local_decode_tokens)
++            + restore_idx % local_tokens
++            - local_decode_tokens
++        ).to(torch.int64)
++        # Gathered current KV retains one shared decode area before prefill KV.
++        current_kv_indices = query_restore_idx + local_decode_tokens
++
++        rows = context.local_to_global_req_indices[num_decodes : num_decodes + num_prefills]
++        if len(rows) != num_prefills:
++            raise RuntimeError("GQA prefill request mapping does not match the local fragment count.")
++        if common_attn_metadata.causal:
++            history_lens = torch.as_tensor(batch.num_computed_tokens_np[list(rows)], dtype=seq_lens.dtype)
++            current_lens = seq_lens[num_decodes:] - history_lens
++        else:
++            # Noncausal Q fragments must see the entire current chunk of their request.
++            global_query_lens = np.diff(batch.query_start_loc_np[: batch.num_reqs + 1])
++            current_lens = torch.as_tensor(global_query_lens[list(rows)], dtype=seq_lens.dtype)
++        starts = batch.query_start_loc_np[list(rows)] - global_decode_tokens
++        prefixes = [current_kv_indices[start : start + length] for start, length in zip(starts, current_lens.tolist())]
++
++        chunked_context = self._build_pcp_chunked_context(
++            common_attn_metadata, global_num_decodes, local_decode_tokens, query_restore_idx
++        )
++        if chunked_context is not None:
++            assert self._pcp_cache_group_idx is not None
++            block_table = context.global_block_tables[self._pcp_cache_group_idx][global_num_decodes : batch.num_reqs]
++        else:
++            block_table = block_table[num_decodes:]
++        return AscendMetadataForPrefill(
++            block_tables=block_table,
++            actual_seq_lengths_q=query_lens[num_decodes:].cumsum(0).tolist(),
++            pcp_current_kv_indices=torch.cat(prefixes),
++            pcp_actual_seq_lengths_kv=current_lens.cumsum(0).tolist(),
++            chunked_context=chunked_context,
++        )
++
++    def _build_chunked_context_metadata(
++        self,
++        query_lens: torch.Tensor,
++        context_lens_cpu: torch.Tensor,
++        *,
++        context_lens: torch.Tensor | None = None,
++    ) -> AscendMetadataForPrefill.ChunkedContextMetadata:
++        """Build shared history fields while keeping host FIA lengths and device cache-load lengths separate."""
++        interleave = self.vllm_config.parallel_config.cp_kv_cache_interleave_size
++        local_context_lens_cpu = get_dcp_local_seq_lens(
++            context_lens_cpu, dcp_size=self.dcp_size, dcp_rank=self.dcp_rank, cp_kv_cache_interleave_size=interleave
++        )
++        if context_lens is None:
++            local_context_lens = local_context_lens_cpu.to(self.device, non_blocking=True)
++        else:
++            local_context_lens = get_dcp_local_seq_lens(
++                context_lens, dcp_size=self.dcp_size, dcp_rank=self.dcp_rank, cp_kv_cache_interleave_size=interleave
++            )
++        return AscendMetadataForPrefill.ChunkedContextMetadata(
++            actual_chunk_seq_lengths=query_lens.cumsum(0).tolist(),
++            actual_seq_lengths_kv=local_context_lens_cpu.cumsum(0).tolist(),
++            starts=torch.zeros(query_lens.numel(), dtype=torch.int32, device=self.device),
++            local_context_lens=local_context_lens,
++            local_total_toks=int(local_context_lens_cpu.sum()),
++        )
++
++    def _build_pcp_chunked_context(
++        self,
++        common_attn_metadata: AscendCommonAttentionMetadata,
++        global_num_decodes: int,
++        local_decode_tokens: int,
++        query_restore_idx: torch.Tensor,
++    ) -> AscendMetadataForPrefill.ChunkedContextMetadata | None:
++        """Prepare the global request view and PCP query indices for historical attention."""
++        context = self._pcp_context
++        assert context is not None
++        batch = context.global_batch
++        history_lens = torch.from_numpy(batch.num_computed_tokens_np[global_num_decodes : batch.num_reqs].copy()).int()
++        if not history_lens.any():
++            return None
++        if self._pcp_cache_group_idx is None or context.padded_gather_idx is None:
++            raise RuntimeError("GQA history attention requires PCP's global cache table and query layout.")
++        query_lens = torch.from_numpy(
++            np.diff(batch.query_start_loc_np[global_num_decodes : batch.num_reqs + 1]).copy()
++        ).int()
++        metadata = self._build_chunked_context_metadata(query_lens, history_lens)
++        local_tokens = common_attn_metadata.slot_mapping.numel() // self.pcp_group.world_size
++        rank_start = self.pcp_group.rank_in_group * local_tokens
++        local_query_slice = slice(rank_start + local_decode_tokens, rank_start + common_attn_metadata.num_actual_tokens)
++        global_decode_tokens = int(batch.query_start_loc_np[global_num_decodes])
++        metadata.pcp_query_restore_idx = query_restore_idx
++        metadata.pcp_local_query_indices = (context.padded_gather_idx[local_query_slice] - global_decode_tokens).to(
++            torch.int64
++        )
++        return metadata
+ 
+     def _build_backend_metadata(
+         self,
+@@ -159,49 +302,27 @@ class AscendAttentionDCPMetadataBuilder(
+     ) -> dict[str, object]:
+         prefill_metadata = None
+         if num_prefills > 0:
+-            prefill_query_lens = query_lens[num_decodes:]
+-            prefill_query_ends = torch.cumsum(prefill_query_lens, dim=0)
+-            context_lens_cpu = (seq_lens - query_lens)[num_decodes:]
+-            chunked_context_metadata = None
+-            if self.chunked_prefill_enabled and context_lens_cpu.numel() > 0 and context_lens_cpu.max().item() > 0:
+-                local_chunked_kv_lens_cpu = get_dcp_local_seq_lens(
+-                    context_lens_cpu,
+-                    dcp_size=self.dcp_size,
+-                    dcp_rank=self.dcp_rank,
+-                    cp_kv_cache_interleave_size=self.vllm_config.parallel_config.cp_kv_cache_interleave_size,
++            if self.pcp_enabled:
++                prefill_metadata = self._build_pcp_prefill_metadata(
++                    common_attn_metadata, block_table, query_lens, seq_lens, num_decodes, num_prefills
+                 )
+-                chunked_req_mask = self._get_chunked_req_mask(context_lens_cpu)
+-                # KV cache load uses device-local history; host FIA parameters stay on CPU.
+-                prefill_end = num_decodes + num_prefills
+-                query_start_loc = common_attn_metadata.query_start_loc[num_decodes : prefill_end + 1]
+-                context_lens = common_attn_metadata.seq_lens[num_decodes:prefill_end] - torch.diff(query_start_loc)
+-                local_context_lens = get_dcp_local_seq_lens(
+-                    context_lens,
+-                    dcp_size=self.dcp_size,
+-                    dcp_rank=self.dcp_rank,
+-                    cp_kv_cache_interleave_size=self.vllm_config.parallel_config.cp_kv_cache_interleave_size,
++            else:
++                prefill_query_lens = query_lens[num_decodes:]
++                prefill_query_ends = torch.cumsum(prefill_query_lens, dim=0)
++                context_lens_cpu = (seq_lens - query_lens)[num_decodes:]
++                chunked_context_metadata = None
++                if self.chunked_prefill_enabled and context_lens_cpu.numel() > 0 and context_lens_cpu.max().item() > 0:
++                    prefill_end = num_decodes + num_prefills
++                    query_start_loc = common_attn_metadata.query_start_loc[num_decodes : prefill_end + 1]
++                    context_lens = common_attn_metadata.seq_lens[num_decodes:prefill_end] - torch.diff(query_start_loc)
++                    chunked_context_metadata = self._build_chunked_context_metadata(
++                        prefill_query_lens, context_lens_cpu, context_lens=context_lens
++                    )
++                prefill_metadata = AscendMetadataForPrefill(
++                    chunked_context=chunked_context_metadata,
++                    block_tables=block_table[num_decodes:],
++                    actual_seq_lengths_q=prefill_query_ends.tolist(),
+                 )
+-                chunked_context_metadata = AscendMetadataForPrefill.ChunkedContextMetadata(
+-                    actual_chunk_seq_lengths=prefill_query_ends,
+-                    actual_seq_lengths_kv=torch.cumsum(local_chunked_kv_lens_cpu, dim=0).tolist(),
+-                    chunked_req_mask=chunked_req_mask,
+-                    starts=torch.zeros(
+-                        num_prefills,
+-                        dtype=torch.int32,
+-                        device=self.device,
+-                    ),
+-                    local_context_lens=local_context_lens,
+-                    chunk_seq_mask_filtered_indices=filter_chunked_req_indices(
+-                        prefill_query_lens,
+-                        chunked_req_mask,
+-                    ).to(self.device),
+-                    local_total_toks=local_chunked_kv_lens_cpu.sum().item(),
+-                )
+-            prefill_metadata = AscendMetadataForPrefill(
+-                chunked_context=chunked_context_metadata,
+-                block_tables=block_table[num_decodes:],
+-                actual_seq_lengths_q=prefill_query_ends,
+-            )
+ 
+         decode_metadata = None
+         if num_decodes > 0:
+@@ -289,6 +410,10 @@ class AscendAttentionDCPImpl(DCPImplMixin, AscendAttentionBackendImpl):
+     can_return_lse_for_decode: bool = True
+     supports_mtp_with_cp_non_trivial_interleave_size: bool = True
+ 
++    def __init__(self, *args, **kwargs) -> None:
++        super().__init__(*args, **kwargs)
++        self.pcp_enabled = self.vllm_config.parallel_config.prefill_context_parallel_size > 1
++
+     def _run_dcp_attention(
+         self,
+         query: torch.Tensor,
+@@ -403,38 +528,18 @@ class AscendAttentionDCPImpl(DCPImplMixin, AscendAttentionBackendImpl):
+             local_lse=current_lse,
+         )
+ 
+-    def _update_chunk_attn_out_lse_with_current_attn_out_lse(
+-        self,
+-        current_attn_output_prefill,
+-        current_attn_lse_prefill,
+-        attn_output_full_chunk,
+-        attn_lse_full_chunk,
+-        prefill_query,
+-        attn_metadata,
+-    ):
+-        num_tokens = prefill_query.size(0)
+-        attn_output_full_chunk = attn_output_full_chunk[:num_tokens]
+-        attn_lse_full_chunk = attn_lse_full_chunk[:num_tokens]
+-
+-        assert (
+-            attn_output_full_chunk.shape == current_attn_output_prefill.shape
+-            and attn_lse_full_chunk.shape == current_attn_lse_prefill.shape
+-        )
+-        filtered_indices = attn_metadata.prefill.chunked_context.chunk_seq_mask_filtered_indices
+-
+-        attn_output_prefill_filtered = current_attn_output_prefill[filtered_indices, :, :]
+-        attn_lse_prefill_filtered = current_attn_lse_prefill[filtered_indices, :, :]
+-        attn_output_full_chunk = attn_output_full_chunk[filtered_indices, :, :]
+-        attn_lse_full_chunk = attn_lse_full_chunk[filtered_indices, :, :]
+-
+-        attn_output_filtered = _npu_attn_out_lse_update(
+-            attn_lse_prefill_filtered, attn_lse_full_chunk, attn_output_prefill_filtered, attn_output_full_chunk
+-        )
+-
+-        current_attn_output_prefill[filtered_indices, :, :] = attn_output_filtered.to(current_attn_output_prefill.dtype)
+-
+     def _prefill_query_all_gather(self, attn_metadata, prefill_query):
+-        return self._dcp_all_gather(prefill_query, 1)
++        if self.pcp_enabled:
++            prefill = attn_metadata.prefill
++            assert prefill is not None
++            chunked_context = prefill.chunked_context
++            assert chunked_context is not None and chunked_context.pcp_query_restore_idx is not None
++            # PCP splits the query sequence, not the history KV cache. Restore
++            # all current queries before computing each DCP history shard.
++            prefill_query = self.pcp_group.all_gather(prefill_query.contiguous(), dim=0)
++            prefill_query = torch.index_select(prefill_query, 0, chunked_context.pcp_query_restore_idx)
++        (prefill_query,) = self._dcp_all_gather_fragments(prefill_query, dim=1)
++        return prefill_query
+ 
+     def _compute_prefill_context(
+         self,
+@@ -451,10 +556,7 @@ class AscendAttentionDCPImpl(DCPImplMixin, AscendAttentionBackendImpl):
+         assert local_chunked_kv_lens_rank is not None
+         total_toks = prefill_metadata.chunked_context.local_total_toks
+         key, value = self._load_kv_for_chunk(attn_metadata, kv_cache, local_chunked_kv_lens_rank, query, total_toks)
+-        if self.dcp_size > 1:
+-            num_heads = self.num_heads * self.dcp_size
+-        else:
+-            num_heads = self.num_heads
++        num_heads = query.shape[1]
+ 
+         if total_toks == 0:
+             return (
+@@ -485,6 +587,47 @@ class AscendAttentionDCPImpl(DCPImplMixin, AscendAttentionBackendImpl):
+ 
+         return prefix_chunk_output, prefix_chunk_lse
+ 
++    def _forward_prefill_current_kv(
++        self,
++        query: torch.Tensor,
++        key: torch.Tensor,
++        value: torch.Tensor,
++        attn_metadata: AscendAttentionDCPMetadata,
++    ) -> tuple[torch.Tensor, torch.Tensor]:
++        """Compute local Q against current KV, selecting PCP causal prefixes when needed."""
++        prefill = attn_metadata.prefill
++        assert prefill is not None and prefill.actual_seq_lengths_q is not None
++        query_lens = prefill.actual_seq_lengths_q
++        local_query = query[attn_metadata.num_decode_tokens : attn_metadata.num_actual_tokens].contiguous()
++        causal = attn_metadata.causal
++        if self.pcp_enabled:
++            assert prefill.pcp_current_kv_indices is not None and prefill.pcp_actual_seq_lengths_kv is not None
++            key = torch.index_select(key, 0, prefill.pcp_current_kv_indices)
++            value = torch.index_select(value, 0, prefill.pcp_current_kv_indices)
++            kv_lens = prefill.pcp_actual_seq_lengths_kv
++        else:
++            key = key[attn_metadata.num_decode_tokens : attn_metadata.num_actual_tokens].contiguous()
++            value = value[attn_metadata.num_decode_tokens : attn_metadata.num_actual_tokens].contiguous()
++            kv_lens = query_lens
++        record_attention_compute_start()
++        attn_output, attn_lse = torch_npu.npu_fused_infer_attention_score(
++            local_query,
++            key,
++            value,
++            num_heads=self.num_heads,
++            num_key_value_heads=self.num_kv_heads,
++            input_layout="TND",
++            atten_mask=attn_metadata.attn_mask if causal else None,
++            sparse_mode=3 if causal else 0,
++            scale=self.scale,
++            antiquant_mode=0,
++            antiquant_scale=None,
++            softmax_lse_flag=True,
++            actual_seq_lengths=query_lens,
++            actual_seq_lengths_kv=kv_lens,
++        )
++        return attn_output.view_as(local_query), attn_lse
++
+     def _load_kv_for_chunk(self, attn_metadata, kv_cache, local_chunked_kv_lens_rank, query, total_toks):
+         cache_key = kv_cache[0]
+         cache_value = kv_cache[1]
+@@ -506,32 +649,6 @@ class AscendAttentionDCPImpl(DCPImplMixin, AscendAttentionBackendImpl):
+             )
+         return key, value
+ 
+-    def _gather_global_context_output(self, local_context_attn_output):
+-        if self.dcp_size > 1:
+-            dcp_context_attn_output = torch.empty_like(local_context_attn_output)
+-            dist.all_to_all_single(
+-                dcp_context_attn_output,
+-                local_context_attn_output,
+-                group=self.dcp_device_group,
+-            )
+-        else:
+-            dcp_context_attn_output = local_context_attn_output
+-
+-        return dcp_context_attn_output
+-
+-    def _update_global_context_output(self, global_context_output):
+-        B_total, H_total, D_plus_1 = global_context_output.shape
+-        S = B_total
+-        H = H_total // self.dcp_size
+-        D = self.head_size
+-        assert D_plus_1 == D + 1
+-        x = global_context_output.view(S, self.dcp_size, H, D_plus_1)
+-        x = x.permute(1, 0, 2, 3).contiguous()
+-        # Split out lse
+-        attn_out_allgather, attn_lse_allgather = torch.split(x, [D, 1], dim=-1)  # [N, S, H, D], [N, S, H, 1]
+-        context_output, context_lse = _update_out_and_lse(attn_out_allgather, attn_lse_allgather)
+-        return context_output, context_lse
+-
+     def forward_impl(
+         self,
+         query: torch.Tensor,
+@@ -542,86 +659,54 @@ class AscendAttentionDCPImpl(DCPImplMixin, AscendAttentionBackendImpl):
+         output: torch.Tensor,
+     ) -> torch.Tensor:
+         assert isinstance(attn_metadata, AscendAttentionDCPMetadata)
+-        has_decode = attn_metadata.num_decodes > 0
+-        has_prefill = attn_metadata.num_prefills > 0
+         num_decode_tokens = attn_metadata.num_decode_tokens
+-        if has_decode:
++        if attn_metadata.num_decodes > 0:
+             assert attn_metadata.decode is not None and attn_metadata.decode.actual_seq_lengths_q is not None
+-            # TND lengths include graph-padding queries as well as real tokens.
+-            num_decode_tokens = attn_metadata.decode.actual_seq_lengths_q[-1]
+-            decode_query = query[:num_decode_tokens].contiguous()
+-            output_decode = self._forward_decode_dcp(
+-                decode_query,
++            # Preserve upstream graph-padding queries; prefill keeps its real-token offset.
++            decode_query_end = attn_metadata.decode.actual_seq_lengths_q[-1]
++            output[:decode_query_end] = self._forward_decode_dcp(
++                query[:decode_query_end].contiguous(),
+                 attn_metadata,
+-                key[:num_decode_tokens] if key is not None else None,
+-                value[:num_decode_tokens] if value is not None else None,
+-            )
+-            output[:num_decode_tokens] = output_decode
+-        if has_prefill:
+-            assert attn_metadata.prefill is not None
+-            # chunked prefill vars init
+-            has_chunked_context = attn_metadata.prefill.chunked_context is not None
+-            # Note(qcs): we use multi-stream for computation-communication overlap
+-            # when enabling chunked prefill.
+-            # current part
+-            # current_stream: init -- pre -- head attn ------------------ tail attn -- post -- update
+-            # context part                                                                     -/
+-            # current_stream: -----                    -- context attn --                     -/
+-            # COMM_STREAM:         \-- all_gather Q --/                  \-- a2a ag output --/
+-
+-            # qkv init
+-            prefill_query = query[num_decode_tokens : attn_metadata.num_actual_tokens].contiguous()
+-            key = key[num_decode_tokens : attn_metadata.num_actual_tokens].contiguous()
+-            value = value[num_decode_tokens : attn_metadata.num_actual_tokens].contiguous()
+-
+-            if has_chunked_context:
+-                # all_gather q for chunked prefill // overlap the computation inner current chunk
+-                cp_chunkedprefill_comm_stream().wait_stream(torch.npu.current_stream())
+-                with torch_npu.npu.stream(cp_chunkedprefill_comm_stream()):
+-                    prefill_query_all = self._prefill_query_all_gather(attn_metadata, prefill_query.clone())
+-
+-            # Record the compute-stream gate once before any attention phase
+-            # starts, so the layerwise transfer thread can overlap H2D copies
+-            # with the prefill computation.
+-            record_attention_compute_start()
+-
+-            attn_output_prefill, attn_lse_prefill = torch.ops.npu.npu_fused_infer_attention_score(
+-                prefill_query,
+-                key,
+-                value,
+-                num_heads=self.num_heads,
+-                num_key_value_heads=self.num_kv_heads,
+-                input_layout="TND",
+-                atten_mask=attn_metadata.attn_mask,
+-                scale=self.scale,
+-                sparse_mode=3,
+-                antiquant_mode=0,
+-                antiquant_scale=None,
+-                softmax_lse_flag=True,
+-                actual_seq_lengths_kv=attn_metadata.prefill.actual_seq_lengths_q,
+-                actual_seq_lengths=attn_metadata.prefill.actual_seq_lengths_q,
++                key[:decode_query_end] if key is not None else None,
++                value[:decode_query_end] if value is not None else None,
+             )
++        if attn_metadata.num_prefills == 0:
++            return output
+ 
+-            if has_chunked_context:
+-                torch.npu.current_stream().wait_stream(cp_chunkedprefill_comm_stream())
+-                # computation of context
+-                context_output = self._compute_prefill_context(prefill_query_all, kv_cache, attn_metadata)
+-                # Note(qcs): (output, lse) -> [Seq, Head_num, Head_dim+1] -> [Head_num, Head_dim+1, Seq]
+-                local_context_output = torch.cat(context_output, dim=-1).permute([1, 2, 0]).contiguous()
+-
+-                # all2all and all_gather output&lse // overlap the computation inner current chunk
+-                cp_chunkedprefill_comm_stream().wait_stream(torch.npu.current_stream())
+-                with torch_npu.npu.stream(cp_chunkedprefill_comm_stream()):
+-                    global_context_output = self._gather_global_context_output(local_context_output)
+-
+-            if has_chunked_context:
+-                # update the output of current chunk with context part
+-                torch.npu.current_stream().wait_stream(cp_chunkedprefill_comm_stream())
+-                global_context_output = global_context_output.permute([2, 0, 1]).contiguous()
+-                context_output, context_lse = self._update_global_context_output(global_context_output)
+-                self._update_chunk_attn_out_lse_with_current_attn_out_lse(
+-                    attn_output_prefill, attn_lse_prefill, context_output, context_lse, prefill_query, attn_metadata
+-                )
++        prefill = attn_metadata.prefill
++        assert prefill is not None
++        chunked_context = prefill.chunked_context
++        main_stream = torch.npu.current_stream()
++        if chunked_context is not None:
++            # PCP query gather includes padding; current attention uses actual local tokens.
++            query_end = attn_metadata.num_actual_tokens
++            if self.pcp_enabled:
++                assert attn_metadata.pcp_local_num_input_tokens is not None
++                query_end = attn_metadata.pcp_local_num_input_tokens
++            history_query = query[num_decode_tokens:query_end].contiguous()
++            comm_stream = cp_chunkedprefill_comm_stream()
++            comm_stream.wait_stream(main_stream)
++            with torch_npu.npu.stream(comm_stream):
++                history_query = self._prefill_query_all_gather(attn_metadata, history_query)
++
++        current_output, current_lse = self._forward_prefill_current_kv(query, key, value, attn_metadata)
++        if chunked_context is not None:
++            main_stream.wait_stream(comm_stream)
++            history_output, history_lse = self._compute_prefill_context(history_query, kv_cache, attn_metadata)
++            comm_stream.wait_stream(main_stream)
++            with torch_npu.npu.stream(comm_stream):
++                history_recv = self._merge_dcp_attention_output(history_output, history_lse, defer_combine=True)
++            main_stream.wait_stream(comm_stream)
++            if self.pcp_enabled:
++                assert chunked_context.pcp_local_query_indices is not None
++                history_recv = torch.index_select(history_recv, 2, chunked_context.pcp_local_query_indices)
++            current_output = fused_dcp_lse_combine(
++                history_recv,
++                self.head_size,
++                scatter_dim=1,
++                local_output=current_output,
++                local_lse=current_lse,
++            )
+ 
+-            output[num_decode_tokens : attn_output_prefill.shape[0] + num_decode_tokens] = attn_output_prefill
++        output[num_decode_tokens : num_decode_tokens + current_output.shape[0]] = current_output
+         return output
+diff --git a/vllm_ascend/patch/platform/patch_speculative_config.py b/vllm_ascend/patch/platform/patch_speculative_config.py
+index 2bb37b11f..05da48e4d 100644
+--- a/vllm_ascend/patch/platform/patch_speculative_config.py
++++ b/vllm_ascend/patch/platform/patch_speculative_config.py
+@@ -10,7 +10,7 @@ from vllm.config.model import ModelConfig
+ from vllm.config.speculative import SpeculativeConfig
+ from vllm.transformers_utils.configs.speculators import SpeculatorsConfig
+ 
+-from vllm_ascend.utils import is_deepseek_v41
++from vllm_ascend.utils import is_deepseek_v41, is_gqa_pcp_dcp_config
+ 
+ _orig_post_init = SpeculativeConfig.__post_init__
+ _orig_hf_config_override = SpeculativeConfig.hf_config_override
+@@ -248,6 +248,12 @@ _orig_verify_with_parallel_config = ModelConfig.verify_with_parallel_config
+ def _ascend_verify_with_parallel_config(self, parallel_config):
+     if parallel_config.enable_expert_parallel and not self.is_moe and getattr(self, "runner_type", None) == "draft":
+         return
++    # TODO: Remove this guard once upstream GQA/MQA DCP validation supports
++    # PCP-based KV-head replica groups.
++    if is_gqa_pcp_dcp_config(self, parallel_config):
++        guard_parallel_config = copy(parallel_config)
++        guard_parallel_config.decode_context_parallel_size = 1
++        return _orig_verify_with_parallel_config(self, guard_parallel_config)
+     return _orig_verify_with_parallel_config(self, parallel_config)
+ 
+ 
+diff --git a/vllm_ascend/platform.py b/vllm_ascend/platform.py
+index 13591803f..873065dcf 100644
+--- a/vllm_ascend/platform.py
++++ b/vllm_ascend/platform.py
+@@ -498,6 +498,7 @@ class NPUPlatform(Platform):
+         cls._validate_indexer_pp_config(vllm_config)
+ 
+         _validate_routing_replay_config(vllm_config)
++        _validate_pcp_dcp_config(vllm_config)
+         _validate_draft_decode_context_parallel_config(vllm_config)
+         _validate_parallel_config(vllm_config)
+         _validate_engram_config(vllm_config)
+@@ -1685,6 +1686,32 @@ def _validate_parallel_config(vllm_config: VllmConfig) -> None:
+             )
+ 
+ 
++def _validate_model_pcp_dcp_config(
++    model_config: ModelConfig,
++    pcp_size: int,
++    dcp_size: int,
++) -> None:
++    """Require equal PCP/DCP sizes for GQA/MQA stacking."""
++    if model_config.use_mla or pcp_size <= 1 or dcp_size <= 1:
++        return
++    if pcp_size != dcp_size:
++        raise ValueError(
++            "GQA/MQA PCP+DCP requires prefill_context_parallel_size "
++            "to equal decode_context_parallel_size; "
++            f"got PCP={pcp_size}, DCP={dcp_size}."
++        )
++
++
++def _validate_pcp_dcp_config(vllm_config: VllmConfig) -> None:
++    """Validate GQA/MQA PCP+DCP sizes for the target model."""
++    parallel_config = vllm_config.parallel_config
++    _validate_model_pcp_dcp_config(
++        vllm_config.model_config,
++        parallel_config.prefill_context_parallel_size,
++        parallel_config.decode_context_parallel_size,
++    )
++
++
+ def _validate_draft_decode_context_parallel_config(vllm_config: VllmConfig) -> None:
+     speculative_config = vllm_config.speculative_config
+     if speculative_config is None:
+@@ -1708,10 +1735,15 @@ def _validate_draft_decode_context_parallel_config(vllm_config: VllmConfig) -> N
+     if draft_model_config is None:
+         return
+ 
+-    # MLA draft models do not use the GQA/MQA DCP head-sharding rule.
++    # MLA draft models do not use the GQA/MQA head-sharding rules below.
+     if draft_model_config.use_mla:
+         return
+ 
++    pcp_size = parallel_config.prefill_context_parallel_size
++    if pcp_size > 1:
++        _validate_model_pcp_dcp_config(draft_model_config, pcp_size, decode_context_parallel_size)
++        return
++
+     draft_parallel_config = speculative_config.draft_parallel_config
+     if draft_parallel_config is not None:
+         draft_tensor_parallel_size = draft_parallel_config.tensor_parallel_size
+diff --git a/vllm_ascend/utils.py b/vllm_ascend/utils.py
+index cdbfdf3c4..58e52b6b3 100644
+--- a/vllm_ascend/utils.py
++++ b/vllm_ascend/utils.py
+@@ -87,6 +87,15 @@ _CUSTOM_OP_BASE_DIR = (
+ _IS_ROT_WEIGHT_USED = None
+ 
+ 
++def is_gqa_pcp_dcp_config(model_config: Any, parallel_config: Any) -> bool:
++    """Whether a GQA/MQA model enables both PCP and DCP."""
++    return (
++        parallel_config.decode_context_parallel_size > 1
++        and parallel_config.prefill_context_parallel_size > 1
++        and not model_config.use_mla
++    )
++
++
+ def extract_dsv4_layer_index(config: Any, layer_name: str) -> int:
+     """Extract DSV4 index for config per-layer arrays.
+ 

@@ -1,0 +1,604 @@
+commit a5e97927ac100bb70b68cb2388852f1c3185ba7d
+Author:     ZixuanWang <44628360+Toneymiller@users.noreply.github.com>
+AuthorDate: Sun Oct 18 14:30:37 2026 +0800
+Commit:     GitHub <noreply@github.com>
+CommitDate: Sun Oct 18 14:30:37 2026 +0800
+
+    [BugFix] Prevent GLM KPool empty-work memory corruption on A3 (#19073)
+    
+    ### What this PR does / why we need it?
+    
+    Fix A3 GLM KPool memory corruption when DSA-CP leaves a local shard with
+    queries but no completed pooled keys.
+    
+    On the reproduced A3 stack, CANN PoolKeyIndexer entered an empty-work
+    initialization path that wrote beyond its TND output allocation.
+    Isolated empty-history cases reported illegal writes; in the model,
+    unrelated cached weights became NaN and requests produced repeated `!`
+    or non-finite logprobs.
+    
+    Append a sentinel request with effective work, clamp empty pooled
+    histories to one valid physical pool, then discard sentinel and
+    synthetic-history candidates using the original positions and request
+    boundaries. This also protects entirely padded graph replays. CANN still
+    performs the pooled-key scoring and top-k computation.
+    
+    `prepare_nonempty_keypool_inputs` fuses input copying, padding and
+    length clamping into one Triton launch for contiguous inputs. It lives
+    in its own matching module, with a matching operator document and
+    nightly accuracy test. Strided inputs are normalized first; allocations
+    are independent across invocations, and captured allocations are reused
+    during graph replay. There is no per-step CPU synchronization or shared
+    mutable workspace.
+    
+    ### Does this PR introduce _any_ user-facing change?
+    
+    Prevents the observed empty-work corruption with DSA-CP, MTP and graph
+    execution enabled. No new configuration is required. Validation uses
+    W8A8 model weights and a BF16 KPool cache; this does not enable MXFP8
+    model weights on A3.
+    
+    ### How was this patch tested?
+    
+    - After extracting the operator and moving the test, **11 A3 NPU
+    accuracy/integration cases passed** on the exact release source plus
+    this change, using CANN 9.2.0, torch_npu 2.10.0.post7 and the vLLM
+    0.30.0 development image. The new operator, CANN adapter, index-packing
+    module and accuracy test are identical across the two PRs. The
+    kernel/function AST is unchanged by extraction.
+    - Eight contiguous/strided cases compare all six outputs exactly with an
+    independent PyTorch reference and verify unchanged inputs. Integration
+    cases cover empty local histories, zero-query requests, entirely padded
+    replay, metadata transitions without recapture, and top-k equality with
+    an unadapted nonempty CANN call.
+    - Ruff lint/format, codespell, Python package checks and `git diff
+    --check` passed for the changes. Markdownlint 0.45.0 passed with the
+    repository configuration. Full `bash format.sh ci` was attempted on both
+    checkouts but did not complete while initializing the remote Ruff
+    pre-commit environment; GitHub CI remains authoritative for complete
+    repository checks.
+    
+    ```bash
+    python -m pytest -q --confcutdir=tests/e2e/nightly/single_node/ops \
+      tests/e2e/nightly/single_node/ops/singlecard_ops/triton/test_prepare_nonempty_keypool_inputs.py
+    ```
+    
+    Earlier validation of the same computation on the explicitly identified
+    image-plus-#18295/#16730 stack: the synchronous, uncached mssanitizer
+    configuration reported no illegal accesses in the guarded indexer and
+    fused preparation checks; 32/32 concurrent short-answer requests were
+    correct with finite logprobs. Serving used GLM-5.3-Flash W8A8,
+    DP2/TP4/EP, DSA-CP, MTP5 and FULL_DECODE_ONLY graphs. These are focused
+    regression results, not a full accuracy benchmark or a final-head
+    full-model deployment. No GSM8K was run.
+    
+    The previous same-device graph measurements showed 66–88% less
+    input-preparation latency than the cat-based guard. This is an operator
+    measurement on that validation stack, not a model-throughput claim. The
+    adapter still copies inputs and adds sentinel work.
+    
+    ### Additional CI regression fix
+    
+    Keep the existing build-cache concurrency regression fix: a 30-second
+    publication-lock budget and a single 60-second batch deadline, with
+    child cleanup on failure. All concurrent-hit, no-rebuild and
+    artifact-completeness assertions remain. Production cache behavior is
+    unchanged. Earlier validation: 83 build-cache tests passed; four
+    concurrency cases also passed with two-CPU affinity.
+    
+    - vLLM main:
+    https://github.com/vllm-project/vllm/commit/c4df37dfcc7f72ca41cd43801a468526ecf99a2b
+    
+    ---------
+    
+    Signed-off-by: Toneymiller <44628360+Toneymiller@users.noreply.github.com>
+
+diff --git a/tests/e2e/nightly/single_node/ops/singlecard_ops/triton/test_prepare_nonempty_keypool_inputs.py b/tests/e2e/nightly/single_node/ops/singlecard_ops/triton/test_prepare_nonempty_keypool_inputs.py
+new file mode 100644
+index 000000000..254c9d34a
+--- /dev/null
++++ b/tests/e2e/nightly/single_node/ops/singlecard_ops/triton/test_prepare_nonempty_keypool_inputs.py
+@@ -0,0 +1,134 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""Accuracy tests for nonempty KPool inputs and their CANN integration.
++
++Run under mssanitizer memcheck as well to detect writes past CANN's TND output.
++"""
++
++from types import SimpleNamespace
++
++import pytest
++import torch
++import torch_npu  # noqa: F401
++
++from vllm_ascend.ops.cann_keypool import pool_key_indexer_nonempty
++from vllm_ascend.ops.triton.glm5_next_cann_keypool import pack_keypool_indices
++from vllm_ascend.ops.triton.prepare_nonempty_keypool_inputs import prepare_nonempty_keypool_inputs
++from vllm_ascend.utils import bootstrap_custom_op_env
++
++
++@pytest.mark.parametrize("tokens,requests,columns", [(1, 1, 1), (5, 2, 128), (65, 64, 1025), (257, 4, 65)])
++@pytest.mark.parametrize("strided", [False, True])
++def test_prepare_nonempty_keypool_inputs_matches_reference(tokens, requests, columns, strided):
++    torch.manual_seed(1024)
++    device = "npu:0"
++    step = 2 if strided else 1
++    query = torch.randn(tokens, 32, 128 * step, device=device, dtype=torch.bfloat16)[..., ::step]
++    weights = torch.randn(tokens, 32 * step, device=device, dtype=torch.bfloat16)[:, ::step]
++    ends = torch.arange(requests * step, device=device, dtype=torch.int64)[::step] * tokens // (requests * step)
++    lengths = torch.arange(requests * step, device=device, dtype=torch.int64)[::step]
++    tails = lengths % 4
++    table = torch.arange(requests * columns * step, device=device, dtype=torch.int32).view(requests, -1)[:, ::step]
++    inputs = (query, weights, ends, lengths, tails, table)
++    originals = tuple(t.clone() for t in inputs)
++    expected = (
++        torch.cat((query, torch.zeros_like(query[:1]))),
++        torch.cat((weights, torch.zeros_like(weights[:1]))),
++        torch.cat((ends, ends.new_full((1,), tokens + 1))),
++        torch.cat((lengths.clamp_min(1), lengths.new_ones((1,)))),
++        torch.cat((tails, tails.new_zeros((1,)))),
++        torch.cat((table, torch.zeros_like(table[:1]))),
++    )
++    actual = prepare_nonempty_keypool_inputs(*inputs)
++    for result, reference in zip(actual, expected):
++        assert result.is_contiguous()
++        torch.testing.assert_close(result.cpu(), reference.cpu(), rtol=0, atol=0)
++    for value, original in zip(inputs, originals):
++        torch.testing.assert_close(value.cpu(), original.cpu(), rtol=0, atol=0)
++
++
++@pytest.mark.parametrize("graph_mode", [False, True])
++def test_empty_pool_shards_and_padding(graph_mode):
++    bootstrap_custom_op_env(include_vendor_lib=True)
++    import cann_ops_transformer  # noqa: F401
++
++    device = "npu:0"
++    query = torch.zeros(5, 32, 128, dtype=torch.bfloat16, device=device)
++    weights = torch.ones(5, 32, dtype=torch.bfloat16, device=device)
++    cache = torch.zeros(16, 32, 1, 128, dtype=torch.bfloat16, device=device)
++    table = torch.zeros(2, 128, dtype=torch.int32, device=device)
++    ends = torch.tensor([3, 3], dtype=torch.int64, device=device)
++    lengths = torch.zeros(2, dtype=torch.int64, device=device)
++    tails = torch.tensor([3, 0], dtype=torch.int64, device=device)
++    positions = torch.tensor([0, 1, 2, 0, 0], dtype=torch.int64, device=device)
++    metadata = SimpleNamespace(positions=positions, cum_query_lens=ends)
++
++    def run():
++        indices, _ = pool_key_indexer_nonempty(
++            torch.ops.cann_ops_transformer.pool_key_indexer,
++            query,
++            cache,
++            weights,
++            tails,
++            actual_seq_q=ends,
++            actual_seq_k=lengths,
++            block_table=table,
++            topk=2048,
++            pool_size=4,
++        )
++        return pack_keypool_indices(indices, metadata, 2048, 4)
++
++    run()
++    torch.npu.synchronize()
++    graph = None
++    if graph_mode:
++        graph = torch.npu.NPUGraph()
++        with torch.npu.graph(graph):
++            output = run()
++    scenarios = [
++        ([3, 3], [0, 0], [3, 0], [0, 1, 2, 0, 0]),
++        ([0, 3], [0, 0], [0, 3], [0, 1, 2, 0, 0]),
++        ([0, 0], [0, 0], [0, 0], [0, 0, 0, 0, 0]),
++        ([2, 4], [1, 2], [1, 1], [3, 4, 7, 8, 0]),
++    ]
++    for q, k, t, p in scenarios:
++        for target, value in ((ends, q), (lengths, k), (tails, t), (positions, p)):
++            target.copy_(torch.tensor(value, dtype=target.dtype, device=device))
++        if graph is None:
++            output = run()
++        else:
++            graph.replay()
++        actual = output.cpu()
++        expected = torch.full((5, 1, 2051), -1, dtype=torch.int32)
++        for row in range(q[-1]):
++            expected[row, 0, : p[row] + 1] = torch.arange(p[row] + 1, dtype=torch.int32)
++        torch.testing.assert_close(actual, expected)
++
++
++def test_nonempty_topk_matches_unadapted_cann():
++    bootstrap_custom_op_env(include_vendor_lib=True)
++    import cann_ops_transformer  # noqa: F401
++
++    torch.manual_seed(1024)
++    device = "npu:0"
++    query = torch.randn(3, 32, 128, dtype=torch.bfloat16, device=device)
++    weights = torch.ones(3, 32, dtype=torch.bfloat16, device=device)
++    cache = torch.randn(32, 32, 1, 128, dtype=torch.bfloat16, device=device)
++    ends = torch.tensor([3], dtype=torch.int64, device=device)
++    lengths = torch.tensor([700], dtype=torch.int64, device=device)
++    tails = torch.zeros(1, dtype=torch.int64, device=device)
++    table = torch.arange(32, dtype=torch.int32, device=device).view(1, 32)
++    kwargs = dict(
++        actual_seq_q=ends,
++        actual_seq_k=lengths,
++        block_table=table,
++        topk=2048,
++        pool_size=4,
++        layout_q="TND",
++        layout_k="PA_BBND",
++        mask_mode=3,
++    )
++    op = torch.ops.cann_ops_transformer.pool_key_indexer
++    expected, _ = op(query, cache, weights, tails, **kwargs)
++    actual, _ = pool_key_indexer_nonempty(op, query, cache, weights, tails, **kwargs)
++    torch.testing.assert_close(actual.cpu(), expected.cpu())
+diff --git a/tests/ut/_tools/test_build_cache_concurrency.py b/tests/ut/_tools/test_build_cache_concurrency.py
+index 02cda5050..71c4bb66c 100644
+--- a/tests/ut/_tools/test_build_cache_concurrency.py
++++ b/tests/ut/_tools/test_build_cache_concurrency.py
+@@ -245,32 +245,48 @@ def test_many_parallel_hits_complete_without_hang(tmp_path: Path):
+     shutil.rmtree(state, ignore_errors=True)
+     shutil.rmtree(tmp_path / "seed-stages", ignore_errors=True)
+ 
++    # All 32 hits serialize publication. Allow contention on shared CI
++    # runners; the dedicated lock-timeout tests above cover fail-fast behavior.
++    lock_timeout_seconds = 30
++    batch_timeout_seconds = 60
+     env = os.environ.copy()
+     env.update(
+         {
+-            "VLLM_ASCEND_BUILD_CACHE_ACTION_LOCK_TIMEOUT_SECONDS": "5",
+-            "VLLM_ASCEND_BUILD_CACHE_PUBLISH_LOCK_TIMEOUT_SECONDS": "5",
++            "VLLM_ASCEND_BUILD_CACHE_ACTION_LOCK_TIMEOUT_SECONDS": str(lock_timeout_seconds),
++            "VLLM_ASCEND_BUILD_CACHE_PUBLISH_LOCK_TIMEOUT_SECONDS": str(lock_timeout_seconds),
+         }
+     )
+ 
+     processes = []
+-    for command, _ in commands:
+-        processes.append(
+-            subprocess.Popen(
+-                command,
+-                stdout=subprocess.PIPE,
+-                stderr=subprocess.PIPE,
+-                text=True,
+-                env=env,
+-            )
+-        )
+-
+     outputs = []
+-    for proc in processes:
+-        stdout, stderr = proc.communicate(timeout=20)
+-        outputs.append((proc.returncode, stdout, stderr))
++    deadline = time.monotonic() + batch_timeout_seconds
++    try:
++        for command, _ in commands:
++            processes.append(
++                subprocess.Popen(
++                    command,
++                    stdout=subprocess.PIPE,
++                    stderr=subprocess.PIPE,
++                    text=True,
++                    env=env,
++                )
++            )
+ 
+-    assert all(code == 0 for code, _, _ in outputs), outputs
++        # Bound the whole wave, rather than giving each child a fresh timeout.
++        for proc in processes:
++            stdout, stderr = proc.communicate(timeout=max(0, deadline - time.monotonic()))
++            outputs.append((proc.returncode, stdout, stderr))
++    finally:
++        # A timeout or spawn failure must not leave publishers running after
++        # pytest starts cleaning up the temporary build tree.
++        for proc in processes:
++            if proc.poll() is None:
++                proc.kill()
++        for proc in processes:
++            proc.communicate()
++
++    failures = [output for output in outputs if output[0] != 0]
++    assert not failures, failures
+     assert all("[build-cache] HIT" in stdout for _, stdout, _ in outputs)
+     assert all(counter.read_text() == "1" for _, counter in commands)
+     assert len(list(publish.glob("*.o"))) == action_count
+diff --git a/vllm_ascend/attention/indexer_kpool.py b/vllm_ascend/attention/indexer_kpool.py
+index c523468e6..2567f7760 100644
+--- a/vllm_ascend/attention/indexer_kpool.py
++++ b/vllm_ascend/attention/indexer_kpool.py
+@@ -3,6 +3,7 @@
+ """Cache metadata and execution backends for the GLM-Next pooled indexer."""
+ 
+ from dataclasses import dataclass
++from functools import partial
+ from importlib import import_module
+ from typing import Any
+ 
+@@ -621,7 +622,10 @@ class Glm5NextKPoolIndexerBackend(nn.Module):
+             self._prepare_keypool_state = adapters.prepare_keypool_state
+             self._write_keypool_caches = fused.write_keypool_caches
+             self._key_pool = torch.ops.cann_ops_transformer.key_pool
+-            self._pool_key_indexer = torch.ops.cann_ops_transformer.pool_key_indexer
++            self._pool_key_indexer = partial(
++                adapters.pool_key_indexer_nonempty,
++                torch.ops.cann_ops_transformer.pool_key_indexer,
++            )
+         except (ImportError, AttributeError) as exc:
+             raise RuntimeError(
+                 "GLM-5.3-Flash KPool requires cann_ops_transformer with key_pool and pool_key_indexer, "
+diff --git a/vllm_ascend/ops/cann_keypool.py b/vllm_ascend/ops/cann_keypool.py
+index a130c6f15..acff8ef83 100644
+--- a/vllm_ascend/ops/cann_keypool.py
++++ b/vllm_ascend/ops/cann_keypool.py
+@@ -1,9 +1,11 @@
+ # SPDX-License-Identifier: Apache-2.0
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+-"""State gather for CANN KeyPool."""
++"""State gathering and nonempty input adaptation for CANN KeyPool."""
+ 
+ import torch
+ 
++from vllm_ascend.ops.triton.prepare_nonempty_keypool_inputs import prepare_nonempty_keypool_inputs
++
+ 
+ def _cache_rows(cache):
+     width = cache.shape[-1]
+@@ -27,3 +29,51 @@ def prepare_keypool_state(tail, starts, tail_metadata, pool):
+ 
+ def gather_retained_hidden(hidden, indices):
+     return torch.index_select(hidden, 0, indices.flatten())
++
++
++def pool_key_indexer_nonempty(
++    op,
++    query,
++    pool_key,
++    weights,
++    pool_tail_k,
++    *,
++    actual_seq_q,
++    actual_seq_k,
++    block_table,
++    topk,
++    pool_size,
++    layout_q="TND",
++    layout_k="PA_BBND",
++    mask_mode=3,
++):
++    """Keep CANN's TND indexer out of its unsafe zero-work paths.
++
++    Short DSA-CP shards can have queries but no completed pool. On A3 the
++    zero-work kernel initializes B*T output rows although TND only allocates T.
++    A trailing dummy request guarantees work, including fully padded replay.
++    Empty real histories use one physical pool; index packing discards these
++    candidates using the original positions, so they cannot enter attention.
++    All metadata stays on device and the shapes remain graph-capturable.
++    """
++    if layout_q != "TND" or layout_k != "PA_BBND" or mask_mode != 3:
++        raise ValueError("The KPool empty-work adapter requires causal TND/PA_BBND inputs.")
++    tokens = query.shape[0]
++    query_padded, weights_padded, query_ends, key_lengths, tails, tables = prepare_nonempty_keypool_inputs(
++        query, weights, actual_seq_q, actual_seq_k, pool_tail_k, block_table
++    )
++    indices, values = op(
++        query_padded,
++        pool_key,
++        weights_padded,
++        tails,
++        actual_seq_q=query_ends,
++        actual_seq_k=key_lengths,
++        block_table=tables,
++        layout_q=layout_q,
++        layout_k=layout_k,
++        topk=topk,
++        pool_size=pool_size,
++        mask_mode=mask_mode,
++    )
++    return indices[:tokens], values
+diff --git a/vllm_ascend/ops/triton/docs/prepare_nonempty_keypool_inputs.md b/vllm_ascend/ops/triton/docs/prepare_nonempty_keypool_inputs.md
+new file mode 100644
+index 000000000..c0547f98c
+--- /dev/null
++++ b/vllm_ascend/ops/triton/docs/prepare_nonempty_keypool_inputs.md
+@@ -0,0 +1,95 @@
++# prepare_nonempty_keypool_inputs
++
++## Description
++
++- **Function**: Prepare the six inputs needed to keep the CANN pooled key
++  indexer supplied with nonempty work. Append a zero query and weight row,
++  append a sentinel request with one pooled key, clamp empty real key histories
++  to one physical pool, and append a zero block-table row. The CANN operator
++  still computes pooled-key scores and top-k indices.
++- **Formula**: For `T` query rows, `R` requests, and concatenation `cat`:
++  `Q' = cat(Q, 0)`, `W' = cat(W, 0)`,
++  `E' = cat(E, T + 1)`, `L' = cat(max(L, 1), 1)`,
++  `S' = cat(S, 0)`, and `B' = cat(B, 0)` along the first dimension.
++- **Algorithm flow**: Normalize strided views with `contiguous()`, allocate
++  independent outputs, and launch one Triton kernel to copy data and initialize
++  the added rows. Wide tiles copy query, weight, and block-table elements;
++  separate 16-element tiles handle int64 metadata. Contiguous inputs need no
++  preliminary copies. The caller invokes CANN, removes the sentinel query
++  result, and packs indices using the original positions and request boundaries
++  to discard synthetic history and graph-padding candidates.
++- **Supported modes**: Validated on Atlas A3 with BF16 query and weight tensors,
++  in eager execution and NPU graph capture/replay. Other hardware is not
++  validated by these results.
++
++## Parameters
++
++All inputs are required. The return value is a tuple of six tensors in the
++order listed below. Outputs retain their corresponding input device and dtype.
++
++| Parameter | Input/Output/Attribute | Description | Data type | Data format |
++| --- | --- | --- | --- | --- |
++| `query` | Input | `T` query rows, `H` heads, head dimension `D` | bfloat16 | `[T, H, D]`, TND |
++| `weights` | Input | Per-query head weights | bfloat16 | `[T, H]` |
++| `ends` | Input | Cumulative local query ends for `R` requests | int64 | `[R]` |
++| `lengths` | Input | Number of completed pooled keys per request | int64 | `[R]` |
++| `tails` | Input | Number of unpooled tail tokens per request | int64 | `[R]` |
++| `table` | Input | Physical pooled-key cache block IDs; `C` columns | int32 | `[M, C]` |
++| `padded_query` | Output | Original queries followed by one zero row | bfloat16 | `[T + 1, H, D]`, contiguous |
++| `padded_weights` | Output | Original weights followed by one zero row | bfloat16 | `[T + 1, H]`, contiguous |
++| `padded_ends` | Output | Original ends followed by `T + 1` | int64 | `[R + 1]`, contiguous |
++| `padded_lengths` | Output | Real lengths clamped to at least one; sentinel length one | int64 | `[R + 1]`, contiguous |
++| `padded_tails` | Output | Original tails followed by zero | int64 | `[R + 1]`, contiguous |
++| `padded_table` | Output | Original table followed by one zero row | int32 | `[M + 1, C]`, contiguous |
++
++## Constraints
++
++- All inputs must be on the same NPU. Query/weight shapes and the three
++  request-metadata lengths must agree. Inputs may be strided; outputs are
++  contiguous and do not alias the inputs or other invocations.
++- The GLM KPool integration uses `H = 32`, `D = 128`, and pool size four.
++  `ends` is nondecreasing and lies in `[0, T]`; repeated ends represent empty
++  local requests. Rows after the final end are graph padding. `lengths` is
++  nonnegative and `tails` lies in `[0, 3]` for pool size four.
++- `M >= R` and `C >= 1`. When `M > R`, unused table rows, including row `R`
++  used by the sentinel request, must already contain valid block IDs. The
++  appended row is zero-filled. Physical cache block zero must be allocated and
++  readable; each real request's first block must also be valid when its history
++  is empty. This helper does not allocate or initialize cache blocks.
++- The caller uses causal CANN `TND`/`PA_BBND` indexing (`mask_mode = 3`). Clamping
++  empty histories is safe only together with index packing that filters using
++  the original metadata. Passing the synthetic candidates directly to attention
++  would change the real request's semantics.
++- Graph replay keeps tensor shapes and addresses fixed while metadata values
++  may change, including all-empty local requests. Outputs are allocated per
++  invocation and captured allocations are reused on replay. There is no
++  device-to-host synchronization or data-dependent Python branch.
++
++## Origin and Differences
++
++- **Origin**: Developed for vLLM Ascend's CANN KPool integration. This input
++  preparation helper is not a replacement implementation of the CANN indexer.
++- **Differences**: Fuse concatenation, zero initialization, and length clamping
++  into one kernel for contiguous inputs. A sentinel provides effective work
++  when a DSA-CP shard has no completed pooled keys, avoiding the A3 CANN
++  empty-work output-initialization path. Small metadata tiles avoid expensive
++  wide int64 vector lowering on A3. No CANN package files are modified.
++
++## Test Cases
++
++The accuracy suite uses the GLM head count, head dimension, and pool size above.
++It compares all six prepared tensors against an independent PyTorch reference
++with exact equality (`rtol = 0`, `atol = 0`), checks contiguous and strided
++inputs, and verifies that inputs remain unchanged. Shape variations exercise
++single-row inputs, graph padding, metadata tile boundaries, and wide tables.
++
++CANN integration cases cover empty local histories, zero-query requests,
++fully padded replay, and transitions to nonempty histories without recapture.
++Packed indices are compared with the expected real-token indices. A nonempty
++top-k case compares with an unadapted CANN call. These are integer comparisons;
++there is no floating-point tolerance to relax. Run with a compatible CANN
++pooled-indexer custom-op package installed.
++
++```bash
++pytest -sv tests/e2e/nightly/single_node/ops/singlecard_ops/triton/test_prepare_nonempty_keypool_inputs.py
++```
+diff --git a/vllm_ascend/ops/triton/prepare_nonempty_keypool_inputs.py b/vllm_ascend/ops/triton/prepare_nonempty_keypool_inputs.py
+new file mode 100644
+index 000000000..43dafc13f
+--- /dev/null
++++ b/vllm_ascend/ops/triton/prepare_nonempty_keypool_inputs.py
+@@ -0,0 +1,99 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""Prepare nonempty inputs for the CANN pooled key indexer."""
++
++from vllm.triton_utils import tl, triton
++
++
++@triton.jit(do_not_specialize=["tokens", "requests", "table_rows"])
++def _prepare_nonempty_keypool_inputs_kernel(
++    query,
++    weights,
++    ends,
++    lengths,
++    tails,
++    table,
++    padded_query,
++    padded_weights,
++    padded_ends,
++    padded_lengths,
++    padded_tails,
++    padded_table,
++    tokens,
++    requests,
++    table_rows,
++    HEADS: tl.constexpr,
++    DIM: tl.constexpr,
++    TABLE_COLS: tl.constexpr,
++    BLOCK: tl.constexpr,
++):
++    block = tl.program_id(0)
++    if block * BLOCK < (tokens + 1) * HEADS * DIM:
++        offsets = block * BLOCK + tl.arange(0, BLOCK)
++        value = tl.load(query + offsets, offsets < tokens * HEADS * DIM, other=0)
++        tl.store(padded_query + offsets, value, offsets < (tokens + 1) * HEADS * DIM)
++    if block * BLOCK < (tokens + 1) * HEADS:
++        offsets = block * BLOCK + tl.arange(0, BLOCK)
++        value = tl.load(weights + offsets, offsets < tokens * HEADS, other=0)
++        tl.store(padded_weights + offsets, value, offsets < (tokens + 1) * HEADS)
++    # Int64 vector arithmetic is scalarized on A3. Keep these small metadata
++    # tiles separate from the wide BF16/int32 copies. Tile boundaries also
++    # keep different cores from writing the same 32-byte output cache line.
++    META_BLOCK: tl.constexpr = 16
++    if block * META_BLOCK < requests + 1:
++        offsets = block * META_BLOCK + tl.arange(0, META_BLOCK)
++        end = tl.load(ends + offsets, offsets < requests, other=0)
++        length = tl.load(lengths + offsets, offsets < requests, other=0)
++        tail = tl.load(tails + offsets, offsets < requests, other=0)
++        tl.store(padded_ends + offsets, tl.where(offsets < requests, end, tokens + 1), offsets < requests + 1)
++        tl.store(padded_lengths + offsets, tl.maximum(length, 1), offsets < requests + 1)
++        tl.store(padded_tails + offsets, tail, offsets < requests + 1)
++    if block * BLOCK < (table_rows + 1) * TABLE_COLS:
++        offsets = block * BLOCK + tl.arange(0, BLOCK)
++        value = tl.load(table + offsets, offsets < table_rows * TABLE_COLS, other=0)
++        tl.store(padded_table + offsets, value, offsets < (table_rows + 1) * TABLE_COLS)
++
++
++def prepare_nonempty_keypool_inputs(query, weights, ends, lengths, tails, table):
++    """Append safe CANN sentinel inputs in one launch, without temporary fills.
++
++    Allocate outputs per invocation so independently captured graphs and layers
++    cannot alias a mutable workspace. Graph replay reuses captured allocations.
++    Contiguous inputs use a single vector-copy launch. Normalize strided views
++    first to avoid scalar gather lowering on A3; contiguous() is a no-op on the
++    ordinary backend inputs. All operator inputs returned here are contiguous.
++    """
++    tokens, heads, dim = query.shape
++    requests = ends.numel()
++    table_rows, table_cols = table.shape
++    padded_query = query.new_empty((tokens + 1, heads, dim))
++    padded_weights = weights.new_empty((tokens + 1, heads))
++    padded_ends = ends.new_empty((requests + 1,))
++    padded_lengths = lengths.new_empty((requests + 1,))
++    padded_tails = tails.new_empty((requests + 1,))
++    padded_table = table.new_empty((table_rows + 1, table_cols))
++    block = 8192
++    size = max(padded_query.numel(), padded_weights.numel(), requests + 1, padded_table.numel())
++    grid = max(triton.cdiv(size, block), triton.cdiv(requests + 1, 16))
++    _prepare_nonempty_keypool_inputs_kernel[(grid,)](
++        query.contiguous(),
++        weights.contiguous(),
++        ends.contiguous(),
++        lengths.contiguous(),
++        tails.contiguous(),
++        table.contiguous(),
++        padded_query,
++        padded_weights,
++        padded_ends,
++        padded_lengths,
++        padded_tails,
++        padded_table,
++        tokens,
++        requests,
++        table_rows,
++        heads,
++        dim,
++        table_cols,
++        block,
++    )
++    return padded_query, padded_weights, padded_ends, padded_lengths, padded_tails, padded_table

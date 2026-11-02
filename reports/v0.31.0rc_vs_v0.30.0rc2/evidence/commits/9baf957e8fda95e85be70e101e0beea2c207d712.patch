@@ -1,0 +1,168 @@
+commit 9baf957e8fda95e85be70e101e0beea2c207d712
+Author:     recky-c <ruiqicheng510@gmail.com>
+AuthorDate: Sun Oct 11 20:18:51 2026 +0800
+Commit:     GitHub <noreply@github.com>
+CommitDate: Sun Oct 11 20:18:51 2026 +0800
+
+    [Bugfix] Profile MRV2 with PCP-local token budget (#18270)
+    
+    ### What this PR does / why we need it?
+    
+    MRV2 initial profiling bypasses PCP batch partitioning. With EP and
+    fused MC2, the global token budget can exceed the communication buffer
+    during startup.
+    
+    In profile_run, compute ceil(max_num_tokens / PCP), use this value for
+    the MC2 reservation threshold, and temporarily assign it while calling
+    the parent profile_run. Restore the original value in finally. Existing
+    TP slicing, sampler/MTP calls and sparse-offload reservations are
+    retained. No MoE prepare/finalize or forward-context changes remain.
+    
+    ### Does this PR introduce _any_ user-facing change?
+    
+    PCP startup memory profiling uses a rank-local token budget. No new
+    options or environment variables are introduced.
+    
+    ### How was this patch tested?
+    
+    - Eleven profile-control unit cases passed with repository mocks,
+    covering PCP1, PCP16, rounding, normal/exception restoration and MC2
+    thresholds. Ruff and pre-commit/mypy passed.
+    - Ascend A3, GLM-4.7-Flash-W8A8, MRV2, EP, fused MC2, MTP=1, eager,
+    16384-token budget: PCP16 main profile M changed from 16384 to 1024 on
+    all 16 ranks. Available KV memory changed from 24.78 to 25.73 GiB per
+    rank.
+    - Matched-degree control with the same patched runtime: TP4/PCP1 and
+    TP1/PCP4 both measured main profile M=4096 on all four ranks.
+    Target-model prefill M matched at 552 for a 2205-token prompt and 1998
+    for a 7990-token prompt. Both completed inference with exit 0.
+    - TP16 is unsupported by this model's 20 attention heads, so the direct
+    comparison uses degree 4. Extra MC2 reservation dummy M differs (2
+    versus 8), as do replicated MTP and decode paths. Equality is
+    established for the measured main profile and target-model prefill,
+    rather than every operator invocation.
+    - At memory utilization 0.9 and max_num_seqs=64, the patched PCP16
+    runtime completed two 15980-token prompts with 32-token generation
+    without OOM. Actual replicated MTP prefill reached M=15982, which
+    remains a peak-memory caveat.
+    - The matched-degree samples produced identical outputs. Earlier
+    repeated PCP16 controls varied in both baseline and patched runs;
+    general accuracy equivalence is not established.
+    
+    The NPU tests backport the profile behavior onto the existing test
+    runtime rather than deploying the full current main. Broader peak-memory
+    validation, output-variability investigation and the original GLM-5.3
+    PCP16/PP2 two-node case remain outstanding. The smaller model's baseline
+    also starts, so these runs confirm corrected shapes and executable
+    requests rather than reproducing the original startup failure.
+    
+    
+    - GitHub CI passed after rerunning the A3 four-card part 5-5 test, which
+    had failed during TCPStore startup with a port conflict.
+    
+    ---------
+    
+    Signed-off-by: recky-c <252898884+recky-c@users.noreply.github.com>
+    Co-authored-by: recky-c <252898884+recky-c@users.noreply.github.com>
+
+diff --git a/tests/ut/worker/test_model_runner_v2.py b/tests/ut/worker/test_model_runner_v2.py
+index db4c900aa..4470ebfbe 100644
+--- a/tests/ut/worker/test_model_runner_v2.py
++++ b/tests/ut/worker/test_model_runner_v2.py
+@@ -24,7 +24,8 @@ def _make_runner(need_timing: bool = True):
+         scheduler_config=SimpleNamespace(profiling_chunk_config=SimpleNamespace(need_timing=need_timing)),
+         sparse_kv_offload_config=SimpleNamespace(enabled=False),
+     )
+-    runner.vllm_config = SimpleNamespace()
++    runner.vllm_config = SimpleNamespace(parallel_config=SimpleNamespace(prefill_context_parallel_size=1))
++    runner.max_num_tokens = 16
+     runner.model_config = SimpleNamespace(hf_config=SimpleNamespace(model_type="other_model"))
+     runner.kv_cache_config = KVCacheConfig(num_blocks=0, kv_cache_tensors=[], kv_cache_groups=[])
+     runner.kvpp = SimpleNamespace(complete_forward=lambda: None)
+@@ -844,7 +845,7 @@ def test_initialize_kv_cache_forwards_allocation_context():
+ def test_profile_run_dummy_reserves_mc2(moe_type):
+     runner = _make_runner()
+     runner.max_num_tokens = 16
+-    runner.vllm_config = SimpleNamespace()
++    runner.vllm_config = SimpleNamespace(parallel_config=SimpleNamespace(prefill_context_parallel_size=1))
+     runner.get_model = MagicMock(return_value="m")
+     runner._dummy_run = MagicMock()
+     with (
+@@ -872,6 +873,44 @@ def test_profile_run_skips_mc2_dummy_without_capacity():
+     runner._dummy_run.assert_not_called()
+ 
+ 
++@pytest.mark.parametrize(("pcp_size", "tokens", "expected"), [(1, 16384, 16384), (16, 16384, 1024), (4, 17, 5)])
++@pytest.mark.parametrize("fail", [False, True])
++def test_profile_run_uses_pcp_local_tokens_and_restores_budget(pcp_size, tokens, expected, fail):
++    runner = _make_runner()
++    runner.vllm_config.parallel_config.prefill_context_parallel_size = pcp_size
++    runner.max_num_tokens = tokens
++
++    def parent_profile(self):
++        assert self.max_num_tokens == expected
++        if fail:
++            raise RuntimeError("profile failed")
++
++    with (
++        patch("vllm_ascend.worker.v2.model_runner.get_mc2_tokens_capacity", return_value=None),
++        patch.object(GPUModelRunner, "profile_run", parent_profile),
++    ):
++        if fail:
++            with pytest.raises(RuntimeError, match="profile failed"):
++                runner.profile_run()
++        else:
++            runner.profile_run()
++    assert runner.max_num_tokens == tokens
++
++
++def test_profile_run_compares_mc2_capacity_with_pcp_local_budget():
++    runner = _make_runner()
++    runner.max_num_tokens = 16384
++    runner.vllm_config.parallel_config.prefill_context_parallel_size = 16
++    runner._dummy_run = Mock()
++    with (
++        patch("vllm_ascend.worker.v2.model_runner.get_mc2_tokens_capacity", return_value=2048),
++        patch.object(GPUModelRunner, "profile_run"),
++    ):
++        runner.profile_run()
++    runner._dummy_run.assert_not_called()
++    assert runner.max_num_tokens == 16384
++
++
+ def test_profile_run_reserves_sparse_offload_topk_buffers():
+     runner = _make_runner()
+     sparse_cfg = SimpleNamespace(enabled=True)
+diff --git a/vllm_ascend/worker/v2/model_runner.py b/vllm_ascend/worker/v2/model_runner.py
+index 76e3ab601..4670878ed 100644
+--- a/vllm_ascend/worker/v2/model_runner.py
++++ b/vllm_ascend/worker/v2/model_runner.py
+@@ -591,17 +591,26 @@ class NPUModelRunner(GPUModelRunner):
+         if sparse_cfg.enabled:
+             allocate_kv_offload_topk_profile_buffers(self.get_kv_cache_spec(), self.vllm_config, sparse_cfg)
+         mc2_tokens_capacity = get_mc2_tokens_capacity()
++        # The initial dummy profile bypasses PCP batch partitioning. Profile
++        # rank-local tokens; the existing MoE preparation still handles TP.
++        pcp_size = self.vllm_config.parallel_config.prefill_context_parallel_size
++        global_max_num_tokens: int = self.max_num_tokens
++        profile_max_num_tokens = (global_max_num_tokens + pcp_size - 1) // pcp_size
+         with override_mrv2_in_profile_run(True):
+             if (
+                 mc2_tokens_capacity is not None
+-                and self.max_num_tokens > mc2_tokens_capacity
++                and profile_max_num_tokens > mc2_tokens_capacity
+                 and select_moe_comm_method(mc2_tokens_capacity, self.vllm_config)
+                 in {MoECommType.MC2, MoECommType.FUSED_MC2}
+             ):
+                 # Use a call-scoped bypass because skip_compiled would require runner-specific ForwardContext plumbing.
+                 with disable_compilation(self.get_model()):
+                     self._dummy_run(mc2_tokens_capacity, skip_attn=True, skip_eplb=True, is_profile=True)
+-            super().profile_run()
++            self.max_num_tokens: int = profile_max_num_tokens
++            try:
++                super().profile_run()
++            finally:
++                self.max_num_tokens = global_max_num_tokens
+ 
+     def gather_batch_req_state(self, scheduler_output: SchedulerOutput, dummy_run: bool):
+         batch_state, uniform_token_count = super().gather_batch_req_state(scheduler_output, dummy_run)

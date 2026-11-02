@@ -1,0 +1,670 @@
+commit 15f24d5e6f5e6d735bf671a23a36fe72c984d3a1
+Author:     recky-c <ruiqicheng510@gmail.com>
+AuthorDate: Sun Oct 11 20:07:03 2026 +0800
+Commit:     GitHub <noreply@github.com>
+CommitDate: Sun Oct 11 20:07:03 2026 +0800
+
+    [Feature][PCP] Support fixed-K speculative decode request sharding (#18112)
+    
+    ### What this PR does / why we need it?
+    
+    Enable PCP decode request sharding with fixed-K speculative decoding.
+    The target uses PCP sharding while the draft continues to run a
+    replicated global batch.
+    
+    - Expose consistent global token extents, request boundaries and hidden
+    states at the PCP restoration boundary while preserving the target's
+    graph inputs.
+    - Pad FULL MLA/GQA draft metadata for DP dummy execution as well as real
+    requests; both CPU and GPU query boundaries cover the selected graph.
+    - Rebuild global draft attention metadata for sharded MLA/GQA targets
+    using FULL graphs. Describe graph padding with zero-KV dummy requests
+    and keep CPU/GPU query boundaries consistent.
+    - Synchronize replicated DSpark draft batches independently across DP
+    ranks, matching the existing MTP/Eagle behavior.
+    - Preallocate the DeepSeek V4 MTP residual buffer before compilation so
+    graph replay and draft restoration use the same storage.
+    
+    ### Does this PR introduce _any_ user-facing change?
+    
+    Yes. Fixed-K speculative decoding can use PCP decode sharding with
+    supported graph modes. No new configuration options are introduced. The
+    draft remains replicated.
+    
+    ### How was this patch tested?
+    
+    - Latest revision `0a524ae30`, rebased onto main `7fa6b34dc`: initialize
+    replicated_pcp=False in the DCP speculator test fixture, which bypasses
+    __init__. The previous CPU CI failure was reproduced as 19 failing
+    cases; all 281 related tests passed remotely after the one-line fixture
+    repair and rebase. No additional runtime change was made for this CI
+    failure. Latest CI is pending.
+    
+    - Latest update `9fd91c25e`: reproduced a DP2 x TP2 x PCP2 MLA/MTP
+    FULL-graph failure in runtime dummy execution (`actual_seq_lengths=8`,
+    query T=16). After the fix, both FULL_DECODE_ONLY and eager completed
+    balanced (4/4 requests), uneven with an idle DP rank (1/4), and mixed
+    queued batches (7/3). Target and draft graph replay were observed. Small
+    random dummy-weight model, fixed-K=3, input lengths 1-960; functional
+    coverage only.
+    - All 243 relevant remote unit tests passed, including dummy-padding
+    CPU/GPU boundary consistency and existing real-request regressions.
+    Latest CI is pending.
+    
+    - Latest update `c2b5263a4` rebased onto main `03f31cfb8`: 238 relevant
+    unit tests passed remotely. Before the fix, the DSpark regression
+    reproduced the upstream assertion when four global draft requests reused
+    a target sync covering two requests; the non-PCP control passed.
+    - A remote two-process Gloo probe passed balanced, uneven, idle-rank and
+    eager-fallback DP synchronization cases using the upstream dispatch
+    helper. Graph selection was mocked; this is not an end-to-end DSpark NPU
+    model inference test. DSpark multi-DP NPU model execution remains
+    unverified; the MLA/MTP coverage is described above.
+    - CI for the latest update is queued; the results below refer to the
+    previous revision.
+    
+    - All CI checks passed on `f879386ed`: 31 successful checks and 5
+    skipped checks, including CPU unit tests for vLLM main and `v0.30.0` and
+    the selected NPU tests.
+    - 185 relevant unit tests passed in a remote Ascend container:
+    
+      ```bash
+      pytest -q tests/ut/worker/test_pcp_manager_v2.py \
+        tests/ut/worker/test_mtp_pcp_speculator_v2.py \
+        tests/ut/worker/v2/test_speculator.py
+      ```
+    
+    - Remote MLA/MTP regression tests passed with PCP sharding in both
+    `FULL_DECODE_ONLY` (capture sizes `[8, 16]`) and eager mode: short
+    single request, long single request, mixed three requests and mixed
+    seven requests. The original FIA query-length mismatch did not recur.
+    These tests used a small random model with dummy weights and validate
+    functional execution and metadata layout, not numerical accuracy.
+    - Local Ruff and diff checks passed.
+    
+    The remote runtime used [vLLM commit
+    ced6857](https://github.com/vllm-project/vllm/commit/ced6857afa0ea7b2e3f0846a62e1394e90f15607).
+    The latest parent-restoration refactor was checked with the 185 unit
+    tests; the preceding production revision passed the MLA runtime cases
+    above. Earlier real-model comparisons had unresolved mixed-batch output
+    differences, so complete numerical equivalence is not claimed.
+    
+    - vLLM main:
+    https://github.com/vllm-project/vllm/commit/ced6857afa0ea7b2e3f0846a62e1394e90f15607
+    
+    ---------
+    
+    Signed-off-by: chengruiqi (C) <c00913489@china.huawei.com>
+    Co-authored-by: chengruiqi (C) <c00913489@china.huawei.com>
+
+diff --git a/tests/ut/attention/test_dsa_v41_cp.py b/tests/ut/attention/test_dsa_v41_cp.py
+index 6672f3c03..fe486b691 100644
+--- a/tests/ut/attention/test_dsa_v41_cp.py
++++ b/tests/ut/attention/test_dsa_v41_cp.py
+@@ -142,6 +142,7 @@ def builders(monkeypatch):
+         monkeypatch.setattr(module, "get_full_cos_and_sin_dsa_for_layer", lambda name: (full_cos, full_sin))
+ 
+     def make(world=2, rank=0, *, max_seqs=2, graph_sizes=(12, 24), dcp=1, legacy=False, decode_sharded=False):
++        monkeypatch.setattr(dsa_v41_cp, "is_pcp_decode_sharding_enabled", lambda config: decode_sharded)
+         config = SimpleNamespace(
+             parallel_config=SimpleNamespace(
+                 tensor_parallel_size=world if legacy else 1,
+diff --git a/tests/ut/spec_decode/test_mla_dspark.py b/tests/ut/spec_decode/test_mla_dspark.py
+index 6a709f208..04021e220 100644
+--- a/tests/ut/spec_decode/test_mla_dspark.py
++++ b/tests/ut/spec_decode/test_mla_dspark.py
+@@ -10,6 +10,7 @@ import numpy as np
+ import pytest
+ import torch
+ from vllm.config import AttentionConfig
++from vllm.v1.worker.gpu.dp_utils import DPSyncState
+ from vllm.v1.worker.gpu.spec_decode.dspark.speculator import DSparkSpeculator
+ 
+ from vllm_ascend.attention.attention_v1 import AscendAttentionBackend, AscendAttentionState
+@@ -27,6 +28,7 @@ from vllm_ascend.worker.v2.spec_decode.dspark.speculator import AscendDSparkSpec
+ 
+ def make_speculator():
+     spec = AscendDSparkSpeculator.__new__(AscendDSparkSpeculator)
++    spec.replicated_pcp = False
+     spec.attn_architecture = "MLA"
+     spec.use_dcp = False
+     spec.requires_non_causal = True
+@@ -45,6 +47,34 @@ def make_speculator():
+     return spec
+ 
+ 
++@pytest.mark.parametrize("replicated_pcp", [False, True])
++def test_dspark_sync_matches_global_draft_requests(monkeypatch, replicated_pcp):
++    spec = make_speculator()
++    spec.replicated_pcp = replicated_pcp
++    spec.max_num_reqs = 4
++    spec.max_num_tokens = 20
++    batch = SimpleNamespace(num_reqs=4, is_prefilling_np=np.zeros(4, dtype=np.bool_))
++    target_sync = SimpleNamespace(num_reqs=2 if replicated_pcp else 4)
++    monkeypatch.setattr(shared, "build_attn_metadata_wrapper", nullcontext)
++    monkeypatch.setattr(shared, "build_attn_metadata_factory", lambda *a, **kw: nullcontext())
++
++    def parent_propose(self, *args, **kwargs):
++        sync = args[11]
++        if sync is not None:
++            # Execute the actual upstream capacity check, not a duplicate of it.
++            self._build_uniform_batch_dp_sync(sync, batch.num_reqs, self.num_query_per_req)
++        assert (sync is None) == replicated_pcp
++        return "draft"
++
++    if not replicated_pcp:
++        # The helper replaces the real DP state after checking capacity.
++        target_sync = DPSyncState(
++            num_tokens_across_dp=torch.tensor([4, 4]), uniform_token_count=1, eager=False, num_reqs=4
++        )
++    monkeypatch.setattr(DSparkSpeculator, "propose", parent_propose)
++    assert spec.propose(batch, *[None for _ in range(10)], dp_sync=target_sync) == "draft"
++
++
+ def make_target():
+     return SimpleNamespace(
+         model=SimpleNamespace(
+diff --git a/tests/ut/worker/test_dcp_speculator_metadata_v2.py b/tests/ut/worker/test_dcp_speculator_metadata_v2.py
+index 6b6c11b7e..08f866988 100644
+--- a/tests/ut/worker/test_dcp_speculator_metadata_v2.py
++++ b/tests/ut/worker/test_dcp_speculator_metadata_v2.py
+@@ -76,6 +76,7 @@ def _speculator(monkeypatch, kind, architecture, width, padded, step, use_dcp=Tr
+     manager.vllm_config = config
+     cls = AscendDSparkSpeculator if kind == "dspark" else AscendMTPSpeculator
+     spec = object.__new__(cls)
++    spec.replicated_pcp = False
+     if kind == "mtp":
+         spec._sparse_kv_offload_metadata = SimpleNamespace(build_kwargs=lambda *args: None)
+         spec.model_state = object()
+diff --git a/tests/ut/worker/test_mtp_pcp_speculator_v2.py b/tests/ut/worker/test_mtp_pcp_speculator_v2.py
+index 388696a59..c2281afcc 100644
+--- a/tests/ut/worker/test_mtp_pcp_speculator_v2.py
++++ b/tests/ut/worker/test_mtp_pcp_speculator_v2.py
+@@ -745,6 +745,49 @@ def test_graph_prefill_refreshes_captured_cache_buffers(attn_architecture: str)
+         assert (captured_blocks.data_ptr(), captured_slots.data_ptr()) == (block_ptr, slot_ptr)
+ 
+ 
++@pytest.mark.parametrize("attn_architecture", ["GQA", "MLA"])
++@pytest.mark.parametrize("target_has_padding", [False, True])
++@pytest.mark.parametrize("is_dummy", [False, True])
++def test_sharded_target_graph_prefill_rebuilds_global_metadata(
++    attn_architecture: str, target_has_padding: bool, is_dummy: bool
++) -> None:
++    speculator = object.__new__(AscendMTPSpeculator)
++    speculator.input_buffers = SimpleNamespace(query_start_loc=torch.tensor([0, 4, 4], dtype=torch.int32))
++    query_buffer_ptr = speculator.input_buffers.query_start_loc.data_ptr()
++    speculator.replicated_pcp = True
++    speculator.pcp_manager = SimpleNamespace(is_decode_sharded=True)
++    speculator.attn_architecture = attn_architecture
++    batch = _make_padded_input_batch()
++    batch.is_dummy = is_dummy
++    batch.num_reqs, batch.num_tokens = 1, 4
++    batch.query_start_loc_np = np.array([0, 4], dtype=np.int32)
++    batch.seq_lens_cpu_upper_bound = torch.tensor([9, 99] if target_has_padding else [9], dtype=torch.int32)
++    speculator.input_batch = batch
++    speculator.block_tables = MagicMock()
++    speculator.kv_cache_config = object()
++    global_metadata = {"draft.layer": object()}
++    speculator._build_attn_metadata = MagicMock(return_value=global_metadata)
++    with patch.object(speculator_module, "build_slot_mappings_by_layer", return_value={}) as build_slots:
++        metadata, _ = speculator._prepare_replicated_prefill_attn(
++            {"draft.layer": SimpleNamespace(actual_seq_lengths_q=[2, 4])},
++            {},
++            2,
++            8,
++            CUDAGraphMode.FULL,
++        )
++    assert metadata is global_metadata
++    kwargs = speculator._build_attn_metadata.call_args.kwargs
++    np.testing.assert_array_equal(kwargs["query_start_loc_np"], [0, 4, 8])
++    assert kwargs["seq_lens_cpu_upper_bound"].tolist() == [9, 0]
++    assert kwargs["num_reqs"] == 2
++    assert speculator.input_buffers.query_start_loc.tolist() == [0, 4, 8]
++    assert speculator.input_buffers.query_start_loc.data_ptr() == query_buffer_ptr
++    assert kwargs["batch_desc"].num_tokens == 8
++    np.testing.assert_array_equal(batch.query_start_loc_np, [0, 4])
++    assert batch.seq_lens_cpu_upper_bound.tolist() == ([9, 99] if target_has_padding else [9])
++    build_slots.assert_called_once()
++
++
+ @pytest.mark.parametrize("guard", ["non_pcp", "no_batch", "no_metadata"])
+ def test_prepare_replicated_prefill_preserves_bypass(guard: str) -> None:
+     speculator = object.__new__(AscendMTPSpeculator)
+@@ -768,13 +811,14 @@ def test_prepare_replicated_prefill_preserves_bypass(guard: str) -> None:
+     speculator._build_attn_metadata.assert_not_called()
+ 
+ 
+-@pytest.mark.parametrize("attn_architecture", ["GQA", "SFA"])
++@pytest.mark.parametrize("attn_architecture", ["GQA", "MLA", "SFA"])
+ def test_graph_prefill_uses_local_dummy_metadata(attn_architecture: str) -> None:
+     speculator = object.__new__(AscendMTPSpeculator)
+     speculator.replicated_pcp = True
+     speculator.attn_architecture = attn_architecture
+     speculator.input_batch = _make_padded_input_batch()
+     speculator.input_batch.is_dummy = True
++    speculator.input_buffers = SimpleNamespace(query_start_loc=torch.zeros(5, dtype=torch.int32))
+     speculator.block_tables = MagicMock()
+     speculator.kv_cache_config = object()
+     target_metadata, draft_metadata = object(), object()
+@@ -794,10 +838,16 @@ def test_graph_prefill_uses_local_dummy_metadata(attn_architecture: str) -> None
+         speculator.block_tables.get_dummy_slot_mappings.return_value, speculator.kv_cache_config
+     )
+     kwargs = speculator._build_attn_metadata.call_args.kwargs
+-    assert kwargs["num_reqs"] == 2
+     assert kwargs["step"] == 0
+-    assert kwargs["query_start_loc_np"] is speculator.input_batch.query_start_loc_np
+-    assert kwargs["seq_lens_cpu_upper_bound"] is speculator.input_batch.seq_lens_cpu_upper_bound
++    if attn_architecture in ("MLA", "GQA"):
++        assert kwargs["num_reqs"] == 4
++        np.testing.assert_array_equal(kwargs["query_start_loc_np"], [0, 3, 6, 7, 8])
++        assert speculator.input_buffers.query_start_loc.tolist() == [0, 3, 6, 7, 8]
++        assert kwargs["seq_lens_cpu_upper_bound"].tolist() == [0, 1, 0, 0]
++    else:
++        assert kwargs["num_reqs"] == 2
++        assert kwargs["query_start_loc_np"] is speculator.input_batch.query_start_loc_np
++        assert kwargs["seq_lens_cpu_upper_bound"] is speculator.input_batch.seq_lens_cpu_upper_bound
+ 
+ 
+ @pytest.mark.parametrize("replicated", [False, True])
+@@ -852,7 +902,7 @@ def test_propose_sync_follows_draft_token_layout(speculator_cls, parent_cls, rep
+     speculator = object.__new__(speculator_cls)
+     speculator.replicated_pcp = replicated_pcp
+     speculator.input_batch = None
+-    speculator.pcp_manager = MagicMock()
++    speculator.pcp_manager = MagicMock(is_decode_sharded=False)
+     speculator.model_state = SimpleNamespace(
+         pcp_manager=speculator.pcp_manager,
+     )
+diff --git a/tests/ut/worker/test_pcp_manager_v2.py b/tests/ut/worker/test_pcp_manager_v2.py
+index 4ab534fd8..0508479d1 100644
+--- a/tests/ut/worker/test_pcp_manager_v2.py
++++ b/tests/ut/worker/test_pcp_manager_v2.py
+@@ -88,10 +88,11 @@ def _make_pcp_config(
+     "cudagraph_mode,speculative,pcp_size,dcp_size,expected_sharding",
+     [
+         (CUDAGraphMode.NONE, False, 2, 1, True),
+-        (CUDAGraphMode.NONE, True, 2, 1, False),
++        (CUDAGraphMode.NONE, True, 2, 1, True),
+         (CUDAGraphMode.NONE, False, 1, 1, False),
+         (CUDAGraphMode.NONE, False, 2, 2, False),
+         (CUDAGraphMode.FULL_DECODE_ONLY, False, 2, 1, True),
++        (CUDAGraphMode.FULL_DECODE_ONLY, True, 2, 1, True),
+     ],
+ )
+ def test_decode_sharding_uses_parallel_config(cudagraph_mode, speculative, pcp_size, dcp_size, expected_sharding):
+@@ -139,7 +140,7 @@ def test_decode_sharding_does_not_add_a_parallel_config_field():
+ 
+     assert not hasattr(parallel_config, "pcp_shard_decode_requests")
+     replace(parallel_config)
+-    assert is_pcp_decode_sharding_enabled(config) is False
++    assert is_pcp_decode_sharding_enabled(config) is True
+ 
+ 
+ def test_validate_config_allows_sparse_mla_full_decode_only():
+@@ -363,9 +364,16 @@ def test_full_decode_request_layout_is_token_sized_only_without_drafts():
+     assert manager._full_decode_requests_are_token_sized(decode_batch) is False
+ 
+ 
++class _ReplicatedPCPManager(AscendPCPManager):
++    """Exercise replicated layouts explicitly, independently of speculation."""
++
++    @property
++    def is_decode_sharded(self):
++        return False
++
++
+ def _make_replicated_pcp_manager():
+-    manager = AscendPCPManager(2, 0, torch.device("cpu"), max_num_reqs=8, max_num_tokens=32)
+-    # Graph execution with speculation stays replicated.
++    manager = _ReplicatedPCPManager(2, 0, torch.device("cpu"), max_num_reqs=8, max_num_tokens=32)
+     manager.vllm_config = _make_pcp_config(
+         CUDAGraphMode.FULL_DECODE_ONLY,
+         speculative_config=SimpleNamespace(num_speculative_tokens=3),
+@@ -628,7 +636,7 @@ def test_partition_batch_preserves_fia_dummy_layout() -> None:
+         prefill_len=SimpleNamespace(gpu=torch.zeros(2, dtype=torch.int32)),
+         draft_tokens=torch.empty((2, 0), dtype=torch.int64),
+     )
+-    manager = AscendPCPManager(
++    manager = _ReplicatedPCPManager(
+         pcp_world_size=2,
+         pcp_rank=0,
+         device=torch.device("cpu"),
+@@ -719,7 +727,7 @@ def test_partition_batch_preserves_speculative_target_inputs(pcp_rank) -> None:
+     global_batch.attn_state = build_attn_state(
+         config, global_batch.seq_lens_np, 2, global_batch.num_scheduled_tokens, np.ones(2, dtype=np.int32)
+     )
+-    manager = AscendPCPManager(2, pcp_rank, torch.device("cpu"), max_num_reqs=2, max_num_tokens=5)
++    manager = _ReplicatedPCPManager(2, pcp_rank, torch.device("cpu"), max_num_reqs=2, max_num_tokens=5)
+     manager.vllm_config = config
+ 
+     with (
+@@ -776,6 +784,29 @@ def test_request_state_cpu_and_numpy_tokens_share_storage() -> None:
+     assert state.num_computed_tokens_np[1] == 23
+ 
+ 
++def test_sampling_restore_exposes_unpadded_global_view() -> None:
++    manager = AscendPCPManager.__new__(AscendPCPManager)
++    batch = _make_global_pcp_batch()
++    batch.is_dummy = False
++    batch.num_tokens = 12
++    batch.num_tokens_after_padding = 16
++    batch.query_start_loc_np = np.array([0, 12, 16], dtype=np.int32)
++    batch.query_start_loc = torch.tensor([0, 12, 16], dtype=torch.int32)
++    manager._global_batch = batch
++    manager._sampling_hidden_restored = True
++    hidden_states = torch.arange(32).reshape(16, 2)
++    with patch.object(AscendPCPManager, "_restore_unpadded_global_batch", return_value=True):
++        restored_hidden, restored_batch = manager.restore_for_sampling(hidden_states)
++    assert restored_batch is not batch
++    assert restored_batch.num_tokens_after_padding == 12
++    assert restored_batch.query_start_loc.tolist() == [0, 12]
++    assert restored_batch.query_start_loc_np.tolist() == [0, 12]
++    assert restored_hidden.shape == (12, 2)
++    assert restored_hidden.data_ptr() == hidden_states.data_ptr()
++    assert batch.num_tokens_after_padding == 16
++    assert batch.query_start_loc.tolist() == [0, 12, 16]
++
++
+ def test_pcp_manager_restores_model_owned_hidden_buffer() -> None:
+     hidden_states = torch.tensor([[1.0, 2.0], [3.0, 4.0], [-1.0, -1.0], [-1.0, -1.0]])
+     restored = torch.tensor([[1.0, 2.0], [5.0, 6.0], [3.0, 4.0], [9.0, 9.0]])
+@@ -1102,8 +1133,8 @@ def test_validate_config_pcp_dp_graph_modes(dp_size, cudagraph_mode, allowed):
+ @pytest.mark.parametrize("pcp_rank", [0, 1])
+ @pytest.mark.parametrize("has_stale_batch", [False, True])
+ def test_dummy_attention_context_uses_current_batch(pcp_rank, has_stale_batch):
+-    manager = AscendPCPManager(2, pcp_rank, torch.device("cpu"))
+-    # Speculative decoding keeps the dummy batch on the replicated path.
++    manager = _ReplicatedPCPManager(2, pcp_rank, torch.device("cpu"))
++    # Exercise the replicated dummy layout explicitly.
+     manager.vllm_config = _make_pcp_config(
+         CUDAGraphMode.NONE,
+         speculative_config=SimpleNamespace(num_speculative_tokens=3),
+@@ -1198,7 +1229,7 @@ def test_speculative_decode_keeps_draft_tokens_on_pcp_ranks(pcp_rank):
+     batch.is_padding = torch.zeros(4, dtype=torch.bool)
+     batch.num_draft_tokens = 3
+     batch.num_draft_tokens_per_req = np.array([3], dtype=np.int32)
+-    manager = AscendPCPManager(8, pcp_rank, torch.device("cpu"), max_num_reqs=1, max_num_tokens=32)
++    manager = _ReplicatedPCPManager(8, pcp_rank, torch.device("cpu"), max_num_reqs=1, max_num_tokens=32)
+     manager.vllm_config = _make_pcp_config(CUDAGraphMode.FULL_DECODE_ONLY)
+     manager.vllm_config.speculative_config = SimpleNamespace(num_speculative_tokens=3)
+     with (
+@@ -1207,7 +1238,7 @@ def test_speculative_decode_keeps_draft_tokens_on_pcp_ranks(pcp_rank):
+     ):
+         local = manager.partition_batch(batch)
+     assert manager.get_num_tokens_for_dispatch(batch.num_scheduled_tokens, batch.is_prefilling_np) == 4
+-    # FULL_DECODE_ONLY with speculation stays replicated, so every rank keeps the tokens.
++    # Replicated layouts keep the target verification tokens on every rank.
+     assert local.num_tokens == 4
+     assert local.req_ids == batch.req_ids
+     assert batch.num_draft_tokens_per_req.tolist() == [3]
+diff --git a/tests/ut/worker/v2/test_speculator.py b/tests/ut/worker/v2/test_speculator.py
+index ae3827897..dc9d75b01 100644
+--- a/tests/ut/worker/v2/test_speculator.py
++++ b/tests/ut/worker/v2/test_speculator.py
+@@ -600,6 +600,7 @@ def test_propose_replicated_pcp_disables_dp_sync():
+     """Test replicated PCP disables DP synchronization during propose."""
+     speculator = AscendAutoRegressiveSpeculator.__new__(AscendAutoRegressiveSpeculator)
+     speculator.replicated_pcp = True
++    speculator.pcp_manager = None
+     input_batch = object()
+     args = [object() for _ in range(10)]
+     dp_sync = object()
+@@ -625,6 +626,51 @@ def test_propose_replicated_pcp_disables_dp_sync():
+     assert result is expected
+ 
+ 
++def test_propose_consumes_restored_global_inputs():
++    # PCP restoration owns the real token extent and request boundaries.
++    # Draft consumes that view without copying or trimming the input buffers.
++    speculator = AscendAutoRegressiveSpeculator.__new__(AscendAutoRegressiveSpeculator)
++    speculator.replicated_pcp = True
++    speculator.pcp_manager = SimpleNamespace(is_decode_sharded=True)
++    input_batch = SimpleNamespace(
++        num_reqs=3,
++        num_tokens=12,
++        num_tokens_after_padding=12,
++        query_start_loc=torch.tensor([0, 4, 8, 12]),
++        query_start_loc_np=np.array([0, 4, 8, 12]),
++        input_ids=torch.arange(16),
++        positions=torch.arange(16),
++        is_padding=torch.arange(16) >= 12,
++    )
++    hidden = torch.randn(12, 8)
++    auxiliary = [torch.randn(12, 4)]
++    args = [object(), object(), hidden, auxiliary, *[object() for _ in range(6)]]
++    with (
++        patch(
++            "vllm_ascend.worker.v2.spec_decode.autoregressive.speculator.disable_target_pcp_for_replicated_draft",
++            return_value=nullcontext(),
++        ),
++        patch(
++            "vllm_ascend.worker.v2.spec_decode.autoregressive.speculator.build_attn_metadata_wrapper",
++            return_value=nullcontext(),
++        ),
++        patch(
++            "vllm_ascend.worker.v2.spec_decode.autoregressive.speculator.torch_gather_wrapper",
++            return_value=nullcontext(),
++        ),
++        patch.object(AutoRegressiveSpeculator, "propose") as parent_propose,
++    ):
++        speculator.propose(input_batch, *args)
++    draft_batch = parent_propose.call_args.args[0]
++    assert draft_batch is input_batch
++    assert draft_batch.num_tokens_after_padding == 12
++    assert draft_batch.input_ids.shape[0] == draft_batch.positions.shape[0] == draft_batch.is_padding.shape[0] == 16
++    assert input_batch.positions.shape[0] == 16
++    assert draft_batch.query_start_loc[-1] == draft_batch.query_start_loc_np[-1] == 12
++    assert parent_propose.call_args.args[3] is hidden
++    assert parent_propose.call_args.args[4] is auxiliary
++
++
+ def test_init_dcp_disabled():
+     """Test DCP initialization when DCP is disabled."""
+     speculator = AscendAutoRegressiveSpeculator.__new__(AscendAutoRegressiveSpeculator)
+diff --git a/vllm_ascend/attention/context_parallel/common_cp.py b/vllm_ascend/attention/context_parallel/common_cp.py
+index d6eb01f09..0156fbff6 100644
+--- a/vllm_ascend/attention/context_parallel/common_cp.py
++++ b/vllm_ascend/attention/context_parallel/common_cp.py
+@@ -11,19 +11,13 @@ from vllm_ascend.distributed.utils import get_decode_context_model_parallel_worl
+ 
+ 
+ def is_pcp_decode_sharding_enabled(vllm_config) -> bool:
+-    """Shard decode requests for PCP without speculation.
++    """Shard PCP decode requests, including speculative target verification.
+ 
+-    Graph execution follows the sharded path as well. Speculative decoding
+-    stays on the replicated path in this change. The decision is derived from
+-    declared vLLM fields so cloning a draft ``ParallelConfig`` with
+-    ``replace()`` does not see an undeclared attribute.
++    The decision uses declared vLLM fields so cloning a draft
++    ``ParallelConfig`` with ``replace()`` remains supported.
+     """
+     parallel_config = vllm_config.parallel_config
+-    return (
+-        parallel_config.prefill_context_parallel_size > 1
+-        and parallel_config.decode_context_parallel_size == 1
+-        and vllm_config.speculative_config is None
+-    )
++    return parallel_config.prefill_context_parallel_size > 1 and parallel_config.decode_context_parallel_size == 1
+ 
+ 
+ def get_pcp_num_replicated_tokens(num_decode_tokens: int, is_decode_sharded: bool) -> int:
+diff --git a/vllm_ascend/models/deepseek_v4/model.py b/vllm_ascend/models/deepseek_v4/model.py
+index 7e3d8b4cc..4178dd0d4 100644
+--- a/vllm_ascend/models/deepseek_v4/model.py
++++ b/vllm_ascend/models/deepseek_v4/model.py
+@@ -878,17 +878,20 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
+         # permanently cost max_num_batched_tokens * hc_dim per rank.
+         # Aligned with upstream DeepSeekV4 (see vllm PR #50312).
+         spec_config = vllm_config.speculative_config
+-        self._needs_mtp_hidden_states = bool(
++        self._mtp_hidden_buffer: torch.Tensor | None = None
++        if (
+             get_pp_group().is_last_rank
+             and spec_config is not None
+             and (spec_config.use_eagle() or spec_config.uses_draft_model())
+-        )
+-        self._mtp_buffer_shape = (
+-            vllm_config.scheduler_config.max_num_batched_tokens,
+-            hc_dim,
+-        )
+-        self._mtp_buffer_dtype = vllm_config.model_config.dtype
+-        self._mtp_hidden_buffer: torch.Tensor | None = None
++        ):
++            # Bind the buffer before compilation: lazy allocation in forward
++            # can leave FULL graph replay writing a different tensor from the
++            # model-owned residual restored for the replicated PCP draft.
++            self._mtp_hidden_buffer = torch.empty(
++                (vllm_config.scheduler_config.max_num_batched_tokens, hc_dim),
++                dtype=vllm_config.model_config.dtype,
++                device=self.device,
++            )
+ 
+     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
+         return self.embed_tokens(input_ids)
+@@ -983,13 +986,7 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
+             hidden_states = sp_all_gather(hidden_states)[: positions.shape[0]]
+ 
+         # Stash pre-hc_head residual for the MTP draft (captured copy_).
+-        if self._needs_mtp_hidden_states:
+-            if self._mtp_hidden_buffer is None:
+-                self._mtp_hidden_buffer = torch.empty(
+-                    self._mtp_buffer_shape,
+-                    dtype=self._mtp_buffer_dtype,
+-                    device=self.device,
+-                )
++        if self._mtp_hidden_buffer is not None:
+             num_tokens = hidden_states.shape[0]
+             self._mtp_hidden_buffer[:num_tokens].copy_(hidden_states.flatten(1))
+ 
+diff --git a/vllm_ascend/worker/v2/pcp_manager.py b/vllm_ascend/worker/v2/pcp_manager.py
+index 47bff0de3..87f9ba69f 100644
+--- a/vllm_ascend/worker/v2/pcp_manager.py
++++ b/vllm_ascend/worker/v2/pcp_manager.py
+@@ -466,8 +466,23 @@ class AscendPCPManager(PCPManager):
+         restored_hidden_states = super().restore_hidden_states(hidden_states)
+         if self._global_batch is not None:
+             restored_hidden_states[self._global_batch.num_tokens :].zero_()
++            if self._restore_unpadded_global_batch():
++                restored_hidden_states = restored_hidden_states[: self._global_batch.num_tokens]
+         return restored_hidden_states
+ 
++    def _restore_unpadded_global_batch(self) -> bool:
++        """Sampling and replicated drafting consume scheduled global tokens.
++
++        Target graph padding stays private to target attention/capture views.
++        The draft chooses its own execution padding after restoration.
++        """
++        return (
++            getattr(getattr(self, "vllm_config", None), "speculative_config", None) is not None
++            and self.is_decode_sharded
++            and self._global_batch is not None
++            and not self._global_batch.is_dummy
++        )
++
+     def restore_for_sampling(
+         self,
+         hidden_states: torch.Tensor,
+@@ -485,8 +500,20 @@ class AscendPCPManager(PCPManager):
+         assert self._global_batch is not None
+         if self._sampling_hidden_restored:
+             self._sampling_hidden_restored = False
+-            return hidden_states, self._global_batch
+-        return super().restore_for_sampling(hidden_states)
++            global_batch = self._global_batch
++        else:
++            hidden_states, global_batch = super().restore_for_sampling(hidden_states)
++        if self._restore_unpadded_global_batch():
++            # Preserve the target's batch; expose real request boundaries and
++            # token extent at the global restoration boundary.
++            global_batch = replace(
++                global_batch,
++                num_tokens_after_padding=global_batch.num_tokens,
++                query_start_loc=global_batch.query_start_loc[: global_batch.num_reqs + 1],
++                query_start_loc_np=global_batch.query_start_loc_np[: global_batch.num_reqs + 1],
++            )
++            hidden_states = hidden_states[: global_batch.num_tokens]
++        return hidden_states, global_batch
+ 
+     def restore_hidden_state_buffer(self, hidden_states: torch.Tensor) -> None:
+         """Restore a model-owned rank-local buffer to the global PCP layout."""
+diff --git a/vllm_ascend/worker/v2/spec_decode/autoregressive/speculator.py b/vllm_ascend/worker/v2/spec_decode/autoregressive/speculator.py
+index ae86d0fcf..9d1630901 100644
+--- a/vllm_ascend/worker/v2/spec_decode/autoregressive/speculator.py
++++ b/vllm_ascend/worker/v2/spec_decode/autoregressive/speculator.py
+@@ -225,6 +225,9 @@ class AscendAutoRegressiveSpeculator(LmheadTPDraftSamplingMixin, AutoRegressiveS
+             return attn_metadata, slot_mappings
+ 
+         assert isinstance(input_batch, AscendInputBatch)
++        num_reqs = input_batch.num_reqs
++        query_start_loc_np = input_batch.query_start_loc_np
++        seq_lens_cpu = input_batch.seq_lens_cpu_upper_bound
+         if input_batch.is_dummy:
+             # Replicated drafts need local dummy slots instead of target PCP slots.
+             self.block_tables.get_dummy_block_tables(num_reqs_padded)
+@@ -241,11 +244,27 @@ class AscendAutoRegressiveSpeculator(LmheadTPDraftSamplingMixin, AutoRegressiveS
+                 input_batch.positions,
+                 num_tokens_padded=num_tokens_padded,
+             )
+-            # TODO: Remove this early return once FIA supports padded Query tensors
+-            # whose token count exceeds the cumulative query length. Keep the
+-            # mapping refresh above when unifying metadata construction.
+-            if cudagraph_runtime_mode == CUDAGraphMode.FULL and self.attn_architecture in ("MLA", "GQA"):
+-                return attn_metadata, slot_mappings
++        # These FULL backends normally reuse target metadata. A sharded
++        # target instead needs metadata for the restored global draft.
++        if cudagraph_runtime_mode == CUDAGraphMode.FULL and self.attn_architecture in ("MLA", "GQA"):
++            if not input_batch.is_dummy:
++                pcp_manager = getattr(self, "pcp_manager", None)
++                if pcp_manager is None or not pcp_manager.is_decode_sharded:
++                    return attn_metadata, slot_mappings
++            if int(query_start_loc_np[num_reqs]) < num_tokens_padded:
++                # DP dummy runs can also select a graph larger than their input.
++                # Give graph-padding tokens dummy requests with no cached KV.
++                assert num_reqs_padded > num_reqs
++                padding_boundaries = np.linspace(
++                    query_start_loc_np[num_reqs], num_tokens_padded, num_reqs_padded - num_reqs + 1, dtype=np.int32
++                )
++                query_start_loc_np = np.concatenate((query_start_loc_np[:num_reqs], padding_boundaries))
++                # Keep CPU and GPU metadata in the same global layout.
++                self.input_buffers.query_start_loc[: num_reqs_padded + 1].copy_(torch.from_numpy(query_start_loc_np))
++                padded_seq_lens_cpu = torch.zeros(num_reqs_padded, dtype=seq_lens_cpu.dtype)
++                padded_seq_lens_cpu[:num_reqs].copy_(seq_lens_cpu[:num_reqs])
++                seq_lens_cpu = padded_seq_lens_cpu
++                num_reqs = num_reqs_padded
+ 
+         slot_mappings = build_slot_mappings_by_layer(
+             slot_mappings_tensor,
+@@ -254,14 +273,14 @@ class AscendAutoRegressiveSpeculator(LmheadTPDraftSamplingMixin, AutoRegressiveS
+         # This is draft prefill, not the later one-token-per-request decode.
+         # Query lengths may differ, so do not use _build_uniform_attn_metadata.
+         attn_metadata = self._build_attn_metadata(
+-            num_reqs=input_batch.num_reqs,
++            num_reqs=num_reqs,
+             batch_desc=BatchExecutionDescriptor(
+                 cg_mode=cudagraph_runtime_mode,
+                 num_tokens=num_tokens_padded,
+                 num_reqs=num_reqs_padded,
+             ),
+-            query_start_loc_np=input_batch.query_start_loc_np,
+-            seq_lens_cpu_upper_bound=input_batch.seq_lens_cpu_upper_bound,
++            query_start_loc_np=query_start_loc_np,
++            seq_lens_cpu_upper_bound=seq_lens_cpu,
+             step=0,
+         )
+         return attn_metadata, slot_mappings
+diff --git a/vllm_ascend/worker/v2/spec_decode/dspark/speculator.py b/vllm_ascend/worker/v2/spec_decode/dspark/speculator.py
+index a27c90e11..418738f66 100644
+--- a/vllm_ascend/worker/v2/spec_decode/dspark/speculator.py
++++ b/vllm_ascend/worker/v2/spec_decode/dspark/speculator.py
+@@ -423,7 +423,9 @@ class AscendDSparkSpeculator(LmheadTPDraftSamplingMixin, DSparkSpeculator):
+     ) -> torch.Tensor:
+         self.input_batch = input_batch
+         assert self.input_batch is not None
+-        sync_state = dp_sync
++        # Replicated drafts consume global requests, unlike sharded targets.
++        # Every DP rank must synchronize the draft batch independently.
++        sync_state = None if self.replicated_pcp else dp_sync
+         if dummy_run and skip_attn_for_dummy_run:
+             # Profiling runs the draft with its own query token count, which
+             # can differ from the target batch. Let forward_context coordinate

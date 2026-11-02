@@ -1,0 +1,510 @@
+commit 34c9170739ccc7ae6b05282febd51de72e9a5e47
+Author:     Deniz Özcan <66875687+do420@users.noreply.github.com>
+AuthorDate: Wed Oct 14 05:38:00 2026 +0300
+Commit:     GitHub <noreply@github.com>
+CommitDate: Wed Oct 14 10:38:00 2026 +0800
+
+    [BugFix][KV Pool] Prevent scheduler hang on lookup RPC failure (#18017)
+    
+    ## What does this PR do / why do we need it?
+    
+    Fixes #17923
+    
+    Fix a failure mode in the AscendStore KV-pool lookup RPC path where an
+    exception in `LookupKeyServer` can terminate the request thread without
+    sending a REP response. The scheduler-side `LookupKeyClient` could then
+    block indefinitely in `recv()`, hanging the scheduler.
+    
+    This change makes lookup failures degrade to a cache miss instead of an
+    unrecoverable scheduler stall.
+    
+    ### What changed?
+    
+    - Poll the REP socket so the server thread can observe the shutdown
+    flag.
+    - Separate request receive failures from lookup-handler failures. If
+    receiving fails, do not attempt a REP send in an invalid ZeroMQ state;
+    exit the server loop and clean up from the socket-owning thread.
+    - Catch lookup-handler exceptions and reply with `0` hit tokens so a
+    valid REQ/REP exchange stays synchronized.
+    - Set a 1-second receive timeout on the scheduler-side REQ socket and
+    invalidate failed clients so the next lookup can build a fresh socket.
+    - Make client cleanup idempotent and terminate its private ZeroMQ
+    context.
+    - Wire client/server cleanup into the connector's `shutdown()` hook.
+    - Warn if an in-flight server handler has not exited after the bounded
+    1-second join; the owner thread closes its socket/context when it exits.
+    - Add regression tests for handler/receive errors, timeout behavior,
+    client reconstruction, idempotent cleanup, and connector shutdown.
+    
+    A zero-hit response is wire-compatible with the existing protocol and is
+    handled as a normal cache miss by the scheduler.
+    
+    Thread supervision/restart and forced cancellation of a blocked storage
+    handler remain out of scope; Python threads cannot be safely
+    force-cancelled.
+    
+    Closes #17923
+    
+    ### Testing
+    
+    - Fixed the CI-reported undefined `zmq` name and applied formatter
+    changes to the affected test and implementation files.
+    - Fixed mypy errors in the regression tests by importing typed ZeroMQ
+    symbols directly and annotating `server_holder`.
+    - Applied Ruff's requested import cleanup in both affected test files.
+    - Fixed a CPU unit-test fixture to mark its mocked lookup client as open
+    after the scheduler began checking the client's `closed` state.
+    - Latest commit: `c779332d72990a36e7aabff054ce6bdb5039c1a4` (DCO
+    sign-off included).
+    - CI for the latest commit is in progress; verify the CPU unit tests and
+    all required checks before merging.
+    - Focused unit tests and real NPU serving have not been run locally in
+    this environment. Ondre119 separately reported passing real-ZMQ
+    regression tests and 674 AscendStore CPU tests with 12 pre-existing
+    skips in their environment.
+    
+    - vLLM main:
+    https://github.com/vllm-project/vllm/commit/8cc9aa5ad350f6f80cf3bebb298d410803ff75a9
+    
+    Signed-off-by: Deniz Özcan <66875687+do420@users.noreply.github.com>
+
+diff --git a/tests/ut/distributed/ascend_store/test_ascend_store_connector.py b/tests/ut/distributed/ascend_store/test_ascend_store_connector.py
+index 77684723e..74a12b571 100644
+--- a/tests/ut/distributed/ascend_store/test_ascend_store_connector.py
++++ b/tests/ut/distributed/ascend_store/test_ascend_store_connector.py
+@@ -20,11 +20,13 @@ import unittest
+ from unittest.mock import MagicMock, patch
+ 
+ # isort: off
++from zmq.error import ZMQError
+ import tests.ut.distributed.ascend_store._mock_deps  # noqa: F401, E402
+ from vllm.distributed.kv_events import KVCacheEvent
+ from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.ascend_store_connector import (
+     AscendStoreConnector,
+     AscendStoreKVEvents,
++    LookupKeyServer,
+ )
+ from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.metadata import AscendConnectorMetadata
+ 
+@@ -65,6 +67,74 @@ class TestAscendStoreKVEvents(unittest.TestCase):
+         ev._aggregator.reset_workers.assert_called_once()
+ 
+ 
++class TestLookupKeyServer(unittest.TestCase):
++    @patch("vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.ascend_store_connector.threading.Thread")
++    @patch("vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.ascend_store_connector.zmq.Poller")
++    @patch("vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.ascend_store_connector.make_zmq_socket")
++    @patch("vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.ascend_store_connector.zmq.Context")
++    def test_handler_error_returns_zero_and_receive_error_does_not_send(
++        self, mock_context_cls, mock_make_socket, mock_poller_cls, mock_thread_cls
++    ):
++        config = MagicMock()
++        config.parallel_config.data_parallel_rank = 0
++        config.kv_transfer_config.kv_connector_extra_config = {}
++
++        mock_socket = MagicMock()
++        mock_make_socket.return_value = mock_socket
++        mock_poller = MagicMock()
++        mock_poller.poll.side_effect = [[(mock_socket, 1)], [(mock_socket, 1)]]
++        mock_poller_cls.return_value = mock_poller
++        mock_thread_cls.return_value = MagicMock()
++        server_holder: dict[str, LookupKeyServer] = {}
++        calls = {"count": 0}
++
++        def receive(*_args, **_kwargs):
++            calls["count"] += 1
++            if calls["count"] == 1:
++                return [
++                    (64).to_bytes(4, "big"),
++                    b"groups",
++                    (0).to_bytes(4, "big"),
++                    b"hashes",
++                ]
++            server_holder["server"].running = False
++            raise ZMQError("receive failed")
++
++        mock_socket.recv_multipart.side_effect = receive
++        pool_worker = MagicMock()
++        pool_worker.lookup_scheduler.side_effect = RuntimeError("handler failed")
++        server = LookupKeyServer(pool_worker, config)
++        server_holder["server"] = server
++        server.decoder = MagicMock()
++        server.decoder.decode.side_effect = [[0], ["hash"]]
++        target = mock_thread_cls.call_args.kwargs["target"]
++
++        target()
++
++        mock_socket.send.assert_called_once_with((0).to_bytes(4, "big"))
++        mock_socket.close.assert_called_once_with(linger=0)
++        mock_context_cls.return_value.term.assert_called_once_with()
++
++    @patch("vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.ascend_store_connector.threading.Thread")
++    @patch("vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.ascend_store_connector.make_zmq_socket")
++    @patch("vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.ascend_store_connector.zmq.Context")
++    def test_close_stops_and_joins_thread(self, mock_context_cls, mock_make_socket, mock_thread_cls):
++        config = MagicMock()
++        config.parallel_config.data_parallel_rank = 0
++        config.kv_transfer_config.kv_connector_extra_config = {}
++        mock_make_socket.return_value = MagicMock()
++        thread = MagicMock()
++        thread.is_alive.return_value = False
++        mock_thread_cls.return_value = thread
++
++        server = LookupKeyServer(MagicMock(), config)
++        server.close()
++        server.close()
++
++        self.assertFalse(server.running)
++        thread.join.assert_called_once_with(timeout=1)
++
++
+ class TestAscendStoreConnector(unittest.TestCase):
+     def test_bind_metadata_prepares_only_layerwise_workers(self):
+         for use_layerwise in (False, True):
+@@ -503,6 +573,20 @@ class TestAscendStoreConnector(unittest.TestCase):
+             mock_worker_cls.return_value.get_kv_events.return_value = events
+             self.assertIsInstance(connector.get_kv_connector_kv_cache_events(), expected_type)
+ 
++    @patch("vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.ascend_store_connector.LookupKeyServer")
++    @patch("vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.ascend_store_connector.KVPoolWorker")
++    def test_shutdown_closes_lookup_server(self, mock_worker_cls, mock_lookup_cls):
++        config = self._make_vllm_config(extra_config={"use_layerwise": False})
++        from vllm.distributed.kv_transfer.kv_connector.v1.base import KVConnectorRole
++
++        connector = AscendStoreConnector(
++            vllm_config=config,
++            role=KVConnectorRole.WORKER,
++            kv_cache_config=None,
++        )
++        connector.shutdown()
++        mock_lookup_cls.return_value.close.assert_called_once_with()
++
+ 
+ class TestAscendStoreConnectorLayerwise(unittest.TestCase):
+     """Test connector methods that are specific to layerwise mode."""
+diff --git a/tests/ut/distributed/ascend_store/test_glm53_store.py b/tests/ut/distributed/ascend_store/test_glm53_store.py
+index 9c0264ed5..ea681ed91 100644
+--- a/tests/ut/distributed/ascend_store/test_glm53_store.py
++++ b/tests/ut/distributed/ascend_store/test_glm53_store.py
+@@ -157,6 +157,7 @@ class TestGLM53Store(unittest.TestCase):
+                 self.assertEqual(worker.cache_transfer_granularity, 512)
+                 for prompt_len, hit, expected in ((512, 512, 0), (1024, 1024, 512), (1025, 1024, 1024)):
+                     scheduler.client = MagicMock()
++                    scheduler.client.closed = False
+                     scheduler.client.lookup.return_value = hit
+                     request = SimpleNamespace(
+                         request_id="hit", prompt_token_ids=[1] * prompt_len, num_tokens=prompt_len, block_hashes=[]
+diff --git a/tests/ut/distributed/ascend_store/test_pool_scheduler.py b/tests/ut/distributed/ascend_store/test_pool_scheduler.py
+index ca5b3f36a..526a6376b 100644
+--- a/tests/ut/distributed/ascend_store/test_pool_scheduler.py
++++ b/tests/ut/distributed/ascend_store/test_pool_scheduler.py
+@@ -32,6 +32,8 @@ from vllm.v1.kv_cache_interface import (
+     UniformTypeKVCacheSpecs,
+ )
+ from vllm.v1.outputs import KVConnectorOutput
++from zmq.constants import RCVTIMEO
++from zmq.error import ZMQError
+ 
+ import tests.ut.distributed.ascend_store._mock_deps  # noqa: F401, E402
+ from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.coordinator import AscendStoreCoordinator
+@@ -1021,9 +1023,9 @@ class TestKVPoolSchedulerBuildMeta(unittest.TestCase):
+ 
+ class TestLookupKeyClient(unittest.TestCase):
+     @patch("vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.pool_scheduler.make_zmq_socket")
+-    @patch("vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.pool_scheduler.zmq")
++    @patch("vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.pool_scheduler.zmq.Context")
+     @patch("vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.pool_scheduler.MsgpackEncoder")
+-    def test_lookup(self, mock_encoder_cls, mock_zmq, mock_make_socket):
++    def test_lookup(self, mock_encoder_cls, mock_context_cls, mock_make_socket):
+         config = MagicMock()
+         config.parallel_config.data_parallel_rank = 0
+         config.kv_transfer_config.kv_connector_extra_config = {}
+@@ -1031,36 +1033,91 @@ class TestLookupKeyClient(unittest.TestCase):
+         mock_socket = MagicMock()
+         mock_make_socket.return_value = mock_socket
+         mock_socket.recv.return_value = (32).to_bytes(4, "big")
+-
+         mock_encoder_cls.return_value.encode.side_effect = [[b"hashes"], [b"groups"]]
++
+         client = LookupKeyClient(config)
+-        result = client.lookup(64, [b"\xaa\xbb"], hbm_hit_tokens=16)
+-        self.assertEqual(result, 32)
++        self.assertEqual(client.lookup(64, [b"\\xaa\\xbb"], hbm_hit_tokens=16), 32)
+         mock_socket.send_multipart.assert_called_once()
+-        frames = mock_socket.send_multipart.call_args.args[0]
+         self.assertEqual(
+-            frames,
+-            [
+-                (64).to_bytes(4, "big"),
+-                b"groups",
+-                (16).to_bytes(4, "big"),
+-                b"hashes",
+-            ],
++            mock_socket.send_multipart.call_args.args[0],
++            [(64).to_bytes(4, "big"), b"groups", (16).to_bytes(4, "big"), b"hashes"],
+         )
++        client.close()
+ 
+     @patch("vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.pool_scheduler.make_zmq_socket")
+-    @patch("vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.pool_scheduler.zmq")
+-    def test_close(self, mock_zmq, mock_make_socket):
++    @patch("vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.pool_scheduler.zmq.Context")
++    @patch("vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.pool_scheduler.MsgpackEncoder")
++    def test_lookup_zmq_error_returns_zero_and_closes_client(
++        self, mock_encoder_cls, mock_context_cls, mock_make_socket
++    ):
+         config = MagicMock()
+         config.parallel_config.data_parallel_rank = 0
+         config.kv_transfer_config.kv_connector_extra_config = {}
+ 
+         mock_socket = MagicMock()
+         mock_make_socket.return_value = mock_socket
++        mock_socket.recv.side_effect = ZMQError("timeout")
++        mock_encoder_cls.return_value.encode.side_effect = [[b"hashes"], [b"groups"]]
+ 
+         client = LookupKeyClient(config)
++        self.assertEqual(client.lookup(64, [b"\\xaa\\xbb"], hbm_hit_tokens=16), 0)
++        self.assertTrue(client.closed)
++        mock_socket.close.assert_called_once_with(linger=0)
++        client.ctx.term.assert_called_once_with()
++
++    @patch("vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.pool_scheduler.make_zmq_socket")
++    @patch("vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.pool_scheduler.zmq.Context")
++    def test_socket_sets_receive_timeout(self, mock_context_cls, mock_make_socket):
++        config = MagicMock()
++        config.parallel_config.data_parallel_rank = 0
++        config.kv_transfer_config.kv_connector_extra_config = {}
++
++        mock_socket = MagicMock()
++        mock_make_socket.return_value = mock_socket
++
++        LookupKeyClient(config)
++        mock_socket.setsockopt.assert_called_once_with(RCVTIMEO, 1000)
++
++    @patch("vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.pool_scheduler.LookupKeyClient")
++    def test_lookup_failure_rebuilds_client(self, mock_client_cls):
++        scheduler = KVPoolScheduler(make_config(block_size=16), use_layerwise=False)
++        request = MagicMock(
++            prompt_token_ids=list(range(64)),
++            num_tokens=64,
++            request_id="r1",
++            block_hashes=[b"h"] * 4,
++        )
++
++        first_client = MagicMock()
++        first_client.closed = True
++        first_client.lookup.return_value = 0
++        second_client = MagicMock()
++        second_client.closed = False
++        second_client.lookup.return_value = 32
++        mock_client_cls.side_effect = [first_client, second_client]
++
++        self.assertEqual(scheduler.get_num_new_matched_tokens(request, 0), (0, False))
++        self.assertIs(scheduler.client, first_client)
++        self.assertEqual(scheduler.get_num_new_matched_tokens(request, 0), (32, False))
++        self.assertIs(scheduler.client, second_client)
++        self.assertEqual(mock_client_cls.call_count, 2)
++
++    @patch("vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.pool_scheduler.make_zmq_socket")
++    @patch("vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.pool_scheduler.zmq.Context")
++    def test_close_is_idempotent_and_terminates_context(self, mock_context_cls, mock_make_socket):
++        config = MagicMock()
++        config.parallel_config.data_parallel_rank = 0
++        config.kv_transfer_config.kv_connector_extra_config = {}
++
++        mock_socket = MagicMock()
++        mock_make_socket.return_value = mock_socket
++
++        client = LookupKeyClient(config)
++        client.close()
+         client.close()
++        self.assertTrue(client.closed)
+         mock_socket.close.assert_called_once_with(linger=0)
++        client.ctx.term.assert_called_once_with()
+ 
+ 
+ class TestKVPoolSchedulerStoreQueryKeys(unittest.TestCase):
+diff --git a/vllm_ascend/distributed/kv_transfer/kv_pool/ascend_store/ascend_store_connector.py b/vllm_ascend/distributed/kv_transfer/kv_pool/ascend_store/ascend_store_connector.py
+index 58ae8ac5e..b85c6ae26 100644
+--- a/vllm_ascend/distributed/kv_transfer/kv_pool/ascend_store/ascend_store_connector.py
++++ b/vllm_ascend/distributed/kv_transfer/kv_pool/ascend_store/ascend_store_connector.py
+@@ -201,6 +201,18 @@ class AscendStoreConnector(KVConnectorBase_V1, SupportsHMA):
+         if cache is not None and request is not None:
+             cache.save(request, through_tokens, block_ids)
+ 
++    def shutdown(self):
++        """Release the lookup RPC resources owned by this connector."""
++        try:
++            if self.connector_scheduler is not None:
++                client = self.connector_scheduler.client
++                if client is not None:
++                    client.close()
++        finally:
++            if hasattr(self, "lookup_server"):
++                self.lookup_server.close()
++            super().shutdown()
++
+     ############################################################
+     # Scheduler Side Methods
+     ############################################################
+@@ -498,32 +510,69 @@ class LookupKeyServer:
+ 
+         self.pool_worker = pool_worker
+         self.running = True
++        self._closed = False
+ 
+         def process_request():
+-            while self.running:
+-                all_frames = self.socket.recv_multipart(copy=False)
+-                token_len = int.from_bytes(all_frames[0], byteorder="big")
+-                kv_group_ids = self.decoder.decode([all_frames[1]])
+-                hbm_hit_tokens = int.from_bytes(all_frames[2], byteorder="big")
+-                hashes_str = self.decoder.decode(all_frames[3:])
+-                result = self.pool_worker.lookup_scheduler(
+-                    token_len,
+-                    hashes_str,
+-                    kv_group_ids,
+-                    use_layerwise=False,
+-                    hbm_hit_tokens=hbm_hit_tokens,
+-                )
+-                logger.debug(
+-                    "KV pool lookup response token_len=%d groups=%s hit_tokens=%d",
+-                    token_len,
+-                    kv_group_ids,
+-                    result,
+-                )
+-                response = result.to_bytes(4, "big")
+-                self.socket.send(response)
++            poller = zmq.Poller()  # type: ignore[attr-defined]
++            poller.register(self.socket, zmq.POLLIN)  # type: ignore[attr-defined]
++            try:
++                while self.running:
++                    if not poller.poll(timeout=100):
++                        continue
++
++                    # A failed receive leaves a REP socket in an unknown
++                    # protocol state. Do not try to send a synthetic reply.
++                    try:
++                        all_frames = self.socket.recv_multipart(copy=False)
++                    except zmq.ZMQError:  # type: ignore[attr-defined]
++                        if self.running:
++                            logger.exception("Failed to receive KV pool lookup request")
++                        break
++
++                    try:
++                        token_len = int.from_bytes(all_frames[0], byteorder="big")
++                        kv_group_ids = self.decoder.decode([all_frames[1]])
++                        hbm_hit_tokens = int.from_bytes(all_frames[2], byteorder="big")
++                        hashes_str = self.decoder.decode(all_frames[3:])
++                        result = self.pool_worker.lookup_scheduler(
++                            token_len,
++                            hashes_str,
++                            kv_group_ids,
++                            use_layerwise=False,
++                            hbm_hit_tokens=hbm_hit_tokens,
++                        )
++                        logger.debug(
++                            "KV pool lookup response token_len=%d groups=%s hit_tokens=%d",
++                            token_len,
++                            kv_group_ids,
++                            result,
++                        )
++                        response = result.to_bytes(4, "big")
++                    except Exception:
++                        logger.exception("KV pool lookup handler failed; reporting 0 hit tokens")
++                        response = (0).to_bytes(4, "big")
++
++                    try:
++                        self.socket.send(response)
++                    except zmq.ZMQError:  # type: ignore[attr-defined]
++                        if self.running:
++                            logger.exception("Failed to send KV pool lookup response")
++                        break
++            finally:
++                self.socket.close(linger=0)
++                self.ctx.term()
+ 
+         self.thread = threading.Thread(target=process_request, daemon=True)
+         self.thread.start()
+ 
+     def close(self):
+-        self.socket.close(linger=0)
++        if self._closed:
++            return
++        self._closed = True
++        self.running = False
++        self.thread.join(timeout=1)
++        if self.thread.is_alive():
++            logger.warning(
++                "KV pool lookup server thread did not stop within 1 second; "
++                "the active lookup handler may still be running"
++            )
+diff --git a/vllm_ascend/distributed/kv_transfer/kv_pool/ascend_store/pool_scheduler.py b/vllm_ascend/distributed/kv_transfer/kv_pool/ascend_store/pool_scheduler.py
+index fe3e51366..53880349b 100644
+--- a/vllm_ascend/distributed/kv_transfer/kv_pool/ascend_store/pool_scheduler.py
++++ b/vllm_ascend/distributed/kv_transfer/kv_pool/ascend_store/pool_scheduler.py
+@@ -697,7 +697,7 @@ class KVPoolScheduler:
+             else:
+                 if num_computed_tokens >= token_len:
+                     return 0, False
+-                if self.client is None:
++                if self.client is None or self.client.closed:
+                     self.client = LookupKeyClient(self.vllm_config)
+                 num_external_hit_tokens = self.client.lookup(
+                     token_len,
+@@ -1239,6 +1239,8 @@ class LookupKeyClient:
+             zmq.REQ,  # type: ignore[attr-defined]
+             bind=False,
+         )
++        self.socket.setsockopt(zmq.RCVTIMEO, 1000)  # type: ignore[attr-defined]
++        self._closed = False
+ 
+     def lookup(
+         self,
+@@ -1247,6 +1249,9 @@ class LookupKeyClient:
+         kv_cache_group_ids: list[int] | None = None,
+         hbm_hit_tokens: int = 0,
+     ) -> int:
++        if self._closed:
++            return 0
++
+         kv_cache_group_ids = kv_cache_group_ids or [0]
+         hash_strs = [h.hex() for h in block_hashes]
+         hash_frames = self.encoder.encode(hash_strs)
+@@ -1257,13 +1262,30 @@ class LookupKeyClient:
+             hbm_hit_tokens.to_bytes(4, byteorder="big"),
+             *hash_frames,
+         ]
+-        self.socket.send_multipart(all_frames, copy=False)
+-        resp = self.socket.recv()
+-        result = int.from_bytes(resp, "big")
+-        return result
++        try:
++            self.socket.send_multipart(all_frames, copy=False)
++            resp = self.socket.recv()
++        except zmq.ZMQError:  # type: ignore[attr-defined]
++            logger.exception("KV pool lookup failed; reporting 0 hit tokens")
++            self.close()
++            return 0
++
++        return int.from_bytes(resp, "big")
+ 
+     def close(self):
+-        self.socket.close(linger=0)
++        if self._closed:
++            return
++        self._closed = True
++        try:
++            self.socket.close(linger=0)
++        finally:
++            # Each client owns a private context. Close it too so repeated
++            # lookup failures do not leak ZeroMQ IO threads.
++            self.ctx.term()
++
++    @property
++    def closed(self) -> bool:
++        return self._closed
+ 
+ 
+ def get_zmq_rpc_path_lookup(vllm_config: "VllmConfig") -> str:

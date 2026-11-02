@@ -1,0 +1,143 @@
+commit ffb33d798b348af7f843a51226fc69ad5043431e
+Author:     recky-c <ruiqicheng510@gmail.com>
+AuthorDate: Tue Oct 20 20:39:54 2026 +0800
+Commit:     GitHub <noreply@github.com>
+CommitDate: Tue Oct 20 20:39:54 2026 +0800
+
+    [BugFix] Revert PCP-local profile token budget (#18270) (#19243)
+    
+    ### What this PR does / why we need it?
+    
+    Revert #18270 (commit `9baf957e8fda95e85be70e101e0beea2c207d712`).
+    Remove the PCP-local temporary token budget from MRV2 profile_run and
+    restore the previous profile behavior.
+    
+    Only `vllm_ascend/worker/v2/model_runner.py` and
+    `tests/ut/worker/test_model_runner_v2.py` are changed. Later unrelated
+    API/fixture changes are retained. No MoE prepare/finalize, platform,
+    forward-context or runtime MTP changes are introduced.
+    
+    ### Does this PR introduce _any_ user-facing change?
+    
+    Restores the profiling behavior preceding #18270. No new configuration
+    or environment variables.
+    
+    ### How was this patch tested?
+    
+    Not run, as explicitly requested. This is a revert of the original
+    two-file change; no new validation results are claimed.
+    
+    
+    - vLLM main:
+    https://github.com/vllm-project/vllm/commit/a98247ab4db686ee03c66d5feb3c761e52a2f8ab
+    
+    Signed-off-by: chengruiqi (C) <c00913489@china.huawei.com>
+    Co-authored-by: chengruiqi (C) <c00913489@china.huawei.com>
+
+diff --git a/tests/ut/worker/test_model_runner_v2.py b/tests/ut/worker/test_model_runner_v2.py
+index ce8c56615..b29d416d5 100644
+--- a/tests/ut/worker/test_model_runner_v2.py
++++ b/tests/ut/worker/test_model_runner_v2.py
+@@ -36,10 +36,7 @@ def _make_runner(need_timing: bool = True):
+         scheduler_config=SimpleNamespace(profiling_chunk_config=SimpleNamespace(need_timing=need_timing)),
+         sparse_kv_offload_config=SimpleNamespace(enabled=False),
+     )
+-    runner.vllm_config = SimpleNamespace(
+-        parallel_config=SimpleNamespace(prefill_context_parallel_size=1), kv_transfer_config=None
+-    )
+-    runner.max_num_tokens = 16
++    runner.vllm_config = SimpleNamespace(kv_transfer_config=None)
+     runner.model_config = SimpleNamespace(hf_config=SimpleNamespace(model_type="other_model"))
+     runner.kv_cache_config = KVCacheConfig(num_blocks=0, kv_cache_tensors=[], kv_cache_groups=[])
+     runner.kvpp = SimpleNamespace(complete_forward=lambda: None)
+@@ -1350,7 +1347,7 @@ def test_initialize_kv_cache_forwards_allocation_context():
+ def test_profile_run_dummy_reserves_mc2(moe_type, randomize_inputs):
+     runner = _make_runner()
+     runner.max_num_tokens = 16
+-    runner.vllm_config = SimpleNamespace(parallel_config=SimpleNamespace(prefill_context_parallel_size=1))
++    runner.vllm_config = SimpleNamespace()
+     runner.get_model = MagicMock(return_value="m")
+     runner._dummy_run = MagicMock()
+     with (
+@@ -1427,47 +1424,6 @@ def test_profile_run_skips_mc2_dummy_without_capacity():
+     runner._dummy_run.assert_not_called()
+ 
+ 
+-@pytest.mark.parametrize(("pcp_size", "tokens", "expected"), [(1, 16384, 16384), (16, 16384, 1024), (4, 17, 5)])
+-@pytest.mark.parametrize("fail", [False, True])
+-@pytest.mark.parametrize("randomize_inputs", [False, True])
+-def test_profile_run_uses_pcp_local_tokens_and_restores_budget(pcp_size, tokens, expected, fail, randomize_inputs):
+-    expected_randomize = randomize_inputs
+-    runner = _make_runner()
+-    runner.vllm_config.parallel_config.prefill_context_parallel_size = pcp_size
+-    runner.max_num_tokens = tokens
+-
+-    def parent_profile(self, randomize_inputs=False):
+-        assert randomize_inputs == expected_randomize
+-        assert self.max_num_tokens == expected
+-        if fail:
+-            raise RuntimeError("profile failed")
+-
+-    with (
+-        patch("vllm_ascend.worker.v2.model_runner.get_mc2_tokens_capacity", return_value=None),
+-        patch.object(GPUModelRunner, "profile_run", parent_profile),
+-    ):
+-        if fail:
+-            with pytest.raises(RuntimeError, match="profile failed"):
+-                runner.profile_run(randomize_inputs=randomize_inputs)
+-        else:
+-            runner.profile_run(randomize_inputs=randomize_inputs)
+-    assert runner.max_num_tokens == tokens
+-
+-
+-def test_profile_run_compares_mc2_capacity_with_pcp_local_budget():
+-    runner = _make_runner()
+-    runner.max_num_tokens = 16384
+-    runner.vllm_config.parallel_config.prefill_context_parallel_size = 16
+-    runner._dummy_run = Mock()
+-    with (
+-        patch("vllm_ascend.worker.v2.model_runner.get_mc2_tokens_capacity", return_value=2048),
+-        patch.object(GPUModelRunner, "profile_run"),
+-    ):
+-        runner.profile_run()
+-    runner._dummy_run.assert_not_called()
+-    assert runner.max_num_tokens == 16384
+-
+-
+ def test_profile_run_reserves_sparse_offload_topk_buffers():
+     runner = _make_runner()
+     sparse_cfg = SimpleNamespace(enabled=True)
+diff --git a/vllm_ascend/worker/v2/model_runner.py b/vllm_ascend/worker/v2/model_runner.py
+index 1fdee9a9e..fcb9484e0 100644
+--- a/vllm_ascend/worker/v2/model_runner.py
++++ b/vllm_ascend/worker/v2/model_runner.py
+@@ -758,15 +758,10 @@ class NPUModelRunner(GPUModelRunner):
+             allocate_kv_offload_topk_profile_buffers(self.get_kv_cache_spec(), self.vllm_config, sparse_cfg)
+         profile_kwargs = {"randomize_inputs": randomize_inputs}
+         mc2_tokens_capacity = get_mc2_tokens_capacity()
+-        # The initial dummy profile bypasses PCP batch partitioning. Profile
+-        # rank-local tokens; the existing MoE preparation still handles TP.
+-        pcp_size = self.vllm_config.parallel_config.prefill_context_parallel_size
+-        global_max_num_tokens: int = self.max_num_tokens
+-        profile_max_num_tokens = (global_max_num_tokens + pcp_size - 1) // pcp_size
+         with override_mrv2_in_profile_run(True):
+             if (
+                 mc2_tokens_capacity is not None
+-                and profile_max_num_tokens > mc2_tokens_capacity
++                and self.max_num_tokens > mc2_tokens_capacity
+                 and select_moe_comm_method(mc2_tokens_capacity, self.vllm_config)
+                 in {MoECommType.MC2, MoECommType.FUSED_MC2}
+             ):
+@@ -779,11 +774,7 @@ class NPUModelRunner(GPUModelRunner):
+                         is_profile=True,
+                         **profile_kwargs,
+                     )
+-            self.max_num_tokens: int = profile_max_num_tokens
+-            try:
+-                super().profile_run(**profile_kwargs)
+-            finally:
+-                self.max_num_tokens = global_max_num_tokens
++            super().profile_run(**profile_kwargs)
+ 
+     def gather_batch_req_state(self, scheduler_output: SchedulerOutput, dummy_run: bool):
+         batch_state, uniform_token_count = super().gather_batch_req_state(scheduler_output, dummy_run)

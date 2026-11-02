@@ -1,0 +1,593 @@
+commit 063bb4e99a544e78bb64614dd77f5087c555333c
+Author:     Zeyu Yang <yangzeyu7@huawei.com>
+AuthorDate: Thu Oct 22 16:30:21 2026 +0800
+Commit:     GitHub <noreply@github.com>
+CommitDate: Thu Oct 22 16:30:21 2026 +0800
+
+    [Refactor][Worker] Move the 310P and xlite V1 runners into the V1 zone (#19330)
+    
+    ### What this PR does / why we need it?
+    
+    Follow-up to #18863, which created the **V1 zone**
+    `vllm_ascend/worker/v1/` and moved the V1 model runner core into it. Two
+    runner variants were left outside the zone and still pulled the V1
+    runner in on **every** xlite / 310P startup, including processes that
+    selected the V2 runner. This PR moves them in, so `worker/v1/**` can
+    later be deleted as a unit.
+    
+    #### 1. 310P V1 runner (`_310p/` -> `worker/v1/_310p/`)
+    
+    `_310p/model_runner_310p.py` subclasses the V1 `NPUModelRunner` and is
+    only reachable from the V1 path. It moves together with the three
+    modules that only it uses, so nothing is left behind when the zone is
+    removed:
+    
+    | File | Lines | Note |
+    |---|---|---|
+    | `model_runner_310p.py` | 1038 | name kept, `git mv` |
+    | `block_table.py` | 199 | only imported by the above and its test |
+    | `npu_input_batch.py` | 59 | only imported by the above |
+    | `sample/rejection_sampler.py` | 106 | only imported by the above;
+    flattened to `_310p/rejection_sampler.py` |
+    
+    `_310p/worker_310p.py` stays where it is — it is the shared 310P shell
+    that picks between both runners, and `hardware_profile.py` registers it
+    as the 310P `default_worker_cls`. Its module-level `from
+    vllm_ascend._310p.model_runner_310p import NPUModelRunner310` would have
+    kept dragging the V1 runner into V2 processes, so the import is now
+    inside the V1 branch of `_create_model_runner()`, symmetric with the V2
+    branch of the same method.
+    
+    `_310p/kv_block_zeroer.py`, `_310p/kv_cache_sharing.py` and
+    `_310p/sample/sampler.py` stay outside the zone: the 310P V2 runner
+    imports all three (`_310p/worker/v2/kv_block_zeroer.py:9`,
+    `_310p/worker/v2/model_runner.py:44`, `_310p/worker/v2/sampler.py:22`),
+    so moving them would create a `v2 -> v1` edge. `_310p/attention/**`
+    (registered in `platform.py`, imported by the V2 runner) and
+    `_310p/ops/**` (imported from `utils.py` and `patch/`) are shared for
+    the same reason.
+    
+    #### 2. xlite V1 runner (`xlite/` -> `worker/v1/xlite/`)
+    
+    `xlite/xlite_model_runner.py` held the shared mixin plus both
+    subclasses, with `from vllm_ascend.worker.v1.model_runner import
+    NPUModelRunner` at module level — so importing the xlite package always
+    imported the V1 runner. The V1 subclass now lives in
+    `worker/v1/xlite/xlite_model_runner.py` (new, 103 lines; the class body
+    itself is 66 lines) and is imported only on the V1 branch; the shared
+    module keeps the mixin and `XliteModelRunnerV2` and no longer depends on
+    `worker/v1`.
+    
+    While expanding the selection expression into an `if`/`else` (an `if`
+    expression cannot carry the lazy import on the `else` branch), the class
+    choice now reads the same `self.use_v2_model_runner` snapshot as the
+    warning line above it. Before, the warning used the snapshot while the
+    class used `self.vllm_config.use_v2_model_runner`, a property that is
+    recomputed on every access — the only place in the tree that did not use
+    the snapshot (`NPUWorker` uses it in all five of its checks). Behaviour
+    is unchanged in practice; the two lines can no longer disagree.
+    
+    #### Reference updates
+    
+    - `_310p/model_runner_310p.py`: four internal imports repointed
+    (`block_table`, `npu_input_batch`, `rejection_sampler` now local; the
+    rest still point at the shared `_310p/`, `spec_decode/`, `attention/`
+    modules).
+    - `_310p/npu_input_batch.py`: one internal import repointed.
+    - `xlite/xlite_worker.py`: shared-module import narrowed to
+    `XliteModelRunnerV2`; the V1 class imported lazily; selection unified to
+    the snapshot.
+    - `xlite/xlite.py`: `TYPE_CHECKING` import repointed (no runtime
+    effect).
+    - Tests: import paths and `patch()` target strings updated (12 lines
+    across 3 files); no test file or test directory is renamed, since
+    `tests/ut/_310p/` is organised by hardware rather than by runner
+    version. `test_model_runner_310p.py` also reads the runner source by
+    path, and that path is updated.
+    - `AGENTS.md`: 310P runner entry repointed and marked as an isolated V1
+    zone.
+    
+    #### Dependency contract after this PR
+    
+    Production code outside `worker/v1/**` contains **no module-level import
+    of the V1 zone**. The only remaining V1 references are three
+    function-level imports — `worker/worker.py` (runner factory),
+    `_310p/worker_310p.py` (V1 branch) and `xlite/xlite_worker.py` (V1
+    branch) — plus one `TYPE_CHECKING` block in `xlite/xlite.py`.
+    `worker/v2/**`, `patch/**` and `_310p/worker/v2/**` reference the zone
+    nowhere.
+    
+    ### Does this PR introduce _any_ user-facing change?
+    
+    No. Module paths move and one import is deferred; runner selection,
+    configuration surface, entry points and the `VLLM_USE_V2_MODEL_RUNNER=0`
+    escape hatch are unchanged. No release note fragment added, per
+    `release_notes/README.md` ("a pure code move does not need a fragment").
+    
+    ### How was this patch tested?
+    
+    Static verification only — my local environment has no `vllm` /
+    `pytest`, so runtime validation is delegated to CI (310P and a2/a3
+    partitions exercise both paths).
+    
+    1. **Dependency direction** — AST scan of `vllm_ascend/` split by
+    module-level vs function-level imports:
+    - module-level imports of `vllm_ascend.worker.v1.*` outside
+    `worker/v1/`: **0**;
+       - function-level: exactly 3, listed above;
+    - `worker/v2/**`, `patch/**`, `_310p/worker/v2/**`: no reference to
+    `worker.v1` / `worker/v1/`.
+    2. **Rename fidelity** — `git diff -M --summary` reports
+    `block_table.py` and `rejection_sampler.py` at 100% similarity,
+    `model_runner_310p.py` at 99% and `npu_input_batch.py` at 96% (the
+    difference is exactly the repointed imports). The extracted xlite V1
+    class was compared line by line with the block removed from the shared
+    module: 66 lines, only the class docstring differs.
+    3. **Import integrity** — dangling-import scan (`ast` based) over the
+    whole tree compared against the same scan on the base commit:
+    **identical result set**, i.e. no new unresolvable import; the
+    pre-existing 78 false positives (C extensions, `_build_info`, attributes
+    injected at runtime) are unchanged.
+    4. **Residual old paths** — no remaining reference to
+    `_310p.model_runner_310p`, `_310p.block_table`, `_310p.npu_input_batch`,
+    `_310p.sample.rejection_sampler` outside the new locations, across `.py`
+    / `.md` / `.yaml`.
+    5. **Lint** — `ruff check`, `ruff format --check`, `codespell`,
+    `markdownlint` and the repo scripts `check_python_src_init.py`,
+    `check_forbidden_imports.py`, `check_boolean_context_manager.py`,
+    `check_long_functions.py`, `check_symbolic_meta.py` all pass; `python -m
+    py_compile` on every changed file.
+    
+    - vLLM main:
+    https://github.com/vllm-project/vllm/commit/a98247ab4db686ee03c66d5feb3c761e52a2f8ab
+    
+    ---------
+    
+    Signed-off-by: yangzeyu <yangzeyu7@huawei.com>
+
+diff --git a/AGENTS.md b/AGENTS.md
+index 3714cc377..58be24132 100644
+--- a/AGENTS.md
++++ b/AGENTS.md
+@@ -172,7 +172,7 @@ Reviewers must verify:
+ 
+ - `vllm_ascend/worker/v1/model_runner.py` - vLLM v1 model runner (isolated V1 zone, removal-tracked)
+ - `vllm_ascend/worker/v2/model_runner.py` - vLLM v2 model runner
+-- `vllm_ascend/_310p/model_runner_310p.py` - Ascend 310P model runner
++- `vllm_ascend/worker/v1/_310p/model_runner_310p.py` - Ascend 310P model runner (isolated V1 zone, removal-tracked)
+ 
+ ---
+ 
+diff --git a/tests/ut/_310p/test_block_table_310p.py b/tests/ut/_310p/test_block_table_310p.py
+index e3e467d01..45f334ec6 100644
+--- a/tests/ut/_310p/test_block_table_310p.py
++++ b/tests/ut/_310p/test_block_table_310p.py
+@@ -40,7 +40,7 @@ class TestBlockTable310(TestBase):
+             mock_dcp_group.rank_in_group = dcp_rank
+             mock_get_dcp_group.return_value = mock_dcp_group
+ 
+-            from vllm_ascend._310p.block_table import BlockTable
++            from vllm_ascend.worker.v1._310p.block_table import BlockTable
+ 
+             return BlockTable(
+                 block_size=self.block_size,
+@@ -73,7 +73,7 @@ class TestBlockTable310(TestBase):
+             mock_dcp_group.rank_in_group = dcp_rank
+             mock_get_dcp_group.return_value = mock_dcp_group
+ 
+-            from vllm_ascend._310p.block_table import MultiGroupBlockTable
++            from vllm_ascend.worker.v1._310p.block_table import MultiGroupBlockTable
+ 
+             return MultiGroupBlockTable(
+                 max_num_reqs=self.max_num_reqs,
+diff --git a/tests/ut/_310p/test_model_runner_310p.py b/tests/ut/_310p/test_model_runner_310p.py
+index e1e5b8daf..eb2f66e2c 100644
+--- a/tests/ut/_310p/test_model_runner_310p.py
++++ b/tests/ut/_310p/test_model_runner_310p.py
+@@ -24,12 +24,14 @@ from vllm.config import CUDAGraphMode
+ from vllm.v1.kv_cache_interface import AttentionSpec, MambaSpec
+ 
+ from tests.ut.base import TestBase
+-from vllm_ascend._310p.model_runner_310p import NPUModelRunner310
+ from vllm_ascend.attention.attention_v1 import AscendAttentionState
++from vllm_ascend.worker.v1._310p.model_runner_310p import NPUModelRunner310
+ 
+ 
+ def _prepare_inputs_source() -> str:
+-    source_path = Path(__file__).resolve().parents[3] / "vllm_ascend" / "_310p" / "model_runner_310p.py"
++    source_path = (
++        Path(__file__).resolve().parents[3] / "vllm_ascend" / "worker" / "v1" / "_310p" / "model_runner_310p.py"
++    )
+     source = source_path.read_text(encoding="utf-8")
+     start = source.index("    def _prepare_inputs(")
+     end = source.index("    @torch.inference_mode()", start)
+@@ -84,7 +86,7 @@ def test_model_forward_updates_mtp_full_graph_params_before_replay(decoder_repla
+     )
+ 
+     with patch(
+-        "vllm_ascend._310p.model_runner_310p.get_forward_context",
++        "vllm_ascend.worker.v1._310p.model_runner_310p.get_forward_context",
+         return_value=forward_context,
+     ):
+         hidden_states = runner._model_forward(
+@@ -168,9 +170,9 @@ class TestNPUModelRunner310(TestBase):
+         )
+ 
+         with (
+-            patch("vllm_ascend._310p.model_runner_310p.NPUInputBatch") as mock_input_batch,
++            patch("vllm_ascend.worker.v1._310p.model_runner_310p.NPUInputBatch") as mock_input_batch,
+             patch(
+-                "vllm_ascend._310p.model_runner_310p.get_decode_context_model_parallel_world_size",
++                "vllm_ascend.worker.v1._310p.model_runner_310p.get_decode_context_model_parallel_world_size",
+                 return_value=1,
+             ),
+         ):
+@@ -220,8 +222,10 @@ def test_attention_kernel_blocks_match_input_batch_and_cache_shape(
+         kv_cache_tensors=[cache_tensor],
+     )
+     with (
+-        patch("vllm_ascend._310p.model_runner_310p.NPUInputBatch") as input_batch,
+-        patch("vllm_ascend._310p.model_runner_310p.get_decode_context_model_parallel_world_size", return_value=1),
++        patch("vllm_ascend.worker.v1._310p.model_runner_310p.NPUInputBatch") as input_batch,
++        patch(
++            "vllm_ascend.worker.v1._310p.model_runner_310p.get_decode_context_model_parallel_world_size", return_value=1
++        ),
+     ):
+         runner.may_reinitialize_input_batch(cache_config)
+     assert input_batch.call_args.kwargs["kernel_block_sizes"] == [expected_kernel_sizes]
+@@ -230,8 +234,8 @@ def test_attention_kernel_blocks_match_input_batch_and_cache_shape(
+     assert physical_block_size % expected_kernel_sizes[0] == 0
+ 
+     with (
+-        patch("vllm_ascend._310p.model_runner_310p.get_kv_cache_tensor_layers", return_value=["model.attn"]),
+-        patch("vllm_ascend._310p.model_runner_310p.torch_npu.empty_with_format", create=True) as allocate,
++        patch("vllm_ascend.worker.v1._310p.model_runner_310p.get_kv_cache_tensor_layers", return_value=["model.attn"]),
++        patch("vllm_ascend.worker.v1._310p.model_runner_310p.torch_npu.empty_with_format", create=True) as allocate,
+     ):
+         caches = runner._allocate_kv_cache_tensors(cache_config)
+     kernel_size = expected_kernel_sizes[0]
+diff --git a/tests/ut/worker/test_kv_cache_allocation_scope.py b/tests/ut/worker/test_kv_cache_allocation_scope.py
+index b098890ff..95d3c730c 100644
+--- a/tests/ut/worker/test_kv_cache_allocation_scope.py
++++ b/tests/ut/worker/test_kv_cache_allocation_scope.py
+@@ -8,7 +8,7 @@ from unittest.mock import MagicMock, patch
+ 
+ import torch
+ 
+-from vllm_ascend._310p.model_runner_310p import NPUModelRunner310
++from vllm_ascend.worker.v1._310p.model_runner_310p import NPUModelRunner310
+ from vllm_ascend.worker.v1.model_runner import NPUModelRunner
+ from vllm_ascend.worker.worker import NPUWorker
+ 
+diff --git a/vllm_ascend/_310p/worker_310p.py b/vllm_ascend/_310p/worker_310p.py
+index acbaed103..64b5062ee 100644
+--- a/vllm_ascend/_310p/worker_310p.py
++++ b/vllm_ascend/_310p/worker_310p.py
+@@ -26,7 +26,6 @@ from vllm.utils.torch_utils import set_random_seed  # noqa: E402
+ from vllm.v1.core.kv_cache_utils import get_kv_cache_groups
+ 
+ from vllm_ascend._310p.kv_cache_sharing import get_310p_shared_cache_slots
+-from vllm_ascend._310p.model_runner_310p import NPUModelRunner310
+ from vllm_ascend.utils import is_rc_device
+ from vllm_ascend.worker.worker import NPUWorker, init_workspace_manager
+ 
+@@ -55,6 +54,8 @@ class NPUWorker310(NPUWorker):
+             logger.info_once("Using NPUWorker310 and NPUModelRunner310V2.")
+             return model_runner
+ 
++        from vllm_ascend.worker.v1._310p.model_runner_310p import NPUModelRunner310
++
+         model_runner = NPUModelRunner310(self.vllm_config, self.device)
+         logger.info_once("Using NPUWorker310 and NPUModelRunner310.")
+         return model_runner
+diff --git a/vllm_ascend/worker/v1/_310p/__init__.py b/vllm_ascend/worker/v1/_310p/__init__.py
+new file mode 100644
+index 000000000..e69de29bb
+diff --git a/vllm_ascend/_310p/block_table.py b/vllm_ascend/worker/v1/_310p/block_table.py
+similarity index 100%
+rename from vllm_ascend/_310p/block_table.py
+rename to vllm_ascend/worker/v1/_310p/block_table.py
+diff --git a/vllm_ascend/_310p/model_runner_310p.py b/vllm_ascend/worker/v1/_310p/model_runner_310p.py
+similarity index 99%
+rename from vllm_ascend/_310p/model_runner_310p.py
+rename to vllm_ascend/worker/v1/_310p/model_runner_310p.py
+index e52b4dfe8..c2763e239 100644
+--- a/vllm_ascend/_310p/model_runner_310p.py
++++ b/vllm_ascend/worker/v1/_310p/model_runner_310p.py
+@@ -43,12 +43,9 @@ from vllm.v1.kv_cache_interface import (
+ )
+ from vllm.v1.spec_decode.metadata import SpecDecodeMetadata
+ 
+-from vllm_ascend._310p.block_table import MultiGroupBlockTable as MultiGroupBlockTable310
+ from vllm_ascend._310p.kv_block_zeroer import AscendKVBlockZeroer310
+ from vllm_ascend._310p.kv_cache_sharing import get_310p_shared_cache_slots
+-from vllm_ascend._310p.npu_input_batch import NPUInputBatch310 as NPUInputBatch
+ from vllm_ascend._310p.ops.rotary_embedding import prepare_mrope_cos_sin_slices_from_runner
+-from vllm_ascend._310p.sample.rejection_sampler import AscendRejectionSampler310
+ from vllm_ascend._310p.sample.sampler import AscendSampler310
+ from vllm_ascend.attention.attention_v1 import AscendAttentionState
+ from vllm_ascend.distributed.utils import get_decode_context_model_parallel_world_size
+@@ -61,6 +58,9 @@ from vllm_ascend.utils import (
+     is_rc_device,
+     lmhead_tp_enable,
+ )
++from vllm_ascend.worker.v1._310p.block_table import MultiGroupBlockTable as MultiGroupBlockTable310
++from vllm_ascend.worker.v1._310p.npu_input_batch import NPUInputBatch310 as NPUInputBatch
++from vllm_ascend.worker.v1._310p.rejection_sampler import AscendRejectionSampler310
+ from vllm_ascend.worker.v1.model_runner import NPUModelRunner
+ 
+ _NGRAM_GRAPH_UNIFORM_DECODE_QUERY_LEN = 1
+diff --git a/vllm_ascend/_310p/npu_input_batch.py b/vllm_ascend/worker/v1/_310p/npu_input_batch.py
+similarity index 96%
+rename from vllm_ascend/_310p/npu_input_batch.py
+rename to vllm_ascend/worker/v1/_310p/npu_input_batch.py
+index c884c796f..a0277327a 100644
+--- a/vllm_ascend/_310p/npu_input_batch.py
++++ b/vllm_ascend/worker/v1/_310p/npu_input_batch.py
+@@ -2,8 +2,8 @@ import torch
+ from vllm.v1.kv_cache_interface import KVCacheGroupSpec
+ from vllm.v1.sample.logits_processor import LogitsProcessors
+ 
+-from vllm_ascend._310p.block_table import MultiGroupBlockTable
+ from vllm_ascend.worker.npu_input_batch import NPUInputBatch
++from vllm_ascend.worker.v1._310p.block_table import MultiGroupBlockTable
+ 
+ 
+ class NPUInputBatch310(NPUInputBatch):
+diff --git a/vllm_ascend/_310p/sample/rejection_sampler.py b/vllm_ascend/worker/v1/_310p/rejection_sampler.py
+similarity index 100%
+rename from vllm_ascend/_310p/sample/rejection_sampler.py
+rename to vllm_ascend/worker/v1/_310p/rejection_sampler.py
+diff --git a/vllm_ascend/worker/v1/xlite/__init__.py b/vllm_ascend/worker/v1/xlite/__init__.py
+new file mode 100644
+index 000000000..e69de29bb
+diff --git a/vllm_ascend/worker/v1/xlite/xlite_model_runner.py b/vllm_ascend/worker/v1/xlite/xlite_model_runner.py
+new file mode 100644
+index 000000000..d72c80651
+--- /dev/null
++++ b/vllm_ascend/worker/v1/xlite/xlite_model_runner.py
+@@ -0,0 +1,103 @@
++#
++# Copyright (c) 2025 Huawei Technologies Co., Ltd. All Rights Reserved.
++# Copyright 2023 The vLLM team.
++#
++# Licensed under the Apache License, Version 2.0 (the "License");
++# you may not use this file except in compliance with the License.
++# You may obtain a copy of the License at
++#
++#     http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS,
++# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++# See the License for the specific language governing permissions and
++# limitations under the License.
++# This file is a part of the vllm-ascend project.
++#
++"""xlite model runner for the V1 model runner.
++
++The shared mixin and :class:`XliteModelRunnerV2` stay in
++``vllm_ascend/xlite/xlite_model_runner.py``; only the V1 subclass lives here so that
++importing the xlite package no longer pulls in ``vllm_ascend.worker.v1``.
++"""
++
++from contextlib import AbstractContextManager
++from typing import Any
++
++import torch
++import torch.nn as nn
++from vllm.logger import logger
++from vllm.v1.kv_cache_interface import KVCacheConfig
++
++from vllm_ascend.worker.v1.model_runner import NPUModelRunner
++from vllm_ascend.xlite.utils import _TensorRepr
++from vllm_ascend.xlite.xlite_model_runner import XliteModelRunnerMixin
++
++
++class XliteModelRunner(XliteModelRunnerMixin, NPUModelRunner):  # type: ignore[misc]
++    """xlite model runner for model runner V1 (`vllm_ascend/worker/v1/model_runner.py`).
++
++    Remove this module together with `NPUModelRunner` V1 when the V1 runner is dropped; the mixin and
++    `XliteModelRunnerV2` stay in `vllm_ascend/xlite/xlite_model_runner.py`.
++    """
++
++    def __init__(self, *args: Any, **kwargs: Any) -> None:
++        super().__init__(*args, **kwargs)
++
++        if self.enable_sparse_sfa_c8 or self.enable_sparse_li_c8:
++            logger.error("xlite does not currently support Sparse SFA/LI C8.")
++
++    def get_model(self) -> nn.Module:
++        """Returns the unwrapper fallback model. See :meth:`NPUModelRunner.get_model` for details."""
++        with self._bypass_xlite_wrapper():
++            return super().get_model()
++
++    def load_model(self) -> None:
++        super().load_model()
++        self.fallback_model = self.model
++        # NOTE: this will create a circular reference between XliteModelRunner and XliteWrapper instances,
++        # but this should be fine since they are both long-lived objects
++        self.model = self.runner_model = self.runner_cls(self, self.vllm_config, device=self.device)  # type: ignore[assignment]
++
++    def _dummy_run(
++        self, *args: Any, is_profile: bool = False, is_graph_capturing: bool = False, **kwargs: Any
++    ) -> tuple[torch.Tensor, torch.Tensor]:
++        """Route dummy/profile runs to the native runnable, bypassing the xlite wrapper.
++
++        See :meth:`_bypass_xlite_wrapper` for why dummy runs must not trigger the xlite forward. Delegates every
++        argument to the base implementation unchanged.
++        """
++        if not is_profile and not is_graph_capturing:
++            # DP `excute_dummy_batch` must be routed to xlite forward path to avoid out of sync issues
++            return super()._dummy_run(*args, is_profile=is_profile, is_graph_capturing=is_graph_capturing, **kwargs)  # type: ignore[return-value]
++
++        with self._bypass_xlite_wrapper():
++            return super()._dummy_run(*args, is_profile=is_profile, is_graph_capturing=is_graph_capturing, **kwargs)  # type: ignore[return-value]
++
++    def initialize_kv_cache(
++        self, kv_cache_config: KVCacheConfig, kv_cache_allocation_context: AbstractContextManager | None = None
++    ) -> None:
++        super().initialize_kv_cache(kv_cache_config, kv_cache_allocation_context=kv_cache_allocation_context)
++        kv_caches: list[torch.Tensor] = self._get_flattened_kv_caches(self.kv_caches)
++        logger.info_once("xlite: registering kv caches to runner model: %s", _TensorRepr(kv_caches, max_it=None))
++        self.runner_model.register_kv_caches(kv_caches)
++
++        # check attention metadata backend compatibility
++        ascend_metadata_builder = self.attn_groups[0][-1].get_metadata_builder(0)
++        ascend_metadata_cls = getattr(ascend_metadata_builder, "metadata_cls", ascend_metadata_builder)
++        xlite_expects = self.runner_model.adapter_xlite_model._attn_metadata_type
++        if ascend_metadata_cls != xlite_expects and (
++            not isinstance(xlite_expects, tuple) or ascend_metadata_cls not in xlite_expects
++        ):
++            logger.error(
++                "Attention metadata mismatch: xlite expects (one of) %s, but got %s. Be aware of runtime issues.",
++                xlite_expects,
++                ascend_metadata_cls,
++            )
++
++    def _should_build_dummy_attn_metadata(
++        self, force_attention: bool = False, is_profile: bool = False, *args: Any, **kwargs: Any
++    ) -> bool:
++        base_condition = super()._should_build_dummy_attn_metadata(force_attention, is_profile, *args, **kwargs)
++        return base_condition or (self.runner_enabled and not is_profile)
+diff --git a/vllm_ascend/xlite/xlite.py b/vllm_ascend/xlite/xlite.py
+index 1cf202eba..1f53b4af8 100644
+--- a/vllm_ascend/xlite/xlite.py
++++ b/vllm_ascend/xlite/xlite.py
+@@ -50,7 +50,7 @@ from vllm_ascend.xlite.utils import (
+ )
+ 
+ if TYPE_CHECKING:
+-    from vllm_ascend.xlite.xlite_model_runner import XliteModelRunner as XliteModelRunnerV1
++    from vllm_ascend.worker.v1.xlite.xlite_model_runner import XliteModelRunner as XliteModelRunnerV1
+     from vllm_ascend.xlite.xlite_model_runner import XliteModelRunnerV2
+ 
+     XliteModelRunner: TypeAlias = XliteModelRunnerV1 | XliteModelRunnerV2
+diff --git a/vllm_ascend/xlite/xlite_model_runner.py b/vllm_ascend/xlite/xlite_model_runner.py
+index 48e476249..93655c536 100644
+--- a/vllm_ascend/xlite/xlite_model_runner.py
++++ b/vllm_ascend/xlite/xlite_model_runner.py
+@@ -16,7 +16,7 @@
+ # This file is a part of the vllm-ascend project.
+ # Adapted from vllm-project/vllm/vllm/worker/gpu_model_runner.py
+ #
+-"""xlite model runner subclasses (MRV1/MRV2) for `vllm-ascend`"""
++"""xlite model runner mixin and the MRV2 subclass for `vllm-ascend`"""
+ 
+ from collections.abc import Iterable
+ from contextlib import AbstractContextManager, contextmanager
+@@ -28,7 +28,6 @@ from vllm.logger import logger
+ from vllm.v1.kv_cache_interface import KVCacheConfig
+ 
+ from vllm_ascend.ascend_config import get_ascend_config
+-from vllm_ascend.worker.v1.model_runner import NPUModelRunner
+ from vllm_ascend.worker.v2.model_runner import NPUModelRunner as NPUModelRunnerV2
+ from vllm_ascend.xlite.utils import _TensorRepr
+ from vllm_ascend.xlite.xlite import XliteWrapper
+@@ -113,79 +112,11 @@ class XliteModelRunnerMixin:
+         return flattened_kv_caches
+ 
+ 
+-class XliteModelRunner(XliteModelRunnerMixin, NPUModelRunner):  # type: ignore[misc]
+-    """xlite model runner for model runner V1 (`vllm_ascend/worker/v1/model_runner.py`).
+-
+-    Remove this class together with `NPUModelRunner` V1 when the V1 runner is dropped; the mixin and
+-    `XliteModelRunnerV2` below stay.
+-    """
+-
+-    def __init__(self, *args: Any, **kwargs: Any) -> None:
+-        super().__init__(*args, **kwargs)
+-
+-        if self.enable_sparse_sfa_c8 or self.enable_sparse_li_c8:
+-            logger.error("xlite does not currently support Sparse SFA/LI C8.")
+-
+-    def get_model(self) -> nn.Module:
+-        """Returns the unwrapper fallback model. See :meth:`NPUModelRunner.get_model` for details."""
+-        with self._bypass_xlite_wrapper():
+-            return super().get_model()
+-
+-    def load_model(self) -> None:
+-        super().load_model()
+-        self.fallback_model = self.model
+-        # NOTE: this will create a circular reference between XliteModelRunner and XliteWrapper instances,
+-        # but this should be fine since they are both long-lived objects
+-        self.model = self.runner_model = self.runner_cls(self, self.vllm_config, device=self.device)  # type: ignore[assignment]
+-
+-    def _dummy_run(
+-        self, *args: Any, is_profile: bool = False, is_graph_capturing: bool = False, **kwargs: Any
+-    ) -> tuple[torch.Tensor, torch.Tensor]:
+-        """Route dummy/profile runs to the native runnable, bypassing the xlite wrapper.
+-
+-        See :meth:`_bypass_xlite_wrapper` for why dummy runs must not trigger the xlite forward. Delegates every
+-        argument to the base implementation unchanged.
+-        """
+-        if not is_profile and not is_graph_capturing:
+-            # DP `excute_dummy_batch` must be routed to xlite forward path to avoid out of sync issues
+-            return super()._dummy_run(*args, is_profile=is_profile, is_graph_capturing=is_graph_capturing, **kwargs)  # type: ignore[return-value]
+-
+-        with self._bypass_xlite_wrapper():
+-            return super()._dummy_run(*args, is_profile=is_profile, is_graph_capturing=is_graph_capturing, **kwargs)  # type: ignore[return-value]
+-
+-    def initialize_kv_cache(
+-        self, kv_cache_config: KVCacheConfig, kv_cache_allocation_context: AbstractContextManager | None = None
+-    ) -> None:
+-        super().initialize_kv_cache(kv_cache_config, kv_cache_allocation_context=kv_cache_allocation_context)
+-        kv_caches: list[torch.Tensor] = self._get_flattened_kv_caches(self.kv_caches)
+-        logger.info_once("xlite: registering kv caches to runner model: %s", _TensorRepr(kv_caches, max_it=None))
+-        self.runner_model.register_kv_caches(kv_caches)
+-
+-        # check attention metadata backend compatibility
+-        ascend_metadata_builder = self.attn_groups[0][-1].get_metadata_builder(0)
+-        ascend_metadata_cls = getattr(ascend_metadata_builder, "metadata_cls", ascend_metadata_builder)
+-        xlite_expects = self.runner_model.adapter_xlite_model._attn_metadata_type
+-        if ascend_metadata_cls != xlite_expects and (
+-            not isinstance(xlite_expects, tuple) or ascend_metadata_cls not in xlite_expects
+-        ):
+-            logger.error(
+-                "Attention metadata mismatch: xlite expects (one of) %s, but got %s. Be aware of runtime issues.",
+-                xlite_expects,
+-                ascend_metadata_cls,
+-            )
+-
+-    def _should_build_dummy_attn_metadata(
+-        self, force_attention: bool = False, is_profile: bool = False, *args: Any, **kwargs: Any
+-    ) -> bool:
+-        base_condition = super()._should_build_dummy_attn_metadata(force_attention, is_profile, *args, **kwargs)
+-        return base_condition or (self.runner_enabled and not is_profile)
+-
+-
+ class XliteModelRunnerV2(XliteModelRunnerMixin, NPUModelRunnerV2):  # type: ignore[misc]
+     """xlite model runner for model runner V2 (`vllm_ascend/worker/v2/model_runner.py`).
+ 
+     Keeps all V2-only adaptations (KV cache regrouping, `decode_query_len` alias, sparse C8 guard,
+-    `load_model` signature) here so the V1 class above can be removed without touching it.
++    `load_model` signature) here so that the V1 subclass can be removed without touching it.
+     """
+ 
+     def __init__(self, *args: Any, **kwargs: Any) -> None:
+diff --git a/vllm_ascend/xlite/xlite_worker.py b/vllm_ascend/xlite/xlite_worker.py
+index d303f7c9c..8efa49507 100644
+--- a/vllm_ascend/xlite/xlite_worker.py
++++ b/vllm_ascend/xlite/xlite_worker.py
+@@ -21,7 +21,7 @@ from vllm.v1.utils import report_usage_stats
+ from vllm.v1.worker.workspace import init_workspace_manager
+ 
+ from vllm_ascend.worker.worker import NPUWorker
+-from vllm_ascend.xlite.xlite_model_runner import XliteModelRunner, XliteModelRunnerV2
++from vllm_ascend.xlite.xlite_model_runner import XliteModelRunnerV2
+ 
+ 
+ class XliteWorker(NPUWorker):
+@@ -35,7 +35,11 @@ class XliteWorker(NPUWorker):
+         # Init ModelRunner here, so that we have access to self.device.
+         if self.use_v2_model_runner:
+             logger.warning_once("xlite: npu model runner v2 is in developing, some features doesn't work for now.")
+-        runner_cls = XliteModelRunnerV2 if self.vllm_config.use_v2_model_runner else XliteModelRunner
++            runner_cls = XliteModelRunnerV2
++        else:
++            from vllm_ascend.worker.v1.xlite.xlite_model_runner import XliteModelRunner
++
++            runner_cls = XliteModelRunner
+         logger.info_once("XliteModelRunner: using xlite model runner class `%s`", runner_cls.__name__)
+         self.xlite_runner = self.model_runner = runner_cls(self.vllm_config, self.device)  # type: ignore[assignment]
+         if self.rank == 0:

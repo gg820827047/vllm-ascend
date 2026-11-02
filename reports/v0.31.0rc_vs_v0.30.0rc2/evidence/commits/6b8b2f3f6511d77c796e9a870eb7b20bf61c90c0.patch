@@ -1,0 +1,518 @@
+commit 6b8b2f3f6511d77c796e9a870eb7b20bf61c90c0
+Author:     leolee <83689697+li1how@users.noreply.github.com>
+AuthorDate: Mon Oct 12 10:30:12 2026 +0800
+Commit:     GitHub <noreply@github.com>
+CommitDate: Mon Oct 12 10:30:12 2026 +0800
+
+    [BugFix][PCP] Support multimodal inputs for DeepSeek V4.1 (#18281)
+    
+    ### What this PR does / why we need it?
+    
+    Enable MRV2 PCP multimodal inputs for DeepSeek V4.1. Use the batch's
+    common padded length for embedding all-gather and reduce-scatter when
+    ranks have unequal valid token counts, while reusing fixed-capacity
+    buffers and returning only local valid rows. Fine-grained DP embedding
+    exchange retains its fixed-capacity behavior.
+    
+    ### Does this PR introduce _any_ user-facing change?
+    
+    Yes. MRV2 PCP accepts multimodal inputs.
+    
+    ### How was this patch tested?
+    
+    Local CPU validation at `c795e27b7`: **38 tests passed**; `./format.sh
+    ci` passed. Covers PCP/TP exchange, unequal token counts, batch
+    transitions, idle ranks, stable buffer addresses, and the MRV2
+    multimodal preparation path.
+    
+    A3, 16 NPUs, TP1. MMMU validation: fixed first 100 questions,
+    concurrency 64, three rounds per configuration. Engram ON, DSpark5,
+    `FULL_DECODE_ONLY`, temperature=0, seed=1024, `enable_thinking=False`,
+    max output tokens=16384.
+    
+    | Configuration | Correct / 100, three rounds | Median accuracy |
+    |---|---|---:|
+    | PCP1 / DP16 / EP16 | 74 / 77 / 72 | 74.00% |
+    | PCP8 / DP2 / EP16 | 73 / 74 / 75 | 74.00% |
+    
+    PCP minus DP: **0.00 percentage points**. All 600 requests completed
+    successfully. Output-limit finishes: DP 28, PCP 27; truncated and
+    unparsed answers remain in the scoring denominator.
+    
+    MMMU accuracy commit (before the common-span optimization): `dd961f84c`;
+    vLLM: `ced6857a`.
+    
+    - vLLM main:
+    https://github.com/vllm-project/vllm/commit/ced6857afa0ea7b2e3f0846a62e1394e90f15607
+    
+    ---------
+    
+    Signed-off-by: leolee <yihao.li@huawei.com>
+
+diff --git a/tests/ut/models/test_deepseek_v41_vision.py b/tests/ut/models/test_deepseek_v41_vision.py
+index 8b3d2ac43..7a38456d3 100644
+--- a/tests/ut/models/test_deepseek_v41_vision.py
++++ b/tests/ut/models/test_deepseek_v41_vision.py
+@@ -26,6 +26,8 @@ from vllm.models.deepseek_v41.common.mm_preprocess import (
+ )
+ from vllm.multimodal.processing import InputProcessingContext
+ from vllm.transformers_utils.configs.deepseek_v41 import DeepseekV41Config as UpstreamDeepseekV41Config
++from vllm.v1.worker.gpu.mm.encoder_runner import EncoderRunner
++from vllm.v1.worker.gpu.model_states.interface import ModelState
+ 
+ from vllm_ascend.models.deepseek_v41.engram.common import (
+     engram_enabled,
+@@ -33,12 +35,15 @@ from vllm_ascend.models.deepseek_v41.engram.common import (
+ )
+ from vllm_ascend.models.deepseek_v41.model import (
+     AscendDeepseekV41LLMForCausalLM,
++    DeepseekV41Model,
+     _engram_enabled_for_runtime,
+ )
+ from vllm_ascend.models.deepseek_v41.vl_model import (
+     AscendDeepseekV41ForCausalLM,
+ )
++from vllm_ascend.ops.vocab_parallel_embedding import AscendVocabParallelEmbedding
+ from vllm_ascend.utils import normalize_deepseek_v41_config
++from vllm_ascend.worker.v2.model_states.default import AscendModelState
+ 
+ 
+ def make_v41_config(**kwargs):
+@@ -190,6 +195,63 @@ def test_v41_alignment_pad_uses_plain_image_token_embedding():
+     assert embeddings.squeeze(-1).tolist() == [7, IMAGE_SENTINEL_BASE_ID]
+ 
+ 
++@pytest.mark.parametrize("publishes_length", [True, False], ids=["v41-wrapper", "model-without-hook"])
++def test_mrv2_embedding_preparation_preserves_valid_rows_and_padded_buffer(monkeypatch, publishes_length):
++    # Retain the real state -> wrapper -> language model -> embedding chain,
++    # plus the upstream merge and persistent encoder buffer. Only image encoding
++    # and cache selection are outside this test's scope.
++    embedding = AscendVocabParallelEmbedding(8, 2, padding_size=4, disable_tp=True)
++    weight = torch.arange(16, dtype=torch.float32).reshape(8, 2)
++    embedding.weight_loader(embedding.weight, weight)
++    lookup_batches = []
++    embedding.register_forward_pre_hook(
++        lambda layer, args: lookup_batches.append((args[0].numel(), layer._embedding_num_tokens_padded))
++    )
++    backbone = DeepseekV41Model.__new__(DeepseekV41Model)
++    nn.Module.__init__(backbone)
++    backbone.embed_tokens = embedding
++    language_model = AscendDeepseekV41LLMForCausalLM.__new__(AscendDeepseekV41LLMForCausalLM)
++    nn.Module.__init__(language_model)
++    language_model.model = backbone
++    wrapper = AscendDeepseekV41ForCausalLM.__new__(AscendDeepseekV41ForCausalLM)
++    nn.Module.__init__(wrapper)
++    wrapper.language_model = language_model
++    model = wrapper if publishes_length else SimpleNamespace(embed_input_ids=wrapper.embed_input_ids)
++    state = AscendModelState.__new__(AscendModelState)
++    state.model = model
++    state.supports_mm_inputs = True
++    state.mm_pruner = state.prompt_embeds_state = None
++    state.encoder_runner = EncoderRunner(model, 8, 2, None, torch.float32, torch.device("cpu"))
++    monkeypatch.setattr(state, "execute_mm_encoder", lambda scheduled: None)
++    monkeypatch.setattr(ModelState, "gather_mm_embeddings", lambda self, batch: (batch.mm_embeds, batch.mm_mask))
++    buffer_address = state.encoder_runner.inputs_embeds.data_ptr()
++
++    # The second step must replace the first span, and an idle step must not
++    # inherit it. MM fusion receives actual rows; the runner gets padded rows.
++    for num_tokens, padded_tokens in [(3, 5), (1, 2), (0, 0)]:
++        ids = torch.arange(padded_tokens, dtype=torch.long)
++        mask = torch.zeros(num_tokens, dtype=torch.bool)
++        has_image = num_tokens > 1
++        if has_image:
++            mask[1] = True
++        image_embedding = torch.tensor([[100.0, 101.0]])
++        batch = SimpleNamespace(
++            input_ids=ids,
++            num_tokens=num_tokens,
++            num_tokens_after_padding=padded_tokens,
++            mm_embeds=[image_embedding] if has_image else [],
++            mm_mask=mask,
++        )
++        output = state.prepare_inputs_embeds({}, batch, None)
++        expected = weight[ids[:num_tokens]].clone()
++        if has_image:
++            expected[mask] = image_embedding
++        torch.testing.assert_close(output[:num_tokens], expected)
++        assert output.shape == (padded_tokens, 2)
++        assert output.untyped_storage().data_ptr() == buffer_address
++        assert lookup_batches[-1] == (num_tokens, max(1, padded_tokens) if publishes_length else None)
++
++
+ def test_v41_text_only_load_skips_checkpoint_vision_weights():
+     class LanguageModel(nn.Module):
+         def load_weights(self, weights):
+diff --git a/tests/ut/ops/test_vocab_parallel_embedding.py b/tests/ut/ops/test_vocab_parallel_embedding.py
+index d654dcff5..c6334e5a1 100644
+--- a/tests/ut/ops/test_vocab_parallel_embedding.py
++++ b/tests/ut/ops/test_vocab_parallel_embedding.py
+@@ -14,11 +14,14 @@
+ # Adapted from vllm/tests/lora/test_layers.py
+ 
+ import unittest
++from types import SimpleNamespace
+ from unittest import mock
+ from unittest.mock import MagicMock, patch
+ 
++import pytest
+ import torch
+ from vllm.config.vllm import set_current_vllm_config
++from vllm.forward_context import ForwardContext, override_forward_context
+ 
+ from vllm_ascend.distributed import parallel_state
+ from vllm_ascend.ops.vocab_parallel_embedding import (
+@@ -303,96 +306,124 @@ class TestCustomVocabParallelEmbedding(unittest.TestCase):
+         self.assertEqual(layer.num_org_embeddings_per_partition, layer.org_vocab_size_padded)
+         self.assertEqual(layer.num_added_embeddings_per_partition, layer.num_added_embeddings)
+ 
+-    def test_pcp_embedding_communication_order(self):
+-        layer = self._create_layer()
+-        pcp_group = MagicMock(world_size=2, device_group="pcp")
+-        tp_group = MagicMock(world_size=2, unique_name="tp")
+-        layer.token_exchange_group = pcp_group
+-        layer.output_reduce_group = tp_group
+-        layer.embedding_tp_capacity = 2
+-        layer.params_dtype = torch.float32
++
++def _exchange_embedding(monkeypatch, mode, tp_rank=0, tp_size=1, exchange_rank=0):
++    """Keep real planning, weight loading and lookup; replace only runtime topology."""
++    module = "vllm_ascend.ops.vocab_parallel_embedding"
++    tp_group = SimpleNamespace(rank_in_group=tp_rank, world_size=tp_size, unique_name="tp")
++    exchange_group = SimpleNamespace(rank_in_group=exchange_rank, world_size=2, device_group="exchange")
++    config = SimpleNamespace(
++        parallel_config=SimpleNamespace(prefill_context_parallel_size=2 if mode is VocabParallelMode.PCP_X_TP else 1),
++        scheduler_config=SimpleNamespace(max_num_batched_tokens=8),
++    )
++    for name, value in (
++        ("get_tp_group", tp_group),
++        ("get_pcp_group", exchange_group),
++        ("get_embed_tp_group", exchange_group),
++        ("get_current_vllm_config", config),
++        ("get_potential_max_tokens", 8),
++        ("enable_pcp_embedding_lmhead_weight_sharding", mode is VocabParallelMode.PCP_X_TP),
++        ("embedding_tp_enable", mode is VocabParallelMode.FINE_GRAINED),
++        ("lmhead_tp_enable", False),
++    ):
++        monkeypatch.setattr(f"{module}.{name}", lambda value=value: value)
++    layer = AscendVocabParallelEmbedding(8, 2, padding_size=4, prefix="model.embed_tokens")
++    weight = torch.arange(16, dtype=torch.float32).reshape(8, 2) + 1
++    layer.weight_loader(layer.weight, weight)
++    assert layer.parallel_mode is mode
++    return layer, weight
++
++
++@pytest.mark.parametrize(
++    "mode,tp_size",
++    [(VocabParallelMode.PCP_X_TP, 1), (VocabParallelMode.PCP_X_TP, 2), (VocabParallelMode.FINE_GRAINED, 1)],
++)
++def test_embedding_exchange_batch_lifecycle(monkeypatch, mode, tp_size):
++    def run_batch(layer, weight, ids, span, tp_rank, rank):
++        padded_ids = torch.zeros(2, span, dtype=torch.long)
++        for peer in range(2):
++            padded_ids[peer, : ids[peer].numel()] = ids[peer]
++        gathered = padded_ids.flatten()
++        expected = weight[gathered]
++        local_contribution = expected * (gathered // layer.num_embeddings_per_partition == layer.tp_rank).unsqueeze(-1)
++        tp_contribution = expected * (gathered // (8 // tp_size) == tp_rank).unsqueeze(-1)
+         events = []
+ 
+         def all_gather(output, input_, *, group):
+-            events.append(("pcp_all_gather", group))
+-            output.copy_(input_.repeat(2))
+-
+-        def embedding(_, input_):
+-            events.append(("embedding", None))
+-            return input_.unsqueeze(-1).expand(-1, layer.embedding_dim).float()
++            events.append("gather")
++            assert group == "exchange"
++            assert input_.data_ptr() == layer._embed_ag_in_buf.data_ptr()
++            assert output.data_ptr() == layer._embed_ag_out_buf.data_ptr()
++            torch.testing.assert_close(input_, padded_ids[rank])
++            output.copy_(gathered)
+ 
+         def reduce_scatter(output, input_, *, group):
+-            events.append(("pcp_reduce_scatter", group))
+-            output.copy_(input_[: output.shape[0]])
++            events.append("scatter")
++            assert group == "exchange"
++            assert input_.data_ptr() == layer._embed_rs_in_buf.data_ptr()
++            assert output.data_ptr() == layer._embed_rs_out_buf.data_ptr()
++            torch.testing.assert_close(input_, local_contribution)
++            output.copy_(tp_contribution.reshape(2, span, 2)[rank])
+ 
+         def all_reduce(output, group_name):
+-            events.append(("tp_all_reduce", group_name))
+-            return output
+-
+-        layer.quant_method.embedding = MagicMock(side_effect=embedding)
+-        with (
+-            patch("vllm_ascend.ops.vocab_parallel_embedding.dist.all_gather_into_tensor", side_effect=all_gather),
+-            patch("vllm_ascend.ops.vocab_parallel_embedding.dist.reduce_scatter_tensor", side_effect=reduce_scatter),
+-            patch("torch.ops.vllm.all_reduce", side_effect=all_reduce),
+-        ):
+-            output = layer(torch.tensor([15, 16]))
+-
+-        self.assertEqual(
+-            events,
+-            [
+-                ("pcp_all_gather", "pcp"),
+-                ("embedding", None),
+-                ("pcp_reduce_scatter", "pcp"),
+-                ("tp_all_reduce", "tp"),
+-            ],
+-        )
+-        self.assertEqual(output.shape, (2, self.embedding_dim))
+-
+-    def test_pcp_embedding_exchanges_local_span_with_static_buffers(self):
+-        layer = self._create_layer()
+-        layer.token_exchange_group = MagicMock(world_size=2, device_group="pcp")
+-        layer.output_reduce_group = None
+-        layer.parallel_mode = VocabParallelMode.PCP_X_TP
+-        layer.embedding_tp_capacity = 8
+-        layer.params_dtype = torch.float32
+-        shapes: list[tuple[str, int] | tuple[str, int, int]] = []
+-        addresses = []
+-
+-        def all_gather(output, input_, *, group):
+-            shapes.append(("all_gather", input_.shape[0], output.shape[0]))
+-            addresses.append((input_.data_ptr(), output.data_ptr()))
+-            output.copy_(input_.repeat(2))
+-
+-        def embedding(_, input_):
+-            shapes.append(("embedding", input_.shape[0]))
+-            return input_.unsqueeze(-1).expand(-1, layer.embedding_dim).float()
+-
+-        def reduce_scatter(output, input_, *, group):
+-            shapes.append(("reduce_scatter", input_.shape[0], output.shape[0]))
+-            output.copy_(input_[: output.shape[0]])
+-
+-        layer.quant_method.embedding = MagicMock(side_effect=embedding)
+-        with (
+-            patch("vllm_ascend.ops.vocab_parallel_embedding.dist.all_gather_into_tensor", side_effect=all_gather),
+-            patch("vllm_ascend.ops.vocab_parallel_embedding.dist.reduce_scatter_tensor", side_effect=reduce_scatter),
+-        ):
+-            first = layer(torch.tensor([15, 16]))
+-            second = layer(torch.tensor([15]))
+-
+-        self.assertEqual(first.shape, (2, self.embedding_dim))
+-        self.assertEqual(second.shape, (1, self.embedding_dim))
+-        self.assertEqual(
+-            shapes,
+-            [
+-                ("all_gather", 2, 4),
+-                ("embedding", 4),
+-                ("reduce_scatter", 4, 2),
+-                ("all_gather", 1, 2),
+-                ("embedding", 2),
+-                ("reduce_scatter", 2, 1),
+-            ],
+-        )
+-        self.assertEqual(addresses[0], addresses[1])
++            events.append("reduce")
++            assert group_name == "tp"
++            torch.testing.assert_close(output, tp_contribution.reshape(2, span, 2)[rank, : ids[rank].numel()])
++            return weight[ids[rank]]
++
++        module = "vllm_ascend.ops.vocab_parallel_embedding"
++        monkeypatch.setattr(f"{module}.dist.all_gather_into_tensor", all_gather)
++        monkeypatch.setattr(f"{module}.dist.reduce_scatter_tensor", reduce_scatter)
++        monkeypatch.setattr(torch.ops.vllm, "all_reduce", all_reduce)
++        output = layer(ids[rank])
++        torch.testing.assert_close(output, weight[ids[rank]])
++        assert events == ["gather", "scatter"] + (["reduce"] if tp_size > 1 else [])
++
++    # One lifecycle covers fallback, unequal MM rows, graph-padded model input,
++    # shrinking batches and idle ranks. Fine-grained DP must keep fixed capacity.
++    batches = [
++        ([1, 5], [2, 6, 7], None, False, 8),
++        ([1, 5], [2, 6, 7], 3, False, 3),
++        ([1, 5, 0, 0], [2, 6, 7, 0], None, True, 4),
++        ([7], [1, 6], 2, False, 2),
++        ([], [2, 5], 2, False, 2),
++        ([], [], 0, False, 1),
++    ]
++    for tp_rank in range(tp_size):
++        for rank in range(2):
++            layer, weight = _exchange_embedding(monkeypatch, mode, tp_rank, tp_size, rank)
++            addresses = None
++            for first_ids, second_ids, published_span, in_forward, pcp_span in batches:
++                ids = [torch.tensor(first_ids, dtype=torch.long), torch.tensor(second_ids, dtype=torch.long)]
++                span = pcp_span if mode is VocabParallelMode.PCP_X_TP else 8
++                if published_span is not None:
++                    layer.set_embedding_num_tokens_padded(published_span)
++                with override_forward_context(ForwardContext({}, {}, {}) if in_forward else None):
++                    run_batch(layer, weight, ids, span, tp_rank, rank)
++                buffers = (
++                    layer._embed_ag_in_buf,
++                    layer._embed_ag_out_buf,
++                    layer._embed_rs_in_buf,
++                    layer._embed_rs_out_buf,
++                )
++                current_addresses = tuple(buffer.data_ptr() for buffer in buffers)
++                if addresses is not None:
++                    assert current_addresses == addresses
++                addresses = current_addresses
++                assert [buffer.shape[0] for buffer in buffers] == [8, 16, 16, 8]
++
++
++@pytest.mark.parametrize("num_tokens,padded_tokens", [(3, 2), (1, 9)])
++def test_embedding_exchange_rejects_invalid_batch_before_communication(monkeypatch, num_tokens, padded_tokens):
++    layer, _ = _exchange_embedding(monkeypatch, VocabParallelMode.PCP_X_TP)
++    layer.set_embedding_num_tokens_padded(padded_tokens)
++    with (
++        override_forward_context(None),
++        patch("vllm_ascend.ops.vocab_parallel_embedding.dist.all_gather_into_tensor") as gather,
++        pytest.raises(ValueError, match="must cover .* tokens and fit the static capacity"),
++    ):
++        layer(torch.ones(num_tokens, dtype=torch.long))
++    gather.assert_not_called()
+ 
+ 
+ class TestVocabParallelPlan(unittest.TestCase):
+diff --git a/vllm_ascend/models/deepseek_v41/vl_model.py b/vllm_ascend/models/deepseek_v41/vl_model.py
+index cbe4a0943..b3e4c6d12 100644
+--- a/vllm_ascend/models/deepseek_v41/vl_model.py
++++ b/vllm_ascend/models/deepseek_v41/vl_model.py
+@@ -208,6 +208,11 @@ class AscendDeepseekV41ForCausalLM(
+             is_multimodal=is_multimodal,
+         )
+ 
++    def set_embedding_num_tokens_padded(self, num_tokens_padded: int) -> None:
++        # MRV2 model state sees this multimodal wrapper. Forward its batch
++        # length to the vocabulary embedding that performs PCP token exchange.
++        self.language_model.model.embed_tokens.set_embedding_num_tokens_padded(num_tokens_padded)
++
+     def prepare_engram_graph_inputs(self, padded_tokens=None):
+         return self.language_model.prepare_engram_graph_inputs(padded_tokens)
+ 
+diff --git a/vllm_ascend/ops/vocab_parallel_embedding.py b/vllm_ascend/ops/vocab_parallel_embedding.py
+index 8ea8840ec..856b5220b 100644
+--- a/vllm_ascend/ops/vocab_parallel_embedding.py
++++ b/vllm_ascend/ops/vocab_parallel_embedding.py
+@@ -26,6 +26,7 @@ from torch.nn.parameter import Parameter
+ from vllm.config import get_current_vllm_config
+ from vllm.distributed import divide
+ from vllm.distributed.parallel_state import get_pcp_group, get_tp_group
++from vllm.forward_context import is_forward_context_available
+ from vllm.model_executor.layers.logits_processor import LogitsProcessor
+ from vllm.model_executor.layers.quantization.base_config import (
+     QuantizationConfig,
+@@ -180,6 +181,7 @@ class AscendVocabParallelEmbedding(VocabParallelEmbedding):
+         nn.Module.__init__(self)
+         self.disable_tp = disable_tp
+         self.embedding_tp_capacity: int | None = None
++        self._embedding_num_tokens_padded: int | None = None
+ 
+         plan = _resolve_vocab_parallel_plan(
+             prefix=prefix,
+@@ -263,6 +265,12 @@ class AscendVocabParallelEmbedding(VocabParallelEmbedding):
+ 
+         self.update_param_tp_status()
+ 
++    def set_embedding_num_tokens_padded(self, num_tokens_padded: int) -> None:
++        """Publish the padded batch length for lookup outside model forward."""
++        # Empty batches still use a nonzero collective size; output rows are
++        # cropped to the caller's actual input length after communication.
++        self._embedding_num_tokens_padded = max(1, num_tokens_padded)
++
+     def _mask_input_for_vocab_range(
+         self,
+         input_: torch.Tensor,
+@@ -330,9 +338,27 @@ class AscendVocabParallelEmbedding(VocabParallelEmbedding):
+         # prefill and decode.
+         capacity = self.embedding_tp_capacity
+         assert capacity is not None
+-        if num_tokens > capacity:
++        exchange_tokens = capacity
++        # PCP ranks share one batch's padded length. Fine-grained embedding
++        # TP spans DP ranks with independent batches, so it uses the capacity.
++        if self.parallel_mode == VocabParallelMode.PCP_X_TP:
++            if is_forward_context_available():
++                # Text forward and dummy/profile/capture inputs already include
++                # the common PCP padding or graph bucket. Their shape gives the
++                # current communication length without reading saved MM state.
++                exchange_tokens = num_tokens
++            else:
++                # MRV2 MM preparation runs before ForwardContext and passes only
++                # valid local rows. For example, ranks with 98 and 130 rows must
++                # both exchange 130 rows, using the length published by the runner.
++                # Without a published length, keep the common capacity fallback.
++                num_tokens_padded = self._embedding_num_tokens_padded
++                if num_tokens_padded is not None:
++                    exchange_tokens = num_tokens_padded
++        if num_tokens > exchange_tokens or exchange_tokens > capacity:
+             raise ValueError(
+-                f"embedding_tp static capacity {capacity} < num_tokens {num_tokens}; increase max_num_batched_tokens."
++                f"embedding exchange span {exchange_tokens} must cover {num_tokens} tokens "
++                f"and fit the static capacity {capacity}."
+             )
+ 
+         # Lazy init on first call (profiling run, which precedes ACL graph
+@@ -353,17 +379,11 @@ class AscendVocabParallelEmbedding(VocabParallelEmbedding):
+             )
+             self._embed_rs_out_buf = torch.empty((capacity, self.embedding_dim), dtype=self.params_dtype, device=device)
+ 
+-        # PCP ranks have the same local token count. Fine-grained Embedding TP
+-        # keeps the fixed capacity so all DP ranks exchange the same span.
+-        exchange_tokens = capacity
+-        if self.parallel_mode == VocabParallelMode.PCP_X_TP:
+-            exchange_tokens = num_tokens
++        # Exchange only this batch's padded rows while keeping capacity-sized
++        # allocations. Prefix slices preserve the buffers' base addresses.
+         all_gather_input = self._embed_ag_in_buf[:exchange_tokens]
+-        if self.parallel_mode != VocabParallelMode.PCP_X_TP:
+-            # Zero unconditionally: guarding with exchange_tokens > num_tokens
+-            # lets dynamo pin num_tokens == capacity, breaking strictly dynamic
+-            # inputs (tail rows are discarded after the reduce-scatter).
+-            all_gather_input.zero_()
++        # Zero unconditionally so padding does not specialize dynamic inputs.
++        all_gather_input.zero_()
+         all_gather_input[:num_tokens].copy_(input_)
+         all_gather_output = self._embed_ag_out_buf[: exchange_group_size * exchange_tokens]
+         dist.all_gather_into_tensor(
+@@ -396,8 +416,9 @@ class AscendVocabParallelEmbedding(VocabParallelEmbedding):
+             group=exchange_group.device_group,
+         )
+ 
+-        # Strip exchange padding and preserve the original return shape.
+-        output = reduce_scatter_output[:num_tokens].view(num_tokens, -1)
++        # Preserve the caller's row count. In MM preparation this removes
++        # exchange padding so embeddings match the unpadded is_multimodal mask.
++        output = reduce_scatter_output[:num_tokens].view(num_tokens, self.embedding_dim)
+         reduce_group = self.output_reduce_group
+         if reduce_group is not None and reduce_group.world_size > 1:
+             # PCP reduce-scatter reconstructs the TP-local contribution. This
+diff --git a/vllm_ascend/worker/v2/model_states/default.py b/vllm_ascend/worker/v2/model_states/default.py
+index b436cd759..5e7558f8c 100644
+--- a/vllm_ascend/worker/v2/model_states/default.py
++++ b/vllm_ascend/worker/v2/model_states/default.py
+@@ -149,6 +149,16 @@ class AscendModelState(DefaultModelState):
+             "block_table": block_tables[group_id][: batch.num_reqs],
+         }
+ 
++    def prepare_inputs_embeds(self, scheduled_encoder_inputs, input_batch, req_states) -> torch.Tensor:
++        # MRV2 prepares MM embeddings before entering ForwardContext. Upstream
++        # slices input_ids to valid local rows to match the image mask, leaving
++        # different input lengths on PCP ranks. Publish the common padded length
++        # (including graph padding) before that slice, and overwrite it each batch.
++        set_embedding_num_tokens_padded = getattr(self.model, "set_embedding_num_tokens_padded", None)
++        if set_embedding_num_tokens_padded is not None:
++            set_embedding_num_tokens_padded(input_batch.num_tokens_after_padding)
++        return super().prepare_inputs_embeds(scheduled_encoder_inputs, input_batch, req_states)
++
+     def prepare_inputs(self, input_batch, req_states) -> dict[str, Any]:
+         model_inputs = super().prepare_inputs(input_batch, req_states)
+         model_inputs.update(self.prepare_engram_inputs(input_batch, req_states))
+diff --git a/vllm_ascend/worker/v2/pcp_manager.py b/vllm_ascend/worker/v2/pcp_manager.py
+index 87f9ba69f..0c2e98e96 100644
+--- a/vllm_ascend/worker/v2/pcp_manager.py
++++ b/vllm_ascend/worker/v2/pcp_manager.py
+@@ -235,8 +235,6 @@ class AscendPCPManager(PCPManager):
+ 
+         if model_config.is_encoder_decoder:
+             raise NotImplementedError("MRV2 PCP does not support encoder-decoder models yet.")
+-        if supports_mm_inputs:
+-            raise NotImplementedError("MRV2 PCP does not support MM inputs yet.")
+         if vllm_config.lora_config is not None:
+             raise NotImplementedError("MRV2 PCP does not support LoRA yet.")
+         speculative_config = vllm_config.speculative_config

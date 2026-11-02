@@ -1,0 +1,385 @@
+commit b5231d0235ae73955f90b18cef4476912072617d
+Author:     zss <zhaosusu1@h-partners.com>
+AuthorDate: Thu Oct 22 18:51:37 2026 +0800
+Commit:     GitHub <noreply@github.com>
+CommitDate: Thu Oct 22 18:51:37 2026 +0800
+
+    [BugFix][KV Pool] Remove layerwise RPC result caches and scheduler hit cache (#19251)
+    
+    ## Summary
+    
+    Reverts the two cache optimizations introduced by #16947 while keeping
+    its third one (the opt-in deferred last-layer save drain,
+    `VLLM_ASCEND_LW_DEFER_LAST_SAVE`) untouched:
+    
+    1. **Worker per-step RPC result caches** (`_step_keyinfo_cache` /
+    `_step_lease_result` / `_step_exist_cache`): `batch_get_key_info`,
+    `batch_add_lease` and `batch_is_exist` are issued directly again, so
+    every request validates its own keys, lease results and GVA metadata
+    instead of reusing results sampled earlier in the step by a
+    prefix-sharing request.
+    2. **Scheduler-side block hit cache** (`_lw_block_hit_cache`):
+    `_lookup_layerwise_contiguous` re-probes backend readability on every
+    lookup instead of replaying cached (group, block_hash) verdicts.
+    
+    Performance impact validated on Qwen3.8 with Ascend memcache pooling +
+    layerwise transfer: external prefix hit rate unchanged at 93.68% with 0
+    failed requests, and TTFT (avg 6685ms vs 6688ms), prefill throughput
+    (4909 vs 4908 tok/s) and request throughput (4.33 vs 4.33 req/s) are
+    essentially unchanged before vs after applying this PR, confirming no
+    performance regression from removing the scheduler/worker-side caches.
+    
+    ## Why
+    
+    Under tiered (DRAM+SSD) MemCache pools with a small DRAM tier, block
+    state changes on a timescale the TTLs cannot bound:
+    
+    - A cached **hit** (0.5s TTL, which spans many scheduling rounds at
+    decode cadence) can outlive a DRAM eviction or demote-rewarm cycle. The
+    scheduler then over-reports external hits, `num_computed_tokens` is
+    inflated, and the worker can no longer load those blocks: single-group
+    models burn a garbage forward pass before the recompute policy kicks in,
+    multi-group models hard-fail in `_prepare_load_gvas`.
+    - A cached **miss** (30s TTL) pins a transient unreadability — e.g. a
+    mid-rewarm `batch_get_key_info` reporting a zero GVA — for half a
+    minute, and the sequential prefix scan truncates the whole prefix behind
+    it.
+    - #18353 already confirmed that DRAM/SSD demote-rewarm cycles invalidate
+    client-cached GVA state ("wrong-address `batch_copy` writes through
+    stale cached GVAs"). Per-step key-info caching extends exactly that
+    staleness window across requests sharing a prefix.
+    
+    This also resolves the original review concern on #16947 (the
+    cross-request hit cache is never invalidated on save or eviction; a TTL
+    only bounds the stale window) by removing the cache rather than trying
+    to bound it.
+    
+    ## Performance intent
+    
+    The RPC dedup was the main TTFT win of #16947 under high prefix-sharing
+    workloads, so a regression toward the pre-#16947 layerwise numbers is
+    expected and accepted here in exchange for correctness under tiered
+    pools.
+    
+    ## Tests
+    
+    -
+    `test_prefix_lookup_rechecks_after_save_and_eviction_instead_of_using_hit_ttl`
+    is rewritten as `test_prefix_lookup_rechecks_after_save_and_eviction`:
+    it drops the injected-cache parametrization and now asserts that every
+    lookup re-probes the store (`batch_is_readable` call count 6 -> 8 after
+    the mode flip) while the dspark / reuse key-expansion behavior is
+    unchanged.
+    - `test_reuse_snapshot_blocks.reset()` no longer initializes the removed
+    per-step caches.
+    - The remaining ascend_store unit tests mock the batch RPCs with
+    length-matched side effects (single-request fixtures), so they are
+    call-pattern-neutral to this change.
+    
+    ## Verification
+    
+    - `ruff format --check` / `ruff check` clean on the modified files.
+    - `tests/ut/distributed/ascend_store/` delegated to CI: the local
+    container's vLLM checkout predates the APIs current main requires, so
+    the suite cannot run against this base locally.
+    
+    - vLLM main:
+    https://github.com/vllm-project/vllm/commit/a98247ab4db686ee03c66d5feb3c761e52a2f8ab
+    
+    Signed-off-by: zss-hp <321708722+zss-hp@users.noreply.github.com>
+    Co-authored-by: zss-hp <321708722+zss-hp@users.noreply.github.com>
+
+diff --git a/tests/ut/distributed/ascend_store/test_pool_scheduler.py b/tests/ut/distributed/ascend_store/test_pool_scheduler.py
+index da6773912..62bca3b11 100644
+--- a/tests/ut/distributed/ascend_store/test_pool_scheduler.py
++++ b/tests/ut/distributed/ascend_store/test_pool_scheduler.py
+@@ -116,11 +116,13 @@ def test_joint_prefix_draft_only_group_uses_companion_keys_without_losing_mixed_
+         assert scheduler._query_layerwise_block_hits([keys]) == [False]
+ 
+ 
+-@pytest.mark.parametrize("cached_hit", [False, True])
+ @pytest.mark.parametrize("mode", ["dspark", "reuse"])
+-def test_prefix_lookup_rechecks_after_save_and_eviction_instead_of_using_hit_ttl(cached_hit, mode):
++def test_prefix_lookup_rechecks_after_save_and_eviction(mode):
+     scheduler = KVPoolScheduler.__new__(KVPoolScheduler)
+-    scheduler.layerwise_keys = SimpleNamespace(make_hit_check_keys=MagicMock(return_value=["target"]))
++    # A fresh key list per call: _make_layerwise_hit_check_keys extends the
++    # returned list in place when dspark joint keys are active, so a shared
++    # return_value would accumulate draft keys across lookups.
++    scheduler.layerwise_keys = SimpleNamespace(make_hit_check_keys=MagicMock(side_effect=lambda *args: ["target"]))
+     scheduler.tp_size, scheduler.put_step = 4, 4
+     scheduler.num_speculative_blocks_by_group = {}
+     scheduler.dspark_prefix_keys = (
+@@ -132,10 +134,6 @@ def test_prefix_lookup_rechecks_after_save_and_eviction_instead_of_using_hit_ttl
+     scheduler.hash_block_size = 16
+     scheduler.grouped_block_size = [16, 16]
+     scheduler.use_layerwise = True
+-    scheduler._lw_block_hit_cache = {(group_id, "block-hash"): (cached_hit, float("inf")) for group_id in (0, 1)}
+-    original_cache = scheduler._lw_block_hit_cache.copy()
+-    scheduler._lw_hit_cache_ttl, scheduler._lw_hit_cache_hit_ttl = 30.0, 0.5
+-    scheduler._lw_hit_cache_max = 200_000
+     request = SimpleNamespace(request_id="request", block_hashes=["block-hash"])
+     readable_keys: set[str] = set()
+     scheduler.store_scheduler = SimpleNamespace(
+@@ -149,11 +147,12 @@ def test_prefix_lookup_rechecks_after_save_and_eviction_instead_of_using_hit_ttl
+     readable_keys.remove(draft_keys[-1] if draft_keys else "target")
+     assert scheduler._lookup_layerwise_contiguous(request, 16, 0) == 0
+     assert scheduler.store_scheduler.batch_is_readable.call_count == 6
+-    assert scheduler._lw_block_hit_cache == original_cache
+     scheduler.dspark_prefix_keys = None
+     scheduler.layerwise_offload = False
+-    assert scheduler._lookup_layerwise_contiguous(request, 16, 0) == (16 if cached_hit else 0)
+-    assert scheduler.store_scheduler.batch_is_readable.call_count == 6
++    # Without dspark/reuse key expansion the plain target key alone decides
++    # the hit, and the store is re-probed on every lookup.
++    assert scheduler._lookup_layerwise_contiguous(request, 16, 0) == (16 if mode == "dspark" else 0)
++    assert scheduler.store_scheduler.batch_is_readable.call_count == 8
+ 
+ 
+ @pytest.mark.parametrize("draft_first", [False, True])
+diff --git a/tests/ut/distributed/ascend_store/test_reuse_snapshot_blocks.py b/tests/ut/distributed/ascend_store/test_reuse_snapshot_blocks.py
+index dc92b23e6..fdf9a7911 100644
+--- a/tests/ut/distributed/ascend_store/test_reuse_snapshot_blocks.py
++++ b/tests/ut/distributed/ascend_store/test_reuse_snapshot_blocks.py
+@@ -63,7 +63,6 @@ def worker():
+ def reset(w):
+     w._step_load_keys = set()
+     w._masked_runs_cache = {}
+-    w._step_keyinfo_cache, w._step_lease_result, w._step_exist_cache = {}, {}, {}
+     w.layer_save_tasks, w.layer_load_tasks = [[], []], [[], []]
+ 
+ 
+diff --git a/vllm_ascend/distributed/kv_transfer/kv_pool/ascend_store/pool_scheduler.py b/vllm_ascend/distributed/kv_transfer/kv_pool/ascend_store/pool_scheduler.py
+index 3fad11403..4d4d33c59 100644
+--- a/vllm_ascend/distributed/kv_transfer/kv_pool/ascend_store/pool_scheduler.py
++++ b/vllm_ascend/distributed/kv_transfer/kv_pool/ascend_store/pool_scheduler.py
+@@ -1,6 +1,5 @@
+ import importlib
+ import math
+-import time
+ from collections.abc import Sequence
+ from typing import Any
+ 
+@@ -267,24 +266,6 @@ class KVPoolScheduler:
+         self.model_name = model_config.model.split("/")[-1]
+ 
+         self.client: LookupKeyClient | None = None
+-        # PERF-TUNE(3): cross-request block hit cache for the scheduler-side
+-        # layerwise lookup. A block's all-rank presence only changes on save
+-        # or eviction; cache it briefly so concurrent requests sharing a
+-        # prefix skip the repeated batch_get_key_info RPCs. A cached False
+-        # (miss) short-circuits the whole group.
+-        #
+-        # Asymmetry is deliberate: a stale miss only costs one extra RPC
+-        # (the block was saved after we cached its absence), so miss
+-        # entries may live for the full TTL. A stale hit is dangerous: an
+-        # eviction after the entry was cached makes the scheduler report a
+-        # prefix hit the worker can no longer load, and the forward pass
+-        # already skipped recomputation. Hit entries therefore use a much
+-        # shorter TTL so they only cover the same-step concurrent requests
+-        # and cannot outlive an eviction by a meaningful margin.
+-        self._lw_block_hit_cache: dict[tuple[int, str], tuple[bool, float]] = {}
+-        self._lw_hit_cache_ttl = 30.0
+-        self._lw_hit_cache_hit_ttl = 0.5
+-        self._lw_hit_cache_max = 200_000
+ 
+     def _get_or_create_request_tracker(self, req_id: str) -> RequestTracker:
+         tracker = self._request_trackers.get(req_id)
+@@ -510,67 +491,24 @@ class KVPoolScheduler:
+             if not group_block_hashes:
+                 continue
+ 
+-            # PERF-TUNE(3): consume the cached prefix first. The hit check is
+-            # a sequential prefix scan (stop at first miss), so blocks whose
+-            # (group, hash) state is cached are resolved without any RPC.
+-            hit_cache = self._lw_block_hit_cache
+-            if self.layerwise_offload or self.dspark_prefix_keys is not None:
+-                # Reused buffers do not retain every layer's local prefix KV.
+-                # A stale miss would skip its restore; a stale hit may refer
+-                # to evicted KV. Recheck host readability on every lookup.
+-                # DSpark likewise requires fresh target and draft coverage.
+-                hit_cache = {}
+-            now = time.monotonic()
+-            if len(hit_cache) > self._lw_hit_cache_max:
+-                hit_cache.clear()
+-            cached_hits = 0
+-            first_uncached = len(group_block_hashes)
+-            cached_miss = False
+-            for i, bh in enumerate(group_block_hashes):
+-                entry = hit_cache.get((group_id, block_hash_to_str(bh)))
+-                if entry is None or entry[1] < now:
+-                    first_uncached = i
+-                    break
+-                if entry[0]:
+-                    cached_hits += 1
+-                else:
+-                    first_uncached = i
+-                    cached_miss = True
+-                    break
+-
+-            if cached_miss:
+-                # Known-miss prefix block: the whole group resolves to the
+-                # cached hit count with zero RPC.
+-                hits_per_group.append((query_start_block + cached_hits) * effective_block_size)
+-                continue
+-
+-            uncached_hashes = group_block_hashes[first_uncached:]
+-            if not uncached_hashes:
+-                hits_per_group.append((query_start_block + cached_hits) * effective_block_size)
+-                continue
+-
++            # Deliberately no cross-request hit cache: in a tiered (DRAM+SSD)
++            # pool a cached hit can outlive an eviction and over-report
++            # external hits, while a cached miss can hide a freshly saved
++            # block. Every lookup re-probes backend readability instead.
+             keys_by_block = [
+-                self._make_layerwise_hit_check_keys(group_id, block_hash_to_str(bh)) for bh in uncached_hashes
++                self._make_layerwise_hit_check_keys(group_id, block_hash_to_str(bh)) for bh in group_block_hashes
+             ]
+             if not keys_by_block:
+                 continue
+             block_hits = self._query_layerwise_block_hits(keys_by_block)
+-            # PERF-TUNE(3): record every resolved block in the cache (True on
+-            # hit, False on the first miss) so later requests skip these RPCs
+-            # entirely. Misses keep the long TTL (stale miss == wasted RPC
+-            # only); hits get the short TTL so an eviction cannot serve a
+-            # stale hit beyond the same-step window.
+-            for bh, hit in zip(uncached_hashes, block_hits):
+-                ttl = self._lw_hit_cache_ttl if not hit else self._lw_hit_cache_hit_ttl
+-                hit_cache[(group_id, block_hash_to_str(bh))] = (hit, now + ttl)
+-            uncached_hit_blocks = 0
++            num_hit_blocks = 0
+             for hit in block_hits:
+                 if hit:
+-                    uncached_hit_blocks += 1
++                    num_hit_blocks += 1
+                 else:
+                     break
+ 
+-            hits_per_group.append((query_start_block + cached_hits + uncached_hit_blocks) * effective_block_size)
++            hits_per_group.append((query_start_block + num_hit_blocks) * effective_block_size)
+ 
+         if not hits_per_group:
+             logger.debug(
+diff --git a/vllm_ascend/distributed/kv_transfer/kv_pool/ascend_store/pool_worker.py b/vllm_ascend/distributed/kv_transfer/kv_pool/ascend_store/pool_worker.py
+index 5ce4936a5..99e5f4297 100644
+--- a/vllm_ascend/distributed/kv_transfer/kv_pool/ascend_store/pool_worker.py
++++ b/vllm_ascend/distributed/kv_transfer/kv_pool/ascend_store/pool_worker.py
+@@ -490,12 +490,6 @@ class KVPoolWorker:
+         # step in process_layer_data(). masked_block_runs inputs are
+         # layer-invariant, so only the first layer pays the O(blocks) scan.
+         self._masked_runs_cache: dict[tuple[str, str, int, int, int], list[tuple[int, int]]] = {}
+-        # PERF-TUNE(4): per-step RPC result caches. Defined once here so
+-        # mypy does not flag repeated attribute definitions; they are reset
+-        # per step via .clear() in process_layer_data().
+-        self._step_keyinfo_cache: dict[str, Any] = {}
+-        self._step_lease_result: dict[str, int] = {}
+-        self._step_exist_cache: dict[str, int] = {}
+ 
+     def _init_layerwise_config(self) -> None:
+         # Build mapping: physical_layer -> [(group_id, layer_idx_in_group), ...]
+@@ -1933,12 +1927,9 @@ class KVPoolWorker:
+         """
+         if not keys:
+             return set()
+-        # PERF-TUNE(4): reuse this step's existence results for repeated keys
+-        step_cache = getattr(self, "_step_exist_cache", None) or {}
+-        self._step_exist_cache = step_cache
+         unique_keys = list(dict.fromkeys(keys))
+-        uncached_keys = [k for k in unique_keys if k not in step_cache]
+-        for key_batch in self._layerwise_key_batches(uncached_keys):
++        missing: set[str] = set()
++        for key_batch in self._layerwise_key_batches(unique_keys):
+             try:
+                 states = self.m_store.batch_is_exist(key_batch)
+                 if len(states) != len(key_batch):
+@@ -1946,17 +1937,15 @@ class KVPoolWorker:
+                         "MemCache exists check returned unexpected number of states: "
+                         f"expected={len(key_batch)}, actual={len(states)}"
+                     )
+-                for k, state in zip(key_batch, states):
+-                    step_cache[k] = int(state)
++                missing.update(key for key, state in zip(key_batch, states) if int(state) != 1)
+             except Exception as exc:
+                 logger.error(
+                     "Pool exists check failed keys=%d error=%s; treating all as missing",
+                     len(key_batch),
+                     exc,
+                 )
+-                for k in key_batch:
+-                    step_cache[k] = 0
+-        return {k for k in unique_keys if step_cache.get(k, 0) != 1}
++                missing.update(key_batch)
++        return missing
+ 
+     def _alloc_gvas_for_save(self, requests: list[ReqMeta]) -> None:
+         if not self.use_layerwise_transfer:
+@@ -2297,17 +2286,9 @@ class KVPoolWorker:
+                     all_group_load_gvas.append(np.zeros(full_len, dtype=np.int64))
+                     continue
+ 
+-                # PERF-TUNE(4): dedup identical keys across concurrent requests.
+-                ki_cache = getattr(self, "_step_keyinfo_cache", None) or {}
+-                self._step_keyinfo_cache = ki_cache
+-                uncached = [k for k in keys if k not in ki_cache]
+-                if uncached:
+-                    fetched_infos = self.m_store.batch_get_key_info(uncached, for_load=True)
+-                    if fetched_infos is None or len(fetched_infos) != len(uncached):
+-                        return False
+-                    for k, ki in zip(uncached, fetched_infos):
+-                        ki_cache[k] = ki
+-                key_infos = [ki_cache[k] for k in keys]
++                key_infos = self.m_store.batch_get_key_info(keys, for_load=True)
++                if key_infos is None or len(key_infos) != len(keys):
++                    return False
+                 gvas = []
+                 valid_gva_indices = []
+                 invalid_block_ids: list[int] = []
+@@ -2332,23 +2313,14 @@ class KVPoolWorker:
+                         )
+ 
+                 # Only call batch_add_lease for keys with valid size.
+-                # PERF-TUNE(4): keys leased earlier in this step reuse their
+-                # recorded result code; only new keys hit the RPC. The result
+-                # list below stays aligned with valid_gva_indices.
+-                lease_cache = getattr(self, "_step_lease_result", None) or {}
+-                self._step_lease_result = lease_cache
+                 valid_keys = [keys[index] for index in valid_gva_indices]
+-                new_lease_keys = [k for k in valid_keys if k not in lease_cache]
+-                if new_lease_keys:
+-                    new_results = self.m_store.batch_add_lease(new_lease_keys, LAYERWISE_READ_LEASE_TTL_MS)
+-                    if new_results is None or len(new_results) != len(new_lease_keys):
++                if valid_keys:
++                    lease_results = self.m_store.batch_add_lease(valid_keys, LAYERWISE_READ_LEASE_TTL_MS)
++                    if lease_results is None or len(lease_results) != len(valid_keys):
+                         return False
+-                    for k, res in zip(new_lease_keys, new_results):
+-                        lease_cache[k] = res
++                    for key, res in zip(valid_keys, lease_results):
+                         if res == 0:
+-                            self._step_load_keys.add(k)
+-                if valid_keys:
+-                    lease_results = [lease_cache[k] for k in valid_keys]
++                            self._step_load_keys.add(key)
+                     leased_keys = []
+                     for gva_index, lease_res in zip(valid_gva_indices, lease_results):
+                         block_idx = block_indices[gva_index]
+@@ -2363,7 +2335,6 @@ class KVPoolWorker:
+                                 if retry_results is None or len(retry_results) != 1:
+                                     return False
+                                 lease_res = retry_results[0]
+-                                lease_cache[partial_key] = lease_res
+                                 if lease_res == 0:
+                                     self._step_load_keys.add(partial_key)
+                                 if lease_res != MEMCACHE_UNMATCHED_STATE:
+@@ -2974,10 +2945,6 @@ class KVPoolWorker:
+         self.layer_load_tasks = [[] for _ in range(self.num_layers)]
+         if not requests:
+             return
+-        # PERF-TUNE(4): cache repeated memcache RPC results within this step.
+-        self._step_keyinfo_cache = {}
+-        self._step_lease_result = {}
+-        self._step_exist_cache = {}
+         # Mooncake uses the projected stage-local cache layout, including any
+         # draft layers. The GVA/key planes retain their existing PP key count.
+         if not self.use_block_key_layerwise and getattr(self, "pp_size", 1) > 1:

@@ -1,0 +1,369 @@
+commit 49e9738275334f3ff7fd32a0772c8d04851ebdae
+Author:     Ronald <ronaldautomobile@163.com>
+AuthorDate: Sat Oct 10 17:52:23 2026 +0800
+Commit:     GitHub <noreply@github.com>
+CommitDate: Sat Oct 10 09:52:23 2026 +0000
+
+    [BugFix][Model] Apply DeepSeek-V4 attention sinks through the weight loader (#16958)
+    
+    ### What this PR does / why we need it?
+    
+    DeepSeek-V4 Attention Sink loading used direct `copy_` calls, bypassing
+    the parameter's current `weight_loader`. During live/layerwise reload,
+    those writes land on meta parameters instead of entering the reload
+    cache, leaving the original Sink values unchanged.
+    
+    Route the Target, MTP and DSpark Sink branches through
+    `param.weight_loader`, with `default_weight_loader` as the fallback.
+    Keep TP slicing in `load_weights`, preserve full-Sink loading under DSA
+    CP, and keep DSpark's existing `[head_start:head_end]` slice. No shared
+    abstraction or upstream reload framework changes are introduced.
+    
+    The final diff contains only the three Sink loading files and
+    `tests/ut/models/test_deepseek_v4_weight_loader_reload.py`. Runtime
+    RMSNorm ownership, attention quantization scales, sleep/wake fixes and
+    E2E enablement have been removed. DeepSeek-V4 remains skipped in both
+    NPU IPC and HCCL E2E lanes using the baseline `skip_reason` logic.
+    
+    ### Does this PR introduce _any_ user-facing change?
+    
+    Live/layerwise weight updates now apply new Attention Sink values.
+    Ordinary checkpoint loading and TP/DSA CP partitioning remain unchanged.
+    
+    ### How was this patch tested?
+    
+    Expanded the Sink UT to **102 cases**:
+    
+    | Coverage | Target | MTP | DSpark |
+    | --- | --- | --- | --- |
+    | TP=1/2/4/8, every rank, custom loader | 15 | 15 | 15 |
+    | TP=1/2/4/8, every rank, default loader | 15 | 15 | 15 |
+    | DSA CP, TP=2/rank=1, custom/default loader | 2 | 2 | 2 |
+    | Real layerwise reload, two successive updates, TP and DSA CP | 2 | 2 |
+    2 |
+    
+    Custom-loader tests assert exactly one call, the actual destination
+    Parameter, exact tensor values/shape, and unchanged parameter contents
+    when the recording loader does not copy. Checkpoint names traverse the
+    production mappings, including MTP's `mtp_block` and DSpark's real
+    `_remap_dspark_name` (`mtp.1.attn.attn_sink` ->
+    `model.layers.4.self_attn.attn_sink` with three target layers).
+    
+    Local Windows CPU validation (PyTorch 2.7.1+cpu): **102 passed**. This
+    was a **source-isolated run**, not a successful canonical repository
+    pytest run: it compiled the complete production `load_weights` methods
+    and real name-mapping methods directly from the changed files, isolated
+    unrelated serving/NPU imports, and ran this test file through pytest.
+    The reload implementation itself was imported unmodified from upstream
+    vLLM at `ced6857afa0ea7b2e3f0846a62e1394e90f15607` (the merged base's
+    verified dependency), including its metadata/meta/materialization
+    helpers; no replacement reload wrapper was written. All six lifecycle
+    cases verify startup A -> reload B -> reload C and unchanged original
+    storage addresses.
+    
+    Regression sensitivity was verified by temporarily replacing the three
+    Sink loader calls with direct copies: **54 failed, 48 passed**,
+    including failures in all six lifecycle cases. The production files were
+    restored byte for byte; rerunning the fixed version gave **102 passed**.
+    
+    Canonical `python -m pytest
+    tests/ut/models/test_deepseek_v4_weight_loader_reload.py -q` is blocked
+    at conftest import by missing `uvloop` on Windows. A direct collection
+    attempt with `--confcutdir=tests/ut/models` is also blocked by the
+    installed Transformers dependency (`PreTrainedConfig` import). Canonical
+    Linux/NPU CI remains required; no H20 or E2E run was performed.
+    
+    Passed locally: Ruff check/format on all four files, Python compilation,
+    `git diff --check`, forbidden-import, boolean-context-manager,
+    long-function, package-init and symbolic-meta checks. The full
+    `format.sh ci` run passed Ruff 0.14.0 check/format, codespell, typos,
+    clang-format, Markdown lint, actionlint, PNG lint, filename checks,
+    package-init, forbidden imports and boolean-context-manager checks. The
+    full gate did not pass on Windows: Gitleaks/logger hooks could not find
+    `/bin/bash`, ShellCheck is not installed, and the
+    long-function/symbolic-meta hooks could not resolve `python3`. The
+    latter Python checks passed when invoked directly with `python`; the
+    logger check also passed when invoked directly with Git Bash. These
+    environment failures are not reported as a green full gate.
+    
+    Refs #16355, #16322.
+    
+    
+    - vLLM main:
+    https://github.com/vllm-project/vllm/commit/ced6857afa0ea7b2e3f0846a62e1394e90f15607
+    
+    ---------
+    
+    Signed-off-by: Ronald1995 <ronaldautomobile@163.com>
+
+diff --git a/tests/ut/models/test_deepseek_v4_weight_loader_reload.py b/tests/ut/models/test_deepseek_v4_weight_loader_reload.py
+new file mode 100644
+index 000000000..095efec1c
+--- /dev/null
++++ b/tests/ut/models/test_deepseek_v4_weight_loader_reload.py
+@@ -0,0 +1,185 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM Ascend project
++"""Exercise real Sink loaders, checkpoint mappings and layerwise reload on CPU.
++
++TP sharding belongs to load_weights, before the parameter's current loader is
++called. DSA CP keeps the full Sink. Direct copy_ bypasses the reload wrapper and
++loses updates made while the parameter is on meta.
++"""
++
++from types import SimpleNamespace
++
++import pytest
++import torch
++from torch import nn
++from vllm.model_executor.model_loader.reload.layerwise import (
++    finalize_layerwise_reload,
++    initialize_layerwise_reload,
++    record_metadata_for_reloading,
++)
++
++from vllm_ascend.models.deepseek_v4 import dspark as dspark_module
++from vllm_ascend.models.deepseek_v4 import model as target_module
++from vllm_ascend.models.deepseek_v4 import mtp as mtp_module
++
++TOTAL_HEADS = 16
++TARGET_LAYER_IDX = 3
++DSPARK_STAGE = 1
++# TP=1 and every rank of TP=2/4/8, including nonzero offsets.
++TP_RANKS = [(1, 0)] + [(size, rank) for size in (2, 4, 8) for rank in range(size)]
++
++
++class _SinkAttention(nn.Module):
++    def __init__(self, num_heads: int, with_weight_loader: bool) -> None:
++        super().__init__()
++        self.attn_sink = nn.Parameter(torch.full((num_heads,), -1.0), requires_grad=False)
++        self.loader_calls: list[tuple[nn.Parameter, torch.Tensor]] = []
++        if with_weight_loader:
++            self.attn_sink.weight_loader = self.record_load
++
++    def record_load(self, param: nn.Parameter, loaded_weight: torch.Tensor) -> None:
++        # Deliberately do not copy: load_weights must leave the parameter alone.
++        self.loader_calls.append((param, loaded_weight.clone()))
++
++
++class _SinkOnlyModel(nn.Module):
++    """Minimal hierarchy needed by the production load_weights methods."""
++
++    def __init__(self, attention: _SinkAttention, path: str) -> None:
++        super().__init__()
++        layer = nn.Module()
++        if path == "mtp":
++            layer.mtp_block = nn.Module()
++            layer.mtp_block.self_attn = attention
++        else:
++            layer.self_attn = attention
++        layer_idx = TARGET_LAYER_IDX + DSPARK_STAGE if path == "dspark" else 0
++        self.model = nn.Module()
++        self.model.layers = nn.ModuleDict({str(layer_idx): layer})
++        self.model.num_dspark_layers = 2
++        self.model.get_expert_mapping = lambda: []
++        self.config = SimpleNamespace(
++            num_attention_heads=TOTAL_HEADS,
++            num_hidden_layers=TARGET_LAYER_IDX,
++            n_routed_experts=8,
++            n_shared_experts=1,
++        )
++        self.num_redundant_experts = 0
++        self.quant_config = None
++        self.rotation_path = None
++
++    # Keep the actual predicates/mappings, including the MTP block container.
++    no_mtp_block_in_name = mtp_module.DeepSeekV4MTP.no_mtp_block_in_name
++    _remap_dspark_name = dspark_module.DSparkDeepseekV4ForCausalLM._remap_dspark_name
++
++
++@pytest.fixture(params=["target", "mtp", "dspark"])
++def sink_path(request, monkeypatch):
++    """Patch distributed/config dependencies, keeping real loaders and mappings."""
++    path = request.param
++    modules = {"target": target_module, "mtp": mtp_module, "dspark": dspark_module}
++    loaders = {
++        "target": target_module.AscendDeepseekV4ForCausalLM.load_weights,
++        "mtp": mtp_module.DeepSeekV4MTP.load_weights,
++        "dspark": dspark_module.DSparkDeepseekV4ForCausalLM.load_weights,
++    }
++    checkpoint_names = {
++        "target": "model.layers.0.attn.attn_sink",
++        "mtp": "mtp.0.attn.attn_sink",
++        "dspark": f"mtp.{DSPARK_STAGE}.attn.attn_sink",
++    }
++    parameter_names = {
++        "target": "model.layers.0.self_attn.attn_sink",
++        "mtp": "model.layers.0.mtp_block.self_attn.attn_sink",
++        "dspark": f"model.layers.{TARGET_LAYER_IDX + DSPARK_STAGE}.self_attn.attn_sink",
++    }
++    for module in (target_module, mtp_module):
++        monkeypatch.setattr(module, "fused_moe_make_expert_params_mapping", lambda *_, **__: [])
++        monkeypatch.setattr(module, "get_ascend_config", lambda: SimpleNamespace(mix_placement=False))
++    monkeypatch.setattr(target_module, "is_pp_missing_parameter", lambda *_: False)
++    monkeypatch.setattr(dspark_module, "process_eagle_weight", lambda *_: None)
++
++    def build(*, tp_size, tp_rank, dsa_cp=False, with_weight_loader=False):
++        module = modules[path]
++        monkeypatch.setattr(module, "get_tensor_model_parallel_world_size", lambda: tp_size)
++        monkeypatch.setattr(module, "get_tensor_model_parallel_rank", lambda: tp_rank)
++        monkeypatch.setattr(module, "enable_dsa_cp", lambda: dsa_cp)
++        attention = _SinkAttention(TOTAL_HEADS if dsa_cp else TOTAL_HEADS // tp_size, with_weight_loader)
++        model = _SinkOnlyModel(attention, path)
++        load_weights = loaders[path].__get__(model)
++        return SimpleNamespace(
++            model=model,
++            attention=attention,
++            parameter_name=parameter_names[path],
++            load=lambda weight: load_weights([(checkpoint_names[path], weight)]),
++        )
++
++    return build
++
++
++def _expected_sink(weight, tp_size, tp_rank, dsa_cp):
++    if dsa_cp:
++        return weight
++    heads_per_rank = TOTAL_HEADS // tp_size
++    return weight[tp_rank * heads_per_rank : (tp_rank + 1) * heads_per_rank]
++
++
++def _check_load(case, *, tp_size, tp_rank, dsa_cp, with_weight_loader):
++    weight = torch.arange(TOTAL_HEADS, dtype=torch.float32)
++    param = case.attention.attn_sink
++    original_value = param.detach().clone()
++    expected = _expected_sink(weight, tp_size, tp_rank, dsa_cp)
++
++    assert case.load(weight) == {case.parameter_name}
++    assert dict(case.model.named_parameters())[case.parameter_name] is param
++    if with_weight_loader:
++        assert len(case.attention.loader_calls) == 1
++        destination, received = case.attention.loader_calls[0]
++        assert destination is param
++        assert received.shape == param.shape
++        torch.testing.assert_close(received, expected)
++        torch.testing.assert_close(param.detach(), original_value)
++    else:
++        assert not case.attention.loader_calls
++        torch.testing.assert_close(param.detach(), expected)
++
++
++@pytest.mark.parametrize(("tp_size", "tp_rank"), TP_RANKS)
++@pytest.mark.parametrize("with_weight_loader", [True, False], ids=["custom", "default"])
++def test_attention_sink_tp_loading(sink_path, tp_size, tp_rank, with_weight_loader):
++    case = sink_path(tp_size=tp_size, tp_rank=tp_rank, with_weight_loader=with_weight_loader)
++    _check_load(case, tp_size=tp_size, tp_rank=tp_rank, dsa_cp=False, with_weight_loader=with_weight_loader)
++
++
++@pytest.mark.parametrize("with_weight_loader", [True, False], ids=["custom", "default"])
++def test_attention_sink_dsa_cp_loading(sink_path, with_weight_loader):
++    # A nonzero rank distinguishes the complete Sink from the ordinary TP slice.
++    case = sink_path(tp_size=2, tp_rank=1, dsa_cp=True, with_weight_loader=with_weight_loader)
++    _check_load(case, tp_size=2, tp_rank=1, dsa_cp=True, with_weight_loader=with_weight_loader)
++
++
++@pytest.mark.parametrize("dsa_cp", [False, True], ids=["tp", "dsa_cp"])
++def test_attention_sink_layerwise_reload(sink_path, dsa_cp):
++    """The real upstream wrapper must replay two updates into original storage."""
++    case = sink_path(tp_size=2, tp_rank=1, dsa_cp=dsa_cp)
++    initial_weight = torch.arange(TOTAL_HEADS, dtype=torch.float32)
++    assert case.load(initial_weight) == {case.parameter_name}
++    original_param = case.attention.attn_sink
++    original_value = original_param.detach().clone()
++    storage_ptr = original_param.untyped_storage().data_ptr()
++    torch.testing.assert_close(original_value, _expected_sink(initial_weight, 2, 1, dsa_cp))
++    record_metadata_for_reloading(case.model)
++
++    for offset in (100, 200):
++        initialize_layerwise_reload(case.model)
++        assert case.attention.attn_sink.is_meta
++        assert case.attention.attn_sink.weight_loader.__name__ == "online_process_loader"
++        new_weight = initial_weight + offset
++        assert case.load(new_weight) == {case.parameter_name}
++        finalize_layerwise_reload(case.model, SimpleNamespace(dtype=torch.float32))
++        sink = case.attention.attn_sink
++        assert sink.device.type == "cpu"
++        assert sink.untyped_storage().data_ptr() == storage_ptr
++        torch.testing.assert_close(sink.detach(), _expected_sink(new_weight, 2, 1, dsa_cp))
++        torch.testing.assert_close(original_param.detach(), sink.detach())
++    assert not torch.equal(original_param.detach(), original_value)
+diff --git a/vllm_ascend/models/deepseek_v4/dspark.py b/vllm_ascend/models/deepseek_v4/dspark.py
+index c342941bc..25001bc78 100644
+--- a/vllm_ascend/models/deepseek_v4/dspark.py
++++ b/vllm_ascend/models/deepseek_v4/dspark.py
+@@ -518,12 +518,19 @@ class DSparkDeepseekV4ForCausalLM(nn.Module, DeepseekV2MixtureOfExperts, Support
+                 break
+             else:
+                 if "attn_sink" in name:
++                    param = params_dict[name]
++                    # Route the write through the parameter's loader, like the
++                    # target model does. A live weight update runs inside vLLM's
++                    # layerwise reload, which parks the layer on the meta device
++                    # and only replays loads made through ``weight_loader``; a
++                    # direct ``copy_`` lands on the meta tensor and is lost, so
++                    # the draft model's sinks would keep their dummy values.
++                    weight_loader = getattr(param, "weight_loader", default_weight_loader)
+                     if enable_dsa_cp():
+-                        narrow = loaded_weight
++                        weight_loader(param, loaded_weight)
+                     else:
+-                        narrow = loaded_weight[head_start:head_end]
+-                    with torch.no_grad():
+-                        params_dict[name].copy_(narrow)
++                        # Handle attention sinks (distributed across ranks)
++                        weight_loader(param, loaded_weight[head_start:head_end])
+                     loaded_params.add(name)
+                     continue
+                 param = params_dict[name]
+diff --git a/vllm_ascend/models/deepseek_v4/model.py b/vllm_ascend/models/deepseek_v4/model.py
+index 5eb9b8ed9..7e3d8b4cc 100644
+--- a/vllm_ascend/models/deepseek_v4/model.py
++++ b/vllm_ascend/models/deepseek_v4/model.py
+@@ -1222,12 +1222,20 @@ class AscendDeepseekV4ForCausalLM(nn.Module, SupportsPP, DeepseekV2MixtureOfExpe
+                 if is_pp_missing_parameter(name, self):
+                     continue
+                 param = params_dict[name]
++                # Route the write through the parameter's loader. A live weight
++                # update runs inside vLLM's layerwise reload, which parks the
++                # layer on the meta device and buffers every load made through
++                # ``weight_loader`` so it can replay it onto the materialized
++                # layer. A direct ``param.data.copy_`` bypasses that buffer: it
++                # lands on the meta tensor (a no-op), so attention sinks would
++                # silently keep their dummy values after an update.
++                weight_loader = getattr(param, "weight_loader", default_weight_loader)
+                 if enable_dsa_cp():
+-                    param.data.copy_(loaded_weight)
++                    weight_loader(param, loaded_weight)
+                 else:
+                     # Handle attention sinks (distributed across ranks)
+                     narrow_weight = loaded_weight.narrow(0, head_start, heads_per_rank)
+-                    param.data.copy_(narrow_weight)
++                    weight_loader(param, narrow_weight)
+                 loaded_params.add(name)
+                 continue
+ 
+diff --git a/vllm_ascend/models/deepseek_v4/mtp.py b/vllm_ascend/models/deepseek_v4/mtp.py
+index 3704780a5..a07de7cd5 100644
+--- a/vllm_ascend/models/deepseek_v4/mtp.py
++++ b/vllm_ascend/models/deepseek_v4/mtp.py
+@@ -373,12 +373,18 @@ class DeepSeekV4MTP(nn.Module, SupportsPP, DeepseekV2MixtureOfExperts):
+ 
+             if "sink" in name:
+                 param = params_dict[name]
++                # Route the write through the parameter's loader: a live weight
++                # update runs inside vLLM's layerwise reload, which parks the
++                # layer on the meta device and only replays loads made through
++                # ``weight_loader``. A direct ``param.data.copy_`` lands on the
++                # meta tensor and is lost, leaving the sink at its dummy value.
++                weight_loader = getattr(param, "weight_loader", default_weight_loader)
+                 if enable_dsa_cp():
+-                    param.data.copy_(loaded_weight)
++                    weight_loader(param, loaded_weight)
+                 else:
+                     # Handle attention sinks (distributed across ranks)
+                     narrow_weight = loaded_weight.narrow(0, head_start, heads_per_rank)
+-                    param.data.copy_(narrow_weight)
++                    weight_loader(param, narrow_weight)
+                 loaded_params.add(name)
+                 continue
+ 

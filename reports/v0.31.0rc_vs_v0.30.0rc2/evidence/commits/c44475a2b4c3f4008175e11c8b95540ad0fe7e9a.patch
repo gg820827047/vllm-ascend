@@ -1,0 +1,207 @@
+commit c44475a2b4c3f4008175e11c8b95540ad0fe7e9a
+Author:     liben <61270660+q664171689@users.noreply.github.com>
+AuthorDate: Fri Oct 16 09:27:56 2026 +0800
+Commit:     GitHub <noreply@github.com>
+CommitDate: Fri Oct 16 09:27:56 2026 +0800
+
+    [BugFix][KDA] Match fallback compiled launches to Triton signatures (#18672)
+    
+    ### What this PR does / why we need it?
+    
+    Kimi K3 prefill can fail in `StridedKDAFallbackPlan._copy` with:
+    
+    ```text
+    TypeError: launch expects 13 arguments, got 12
+    ```
+    
+    The fallback prepares `batch_memcpy_kernel` with `BLOCK_SIZE=8192`, then
+    directly invokes the retained compiled kernel with only three runtime
+    arguments. Triton 3.6 retains the constexpr slot in the launcher
+    signature, so the direct call is missing one argument.
+    
+    Inspect the compiled source signature once during preparation and retain
+    the optional constexpr argument for gather/scatter launches. Older
+    signatures without constexpr slots keep their three-argument call. A
+    shared constant keeps preparation and launch values aligned. The
+    compiled-kernel protocol declares the source signature for static type
+    checking. Serving continues to bypass JIT, with no version parsing or
+    exception retry.
+    
+    This change is limited to the byte-copy fallback introduced by #17614.
+    The optimized `KDAStateCopyPlan` launcher addressed by #17913 is
+    unchanged.
+    
+    ### Does this PR introduce _any_ user-facing change?
+    
+    Fixes the KDA fallback launcher argument-count error with launchers that
+    retain constexpr arguments. No API or configuration changes.
+    
+    ### How was this patch tested?
+    
+    - Regression coverage is in
+    `tests/e2e/nightly/single_node/ops/singlecard_ops/test_kda_state_copy_integration.py`.
+    No standalone `tests/ut` file is added.
+    - Earlier focused validation on Ascend A3 reproduced the exact error
+    with the unpatched fallback. The fix passed **16 NPU cases**: four
+    existing automatic FP16 fallback cases and twelve new real-launcher
+    cases covering FP32/BF16/FP16, INT32/INT64 indices, gather/scatter,
+    invalid rows, initial-state flags, offset/gapped storage, and payloads
+    extending beyond the 8192-byte tile. Tests forbid JIT/compiler entry
+    after preparation and check copied data and untouched cache backing.
+    - GitHub pre-commit (including mypy), DCO, and both CPU test matrix jobs
+    passed at `99351e2`, before the standalone unit test file was removed.
+    CI for the latest revision is pending. The previous CI gate required a
+    maintainer's test-enabling label for the remaining precision/full tests.
+    - `git diff --check` passed for the unit test removal; production code
+    and NPU integration tests are unchanged by that removal.
+    
+    Focused NPU test command:
+    
+    ```bash
+    pytest -q tests/e2e/nightly/single_node/ops/singlecard_ops/test_kda_state_copy_integration.py -k fallback
+    ```
+    
+    The earlier hardware validation used an isolated candidate module and
+    test files with installed Python 3.11.10, torch 2.10.0, torch-npu
+    2.10.0.post7, Triton 3.6.0, triton-ascend 3.6.0+dev20261007182438, and
+    vLLM 0.30.0. Its harness bypassed repository-wide conftest
+    initialization. These results establish focused operator behavior, not
+    full-model serving or the full branch CI matrix. Compatibility with an
+    installed older Triton runtime has not been hardware-tested.
+    
+    AI assistance: Codex assisted with implementation, validation, and PR
+    preparation.
+    
+    
+    - vLLM main:
+    https://github.com/vllm-project/vllm/commit/c4df37dfcc7f72ca41cd43801a468526ecf99a2b
+    
+    ---------
+    
+    Signed-off-by: q664171689 <664171689@qq.com>
+    Co-authored-by: Codex <noreply@openai.com>
+
+diff --git a/tests/e2e/nightly/single_node/ops/singlecard_ops/test_kda_state_copy_integration.py b/tests/e2e/nightly/single_node/ops/singlecard_ops/test_kda_state_copy_integration.py
+index a8979e343..5498e03f2 100644
+--- a/tests/e2e/nightly/single_node/ops/singlecard_ops/test_kda_state_copy_integration.py
++++ b/tests/e2e/nightly/single_node/ops/singlecard_ops/test_kda_state_copy_integration.py
+@@ -318,6 +318,41 @@ def test_auto_fp16_fallback_is_precompiled(monkeypatch, index_dtype, page_stride
+         torch.testing.assert_close(backing.cpu(), expected_backing, rtol=0, atol=0)
+ 
+ 
++@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16, torch.float16])
++@pytest.mark.parametrize("index_dtype", [torch.int32, torch.int64])
++@pytest.mark.parametrize("to_cache", [False, True])
++@torch.inference_mode()
++def test_fallback_direct_launch_with_constexpr_and_byte_tail(monkeypatch, dtype, index_dtype, to_cache):
++    """Exercise the real fallback launcher beyond one byte-copy tile, without JIT."""
++    from vllm_ascend.ops import kda_state_copy_plan as production
++
++    payload, stride = 4097, 4113
++    backing = torch.full((4 * stride + 1,), -23, dtype=dtype, device="npu")
++    state = backing.as_strided((4, 1, 1, payload), (stride, payload, payload, 1), 1)
++    state.copy_(torch.arange(4, device="npu")[:, None, None, None])
++    initial = backing.cpu()
++    plan = production.StridedKDAFallbackPlan.prepare(state, 4)
++    plan.seal()
++    torch.testing.assert_close(backing.cpu(), initial, rtol=0, atol=0)
++    _forbid_compilation(monkeypatch)
++    monkeypatch.setattr(production.batch_memcpy_kernel, "run", Mock(side_effect=AssertionError("serving JIT")))
++    ids = torch.tensor([3, -1, 4, 0], dtype=index_dtype, device="npu")
++    if to_cache:
++        packed = torch.full((4, 1, 1, payload), 17, dtype=dtype, device="npu")
++        plan.scatter(state, packed, ids)
++        expected = initial.clone()
++        view = expected.as_strided(state.shape, state.stride(), 1)
++        view[[3, 0]] = 17
++        torch.testing.assert_close(backing.cpu(), expected, rtol=0, atol=0)
++    else:
++        flags = torch.tensor([True, True, True, False], device="npu")
++        packed = plan.gather(state, ids, flags)
++        expected = torch.zeros((4, 1, 1, payload), dtype=dtype)
++        expected[0].fill_(3)
++        torch.testing.assert_close(packed.cpu(), expected, rtol=0, atol=0)
++        torch.testing.assert_close(backing.cpu(), initial, rtol=0, atol=0)
++
++
+ @torch.inference_mode()
+ def test_scatter_graph_replay_int64_extremes(monkeypatch):
+     """Graph replay consumes dynamic INT64 values, including invalid extremes."""
+diff --git a/vllm_ascend/ops/kda_state_copy_plan.py b/vllm_ascend/ops/kda_state_copy_plan.py
+index 81d26c129..cda683e16 100644
+--- a/vllm_ascend/ops/kda_state_copy_plan.py
++++ b/vllm_ascend/ops/kda_state_copy_plan.py
+@@ -32,6 +32,9 @@ if TYPE_CHECKING:
+     from vllm_ascend.ops.triton.kda_state_copy_kernel import _CompiledKernel
+ 
+ 
++_FALLBACK_COPY_BLOCK_SIZE = 8192
++
++
+ def supports_kda_state_copy(state: torch.Tensor) -> bool:
+     """Match PR #17301's A5 FP32/BF16 dense-payload capability predicate.
+ 
+@@ -257,6 +260,7 @@ class StridedKDAFallbackPlan:
+     _state_bytes: int
+     _configuration: tuple[str, str, tuple[tuple[str, str], ...]]
+     _compiled: _CompiledKernel
++    _launch_constants: tuple[int, ...]
+     _layer_name: str
+ 
+     @classmethod
+@@ -285,7 +289,13 @@ class StridedKDAFallbackPlan:
+             src = torch.tensor([source.data_ptr()], dtype=torch.int64, device=state.device)
+             dst = torch.tensor([dest.data_ptr()], dtype=torch.int64, device=state.device)
+             size = torch.tensor([32], dtype=torch.int64, device=state.device)
+-            plan._compiled = batch_memcpy_kernel[(1,)](src, dst, size, BLOCK_SIZE=8192)
++            plan._compiled = batch_memcpy_kernel[(1,)](src, dst, size, BLOCK_SIZE=_FALLBACK_COPY_BLOCK_SIZE)
++            # Newer Triton launchers retain constexpr slots; older signatures
++            # contain only runtime arguments. Resolve this once during prepare
++            # so direct serving launches match the compiled kernel's ABI.
++            plan._launch_constants = (
++                (_FALLBACK_COPY_BLOCK_SIZE,) if "constexpr" in plan._compiled.src.signature.values() else ()
++            )
+             torch.npu.synchronize()
+         return plan
+ 
+@@ -323,7 +333,7 @@ class StridedKDAFallbackPlan:
+             packed.zero_()
+             src, dst = cache_ptrs, packed_ptrs
+         with torch.npu.device(state.device):
+-            self._compiled[(count, 1, 1)](src, dst, sizes)
++            self._compiled[(count, 1, 1)](src, dst, sizes, *self._launch_constants)
+ 
+     def gather(self, state, indices, flags):
+         """Gather valid rows and clear false flags without any serving JIT."""
+diff --git a/vllm_ascend/ops/triton/kda_state_copy_kernel.py b/vllm_ascend/ops/triton/kda_state_copy_kernel.py
+index 0552bc494..0586494ef 100644
+--- a/vllm_ascend/ops/triton/kda_state_copy_kernel.py
++++ b/vllm_ascend/ops/triton/kda_state_copy_kernel.py
+@@ -23,7 +23,7 @@ Cache and packed storage must not overlap. Concurrent writers are unsupported.
+ from __future__ import annotations
+ 
+ import os
+-from collections.abc import Callable
++from collections.abc import Callable, Mapping
+ from typing import TYPE_CHECKING, Protocol
+ 
+ import torch
+@@ -31,9 +31,18 @@ from vllm.triton_utils import tl, triton
+ 
+ if TYPE_CHECKING:
+ 
++    class _CompiledKernelSource(Protocol):
++        """Source metadata needed to match a compiled launcher's arguments."""
++
++        @property
++        def signature(self) -> Mapping[str, str]: ...
++
+     class _CompiledKernel(Protocol):
+         """Structural launch interface for vendor Triton kernels without stubs."""
+ 
++        @property
++        def src(self) -> _CompiledKernelSource: ...
++
+         def __getitem__(self, grid: tuple[int, int, int]) -> Callable[..., object]: ...
+ 
+ 

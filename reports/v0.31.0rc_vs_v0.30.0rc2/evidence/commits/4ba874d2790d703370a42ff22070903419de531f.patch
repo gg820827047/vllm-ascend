@@ -1,0 +1,122 @@
+commit 4ba874d2790d703370a42ff22070903419de531f
+Author:     zhenwenqi2024 <155598497+zhenwenqi2024@users.noreply.github.com>
+AuthorDate: Tue Oct 13 10:13:50 2026 +0800
+Commit:     GitHub <noreply@github.com>
+CommitDate: Tue Oct 13 10:13:50 2026 +0800
+
+    [BugFix][MoE] Preserve MiniMax-M3 prequantized shared Down input (#18396)
+    
+    ### What this PR does / why we need it?
+    
+    MiniMax-M3 on Ascend A5 with W8A8-MXFP8 shared experts can return a
+    pre-quantized `(activation, scale)` tuple from its SwiGLU-OAI
+    activation. With shared-expert multistream overlap enabled,
+    `_prepare_linear_input_for_overlap` passes that tuple into
+    `prepare_input_for_overlap`, which assumes a Tensor and calls `x.dim()`.
+    This causes `AttributeError: 'tuple' object has no attribute 'dim'`
+    (seen in [this nightly
+    job](https://github.com/vllm-project/vllm-ascend/actions/runs/38200792613/job/114654898426)).
+    
+    Accept the existing `LinearInput` contract at the overlap preparation
+    boundary. Already-prepared inputs pass unchanged to the registered Down
+    projection, preserving the quantized tensor and scale without a second
+    quantization. Plain Tensor inputs still use the scheme-owned early
+    preparation path. Add a regression test that exercises the
+    linear-wrapper Down stage with a tuple activation and verifies the
+    scheme is not called again.
+    
+    ### Does this PR introduce _any_ user-facing change?
+    
+    Yes. It prevents this MiniMax-M3 MXFP8 multistream path from failing
+    during model execution. No CLI or API changes.
+    
+    ### How was this patch tested?
+    
+    - `ruff check vllm_ascend/ops/fused_moe/shared_experts.py
+    tests/ut/ops/test_fused_moe.py` — passed.
+    - `ruff format --check vllm_ascend/ops/fused_moe/shared_experts.py
+    tests/ut/ops/test_fused_moe.py` — passed.
+    - `python -m compileall -q vllm_ascend/ops/fused_moe/shared_experts.py
+    tests/ut/ops/test_fused_moe.py` — passed.
+    - `git diff --check` — passed.
+    - Targeted pytest was attempted, but the local Windows environment does
+    not have `vllm` or `torch_npu`; collection stops with
+    `ModuleNotFoundError: No module named 'vllm'`. A5 NPU eager and ACL
+    graph validation is still required before marking this PR ready for
+    review.
+    
+    AI assistance was used to prepare this change; the submitter should
+    review every changed line and validate the model path on NPU before
+    requesting review.
+    
+    - vLLM main:
+    https://github.com/vllm-project/vllm/commit/8cc9aa5ad350f6f80cf3bebb298d410803ff75a9
+    
+    Signed-off-by: zhenwenqi2024 <zhenwenqi_2022@qq.com>
+
+diff --git a/tests/ut/ops/test_fused_moe.py b/tests/ut/ops/test_fused_moe.py
+index 8f9daae1c..387e2239b 100644
+--- a/tests/ut/ops/test_fused_moe.py
++++ b/tests/ut/ops/test_fused_moe.py
+@@ -1598,6 +1598,41 @@ def test_linear_wrapper_prepares_gate_input_before_router_stage(monkeypatch):
+     assert prepared_down_input.output_dtype == torch.bfloat16
+ 
+ 
++def test_linear_wrapper_preserves_prequantized_activation_for_down_proj(monkeypatch):
++    quant_scheme = AscendW8A8MXFP8DynamicLinearMethod.__new__(AscendW8A8MXFP8DynamicLinearMethod)
++    down_proj = MagicMock(return_value=(torch.randn(2, 4), None))
++    down_proj.quant_method = SimpleNamespace(quant_method=quant_scheme)
++    shared_experts = AscendSharedExperts.__new__(AscendSharedExperts)
++    shared_experts.layer = SimpleNamespace(down_proj=down_proj)
++    shared_experts.multistream_overlap = True
++    shared_experts.lora_context = None
++    shared_experts._wait_for_routed_stage = MagicMock()
++
++    hidden_states = torch.randn(2, 4)
++    quantized = torch.ones(2, 4, dtype=torch.float8_e4m3fn)
++    scale = torch.ones(2, 1)
++    prequantized_activation = (quantized, scale)
++    shared_experts.apply_activation = MagicMock(return_value=prequantized_activation)
++    submitted_gate_up = SubmittedSharedExpertGateUp(
++        hidden_states=hidden_states,
++        gate_up=torch.randn(2, 8),
++        gate_up_input_scale=None,
++        local_dp_metadata=None,
++        path=SharedExpertMLPPath.LINEAR_WRAPPER,
++    )
++    monkeypatch.setattr(shared_experts_module, "has_lora", lambda _: False)
++
++    with patch.object(
++        quant_scheme, "prepare_input_for_overlap", wraps=quant_scheme.prepare_input_for_overlap
++    ) as prepare:
++        result = shared_experts._finish_linear_wrapped_mlp(submitted_gate_up, RoutedMoEMilestones())
++
++    assert result is down_proj.return_value[0]
++    prepare.assert_not_called()
++    down_proj.assert_called_once_with(prequantized_activation)
++    assert down_proj.call_args.args[0] is prequantized_activation
++
++
+ @pytest.mark.parametrize(
+     "device_type",
+     [
+diff --git a/vllm_ascend/ops/fused_moe/shared_experts.py b/vllm_ascend/ops/fused_moe/shared_experts.py
+index 871d05a0d..2a2ae246d 100644
+--- a/vllm_ascend/ops/fused_moe/shared_experts.py
++++ b/vllm_ascend/ops/fused_moe/shared_experts.py
+@@ -437,11 +437,14 @@ class AscendSharedExperts:
+     def _prepare_linear_input_for_overlap(
+         self,
+         layer: torch.nn.Module,
+-        hidden_states: torch.Tensor,
++        hidden_states: LinearInput,
+     ) -> LinearInput:
+         """Run scheme-owned Vector/AIV preparation before a stage barrier."""
+         if not self.multistream_overlap or has_lora(self.lora_context):
+             return hidden_states
++        if not isinstance(hidden_states, torch.Tensor):
++            # Activation may have already quantized the Down input and scale.
++            return hidden_states
+ 
+         linear_method = getattr(layer, "quant_method", None)
+         quant_scheme = getattr(linear_method, "quant_method", linear_method)

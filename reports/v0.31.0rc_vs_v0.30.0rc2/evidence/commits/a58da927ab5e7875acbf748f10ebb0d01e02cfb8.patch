@@ -1,0 +1,1034 @@
+commit a58da927ab5e7875acbf748f10ebb0d01e02cfb8
+Author:     Yizhou <136800916+yiz-liu@users.noreply.github.com>
+AuthorDate: Thu Oct 15 19:32:03 2026 +0800
+Commit:     GitHub <noreply@github.com>
+CommitDate: Thu Oct 15 19:32:03 2026 +0800
+
+    [Feature][Model] Support DeepSeek V4.1 decoder bounded replay (#17496)
+    
+    ### What this PR does / why we need it?
+    
+    Add decoder bounded replay for DeepSeek V4.1 on Ascend MRV2, following
+    vllm-project/vllm#58132.
+    
+    For eligible prefill requests, layers after the last KV-source layer
+    process only the final sliding-window tokens. Earlier layers process the
+    full batch. Decode tokens and rows required for prompt logprobs are
+    preserved.
+    
+    - Prepare replay batches and independent attention metadata through the
+    MRV2 model-state hook.
+    - Coordinate replay decisions and token counts across DP ranks,
+    including idle ranks.
+    - Gather rows, positions, query boundaries, and slot mappings with a
+    Triton kernel.
+    - Handle sequence-parallel states and DSA CP indexer buffers, then
+    scatter retained outputs and auxiliary hidden states back to their
+    original positions.
+    - Reuse upstream Ascend SWA visibility bounds and preserve encoder-side
+    replay boundaries for prefix-cache hits.
+    
+    The implementation targets MRV2 only and adds no MRV1 runner changes.
+    
+    ### Does this PR introduce _any_ user-facing change?
+    
+    Yes. Decoder replay is controlled by `swa_bounded_replay=True` in `LLM`,
+    or `--swa-bounded-replay` in the CLI.
+    
+    Supported configurations require MRV2 and `NONE` or `FULL_DECODE_ONLY`.
+    Trimming runs only in eager steps; graph steps retain the full batch.
+    Prefix caching uses the existing encoder-side bounded replay support.
+    
+    Sequence parallelism requires DSA CP. Speculative decoding is limited to
+    DSpark with a compatible sliding window. MRV1, PP, PCP, DCP,
+    microbatching, LoRA, and configurations with Engram layers after the
+    replay boundary disable decoder replay with a warning.
+    
+    ### How was this patch tested?
+    
+    Waiting to be tested.
+    
+    
+    - vLLM main:
+    https://github.com/vllm-project/vllm/commit/c4df37dfcc7f72ca41cd43801a468526ecf99a2b
+    
+    Signed-off-by: Yizhou Liu <liu_yizhou@outlook.com>
+
+diff --git a/.github/workflows/scripts/estimated_times.yaml b/.github/workflows/scripts/estimated_times.yaml
+index 06c8a8e6a..2fa07ec6c 100644
+--- a/.github/workflows/scripts/estimated_times.yaml
++++ b/.github/workflows/scripts/estimated_times.yaml
+@@ -63,6 +63,7 @@ estimated_times:
+   tests/e2e/pull_request/one_card/test_cpu_offloading.py: 250
+   tests/e2e/pull_request/one_card/test_ec_cpu_offload.py: 1200
+   tests/e2e/pull_request/one_card/test_cpu_weight_offload.py: 530
++  tests/e2e/pull_request/one_card/test_decoder_replay.py: 60
+   tests/e2e/pull_request/one_card/test_gdn_stable_argsort.py: 60
+   tests/e2e/pull_request/one_card/test_guided_decoding.py: 690
+   tests/e2e/pull_request/one_card/test_minicpm.py: 330
+diff --git a/tests/e2e/pull_request/one_card/test_decoder_replay.py b/tests/e2e/pull_request/one_card/test_decoder_replay.py
+new file mode 100644
+index 000000000..401840db6
+--- /dev/null
++++ b/tests/e2e/pull_request/one_card/test_decoder_replay.py
+@@ -0,0 +1,46 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++
++import torch
++
++from vllm_ascend.ops.triton.decoder_replay import gather_replay_batch
++
++
++def test_decoder_replay_gather_preserves_slots_and_prefix_floor():
++    device = torch.device("npu")
++    query = torch.tensor([0, 1, 7, 13], dtype=torch.int32, device=device)
++    dropped = torch.tensor([0, 0, 4, 4], dtype=torch.int32, device=device)
++    seq_lens = torch.tensor([20, 16, 13], dtype=torch.int32, device=device)
++    encoder_start = torch.tensor([19, 12, 9], dtype=torch.int32, device=device)
++    positions = torch.arange(13, device=device)
++    source_slots = torch.arange(32, device=device).reshape(2, 16)[:, :13]
++    rows = torch.empty(12, dtype=torch.int64, device=device)
++    offsets = torch.empty(4, dtype=torch.int32, device=device)
++    replay_positions = torch.empty_like(rows)
++    slots = torch.empty((2, 16), dtype=torch.int64, device=device)[:, :12]
++    starts = torch.empty(3, dtype=torch.int32, device=device)
++
++    gather_replay_batch(
++        query,
++        dropped,
++        seq_lens,
++        encoder_start,
++        positions,
++        source_slots,
++        rows,
++        offsets,
++        replay_positions,
++        slots,
++        starts,
++        12,
++        2,
++    )
++
++    retained = torch.tensor([0, 5, 6, 7, 8, 9, 10, 11, 12], device=device)
++    torch.testing.assert_close(rows[:9], retained)
++    torch.testing.assert_close(rows[9:], torch.zeros(3, dtype=torch.int64, device=device))
++    torch.testing.assert_close(replay_positions[:9], positions[retained])
++    torch.testing.assert_close(slots[:, :9], source_slots[:, retained])
++    torch.testing.assert_close(slots[:, 9:], torch.full((2, 3), -1, dtype=torch.int64, device=device))
++    assert offsets.cpu().tolist() == [0, 1, 3, 9]
++    assert starts.cpu().tolist() == [19, 14, 9]
+diff --git a/tests/ut/models/test_deepseek_v41_decoder_replay.py b/tests/ut/models/test_deepseek_v41_decoder_replay.py
+new file mode 100644
+index 000000000..1c6221dad
+--- /dev/null
++++ b/tests/ut/models/test_deepseek_v41_decoder_replay.py
+@@ -0,0 +1,113 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++
++from contextlib import nullcontext
++from types import SimpleNamespace
++
++import pytest
++import torch
++from vllm.config import CUDAGraphMode
++
++from vllm_ascend.models.deepseek_v41 import decoder_replay_layers as replay_mod
++from vllm_ascend.models.deepseek_v41.model import DeepseekV41Model
++
++
++@pytest.mark.parametrize("use_v2", [False, True])
++def test_decoder_replay_requires_mrv2_with_prefix_caching(use_v2):
++    model = SimpleNamespace(
++        config=SimpleNamespace(kv_source_layer_ids=[0], sliding_window=2, engram_layer_ids=[]),
++        end_layer=3,
++        decoder_replay_start=3,
++        use_sequence_parallel=False,
++        _run_replay_layers=lambda *states: states,
++        topk_indices_buffer=torch.zeros(8, 2),
++        candidate_indices_buffer=torch.zeros(8, 2),
++    )
++    config = SimpleNamespace(
++        cache_config=SimpleNamespace(swa_bounded_replay=True, enable_prefix_caching=True),
++        use_v2_model_runner=use_v2,
++        parallel_config=SimpleNamespace(
++            pipeline_parallel_size=1,
++            prefill_context_parallel_size=1,
++            decode_context_parallel_size=1,
++            use_ubatching=False,
++        ),
++        compilation_config=SimpleNamespace(cudagraph_mode=CUDAGraphMode.FULL_DECODE_ONLY),
++        speculative_config=None,
++        lora_config=None,
++    )
++    replay = replay_mod.make_decoder_replay(model, config)
++    assert (replay is not None) == use_v2
++    assert model.decoder_replay_start == (1 if use_v2 else 3)
++
++
++def test_replay_scatter_preserves_row_zero_with_padding(monkeypatch):
++    monkeypatch.setattr(replay_mod, "enable_dsa_cp", lambda: False)
++    buffer = torch.arange(6).reshape(6, 1)
++    hidden = torch.arange(6, dtype=torch.float32).reshape(6, 1)
++    replay = replay_mod.AscendDecoderReplayLayers(
++        2, lambda hidden, mix, positions, ids: (hidden + 10, mix, hidden + 20), [buffer]
++    )
++    replay.rows = torch.tensor([0, 4, 5, 0])
++    replay.num_actual_rows = 3
++    replay.context_factory = nullcontext
++    output, mix, aux = replay(hidden, hidden, torch.arange(6), None)
++    assert output[:, 0].tolist() == [10, 0, 0, 0, 14, 15]
++    assert aux[:, 0].tolist() == [20, 0, 0, 0, 24, 25]
++    assert mix[:, 0].tolist() == [0, 0, 0, 0, 4, 5]
++    assert buffer[:4, 0].tolist() == [0, 4, 5, 0]
++
++
++def test_replay_without_rows_keeps_inputs():
++    hidden = torch.arange(6)
++    replay = replay_mod.AscendDecoderReplayLayers(2, lambda *states: states, [])
++    assert replay(hidden, None) == (hidden, None)
++
++
++def test_model_replays_only_layers_after_kv_sources(monkeypatch):
++    monkeypatch.setattr(replay_mod, "enable_dsa_cp", lambda: False)
++    seen = []
++
++    class Layer:
++        engram = None
++
++        def __init__(self, index):
++            self.layer_idx = index
++
++        def __call__(self, positions, hidden, mix, unused, input_ids):
++            seen.append((self.layer_idx, positions.tolist()))
++            return hidden + 1, mix
++
++        @staticmethod
++        def hc_collapse(hidden, mix):
++            return hidden.mean(dim=1)
++
++    model = DeepseekV41Model.__new__(DeepseekV41Model)
++    torch.nn.Module.__init__(model)
++    model.hc_mult = 1
++    model.use_sequence_parallel = False
++    model._mtp_hidden_buffer = None
++    model.shared_attention_state = SimpleNamespace(reset=lambda: None)
++    model.layers = [Layer(i) for i in range(3)]
++    model.norm = lambda hidden: hidden
++    model.end_layer = 3
++    model.decoder_replay_start = 1
++    model.aux_hidden_state_layers = (1, 3)
++    replay = replay_mod.AscendDecoderReplayLayers(2, model._run_replay_layers, [])
++    replay.rows = torch.tensor([2, 3])
++    replay.num_actual_rows = 2
++    replay.context_factory = nullcontext
++    model.decoder_replay_layers = replay
++    output, aux = DeepseekV41Model.forward(
++        model,
++        torch.arange(4),
++        torch.arange(4),
++        None,
++        inputs_embeds=torch.ones(4, 1),
++        engram_lookups={},
++        engram_mask=torch.empty(0, dtype=torch.bool),
++    )
++    assert seen == [(0, [0, 1, 2, 3]), (1, [2, 3]), (2, [2, 3])]
++    assert output[:, 0].tolist() == [0, 0, 4, 4]
++    assert aux[0][:, 0].tolist() == [1, 1, 1, 1]
++    assert aux[1][:, 0].tolist() == [0, 0, 3, 3]
+diff --git a/tests/ut/models/test_deepseek_v41_decoder_replay_state.py b/tests/ut/models/test_deepseek_v41_decoder_replay_state.py
+new file mode 100644
+index 000000000..146d09401
+--- /dev/null
++++ b/tests/ut/models/test_deepseek_v41_decoder_replay_state.py
+@@ -0,0 +1,111 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++
++from types import SimpleNamespace
++from unittest.mock import Mock
++
++import numpy as np
++import pytest
++import torch
++from vllm.config import CUDAGraphMode
++
++from vllm_ascend.models.deepseek_v41 import decoder_replay_state as replay_mod
++from vllm_ascend.models.deepseek_v41.decoder_replay_layers import AscendDecoderReplayLayers
++from vllm_ascend.models.deepseek_v41.engram.model_state import EngramModelState
++from vllm_ascend.worker.v2.model_states.default import AscendModelState
++
++
++@pytest.fixture
++def state(monkeypatch):
++    monkeypatch.setattr(replay_mod, "enable_dsa_cp", lambda: False)
++    monkeypatch.setattr(replay_mod, "get_mrv2_in_profile_run", lambda: False)
++    config = SimpleNamespace(
++        scheduler_config=SimpleNamespace(max_num_seqs=4, max_num_batched_tokens=32),
++        parallel_config=SimpleNamespace(data_parallel_size=1, tensor_parallel_size=1),
++    )
++    layers = AscendDecoderReplayLayers(2, lambda *states: states, [])
++    state = replay_mod.DecoderReplayState(config, layers, torch.device("cpu"))
++    state.slots = torch.empty((1, 32), dtype=torch.int64)
++    monkeypatch.setattr(state, "_gather", Mock())
++    monkeypatch.setattr(state, "_build_metadata", Mock(return_value={}))
++    return state
++
++
++def inputs(*, dummy=False):
++    batch = SimpleNamespace(
++        num_reqs=3,
++        query_start_loc_np=np.array([0, 1, 7, 13], dtype=np.int32),
++        is_prefilling_np=np.array([False, True, True]),
++        idx_mapping_np=np.array([2, 0, 1]),
++        is_dummy=dummy,
++    )
++    return replay_mod.DecoderReplayInputs(batch, (), torch.empty(1, 13), [], torch.zeros(3, dtype=torch.int32))
++
++
++def test_prefill_trims_but_decode_and_prompt_logprobs_keep_rows(state):
++    state.keeps_rows[0] = True
++    state.prepare(inputs(), CUDAGraphMode.NONE)
++    assert state.num_actual_tokens == 9
++    assert state.dropped_before.np[:4].tolist() == [0, 0, 0, 4]
++    assert state._build_metadata.call_args.args[1].tolist() == [0, 1, 7, 9]
++
++
++@pytest.mark.parametrize("mode", [CUDAGraphMode.FULL, CUDAGraphMode.PIECEWISE])
++def test_graph_step_clears_previous_replay(state, mode):
++    state.layers.rows = torch.arange(2)
++    state.prepare(inputs(), mode)
++    assert state.layers.rows is None
++    state._gather.assert_not_called()
++
++
++@pytest.mark.parametrize("capture,profile", [(True, False), (False, True)])
++def test_capture_and_profile_do_not_prepare_replay(state, monkeypatch, capture, profile):
++    monkeypatch.setattr(replay_mod, "get_mrv2_in_profile_run", lambda: profile)
++    state.prepare(inputs(), CUDAGraphMode.NONE, for_capture=capture)
++    assert state.layers.rows is None
++    state._gather.assert_not_called()
++
++
++def test_idle_dp_rank_participates_when_peer_trims(state, monkeypatch):
++    state.config.parallel_config.data_parallel_size = 2
++    monkeypatch.setattr(replay_mod, "should_skip_allreduce_across_dp_group", lambda config: False)
++    monkeypatch.setattr(replay_mod, "should_skip_dp_coordination", lambda: False)
++    monkeypatch.setattr(replay_mod, "get_dp_group", lambda: SimpleNamespace(rank_in_group=0, cpu_group=None))
++
++    def agree(values, group):
++        values[:, 1] = torch.tensor([1, 2])
++
++    monkeypatch.setattr(replay_mod.dist, "all_reduce", agree)
++    state.prepare(inputs(dummy=True), CUDAGraphMode.NONE)
++    assert state.layers.rows.numel() == 13
++    assert state.dp_tokens.tolist() == [13, 2]
++    assert state.dropped_before.np[:4].tolist() == [0, 0, 0, 0]
++
++
++def test_unsynchronized_dp_does_not_trim(state, monkeypatch):
++    state.config.parallel_config.data_parallel_size = 2
++    monkeypatch.setattr(replay_mod, "should_skip_allreduce_across_dp_group", lambda config: True)
++    state.prepare(inputs(), CUDAGraphMode.NONE)
++    assert state.layers.rows is None
++    state._gather.assert_not_called()
++
++
++def test_dsa_cp_pads_replay_without_adding_actual_rows(state, monkeypatch):
++    monkeypatch.setattr(replay_mod, "enable_dsa_cp", lambda: True)
++    state.config.parallel_config.tensor_parallel_size = 4
++    state.prepare(inputs(), CUDAGraphMode.NONE)
++    assert state.layers.num_actual_rows == 5
++    assert state.layers.rows.numel() == 8
++
++
++@pytest.mark.parametrize("prompt_logprobs", [None, 0, 3])
++def test_request_reuse_refreshes_prompt_logprob_retention(state, monkeypatch, prompt_logprobs):
++    monkeypatch.setattr(AscendModelState, "add_request", lambda *args: None)
++    model_state = EngramModelState.__new__(EngramModelState)
++    model_state.decoder_replay = state
++    model_state._replay_start_np = np.zeros(4, dtype=np.int32)
++    state.keeps_rows[1] = True
++    request = SimpleNamespace(replay_start=7, sampling_params=SimpleNamespace(prompt_logprobs=prompt_logprobs))
++    model_state.add_request(1, request)
++    assert state.keeps_rows[1] == (prompt_logprobs is not None)
++    assert model_state._replay_start_np[1] == 7
+diff --git a/tests/ut/models/test_deepseek_v41_dspark.py b/tests/ut/models/test_deepseek_v41_dspark.py
+index b60b8fbcc..dd547ca1b 100644
+--- a/tests/ut/models/test_deepseek_v41_dspark.py
++++ b/tests/ut/models/test_deepseek_v41_dspark.py
+@@ -91,6 +91,7 @@ def test_target_exports_residual_entering_selected_layers(monkeypatch):
+ 
+     model = SimpleNamespace(
+         hc_mult=4,
++        decoder_replay_layers=None,
+         needs_moe_input_ids=False,
+         _mtp_hidden_buffer=None,
+         prepare_engram=lambda input_ids, positions: ({}, torch.empty(0, dtype=torch.bool)),
+diff --git a/tests/ut/models/test_deepseek_v41_hyper_connection.py b/tests/ut/models/test_deepseek_v41_hyper_connection.py
+index ea3f15fdb..926abeb70 100644
+--- a/tests/ut/models/test_deepseek_v41_hyper_connection.py
++++ b/tests/ut/models/test_deepseek_v41_hyper_connection.py
+@@ -270,6 +270,7 @@ def test_v41_target_emits_input_residual_for_selected_aux_layers():
+ 
+     model = DeepseekV41Model.__new__(DeepseekV41Model)
+     torch.nn.Module.__init__(model)
++    model.decoder_replay_layers = None
+     model.hc_mult = 2
+     model.needs_moe_input_ids = False
+     model.embed_tokens = torch.nn.Embedding(4, 3)
+diff --git a/tests/ut/models/test_engram_multistream.py b/tests/ut/models/test_engram_multistream.py
+index 8b178d77c..7fb195447 100644
+--- a/tests/ut/models/test_engram_multistream.py
++++ b/tests/ut/models/test_engram_multistream.py
+@@ -58,6 +58,7 @@ def runtime(monkeypatch):
+ def make_model():
+     model = object.__new__(model_mod.DeepseekV41Model)
+     torch.nn.Module.__init__(model)
++    model.decoder_replay_layers = None
+     model.has_engram, model.engram_dp_shared_memory = True, False
+     model._engram_overlap_enabled = True
+     model._engram_input_buffers, model._engram_prepare_stream = None, None
+diff --git a/tests/ut/models/test_engram_v2_model_state.py b/tests/ut/models/test_engram_v2_model_state.py
+index 0d7285ea9..f1fe4ef0f 100644
+--- a/tests/ut/models/test_engram_v2_model_state.py
++++ b/tests/ut/models/test_engram_v2_model_state.py
+@@ -69,6 +69,7 @@ def make_model():
+     model._engram_graph_events = {}
+     model._engram_max_tokens = 8
+     model._mtp_hidden_buffer = None
++    model.decoder_replay_layers = None
+     model.engram_rotation = torch.eye(32)
+     model.config = SimpleNamespace(engram_layer_ids=(1, 2), image_token_id=999)
+     model.layers = [
+diff --git a/tests/ut/worker/v2/test_deepseek_v41_engram_state.py b/tests/ut/worker/v2/test_deepseek_v41_engram_state.py
+index 27d60f8d2..c6b762c01 100644
+--- a/tests/ut/worker/v2/test_deepseek_v41_engram_state.py
++++ b/tests/ut/worker/v2/test_deepseek_v41_engram_state.py
+@@ -162,6 +162,7 @@ def test_full_graph_replay_metadata_is_padded_and_inactive_without_replay(monkey
+ 
+     monkeypatch.setattr(AscendModelState, "prepare_attn", fake_prepare_attn)
+     state = object.__new__(deepseek_v41.EngramModelState)
++    state.decoder_replay = None
+     state._replay_groups = (128, torch.empty(0, dtype=torch.int32))
+     state._replay_start_np = np.zeros(4, dtype=np.int32)
+     state._replay_start = Buffer(8)
+diff --git a/vllm_ascend/models/deepseek_v41/decoder_replay_layers.py b/vllm_ascend/models/deepseek_v41/decoder_replay_layers.py
+new file mode 100644
+index 000000000..38ee940ad
+--- /dev/null
++++ b/vllm_ascend/models/deepseek_v41/decoder_replay_layers.py
+@@ -0,0 +1,140 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++
++from collections.abc import Callable
++from contextlib import AbstractContextManager
++from typing import TYPE_CHECKING
++
++import torch
++from vllm.config import CUDAGraphMode, VllmConfig
++from vllm.distributed import get_tp_group, tensor_model_parallel_all_gather
++from vllm.logger import logger
++
++from vllm_ascend.utils import enable_dsa_cp
++
++if TYPE_CHECKING:
++    from .model import DeepseekV41Model
++
++
++class AscendDecoderReplayLayers:
++    """Gather and scatter the MRV2 decoder sub-batch, including sharded states."""
++
++    def __init__(
++        self,
++        window: int,
++        run_layers: Callable[..., tuple[torch.Tensor, ...]],
++        row_buffers: list[torch.Tensor],
++    ) -> None:
++        self.window = window
++        self.run_layers = run_layers
++        self.row_buffers = row_buffers
++        self.rows: torch.Tensor | None = None
++        self.context_factory: Callable[[], AbstractContextManager[None]] | None = None
++        self.num_actual_rows = 0
++        self.sequence_parallel = False
++
++    def __call__(self, *states: torch.Tensor | None) -> tuple[torch.Tensor, ...]:
++        if self.rows is None:
++            return self.run_layers(*states)
++        assert self.context_factory is not None
++        positions = states[2]
++        assert positions is not None
++        with self.context_factory():
++            rows = self.rows
++            for buffer in self.row_buffers:
++                if enable_dsa_cp():
++                    # Indexer outputs use the old CP partition; replay queries
++                    # repartition the retained rows across the same TP group.
++                    tp = get_tp_group()
++                    local_tokens = positions.shape[0] // tp.world_size
++                    global_buffer = tensor_model_parallel_all_gather(buffer[:local_tokens], dim=0)
++                    replay_tokens = rows.numel() // tp.world_size
++                    local_rows = rows[tp.rank_in_group * replay_tokens : (tp.rank_in_group + 1) * replay_tokens]
++                    buffer[:replay_tokens].copy_(global_buffer.index_select(0, local_rows))
++                else:
++                    buffer[: rows.numel()].copy_(buffer.index_select(0, rows))
++            replay_states: list[torch.Tensor | None] = []
++            for index, state in enumerate(states):
++                if state is None:
++                    replay_states.append(None)
++                    continue
++                sharded = self.sequence_parallel and index != 2
++                if sharded:
++                    state = tensor_model_parallel_all_gather(state, dim=0)
++                state = state.index_select(0, rows)
++                if sharded:
++                    state = state.chunk(get_tp_group().world_size)[get_tp_group().rank_in_group]
++                replay_states.append(state)
++            row_outputs = self.run_layers(*replay_states)
++            outputs = []
++            for index, row_output in enumerate(row_outputs):
++                # Hidden states and pre-mix are SP-local; auxiliary states
++                # have already been gathered by the model's layer loop.
++                sharded = self.sequence_parallel and index < 2
++                if sharded:
++                    row_output = tensor_model_parallel_all_gather(row_output, dim=0)
++                output = row_output.new_zeros((positions.shape[0], *row_output.shape[1:]))
++                output.index_copy_(0, rows[: self.num_actual_rows], row_output[: self.num_actual_rows])
++                if sharded:
++                    tp = get_tp_group()
++                    output = output.chunk(tp.world_size)[tp.rank_in_group]
++                outputs.append(output)
++            return tuple(outputs)
++
++
++def make_decoder_replay(model: "DeepseekV41Model", config: VllmConfig) -> AscendDecoderReplayLayers | None:
++    if not getattr(config.cache_config, "swa_bounded_replay", False):
++        return None
++    parallel = config.parallel_config
++    speculative = config.speculative_config
++    draft_config = speculative.draft_model_config if speculative is not None else None
++    draft_hf_config = getattr(draft_config, "hf_config", None)
++    draft_window = getattr(draft_hf_config, "sliding_window", None)
++    draft_layer_types = getattr(draft_hf_config, "layer_types", None) or ()
++    cut = max(model.config.kv_source_layer_ids)
++    if cut >= model.end_layer - 1:
++        return None
++    if not config.use_v2_model_runner:
++        reason = "decoder bounded replay requires MRV2"
++    elif (
++        (model.use_sequence_parallel and not enable_dsa_cp())
++        or parallel.pipeline_parallel_size > 1
++        or parallel.prefill_context_parallel_size > 1
++        or parallel.decode_context_parallel_size > 1
++        or parallel.use_ubatching
++    ):
++        reason = "SP without DSA CP, PP, PCP, DCP and microbatching need a separate replay layout"
++    elif config.compilation_config.cudagraph_mode not in (CUDAGraphMode.NONE, CUDAGraphMode.FULL_DECODE_ONLY):
++        reason = "replay prefill requires eager execution; use NONE or FULL_DECODE_ONLY"
++    elif any(layer > cut for layer in model.config.engram_layer_ids):
++        reason = "an Engram layer follows the last KV source"
++    elif speculative is not None and not speculative.use_dspark():
++        reason = "the replay adapter currently supports DSpark drafting only"
++    elif draft_config is not None and (
++        draft_window is None
++        or draft_window > model.config.sliding_window
++        or any(layer_type != "sliding_attention" for layer_type in draft_layer_types)
++    ):
++        reason = (
++            f"the drafter (sliding window {draft_window}) reads hidden states "
++            f"outside the target's {model.config.sliding_window}-token window"
++        )
++    elif config.lora_config is not None:
++        reason = "LoRA token mappings need to follow the replay batch"
++    else:
++        model.decoder_replay_start = cut + 1
++        logger.info_once(
++            "Ascend MRV2 decoder bounded replay: layers %d-%d keep each prefill's last %d tokens.",
++            cut + 1,
++            model.end_layer - 1,
++            model.config.sliding_window,
++        )
++        replay = AscendDecoderReplayLayers(
++            model.config.sliding_window,
++            model._run_replay_layers,
++            [model.topk_indices_buffer, model.candidate_indices_buffer],
++        )
++        replay.sequence_parallel = model.use_sequence_parallel
++        return replay
++    logger.warning_once("Ascend decoder bounded replay is disabled: %s.", reason)
++    return None
+diff --git a/vllm_ascend/models/deepseek_v41/decoder_replay_state.py b/vllm_ascend/models/deepseek_v41/decoder_replay_state.py
+new file mode 100644
+index 000000000..48195737c
+--- /dev/null
++++ b/vllm_ascend/models/deepseek_v41/decoder_replay_state.py
+@@ -0,0 +1,210 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++
++from collections.abc import Iterator
++from contextlib import contextmanager
++from dataclasses import dataclass
++from typing import Any
++
++import numpy as np
++import torch
++import torch.distributed as dist
++from vllm.config import CUDAGraphMode, VllmConfig
++from vllm.distributed import get_dp_group, get_tp_group, tensor_model_parallel_all_gather
++from vllm.forward_context import get_forward_context, set_forward_context
++from vllm.utils.math_utils import round_up
++from vllm.v1.utils import CpuGpuBuffer
++from vllm.v1.worker.dp_utils import should_skip_dp_coordination
++from vllm.v1.worker.utils import AttentionGroup
++
++from vllm_ascend.ascend_forward_context import get_mc2_mask, get_mrv2_in_profile_run
++from vllm_ascend.attention.dsa_v41 import AscendDSAV41Metadata, AscendDSAV41MetadataBuilder
++from vllm_ascend.attention.utils import AscendCommonAttentionMetadata
++from vllm_ascend.core.kv_cache_interface import is_circular_kv_cache_spec
++from vllm_ascend.ops.rope_dsv4 import get_cos_and_sin_dsa
++from vllm_ascend.ops.triton.decoder_replay import gather_replay_batch
++from vllm_ascend.utils import enable_dsa_cp, should_skip_allreduce_across_dp_group
++from vllm_ascend.worker.v2.input_batch import AscendInputBatch
++
++from .decoder_replay_layers import AscendDecoderReplayLayers
++
++
++@dataclass(frozen=True)
++class DecoderReplayInputs:
++    batch: AscendInputBatch
++    block_tables: tuple[torch.Tensor, ...]
++    slot_mappings: torch.Tensor
++    attn_groups: list[list[AttentionGroup]]
++    encoder_replay_start: torch.Tensor
++
++
++class DecoderReplayState:
++    def __init__(self, config: VllmConfig, layers: AscendDecoderReplayLayers, device: torch.device) -> None:
++        self.config = config
++        self.layers = layers
++        num_reqs = config.scheduler_config.max_num_seqs
++        capacity = round_up(config.scheduler_config.max_num_batched_tokens, config.parallel_config.tensor_parallel_size)
++        self.keeps_rows = np.zeros(num_reqs, dtype=np.bool_)
++        self.rows = torch.zeros(capacity, dtype=torch.int64, device=device)
++        self.positions = torch.zeros_like(self.rows)
++        self.offsets = torch.zeros(num_reqs + 1, dtype=torch.int32, device=device)
++        self.dropped_before = CpuGpuBuffer(num_reqs + 1, dtype=torch.int32, device=device, pin_memory=False)
++        self.replay_start = torch.zeros(num_reqs, dtype=torch.int32, device=device)
++        self.slots: torch.Tensor | None = None
++        self.builders: list[tuple[int, list[str], AscendDSAV41MetadataBuilder]] = []
++        self.metadata: dict[str, AscendDSAV41Metadata] = {}
++        self.num_tokens = 0
++        self.num_actual_tokens = 0
++        self.dp_tokens: torch.Tensor | None = None
++
++    def _initialize(self, inputs: DecoderReplayInputs) -> None:
++        self.slots = torch.empty(
++            (inputs.slot_mappings.shape[0], self.rows.numel()), dtype=torch.int64, device=self.rows.device
++        )
++        for group_id, groups in enumerate(inputs.attn_groups):
++            for group in groups:
++                if is_circular_kv_cache_spec(group.kv_cache_spec):
++                    continue
++                builder_cls = group.backend.get_builder_cls()
++                if issubclass(builder_cls, AscendDSAV41MetadataBuilder):
++                    builder = builder_cls(group.kv_cache_spec, group.layer_names, self.config, self.rows.device)
++                    self.builders.append((group_id, group.layer_names, builder))
++        self._gather(inputs, warmup=True)
++
++    def _gather(self, inputs: DecoderReplayInputs, *, warmup: bool = False) -> None:
++        batch = inputs.batch
++        assert self.slots is not None
++        gather_replay_batch(
++            batch.query_start_loc[: batch.num_reqs + 1],
++            self.dropped_before.gpu[: batch.num_reqs + 1],
++            batch.seq_lens,
++            inputs.encoder_replay_start,
++            batch.positions,
++            inputs.slot_mappings,
++            self.rows,
++            self.offsets,
++            self.positions,
++            self.slots,
++            self.replay_start,
++            self.num_tokens,
++            self.layers.window,
++            warmup=warmup,
++        )
++
++    def prepare(self, inputs: DecoderReplayInputs, mode: CUDAGraphMode, *, for_capture: bool = False) -> None:
++        self.layers.rows = None
++        self.layers.context_factory = None
++        if self.slots is None:
++            self._initialize(inputs)
++        if for_capture or mode != CUDAGraphMode.NONE or get_mrv2_in_profile_run():
++            return
++        parallel = self.config.parallel_config
++        if parallel.data_parallel_size > 1 and should_skip_allreduce_across_dp_group(self.config):
++            return
++        batch = inputs.batch
++        num_reqs = batch.num_reqs
++        query_lens = np.diff(batch.query_start_loc_np[: num_reqs + 1])
++        trim_requests = batch.is_prefilling_np[:num_reqs] & ~self.keeps_rows[batch.idx_mapping_np[:num_reqs]]
++        if batch.is_dummy:
++            trim_requests = np.zeros(num_reqs, dtype=np.bool_)
++        kept_lens = np.where(trim_requests, np.minimum(query_lens, self.layers.window), query_lens)
++        trims = bool((kept_lens < query_lens).any())
++        self.num_actual_tokens = int(kept_lens.sum())
++        self.num_tokens = self.num_actual_tokens
++        if enable_dsa_cp():
++            self.num_tokens = round_up(self.num_tokens, parallel.tensor_parallel_size)
++        self.dp_tokens = None
++        if parallel.data_parallel_size > 1:
++            agreed = torch.zeros((2, parallel.data_parallel_size), dtype=torch.int32)
++            agreed[:, get_dp_group().rank_in_group] = torch.tensor([trims, self.num_tokens])
++            if not should_skip_dp_coordination():
++                dist.all_reduce(agreed, group=get_dp_group().cpu_group)
++            trims = bool(agreed[0].any())
++            self.dp_tokens = agreed[1]
++        if not trims:
++            return
++        offsets = np.zeros(num_reqs + 1, dtype=np.int32)
++        np.cumsum(kept_lens, out=offsets[1:])
++        dropped = batch.query_start_loc_np[: num_reqs + 1] - offsets
++        self.dropped_before.np[: num_reqs + 1] = dropped
++        self.dropped_before.copy_to_gpu(num_reqs + 1)
++        self._gather(inputs)
++        self.metadata = self._build_metadata(inputs, offsets)
++        self.layers.rows = self.rows[: self.num_tokens]
++        self.layers.num_actual_rows = self.num_actual_tokens
++        self.layers.context_factory = self.forward_context
++
++    def _build_metadata(self, inputs: DecoderReplayInputs, offsets: np.ndarray) -> dict[str, AscendDSAV41Metadata]:
++        batch = inputs.batch
++        num_reqs = batch.num_reqs
++        assert self.slots is not None
++        positions = self.positions[: self.num_tokens]
++        rope = get_cos_and_sin_dsa(positions, use_cache=False)
++        batch_shared: dict[str, Any] = {}
++        group_shared: dict[int, dict[str, Any]] = {}
++        metadata: dict[str, AscendDSAV41Metadata] = {}
++        for group_id, layer_names, builder in self.builders:
++            common = AscendCommonAttentionMetadata(
++                query_start_loc=self.offsets[: num_reqs + 1],
++                query_start_loc_cpu=torch.from_numpy(offsets),
++                seq_lens=batch.seq_lens[:num_reqs],
++                seq_lens_cpu=torch.from_numpy(batch.seq_lens_np[:num_reqs]),
++                num_reqs=num_reqs,
++                num_actual_tokens=self.num_actual_tokens,
++                num_input_tokens=self.num_tokens,
++                max_query_len=max(int(np.diff(offsets).max()), batch.max_query_len or 0),
++                max_seq_len=self.config.model_config.max_model_len,
++                block_table_tensor=inputs.block_tables[group_id][:num_reqs],
++                slot_mapping=self.slots[group_id, : self.num_tokens],
++                positions=positions,
++                attn_state=batch.attn_state,
++                is_prefilling=torch.from_numpy(batch.is_prefilling_np[:num_reqs]),
++                replay_start=self.replay_start[:num_reqs],
++            )
++            value = builder.build(
++                0,
++                common,
++                num_actual_reqs=num_reqs,
++                common_v41_batch_metadata=batch_shared,
++                common_v41_metadata=group_shared.setdefault(group_id, {}),
++                rope_views=rope,
++            )
++            for task in builder.take_device_metadata_tasks():
++                task.run()
++            for name in layer_names:
++                metadata[name] = value
++        return metadata
++
++    @contextmanager
++    def forward_context(self) -> Iterator[None]:
++        outer = get_forward_context()
++        mask = get_mc2_mask()
++        saved_mask = mask.clone() if mask is not None else None
++        try:
++            with set_forward_context(
++                self.metadata,
++                self.config,
++                num_tokens=self.num_tokens,
++                num_tokens_across_dp=self.dp_tokens,
++                cudagraph_runtime_mode=CUDAGraphMode.NONE,
++            ):
++                context = get_forward_context()
++                context.additional_kwargs["eplb_heat_collection_status"] = outer.additional_kwargs.get(
++                    "eplb_heat_collection_status", False
++                )
++                replay_mask = context.additional_kwargs.get("mc2_mask")
++                if replay_mask is not None:
++                    replay_mask[self.num_actual_tokens :].fill_(False)
++                if outer.is_padding is not None:
++                    padding = outer.is_padding
++                    if self.layers.sequence_parallel:
++                        padding = tensor_model_parallel_all_gather(padding, dim=0)
++                    context.is_padding = padding.index_select(0, self.rows[: self.num_tokens])
++                    context.is_padding[self.num_actual_tokens :].fill_(True)
++                    if self.layers.sequence_parallel:
++                        tp = get_tp_group()
++                        context.is_padding = context.is_padding.chunk(tp.world_size)[tp.rank_in_group]
++                yield
++        finally:
++            if saved_mask is not None:
++                mask.copy_(saved_mask)
+diff --git a/vllm_ascend/models/deepseek_v41/engram/model_state.py b/vllm_ascend/models/deepseek_v41/engram/model_state.py
+index afd1ca870..5ff4e22e5 100644
+--- a/vllm_ascend/models/deepseek_v41/engram/model_state.py
++++ b/vllm_ascend/models/deepseek_v41/engram/model_state.py
+@@ -28,6 +28,7 @@ from vllm.v1.kv_cache_interface import KVCacheConfig
+ from vllm.v1.utils import CpuGpuBuffer
+ from vllm.v1.worker.utils import AttentionGroup
+ 
++from vllm_ascend.models.deepseek_v41.decoder_replay_state import DecoderReplayInputs, DecoderReplayState
+ from vllm_ascend.worker.v2.attn_utils import ring_state_update_skipped
+ from vllm_ascend.worker.v2.input_batch import AscendInputBatch
+ from vllm_ascend.worker.v2.model_states.default import AscendModelState, ReplayAttnMetadata
+@@ -85,6 +86,8 @@ class EngramModelState(AscendModelState):
+         self._replay_start_np = np.zeros(self.max_num_reqs, dtype=np.int32)
+         self._replay_start = CpuGpuBuffer(self.max_num_reqs, dtype=torch.int32, device=device, pin_memory=False)
+         self._replay_groups: tuple[int, torch.Tensor] | None = None
++        layers = getattr(model, "decoder_replay_layers", None)
++        self.decoder_replay = DecoderReplayState(vllm_config, layers, device) if layers is not None else None
+         depth = model.token_lookback_depth
+         self.lookback_token_ids: torch.Tensor | None = None
+         self._cg_mode: CUDAGraphMode | None = None
+@@ -103,6 +106,9 @@ class EngramModelState(AscendModelState):
+     def add_request(self, req_index: int, new_req_data) -> None:
+         super().add_request(req_index, new_req_data)
+         self._replay_start_np[req_index] = int(getattr(new_req_data, "replay_start", 0))
++        if self.decoder_replay is not None:
++            params = new_req_data.sampling_params
++            self.decoder_replay.keeps_rows[req_index] = params is not None and params.prompt_logprobs is not None
+ 
+     def finish_execution(self, *, failed: bool) -> None:
+         # Engram owns its lookup buffers and events. Keep their retirement
+@@ -176,7 +182,7 @@ class EngramModelState(AscendModelState):
+         # padded, graph-shaped buffer above.
+         if model_specific_attn_metadata is None and replay_np.any():
+             model_specific_attn_metadata = ReplayAttnMetadata(replay_start)
+-        return super().prepare_attn(
++        attn_metadata = super().prepare_attn(
+             input_batch,
+             cudagraph_mode,
+             block_tables,
+@@ -187,6 +193,13 @@ class EngramModelState(AscendModelState):
+             ubatch_idx=ubatch_idx,
+             model_specific_attn_metadata=model_specific_attn_metadata,
+         )
++        if self.decoder_replay is not None:
++            self.decoder_replay.prepare(
++                DecoderReplayInputs(input_batch, block_tables, slot_mappings, attn_groups, replay_start),
++                cudagraph_mode,
++                for_capture=for_capture,
++            )
++        return attn_metadata
+ 
+     def prepare_engram_inputs(self, input_batch: AscendInputBatch, req_states) -> dict[str, Any]:
+         model_inputs: dict[str, Any] = {}
+diff --git a/vllm_ascend/models/deepseek_v41/model.py b/vllm_ascend/models/deepseek_v41/model.py
+index f4852f38c..8e7e9bcdb 100644
+--- a/vllm_ascend/models/deepseek_v41/model.py
++++ b/vllm_ascend/models/deepseek_v41/model.py
+@@ -81,6 +81,7 @@ from .cache_config import (
+     make_swa_cache_spec,
+ )
+ from .compressor import DeepseekV41Compressor
++from .decoder_replay_layers import make_decoder_replay
+ from .engram import (
+     create_engram_hash_state,
+     engram_cpu_offload,
+@@ -1092,6 +1093,9 @@ class DeepseekV41Model(nn.Module, EagleModelMixin):
+             swa_cache_layer = self.layers[config.engram_layer_ids[0]].self_attn.dsa_attn.swa_cache_layer
+             self.engram_hash = create_engram_hash_state(vllm_config, config, swa_cache_layer)
+ 
++        self.decoder_replay_start = self.end_layer
++        self.decoder_replay_layers = make_decoder_replay(self, vllm_config)
++
+     def _make_empty_intermediate_tensors(self, batch_size, dtype, device):
+         return IntermediateTensors(
+             {
+@@ -1563,6 +1567,13 @@ class DeepseekV41Model(nn.Module, EagleModelMixin):
+         last_layer = None
+         aux_hidden_states = []
+         for layer in self.layers:
++            if self.decoder_replay_layers is not None and layer.layer_idx == self.decoder_replay_start:
++                hidden_states, pre_mix, *late_aux = self.decoder_replay_layers(
++                    hidden_states, pre_mix, positions, input_ids
++                )
++                aux_hidden_states.extend(late_aux)
++                last_layer = self.layers[self.end_layer - 1]
++                break
+             last_layer = layer
+             # DSpark consumes the residual stream entering its configured
+             # target layers. The runner expresses checkpoint IDs as one-based.
+@@ -1616,6 +1627,18 @@ class DeepseekV41Model(nn.Module, EagleModelMixin):
+             return hidden_states, aux_hidden_states
+         return hidden_states
+ 
++    def _run_replay_layers(self, hidden_states, pre_mix, positions, input_ids):
++        aux = []
++        for layer_idx in range(self.decoder_replay_start, self.end_layer):
++            layer = self.layers[layer_idx]
++            if layer.layer_idx + 1 in self.aux_hidden_state_layers:
++                residual = hidden_states.mean(dim=1)
++                if self.use_sequence_parallel:
++                    residual = sp_all_gather(residual)[: positions.shape[0]]
++                aux.append(residual)
++            hidden_states, pre_mix = layer(positions, hidden_states, pre_mix, None, input_ids=input_ids)
++        return hidden_states, pre_mix, *aux
++
+ 
+ class AscendDeepseekV41LLMForCausalLM(nn.Module, DeepseekV41MixtureOfExperts, SupportsPP, SupportsLoRA, SupportsEagle3):
+     packed_modules_mapping = {"gate_up_proj": ["gate_proj", "up_proj"]}
+@@ -1742,6 +1765,10 @@ class AscendDeepseekV41LLMForCausalLM(nn.Module, DeepseekV41MixtureOfExperts, Su
+             engram_mask_ready_event=engram_mask_ready_event,
+         )
+ 
++    @property
++    def decoder_replay_layers(self):
++        return self.model.decoder_replay_layers
++
+     @property
+     def token_lookback_depth(self) -> int:
+         """Tokens before a chunk start the engram hash needs; the runner passes
+diff --git a/vllm_ascend/models/deepseek_v41/vl_model.py b/vllm_ascend/models/deepseek_v41/vl_model.py
+index b3e4c6d12..ade0a8d09 100644
+--- a/vllm_ascend/models/deepseek_v41/vl_model.py
++++ b/vllm_ascend/models/deepseek_v41/vl_model.py
+@@ -254,6 +254,10 @@ class AscendDeepseekV41ForCausalLM(
+             cg_mode=cg_mode,
+         )
+ 
++    @property
++    def decoder_replay_layers(self):
++        return self.language_model.decoder_replay_layers
++
+     @property
+     def token_lookback_depth(self) -> int:
+         """What the runner sizes the prompt lookback buffer from."""
+diff --git a/vllm_ascend/ops/triton/decoder_replay.py b/vllm_ascend/ops/triton/decoder_replay.py
+new file mode 100644
+index 000000000..92b73350c
+--- /dev/null
++++ b/vllm_ascend/ops/triton/decoder_replay.py
+@@ -0,0 +1,115 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++
++import torch
++from vllm.triton_utils import tl, triton
++
++REPLAY_BLOCK_SIZE = 1024
++
++
++@triton.jit(do_not_specialize=["num_tokens_padded"])
++def _gather_replay_batch_kernel(
++    query_start_loc,
++    dropped_before,
++    seq_lens,
++    encoder_replay_start,
++    positions,
++    slot_mappings,
++    source_slot_stride: tl.constexpr,
++    rows_out,
++    query_start_loc_out,
++    positions_out,
++    slot_mappings_out,
++    slot_stride: tl.constexpr,
++    replay_start_out,
++    num_tokens_padded,
++    WINDOW: tl.constexpr,
++    NUM_GROUPS: tl.constexpr,
++    BLOCK: tl.constexpr,
++):
++    req = tl.program_id(0)
++    begin = tl.load(query_start_loc + req)
++    end = tl.load(query_start_loc + req + 1)
++    kept_begin = begin - tl.load(dropped_before + req)
++    kept_end = end - tl.load(dropped_before + req + 1)
++    kept_len = kept_end - kept_begin
++    if req == 0:
++        tl.store(query_start_loc_out, kept_begin)
++    tl.store(query_start_loc_out + req + 1, kept_end)
++    # Untrimmed requests also need the preceding window for their queries.
++    history = tl.where(kept_len < end - begin, 0, WINDOW - 1)
++    replay_start = tl.maximum(tl.load(seq_lens + req) - kept_len - history, 0)
++    replay_start = tl.maximum(replay_start, tl.load(encoder_replay_start + req))
++    tl.store(replay_start_out + req, replay_start)
++
++    first_row = end - kept_len
++    for start in range(kept_begin, kept_end, BLOCK):
++        out_rows = start + tl.arange(0, BLOCK)
++        valid = out_rows < kept_end
++        source_rows = first_row + out_rows - kept_begin
++        tl.store(rows_out + out_rows, source_rows, mask=valid)
++        pos = tl.load(positions + source_rows, mask=valid, other=0)
++        tl.store(positions_out + out_rows, pos, mask=valid)
++        for group in tl.static_range(NUM_GROUPS):
++            slots = tl.load(slot_mappings + group * source_slot_stride + source_rows, mask=valid, other=-1)
++            tl.store(slot_mappings_out + group * slot_stride + out_rows, slots, mask=valid)
++
++    if req == tl.num_programs(0) - 1:
++        # Padding gathers row zero, but must never write a cache slot.
++        first_pos = tl.load(positions)
++        for start in range(kept_end, num_tokens_padded, BLOCK):
++            out_rows = start + tl.arange(0, BLOCK)
++            valid = out_rows < num_tokens_padded
++            tl.store(rows_out + out_rows, 0, mask=valid)
++            tl.store(positions_out + out_rows, first_pos, mask=valid)
++            for group in tl.static_range(NUM_GROUPS):
++                tl.store(slot_mappings_out + group * slot_stride + out_rows, -1, mask=valid)
++
++
++def gather_replay_batch(
++    query_start_loc: torch.Tensor,
++    dropped_before: torch.Tensor,
++    seq_lens: torch.Tensor,
++    encoder_replay_start: torch.Tensor,
++    positions: torch.Tensor,
++    slot_mappings: torch.Tensor,
++    rows_out: torch.Tensor,
++    query_start_loc_out: torch.Tensor,
++    positions_out: torch.Tensor,
++    slot_mappings_out: torch.Tensor,
++    replay_start_out: torch.Tensor,
++    num_tokens_padded: int,
++    window: int,
++    *,
++    warmup: bool = False,
++) -> None:
++    """Gather an MRV2 replay batch into caller-owned buffers.
++
++    ``dropped_before`` contains cumulative discarded query rows at each request
++    boundary, calculated on the host. Device query boundaries preserve decode
++    lengths adjusted by the runner. Slot mappings have shape [groups, tokens],
++    with independent input and output row strides. Callers keep
++    decode and prompt-logprob rows and handle empty/dummy batches separately.
++    ``warmup`` compiles the kernel without reading or writing the buffers.
++    """
++    _gather_replay_batch_kernel.run(
++        query_start_loc,
++        dropped_before,
++        seq_lens,
++        encoder_replay_start,
++        positions,
++        slot_mappings,
++        slot_mappings.stride(0),
++        rows_out,
++        query_start_loc_out,
++        positions_out,
++        slot_mappings_out,
++        slot_mappings_out.stride(0),
++        replay_start_out,
++        num_tokens_padded,
++        WINDOW=window,
++        NUM_GROUPS=slot_mappings.shape[0],
++        BLOCK=REPLAY_BLOCK_SIZE,
++        grid=(query_start_loc.numel() - 1,),
++        warmup=warmup,
++    )

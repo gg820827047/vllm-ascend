@@ -1,0 +1,673 @@
+commit 1e15410985615b468f10c9c2dfef3adb7be63deb
+Author:     Z(.^Y^.)Z <72960376+zzy-6666@users.noreply.github.com>
+AuthorDate: Wed Oct 14 16:24:29 2026 +0800
+Commit:     GitHub <noreply@github.com>
+CommitDate: Wed Oct 14 16:24:29 2026 +0800
+
+    [Performance][DSpark] Stack DeepSeek V4 context WKV projections (#17263)
+    
+    ### What this PR does / why we need it?
+    
+    This PR ports the DeepSeek V4 DSpark context WKV stacking optimization
+    from upstream vLLM:
+    
+    - Upstream PR:
+    [vllm-project/vllm#54674](https://github.com/vllm-project/vllm/pull/54674)
+    
+    In the current vLLM Ascend DSpark implementation, each draft layer
+    independently applies its WKV projection to the same `context_states`.
+    This results in multiple small projection launches over identical
+    inputs.
+    
+    This PR stacks the per-layer WKV projections into a single
+    `MergedColumnParallelLinear` projection, then splits the merged output
+    back into per-layer KV states before the existing KV normalization,
+    RoPE, quantization, and KV-cache insertion logic.
+    
+    Conceptually, the context WKV path changes from multiple projections:
+    
+    ```text
+    X -> WKV_0
+    X -> WKV_1
+    X -> WKV_2
+    ```
+    
+    to a single stacked projection:
+    
+    ```text
+    X -> [WKV_0 | WKV_1 | WKV_2]
+    ```
+    
+    This reduces projection launches and improves GEMM utilization on Ascend
+    while preserving the existing DSpark KV-cache semantics.
+    
+    ### Does this PR introduce any user-facing change?
+    
+    No.
+    
+    This is an internal DSpark performance optimization and does not change
+    any public API or configuration.
+    
+    ### How was this patch tested?
+    
+    The following validation has been completed:
+    
+    - [x] Targeted unit tests
+    - [x] DeepSeek V4 DSpark real-weight model loading on Ascend
+    - [x] Real-weight `W8A8_DYNAMIC` fixed-input equivalence validation
+    - [x] Eager-mode inference smoke test
+    - [x] ACLGraph-mode inference smoke test
+    - [x] Long-context inference smoke test
+    - [x] Paired performance benchmark with Model Runner V2
+    
+    #### Targeted unit tests
+    
+    The targeted preflight and unit validation passed:
+    
+    ```bash
+    python3 tools/deepseek_v4_dspark_wkv_validation/preflight.py \
+      --ascend-repo "$ASCEND_REPO" \
+      --vllm-repo "$VLLM_REPO" \
+      --model "$MODEL_PATH"
+    ```
+    
+    Result:
+    
+    ```text
+    3 passed
+    ```
+    
+    The tests cover:
+    
+    1. Loading each draft layer's WKV checkpoint parameters into the
+    corresponding shard of the stacked projection.
+    2. Executing the stacked context WKV projection once.
+    3. Splitting the merged projection output into the correct per-layer KV
+    states.
+    4. Preserving profiling behavior when context slot mappings are
+    unavailable.
+    
+    #### Real-weight W8A8_DYNAMIC equivalence validation
+    
+    A fixed-input runtime probe was performed with the real quantized
+    checkpoint to compare the original per-layer WKV projections against the
+    new stacked projection.
+    
+    The checkpoint stores all three DSpark WKV projections using
+    `W8A8_DYNAMIC` quantization:
+    
+    ```text
+    mtp.0.attn.wkv.* => W8A8_DYNAMIC
+    mtp.1.attn.wkv.* => W8A8_DYNAMIC
+    mtp.2.attn.wkv.* => W8A8_DYNAMIC
+    ```
+    
+    For each DSpark layer, the probe verified that the corresponding slices
+    of the stacked projection contain exactly the same per-channel
+    quantization parameters as the original projection:
+    
+    ```text
+    scale_equal=True
+    offset_equal=True
+    merged_scale_shape=(512,)
+    original_scale_shape=(512,)
+    ```
+    
+    The probe then replayed the original and stacked projections on
+    identical real `context_states` for the following token counts:
+    
+    ```text
+    1, 8, 32, 128, 512, 2048
+    ```
+    
+    Validation coverage:
+    
+    - 4 tensor-parallel ranks
+    - 3 DSpark layers
+    - 6 input token counts
+    - 72 projection-output comparisons in total
+    
+    Every comparison was bitwise identical:
+    
+    ```text
+    exact=True
+    mismatch=0
+    max_abs=0
+    relative_l2=0
+    ```
+    
+    Representative output:
+    
+    ```text
+    [WKV-PROBE] layer=0 scale_equal=True offset_equal=True merged_scale_shape=(512,) original_scale_shape=(512,)
+    [WKV-PROBE] layer=1 scale_equal=True offset_equal=True merged_scale_shape=(512,) original_scale_shape=(512,)
+    [WKV-PROBE] layer=2 scale_equal=True offset_equal=True merged_scale_shape=(512,) original_scale_shape=(512,)
+    
+    [WKV-PROBE] tokens=1 layer=0 exact=True mismatch=0 max_abs=0 relative_l2=0
+    [WKV-PROBE] tokens=128 layer=1 exact=True mismatch=0 max_abs=0 relative_l2=0
+    [WKV-PROBE] tokens=512 layer=2 exact=True mismatch=0 max_abs=0 relative_l2=0
+    [WKV-PROBE] tokens=2048 layer=2 exact=True mismatch=0 max_abs=0 relative_l2=0
+    ```
+    
+    Together with the targeted unit tests, this validates that:
+    
+    1. Each layer's WKV checkpoint parameters are loaded into the correct
+    merged shard.
+    2. Per-channel `weight_scale` and `weight_offset` parameters are
+    concatenated in the correct order.
+    3. The merged output preserves the original DSpark layer ordering.
+    4. Reshaping and splitting the merged output produces the correct
+    per-layer KV tensors.
+    5. The stacked `W8A8_DYNAMIC` projection is numerically equivalent to
+    the original per-layer projections.
+    
+    Therefore, the PR's WKV weight loading, quantization-parameter
+    concatenation, layer ordering, output reshape/splitting, and
+    `W8A8_DYNAMIC` projection results are verified to be correct.
+    
+    #### Real-weight inference
+    
+    Real-weight DeepSeek V4 Flash serving was validated on Ascend 910B with:
+    
+    - Tensor parallel size: 4
+    - Expert parallelism enabled
+    - Ascend quantization
+    - DSpark speculative decoding
+    - 7 speculative tokens
+    
+    Both eager mode and ACLGraph mode started successfully and returned
+    non-empty OpenAI-compatible chat completions.
+    
+    #### Long-context smoke test
+    
+    A long-context request completed successfully with:
+    
+    ```text
+    prompt_tokens: 26084
+    completion_tokens: 32
+    ```
+    
+    #### Performance benchmark
+    
+    Performance was measured with real weights using vLLM Ascend Model
+    Runner V2 and the following configuration:
+    
+    - Tensor parallel size: 8
+    - Expert parallelism enabled
+    - Ascend quantization
+    - DSpark with 7 speculative tokens
+    - ACLGraph `FULL_DECODE_ONLY` mode
+    - Approximately 50K input tokens per request
+    - 350 output tokens per request
+    - 100 requests with maximum concurrency 6
+    - Full service restart and identical warmup before every measurement
+    
+    To reduce startup-order bias and verify reproducibility across different
+    prompt contents, the benchmark used two independent random seeds:
+    
+    - **Seed A:** three paired measurements in alternating `PR → baseline`,
+    `baseline → PR`, and `PR → baseline` order.
+    - **Seed B:** one additional independent `baseline → PR` measurement.
+    
+    All runs completed successfully with zero failed requests and identical
+    input and output token counts. The results below are calculated from the
+    within-pair PR/baseline ratios. The Seed A and overall columns use the
+    geometric mean across their paired measurements.
+    
+    | Metric | Seed A (3 pairs) | Seed B (1 pair) | Overall (4 pairs) |
+    |---|---:|---:|---:|
+    | Output token throughput | **+3.00%** | **+6.96%** | **+3.97%** |
+    | Mean TTFT | **-6.71%** | **-5.02%** | **-6.29%** |
+    | Median TTFT | **-4.98%** | **-5.81%** | **-5.19%** |
+    | P95 TTFT | **-6.75%** | **-8.99%** | **-7.31%** |
+    | P99 TTFT | **-7.31%** | **-9.40%** | **-7.84%** |
+    | Mean TPOT | **-2.96%** | **-5.19%** | **-3.52%** |
+    | Median TPOT | **-1.85%** | **-3.50%** | **-2.26%** |
+    | P95 TPOT | **-5.72%** | **-4.40%** | **-5.39%** |
+    | P99 TPOT | **-10.26%** | **-2.88%** | **-8.47%** |
+    | Mean ITL | **-4.95%** | **-6.55%** | **-5.36%** |
+    | Median ITL | **-1.40%** | **-2.34%** | **-1.63%** |
+    | P99 ITL | **-7.71%** | **-9.60%** | **-8.19%** |
+    | Mean end-to-end latency | **-3.53%** | **-5.17%** | **-3.94%** |
+    | Median end-to-end latency | **-1.34%** | **-4.98%** | **-2.26%** |
+    | P95 end-to-end latency | **-9.48%** | +1.97% | **-6.75%** |
+    | P99 end-to-end latency | **-11.70%** | **-5.89%** | **-10.28%** |
+    
+    The additional seed reproduced the improvement in output throughput and
+    all reported TTFT metrics. Across all four paired measurements, the
+    stacked WKV projection improved output token throughput by **3.97%**,
+    reduced mean TTFT by **6.29%**, and reduced P95/P99 TTFT by
+    **7.31%/7.84%**.
+    
+    These results show that the optimization consistently reduces
+    long-context prefill latency and improves serving throughput across
+    different random prompt seeds.
+    
+    ### Related PR
+    
+    - Upstream implementation:
+    [vllm-project/vllm#54674](https://github.com/vllm-project/vllm/pull/54674)
+    
+    
+    - vLLM main:
+    https://github.com/vllm-project/vllm/commit/8cc9aa5ad350f6f80cf3bebb298d410803ff75a9
+    
+    ---------
+    
+    Signed-off-by: zzy-6666 <1508736442@qq.com>
+
+diff --git a/tests/ut/models/test_deepseek_v4_dspark_context_wkv.py b/tests/ut/models/test_deepseek_v4_dspark_context_wkv.py
+new file mode 100644
+index 000000000..46b026759
+--- /dev/null
++++ b/tests/ut/models/test_deepseek_v4_dspark_context_wkv.py
+@@ -0,0 +1,174 @@
++# SPDX-License-Identifier: Apache-2.0
++
++from types import SimpleNamespace
++
++import torch
++
++from vllm_ascend.models.deepseek_v4 import dspark as dspark_module
++from vllm_ascend.models.deepseek_v4.dspark import DeepseekV4DSparkModel
++
++
++def test_context_wkv_weights_are_duplicated_by_layer():
++    weights = [
++        ("mtp.0.attn.wkv.weight", torch.arange(4)),
++        ("mtp.1.attn.wq_a.weight", torch.arange(3)),
++        ("mtp.2.attn.wkv.scale", torch.tensor(0.5)),
++        ("mtp.3.attn.wkv.weight", torch.arange(2)),
++    ]
++
++    duplicated = list(
++        dspark_module._duplicate_context_wkv_weights(
++            weights,
++            num_layers=3,
++        )
++    )
++
++    assert [name for name, _ in duplicated] == [
++        "mtp.0.attn.wkv.weight",
++        "context_wkv_proj.weight",
++        "mtp.1.attn.wq_a.weight",
++        "mtp.2.attn.wkv.scale",
++        "context_wkv_proj.scale",
++        "mtp.3.attn.wkv.weight",
++    ]
++
++    assert duplicated[1][1].shard_id == 0
++    assert duplicated[4][1].shard_id == 2
++
++    # detach() does not copy storage.
++    assert duplicated[0][1].data_ptr() == duplicated[1][1].data_ptr()
++    assert duplicated[3][1].data_ptr() == duplicated[4][1].data_ptr()
++
++
++def test_context_kv_uses_one_stacked_wkv_projection(monkeypatch):
++    projection_calls = []
++    rope = object()
++
++    stacked_output = torch.arange(
++        24,
++        dtype=torch.float32,
++    ).view(2, 12)
++
++    class StackedProjection:
++        def __call__(self, context_states):
++            projection_calls.append(context_states)
++            return stacked_output
++
++    attns = [
++        SimpleNamespace(
++            name=f"attn-{i}",
++            rotary_emb=SimpleNamespace(layername=f"layer-{i}"),
++        )
++        for i in range(3)
++    ]
++
++    monkeypatch.setattr(
++        dspark_module,
++        "get_cos_and_sin_dsa",
++        lambda positions, layer_names: rope,
++    )
++
++    layers = {
++        "40": SimpleNamespace(self_attn=attns[0]),
++        "41": SimpleNamespace(self_attn=attns[1]),
++        "42": SimpleNamespace(self_attn=attns[2]),
++    }
++
++    projected = []
++    stored = []
++
++    model = SimpleNamespace(
++        context_wkv_proj=StackedProjection(),
++        num_dspark_layers=3,
++        config=SimpleNamespace(head_dim=4),
++        layers=layers,
++    )
++
++    def project_shared_kv(kv, positions, attn, rope=None):
++        projected.append((kv.clone(), positions, attn, rope))
++        return kv.unsqueeze(1)
++
++    def store_standard_swa_kv(shared_kv, slot_mapping, attn):
++        stored.append(
++            (
++                shared_kv.clone(),
++                slot_mapping,
++                attn,
++            )
++        )
++
++    model._project_shared_kv = project_shared_kv
++    model._store_standard_swa_kv = store_standard_swa_kv
++
++    context_states = torch.zeros(2, 5)
++    positions = torch.tensor([7, 8])
++
++    slot_mappings = [
++        torch.tensor([0, 1]),
++        None,
++        torch.tensor([4, 5]),
++    ]
++
++    DeepseekV4DSparkModel.precompute_and_store_context_kv(
++        model,
++        context_states,
++        positions,
++        slot_mappings,
++    )
++
++    assert len(projection_calls) == 1
++    assert projection_calls[0] is context_states
++
++    assert len(projected) == 2
++    assert len(stored) == 2
++
++    expected = stacked_output.view(2, 3, 4)
++
++    torch.testing.assert_close(
++        projected[0][0],
++        expected[:, 0],
++    )
++    torch.testing.assert_close(
++        projected[1][0],
++        expected[:, 2],
++    )
++    assert projected[0][3] is rope
++    assert projected[1][3] is rope
++
++    assert stored[0][1] is slot_mappings[0]
++    assert stored[1][1] is slot_mappings[2]
++
++
++def test_context_kv_profiles_stacked_projection_without_slot_mappings():
++    projection_calls = []
++
++    class StackedProjection:
++        def __call__(self, context_states):
++            projection_calls.append(context_states)
++            return torch.zeros(2, 12)
++
++    model = SimpleNamespace(
++        context_wkv_proj=StackedProjection(),
++        num_dspark_layers=3,
++        config=SimpleNamespace(head_dim=4),
++        layers={str(layer_idx): SimpleNamespace(self_attn=SimpleNamespace()) for layer_idx in range(3)},
++    )
++
++    def fail_project_shared_kv(*_):
++        raise AssertionError("KV preparation must be skipped without slot mappings")
++
++    def fail_store_standard_swa_kv(*_):
++        raise AssertionError("KV cache writes must be skipped without slot mappings")
++
++    model._project_shared_kv = fail_project_shared_kv
++    model._store_standard_swa_kv = fail_store_standard_swa_kv
++
++    context_states = torch.zeros(2, 5)
++    DeepseekV4DSparkModel.precompute_and_store_context_kv(
++        model,
++        context_states,
++        torch.tensor([7, 8]),
++    )
++
++    assert len(projection_calls) == 1
++    assert projection_calls[0] is context_states
+diff --git a/tests/ut/ops/test_rope_proxy.py b/tests/ut/ops/test_rope_proxy.py
+index 5d9ec5238..02a0a8ea1 100644
+--- a/tests/ut/ops/test_rope_proxy.py
++++ b/tests/ut/ops/test_rope_proxy.py
+@@ -216,36 +216,50 @@ def test_dspark_context_rope_reuses_all_layer_configs(monkeypatch, shared_config
+     layers = {
+         name: SimpleNamespace(self_attn=SimpleNamespace(rotary_emb=SimpleNamespace(layername=name))) for name in names
+     }
++    head_dim = 4
++    stacked_kv = torch.arange(
++        states.shape[0] * len(layers) * head_dim,
++        dtype=torch.float32,
++        device="cpu",
++    ).view(states.shape[0], -1)
++    per_layer_kv = stacked_kv.view(states.shape[0], len(layers), head_dim)
+     lookup = Mock(wraps=get_cos_and_sin_dsa)
+     monkeypatch.setattr(dspark, "get_cos_and_sin_dsa", lookup)
+     seen = []
+ 
+-    def project(hidden_states, input_positions, attn, rope):
+-        assert hidden_states is states
++    def project(kv, input_positions, attn, rope):
+         assert input_positions is positions
+         cos, sin = rope
+         assert set(cos._data) == set(configs)
+         assert set(sin._data) == set(configs)
+         name = attn.rotary_emb.layername
+-        table = tables[configs[names.index(name)]]
++        layer_idx = names.index(name)
++        torch.testing.assert_close(kv, per_layer_kv[:, layer_idx])
++        table = tables[configs[layer_idx]]
+         assert torch.equal(cos[name], table[positions])
+         assert torch.equal(sin[name], -table[positions])
+         seen.append(rope)
+-        return hidden_states
++        return kv
+ 
+     model = SimpleNamespace(
++        context_wkv_proj=Mock(return_value=stacked_kv),
++        num_dspark_layers=len(layers),
++        config=SimpleNamespace(head_dim=head_dim),
+         layers=layers,
+         _project_shared_kv=Mock(side_effect=project),
+         _store_standard_swa_kv=Mock(),
+     )
+     dspark.DeepseekV4DSparkModel.precompute_and_store_context_kv(model, states, positions, slots)
+ 
++    model.context_wkv_proj.assert_called_once_with(states)
+     lookup.assert_called_once_with(positions, layer_names=names)
+     assert len(seen) == len(layers)
+     assert all(rope is seen[0] for rope in seen)
+     assert model._store_standard_swa_kv.call_count == len(layers)
+-    for call, slot, layer in zip(model._store_standard_swa_kv.call_args_list, slots, layers.values()):
+-        assert call.args[0] is states
++    for layer_idx, (call, slot, layer) in enumerate(
++        zip(model._store_standard_swa_kv.call_args_list, slots, layers.values())
++    ):
++        torch.testing.assert_close(call.args[0], per_layer_kv[:, layer_idx])
+         assert call.args[1] is slot
+         assert call.args[2] is layer.self_attn
+ 
+diff --git a/vllm_ascend/models/deepseek_v4/dspark.py b/vllm_ascend/models/deepseek_v4/dspark.py
+index f26e143ac..446084797 100644
+--- a/vllm_ascend/models/deepseek_v4/dspark.py
++++ b/vllm_ascend/models/deepseek_v4/dspark.py
+@@ -27,7 +27,10 @@ from vllm.forward_context import get_forward_context, is_forward_context_availab
+ from vllm.logger import logger
+ from vllm.model_executor.layers.fused_moe import fused_moe_make_expert_params_mapping
+ from vllm.model_executor.layers.layernorm import RMSNorm
+-from vllm.model_executor.layers.linear import ColumnParallelLinear
++from vllm.model_executor.layers.linear import (
++    ColumnParallelLinear,
++    MergedColumnParallelLinear,
++)
+ from vllm.model_executor.layers.logits_processor import LogitsProcessor
+ from vllm.model_executor.layers.vocab_parallel_embedding import (
+     ParallelLMHead,
+@@ -72,6 +75,35 @@ def _get_dspark_num_mtp_layers(config: PretrainedConfig) -> int:
+     return int(num_layers or 3)
+ 
+ 
++# NOTE: Keep this implementation identical to
++# vllm.models.deepseek_v4.nvidia.dspark._duplicate_context_wkv_weights.
++# It remains local to avoid importing the NVIDIA DSpark model module solely
++# for this weight-loading helper.
++_CONTEXT_WKV_RE = re.compile(r"^mtp\.(\d+)\.attn\.wkv\.(.+)$")
++
++
++def _duplicate_context_wkv_weights(
++    weights: Iterable[tuple[str, torch.Tensor]],
++    num_layers: int,
++) -> Iterable[tuple[str, torch.Tensor]]:
++    """Duplicate each draft layer's WKV params into the stacked projection."""
++    for name, weight in weights:
++        yield name, weight
++
++        match = _CONTEXT_WKV_RE.fullmatch(name)
++        if match is None:
++            continue
++
++        layer_idx = int(match.group(1))
++        if layer_idx >= num_layers:
++            continue
++
++        stacked_weight = weight.detach()
++        stacked_weight.shard_id = layer_idx
++
++        yield f"context_wkv_proj.{match.group(2)}", stacked_weight
++
++
+ class DeepseekV4DSparkModel(nn.Module):
+     def __init__(self, *, vllm_config: VllmConfig, prefix: str = "") -> None:
+         super().__init__()
+@@ -106,6 +138,23 @@ class DeepseekV4DSparkModel(nn.Module):
+         first_layer = self.layers[str(self.mtp_start_layer_idx)]
+         self.use_sequence_parallel_moe = first_layer.use_sequence_parallel_moe
+ 
++        # Stack the WKV projections from all DSpark layers into one linear.
++        #
++        # Important for Ascend quantization:
++        # ModelSlim chooses the quantization method according to the linear prefix.
++        # context_wkv_proj is a synthetic runtime module and does not exist in the
++        # checkpoint quantization description, so reuse the first DSpark WKV prefix
++        # when selecting its quantization scheme.
++        self.context_wkv_proj = MergedColumnParallelLinear(
++            config.hidden_size,
++            [config.head_dim] * self.num_dspark_layers,
++            bias=False,
++            return_bias=False,
++            quant_config=vllm_config.quant_config,
++            prefix="mtp.0.self_attn.wkv",
++            disable_tp=True,
++        )
++
+         _model_quant_cfg = getattr(config, "quantization_config", None)
+         _main_proj_qconfig = (
+             vllm_config.quant_config
+@@ -176,13 +225,13 @@ class DeepseekV4DSparkModel(nn.Module):
+ 
+     def _project_shared_kv(
+         self,
+-        hidden_states: torch.Tensor,
++        kv: torch.Tensor,
+         positions: torch.Tensor,
+         attn: type[nn.Module] | None = None,
+         rope=None,
+     ) -> torch.Tensor:
+         assert attn is not None
+-        kv = attn.kv_norm(attn.wkv(hidden_states))
++        kv = attn.kv_norm(kv)
+         # npu_rotary_mul writes its result back to the input storage
+         # (ComplexExpRotaryEmbedding.forward ends with y.copy_(...)), so rope
+         # can run in-place on the rope-segment view of kv; the previous
+@@ -237,20 +286,32 @@ class DeepseekV4DSparkModel(nn.Module):
+         context_positions: torch.Tensor,
+         context_slot_mapping: list[torch.Tensor | None] | None = None,
+     ) -> None:
+-        if context_states.numel() == 0 or context_slot_mapping is None:
++        if context_states.numel() == 0 or context_positions.numel() == 0:
++            return
++        # All DSpark layers consume the same context hidden states.
++        # Stack their WKV projections so that we only launch one linear op.
++        # Profile runs omit slot mappings but must still exercise this new
++        # projection so its workspace is included in memory profiling.
++        all_kv = self.context_wkv_proj(context_states).view(
++            context_states.shape[0],
++            self.num_dspark_layers,
++            self.config.head_dim,
++        )
++        if context_slot_mapping is None:
+             return
++
+         rope_layers = [layer.self_attn.rotary_emb.layername for layer in self.layers.values()]
+         rope = get_cos_and_sin_dsa(
+             context_positions,
+             layer_names=rope_layers,
+         )
+-        for layer_idx, layer in enumerate(self.layers.values()):
+-            layer_context_slot_mapping = None if context_slot_mapping is None else context_slot_mapping[layer_idx]
+-            if context_positions.numel() == 0:
+-                return
++        for layer_idx, (layer, kv) in enumerate(zip(self.layers.values(), all_kv.unbind(1), strict=True)):
++            layer_context_slot_mapping = context_slot_mapping[layer_idx]
++            if layer_context_slot_mapping is None:
++                continue
+             attn = layer.self_attn
+             shared_kv = self._project_shared_kv(
+-                context_states,
++                kv,
+                 context_positions,
+                 attn,
+                 rope=rope,
+@@ -457,6 +518,13 @@ class DSparkDeepseekV4ForCausalLM(nn.Module, DeepseekV2MixtureOfExperts, Support
+         head_start = n_local_head * tp_rank
+         head_end = n_local_head * (tp_rank + 1)
+ 
++        # Keep the per-layer WKV weights for draft-token forward and load one
++        # extra packed copy into context_wkv_proj. This adds hidden_size *
++        # head_dim * num_dspark_layers elements plus quantization metadata,
++        # trading memory for one merged context projection instead of one per
++        # layer.
++        weights = _duplicate_context_wkv_weights(weights, self.model.num_dspark_layers)
++
+         for name, loaded_weight in weights:
+             if name == "embed.weight" and not self.rotation_path:
+                 name = "model.embed_tokens.weight"
+@@ -478,6 +546,18 @@ class DSparkDeepseekV4ForCausalLM(nn.Module, DeepseekV2MixtureOfExperts, Support
+             if name.endswith(".scale"):
+                 name = name.replace(".scale", ".weight_scale")
+ 
++            if name.startswith("model.context_wkv_proj."):
++                param = params_dict[name]
++
++                param.weight_loader(
++                    param,
++                    loaded_weight,
++                    loaded_weight.shard_id,
++                )
++
++                loaded_params.add(name)
++                continue
++
+             # The multimodal checkpoint also contains one vision-router bias
+             # for each MTP/DSpark layer.  DSpark runs only during text decode,
+             # so draft MoE gates intentionally do not expose ``bias_vl``.
+@@ -544,6 +624,9 @@ class DSparkDeepseekV4ForCausalLM(nn.Module, DeepseekV2MixtureOfExperts, Support
+         return loaded_params
+ 
+     def _remap_dspark_name(self, name: str) -> str | None:
++        if name.startswith("context_wkv_proj."):
++            return f"model.{name}"
++
+         m = re.match(r"mtp\.(\d+)\.(.*)", name)
+         if m is None:
+             return None

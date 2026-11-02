@@ -1,0 +1,141 @@
+commit 97ca15220de6194f3883d306e032d33f77a85e2a
+Author:     Haoxin Zong <116423146+HaoxinZong@users.noreply.github.com>
+AuthorDate: Wed Oct 14 23:25:15 2026 +0800
+Commit:     GitHub <noreply@github.com>
+CommitDate: Wed Oct 14 23:25:15 2026 +0800
+
+    [Performance] Enable fused MiniMax sparse prepare through 256K tokens (#18666)
+    
+    ### What this PR does / why we need it
+    
+    Forward-port of #18660 to `main`.
+    
+    MiniMax-M3's fused sparse-prepare path currently falls back to the
+    separate Q/K normalization, RoPE, and cache-insertion chain whenever a
+    batch contains more than 512 tokens. Raise the validated routing limit
+    to 262144 tokens so prefill can use `minimax_qknorm_rope_cache`.
+    Requests beyond the validated range retain the existing fallback.
+    
+    ### Does this PR introduce any user-facing change?
+    
+    No configuration change is required. Supported MiniMax-M3 BF16 NPU
+    prefill batches up to 256K tokens now use the existing fused
+    QK-norm/RoPE/cache-insert kernel.
+    
+    ### How was this patch tested?
+    
+    - Patch is identical to #18660 (`git patch-id --stable`)
+    - Release branch validation: `pytest -q
+    tests/ut/models/minimax_m3/test_fused_sparse_prepare.py` (`23 passed`)
+    - A3 large-prefill correctness and latency validation at 32K, 64K, 128K,
+    and 256K tokens
+    - Runtime validation with MiniMax-M3 prefill chunk size 2048
+    - The `main` forward-port was not separately rerun, per request
+    - vLLM main:
+    https://github.com/vllm-project/vllm/commit/c4df37dfcc7f72ca41cd43801a468526ecf99a2b
+    
+    Signed-off-by: qq_40172610 <chenchaofeng5@huawei.com>
+    Co-authored-by: qq_40172610 <chenchaofeng5@huawei.com>
+
+diff --git a/tests/e2e/pull_request/one_card/test_minimax_qknorm_rope_cache.py b/tests/e2e/pull_request/one_card/test_minimax_qknorm_rope_cache.py
+index 7edf216cf..078f7ef97 100644
+--- a/tests/e2e/pull_request/one_card/test_minimax_qknorm_rope_cache.py
++++ b/tests/e2e/pull_request/one_card/test_minimax_qknorm_rope_cache.py
+@@ -94,6 +94,12 @@ def test_minimax_qknorm_rope_cache(tokens, heads, rotary_dim):
+         assert torch.equal(cache.cpu().view(blocks * block_size, -1)[untouched], gold[untouched])
+ 
+ 
++@pytest.mark.parametrize("tokens", [1024, 2048, 4096, 8192])
++@torch.inference_mode()
++def test_minimax_qknorm_rope_cache_prefill(tokens):
++    test_minimax_qknorm_rope_cache(tokens, (8, 1, 1), 64)
++
++
+ @torch.inference_mode()
+ def test_empty_minimax_qknorm_rope_cache():
+     device = "npu"
+diff --git a/tests/ut/models/minimax_m3/test_fused_sparse_prepare.py b/tests/ut/models/minimax_m3/test_fused_sparse_prepare.py
+index dd307668d..9718a136a 100644
+--- a/tests/ut/models/minimax_m3/test_fused_sparse_prepare.py
++++ b/tests/ut/models/minimax_m3/test_fused_sparse_prepare.py
+@@ -49,7 +49,7 @@ def test_fusion_guard(unsupported):
+     elif unsupported == "eps":
+         layer.k_norm = SimpleNamespace(variance_epsilon=1e-5)
+     elif unsupported == "large_batch":
+-        hidden.shape = (513, 128)
++        hidden.shape = (262145, 128)
+     elif unsupported == "cache_dtype":
+         layer.kv_cache_torch_dtype = torch.float8_e5m2
+     with patch("vllm_ascend.models.minimax_m3.minimax_m3.HAS_TRITON", unsupported != "triton"):
+@@ -77,7 +77,19 @@ def test_fused_forward_skips_materialized_prepare_and_insert():
+     layer._sparse_prepare.assert_not_called()
+ 
+ 
+-@pytest.mark.parametrize("tokens, supported", [(512, True), (513, False)])
++@pytest.mark.parametrize(
++    "tokens, supported",
++    [
++        (512, True),
++        (513, True),
++        (8192, True),
++        (32768, True),
++        (65536, True),
++        (131072, True),
++        (262144, True),
++        (262145, False),
++    ],
++)
+ def test_fusion_token_limit(tokens, supported):
+     hidden = SimpleNamespace(device=SimpleNamespace(type="npu"), dtype=torch.bfloat16, shape=(tokens, 128))
+     with patch("vllm_ascend.models.minimax_m3.minimax_m3.HAS_TRITON", True):
+diff --git a/vllm_ascend/models/minimax_m3/minimax_m3.py b/vllm_ascend/models/minimax_m3/minimax_m3.py
+index 8f83b23d4..9ad59443f 100644
+--- a/vllm_ascend/models/minimax_m3/minimax_m3.py
++++ b/vllm_ascend/models/minimax_m3/minimax_m3.py
+@@ -126,6 +126,7 @@ from vllm_ascend.worker.v2.pp_transport import (
+ )
+ 
+ _FP8_E4M3_MAX = 448.0
++_MAX_FUSED_QKNORM_ROPE_CACHE_INSERT_TOKENS = 262144
+ 
+ 
+ def _resolve_layer_kv_cache_dtype(
+@@ -479,12 +480,12 @@ class MiniMaxM3SparseAttention(nn.Module, AttentionLayerBase):
+         self.impl.forward(self, query, self.kv_cache, topk_idx, attn_output)
+ 
+     def _can_fuse_sparse_prepare(self, positions: torch.Tensor, hidden_states: torch.Tensor) -> bool:
+-        # Direct cache stores benefit decode batches; retain the existing path
+-        # for larger batches where per-token programs become more expensive.
+-        max_fused_tokens = 512
++        # The kernel launches one program per token. A3 measurements keep it
++        # ahead of the separate prepare/cache chain through 256K-token prefill;
++        # retain the fallback beyond the validated range.
+         return (
+             HAS_TRITON
+-            and hidden_states.shape[0] <= max_fused_tokens
++            and hidden_states.shape[0] <= _MAX_FUSED_QKNORM_ROPE_CACHE_INSERT_TOKENS
+             and hidden_states.device.type == "npu"
+             and hidden_states.dtype == torch.bfloat16
+             and positions.ndim == 1
+diff --git a/vllm_ascend/ops/triton/docs/minimax_qknorm_rope_cache.md b/vllm_ascend/ops/triton/docs/minimax_qknorm_rope_cache.md
+index 93d1d0e8e..7fede4e71 100644
+--- a/vllm_ascend/ops/triton/docs/minimax_qknorm_rope_cache.md
++++ b/vllm_ascend/ops/triton/docs/minimax_qknorm_rope_cache.md
+@@ -8,7 +8,7 @@
+   1. Each program handles one token and vectorizes Q/K and index Q/K along contiguous head rows.
+   2. Cos/sin is loaded from the RoPE cache by `positions`. No external gather, slice-contiguous, or cache-scatter kernel is launched.
+   3. The model calls this through the opaque op `minimax_m3_fused_sparse_forward`, then runs the indexer and sparse attention. The original cache-insertion path is not called again.
+-- **Supported modes**: BF16 NPU input, main and index head dimension 128, at most 512 tokens including graph padding. Packed `[Q | K | V | index Q | index K]` projections and separate QKV/index projections are both supported. Other shapes keep the existing prepare path.
++- **Supported modes**: BF16 NPU input, main and index head dimension 128, at most 262144 tokens including graph padding. Packed `[Q | K | V | index Q | index K]` projections and separate QKV/index projections are both supported. Other shapes keep the existing prepare path.
+ 
+ ## Parameters
+ 
+@@ -46,7 +46,7 @@ pytest -q tests/ut/models/minimax_m3
+ pytest -q tests/e2e/pull_request/one_card/test_minimax_qknorm_rope_cache.py
+ ```
+ 
+-Unit tests cover the fusion guard, fallback, dummy and fake forwards, separate index projections, and cache-insertion order. NPU tests cover 1 to 513 tokens, several head layouts, partial and full RoPE, shuffled and negative slots, untouched cache regions, non-contiguous inputs, empty inputs, and graph replay after `positions` or slots change. Dynamic-cache cases use 3, 64, 5392, and 8192 blocks. Two FP8 cases are skipped when A5 is not available.
++Unit tests cover the fusion guard, fallback, dummy and fake forwards, separate index projections, and cache-insertion order. NPU tests cover 1 to 8192 tokens, several head layouts, partial and full RoPE, shuffled and negative slots, untouched cache regions, non-contiguous inputs, empty inputs, and graph replay after `positions` or slots change. A3 large-prefill validation additionally samples output/cache correctness and latency at 32768, 65536, 131072, and 262144 tokens. Dynamic-cache cases use 3, 64, 5392, and 8192 blocks. Two FP8 cases are skipped when A5 is not available.
+ 
+ ## Compilation and performance regression tests
+ 

@@ -1,0 +1,694 @@
+commit 9df8e7fcb0733e52e7a6b4d37aaf95bd00fd8964
+Author:     XUE TONGYAO <xuetongyao2001@gmail.com>
+AuthorDate: Thu Oct 22 15:38:12 2026 +0800
+Commit:     GitHub <noreply@github.com>
+CommitDate: Thu Oct 22 15:38:12 2026 +0800
+
+    [BugFix][Worker] Restore Gemma 4 KV cache capacity on Model Runner V2 (#19264)
+    
+    ### What this PR does / why we need it?
+    
+    Fixes #19259. Related report: #18941.
+    
+    After #14872 (`fd815467c221ee600137f6bdd53fe354d5e7c999`), ordinary
+    full/sliding attention groups use private per-layer allocations even
+    though upstream vLLM's standardized planner budgets for overlapping
+    groups in one physical pool. `_scale_kv_cache_memory_for_multi_group`
+    compensates with `max(group page bytes) / sum(all group page bytes)`.
+    Gemma 4 31B's 50 sliding + 10 full layers become six equal groups,
+    reducing the advertised budget and block count to 1/6. The same
+    six-group geometry occurs for 26B-A4B and E4B; E2B has five groups and a
+    1/5 factor. The issue includes source permalinks and before/after
+    planner evidence.
+    
+    This change restores physical sharing and removes the corresponding
+    budget reduction together:
+    
+    - Use one common eligibility check in the worker and V2 runner for dense
+    full/sliding attention with equal physical page sizes.
+    - Materialize the planner's overlapping layer slots from one allocation.
+    Each slot has separate contiguous K and V halves, retaining the layout
+    required by PA while also supporting different full/SW head dimensions
+    and block sizes.
+    - Groups share the scheduler block pool, where a live block ID belongs
+    to one group at a time. Equal page sizes make each ID map to equal byte
+    ranges across groups. Distinct live IDs therefore remain isolated even
+    though their layer slots alias.
+    - Validate descriptors before allocation; never silently fall back to
+    private buffers after advertising the full shared budget.
+    
+    The new path is limited to FP16/BF16, symmetric dense K/V, unpadded
+    pages, and layer/block-compact layouts without KV transfer or context
+    parallelism. Other cache layouts retain their existing behavior. The
+    eligibility gate is intentionally restricted to `gemma4_text` and
+    standard dense cache dtypes to keep this fix local to the reported
+    regression. Non-Gemma models retain their original paths, including the
+    existing Step model exemptions. There is no new environment variable or
+    runtime copy.
+    
+    **Runner scope:** This PR now targets **Model Runner V2 only**. Ascend
+    selects V2 by default unless explicitly overridden or a feature requires
+    V1 fallback. V1 allocation code is unchanged, and the worker enables the
+    new Gemma 4 budget exemption only when V2 is selected. Shared helpers
+    live in `vllm_ascend/worker/v2/attn_utils.py`; no separate core helper
+    module is added. Existing layout/quantization/transfer safety conditions
+    remain in place. The previously reported A5/V2 hardware tests exercised
+    the same shared allocation algorithm; the scope/helper relocation update
+    has now passed both CPU CI lanes and the hardware CI jobs listed below.
+    The four A2 jobs blocked during container initialization still need a
+    successful run.
+    
+    ### Does this PR introduce _any_ user-facing change?
+    
+    Yes. Compatible Gemma 4 full/sliding attention configurations using
+    Model Runner V2 regain the shared-pool KV capacity instead of losing it
+    to the five/six-group private-allocation factor. Quantized model weights
+    are independent of this restriction; quantized **KV caches** retain
+    their existing path. Release note: `release_notes/fragments/19264.yaml`.
+    
+    ### How was this patch tested?
+    
+    Added `tests/ut/worker/test_full_sliding_kv_cache.py`:
+    
+    - Five/six-group worker budget regression: V2 retains the full shared
+    budget, while V1 and unsupported runners retain their original scaling.
+    Existing Step exemptions are unchanged.
+    - V2 allocating a single backing pool, FP16/BF16, unequal head
+    dimensions/block sizes with equal physical pages.
+    - Real PyTorch K/V writes after the production V2 reshape method, with
+    multiple kernel block sizes, checking six-group isolation, slot
+    separation, shared storage, contiguous views, and V2 shared-layer
+    references.
+    - Uniform group wrappers, multi-layer descriptors, unsupported layouts,
+    malformed descriptor failures before allocation, non-Gemma budget
+    behavior, unchanged Step-3.5/3.7 exemptions, and partial model
+    configurations used by existing tests.
+    
+    Local validation on Windows/CPU:
+    
+    - **56 passed** in an isolated harness using real PyTorch 2.10.0, the
+    production helper, AST-extracted unchanged worker/runner method bodies,
+    and upstream KV spec/dataclass definitions from the verified vLLM pin
+    `a98247ab4db686ee03c66d5feb3c761e52a2f8ab`. NPU-dependent module
+    initialization was bypassed; this is not a full integration run.
+    - Running the same budget regressions against the pre-fix worker at
+    `d606456c4eddf1eeddfffb2b52b70a80e0d4769b` gives the expected **2
+    failures / 30 passes**: 12,288 vs 61,440 (five groups), and 10,240 vs
+    61,440 (six groups). The fixed worker passes both; the V1 cases retain
+    the original budget behavior.
+    - Ruff 0.14.0 check and format check pass for all three changed Python
+    files; `git diff --check` passes.
+    - Normal `python -m pytest -q
+    tests/ut/worker/test_full_sliding_kv_cache.py` is blocked during
+    conftest import because vLLM is unavailable in the local Windows
+    environment.
+    - Attempted the required `bash format.sh ci` for this update; the
+    current local shell cannot find pre-commit. Direct Ruff checks pass, but
+    the full local hook run is not claimed as passing; the latest remote
+    pre-commit CI passed.
+    
+    #### Real A5 hardware validation (reported by the deployment tester)
+    
+    The deployment tester applied this PR's patch to Ascend commit
+    `2581a69bc` and supplied the following measurements. These are real NPU
+    results from that deployment, separate from the author's local CPU
+    harness above. The application was reported as conflict-free and used
+    the existing editable installation. The exact applied PR revision, vLLM
+    runtime SHA, CANN/torch_npu versions, and full launch command were not
+    included in the supplied report; the CI vLLM pin below must not be
+    interpreted as the hardware environment's confirmed version.
+    
+    Configuration: Gemma 4 31B, BF16, TP=2, A5 devices 4/5, Model Runner V2,
+    `max_model_len=8192`, `max_num_batched_tokens=2496` with chunked
+    prefill. Prefix caching was disabled for the initial regression tests
+    and enabled for the separate prefix-cache validation.
+    
+    **Capacity comparison, with unchanged launch parameters for the
+    before/after patch runs:**
+    
+    | Metric | 0.27.1rc1 baseline | `2581a69bc` without patch | `2581a69bc`
+    + this PR |
+    | --- | --- | --- | --- |
+    | Reported available KV cache memory | 41.56 GiB | 6.93 GiB | 41.58 GiB
+    |
+    | Reported KV token capacity | Not recorded | 21,353 | 128,210 |
+    | Estimated concurrency at 8k context | Not recorded | 2.61x | 15.65x |
+    
+    This restores approximately 6x capacity, consistent with eliminating the
+    six-group budget factor. Startup, graph capture, and inference
+    succeeded. The concurrency figures above are startup estimates, not
+    measured simultaneous requests.
+    
+    **Long-input isolation and cancellation/reuse:**
+    
+    - Inputs were measured with `AutoTokenizer`: 5,632-5,650 tokens,
+    cross-checked against API usage (example: 5,645 prompt tokens), above
+    the 1,024-token sliding window. Input plus output stayed below 8,192
+    tokens.
+    - Serial baseline: 16/16 HTTP successes and 16/16 correct
+    request-specific identifiers.
+    - Two rounds of 16 client-concurrent requests: 32/32 HTTP successes and
+    32/32 correct identifiers, with no observed cross-request leakage.
+    - Eight streaming requests were cancelled, followed by eight new
+    requests: all eight replacement requests succeeded and returned their
+    own identifiers. The service remained operational.
+    - Observed scheduler `Running` peaked at 5 in sampled logs; this does
+    not establish 16 simultaneously resident requests or the maximum serving
+    concurrency.
+    - Reported device memory rose from 80,662 MB to 80,842 MB (+180 MB) and
+    remained at that level after the load, with no continuing growth during
+    the approximately one-minute test. This is short-run evidence, not a
+    long-term leak test.
+    - No ERROR, Traceback, OOM, illegal memory access, or worker exit was
+    observed in the reported test window.
+    
+    **Prefix caching enabled:**
+    
+    | Test | HTTP success | Correct request-specific identifier |
+    | --- | --- | --- |
+    | R1: initially cold cache, serial, shared 5,418-token prefix + 8
+    distinct suffix identifiers | 8/8 | 8/8 |
+    | R2: warm cache, serial, same prefix + 8 new identifiers | 8/8 | 8/8 |
+    | R3: warm cache, 8 client-concurrent requests, same prefix + 8 new
+    identifiers | 8/8 | 8/8 |
+    
+    - `prefix_cache_queries_total`: 0 -> 131,135; `prefix_cache_hits_total`:
+    0 -> 123,648. The aggregate hit ratio is **94.3%**, matching the service
+    log's `Prefix cache hit rate: 94.3%`.
+    - No cross-request identifier leakage was observed in these 24 requests.
+    The aggregate counters demonstrate cache reuse; they do not by
+    themselves prove every shared-prefix token hit in every request.
+    - Available KV memory and token capacity remained **41.58 GiB / 128,210
+    tokens** with prefix caching enabled.
+    - No ERROR, OOM, or worker exit was reported.
+    
+    The tester retained the initial regression JSON at
+    `/workspace/logs/gpqa-regression-result.json`, test logs in the same
+    directory, and 158 device-memory samples at `/tmp/gpqa-mem.log` on the
+    test host. These are tester-local artifacts, not public download links.
+    
+    **Remaining coverage (V2):** image/multimodal requests, retrieval of an
+    identifier placed outside the sliding window (the tested identifiers
+    were near the prompt end), sustained high-residency/block-pressure
+    workloads, long-duration stability, other hardware/backend paths, and a
+    formal accuracy/throughput benchmark. These results support the tested
+    A5/V2 configuration, not all supported configurations.
+    
+    **Previous CI at head e8c424dc65 (before descriptor-check
+    simplification):** [Run
+    39540278263](https://github.com/vllm-project/vllm-ascend/actions/runs/39540278263).
+    
+    - Passed: pre-commit, DCO, CPU UT against both the verified vLLM main
+    pin and v0.31.0, all selected 310P and A3 partitions, A2 single-card
+    partitions 3/4/5, and the selected upstream end-to-end job.
+    - A2 single-card partitions 1/2/6/7 failed in **Initialize containers**,
+    before repository checkout or test execution. All four logs report
+    containerd/runc failing to apply the cgroup CPU set: writing
+    `0-191,+1-23` or `0-191,+24-46` to `cpuset.cpus` returns `invalid
+    argument`. This is a runner/container startup failure; these jobs did
+    not execute the PR code. [Example failed
+    job](https://github.com/vllm-project/vllm-ascend/actions/runs/39540278263/job/119033522939).
+    - Consequently, the aggregate ci-gate is red. The runner configuration
+    needs correction and the blocked jobs need rerunning before claiming a
+    fully green CI run. A5 CI was skipped; the separately reported A5
+    hardware results above remain the available A5 evidence.
+    
+    **Review follow-up at head 1e28169960:** Removed redundant descriptor
+    checks for layer coverage, duplicates, offsets, bounds, and byte parity.
+    The upstream default planner constructs coverage and offsets; dense
+    symmetric FP16/BF16 pages guarantee even byte sizes. Retained
+    shared-backing/positive-block and contiguous layer/block stride checks.
+    The planner may round a block stride up for alignment, so an
+    upstream-valid descriptor is not necessarily compatible with the
+    contiguous K/V split.
+    
+    Cross-checked the verified vLLM pin and latest vLLM main
+    a9bf45ed8a856a0b1839197152d0d26fabb6599c. The latter moved placement
+    into
+    [kv_cache_planning.py](https://github.com/vllm-project/vllm/blob/a9bf45ed8a856a0b1839197152d0d26fabb6599c/vllm/v1/core/kv_cache_planning.py#L569);
+    alignment rounding and descriptor construction remain. Ascend main
+    e5e820d5c935e6197bec8bc13e8e8936eb2740d0 still uses the same verified
+    vLLM pin and has no intervening changes to the two modified production
+    files. This source comparison does not claim runtime compatibility with
+    unpinned vLLM main.
+    
+    Gemma 4 remains the sole model gate; cache-format/layout/transfer
+    exclusions are retained because model_type alone does not establish
+    their compatibility. Local isolated CPU regression: 56 passed; Ruff and
+    diff checks passed. Full local format.sh remains blocked by missing
+    pre-commit. Fresh CI for this follow-up is pending.
+    
+    The PR remains in draft pending remaining review and validation.
+    
+    ---
+    
+    ### Checklist
+    
+    #### Testing
+    
+    - [x] **Boundary / edge-case coverage**: Empty/single-type specs,
+    offsets, multiple layers, invalid strides, and zero blocks.
+    - [x] **Regression test**: Five/six-group budget tests fail against the
+    pre-fix worker.
+    - [x] **Error / failure path coverage**: Invalid descriptors fail before
+    allocation.
+    - [x] **Meaningful & reliable tests**: Storage aliasing and isolation
+    checked by real tensor writes.
+    - [ ] **Performance impact**: A5/V2 capacity and targeted end-to-end
+    regressions reported above; formal throughput benchmarking and broader
+    hardware coverage remain pending.
+    
+    
+    - vLLM main:
+    https://github.com/vllm-project/vllm/commit/a98247ab4db686ee03c66d5feb3c761e52a2f8ab
+    
+    ---------
+    
+    Signed-off-by: Alex-stack-hub <alex-stack-hub@github.com>
+    Co-authored-by: Alex-stack-hub <alex-stack-hub@github.com>
+
+diff --git a/release_notes/fragments/19264.yaml b/release_notes/fragments/19264.yaml
+new file mode 100644
+index 000000000..654caadcf
+--- /dev/null
++++ b/release_notes/fragments/19264.yaml
+@@ -0,0 +1,4 @@
++pr: 19264
++entries:
++  - category: bugfix
++    text: Restored shared KV cache capacity for compatible Gemma 4 full and sliding-window attention configurations using Model Runner V2 and dense FP16 or BF16 KV caches.
+diff --git a/tests/ut/worker/test_full_sliding_kv_cache.py b/tests/ut/worker/test_full_sliding_kv_cache.py
+new file mode 100644
+index 000000000..8e54780b9
+--- /dev/null
++++ b/tests/ut/worker/test_full_sliding_kv_cache.py
+@@ -0,0 +1,245 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Ascend project
++
++from dataclasses import replace
++from types import SimpleNamespace
++from unittest.mock import Mock
++
++import pytest
++import torch
++from vllm.v1.kv_cache_interface import (
++    FullAttentionSpec,
++    KVCacheConfig,
++    KVCacheGroupSpec,
++    KVCacheTensor,
++    KVQuantMode,
++    SlidingWindowSpec,
++    UniformTypeKVCacheSpecs,
++)
++
++from vllm_ascend.worker import worker as worker_module
++from vllm_ascend.worker.v2 import attn_utils
++from vllm_ascend.worker.v2.attn_utils import (
++    allocate_shared_attention_kv_cache,
++    can_share_full_and_sliding_kv_cache,
++)
++
++
++def _config():
++    layout = SimpleNamespace(is_layer_compact=True, is_block_compact=True)
++    return SimpleNamespace(
++        model_config=SimpleNamespace(hf_text_config=SimpleNamespace(model_type="gemma4_text"), use_mla=False),
++        cache_config=SimpleNamespace(get_resolved_kv_cache_layout=lambda: layout, cache_dtype="auto"),
++        parallel_config=SimpleNamespace(decode_context_parallel_size=1, prefill_context_parallel_size=1),
++        kv_transfer_config=None,
++    )
++
++
++def _cache_config(sliding_groups=5, dtype=torch.bfloat16):
++    # Different head dimensions and block sizes, but equal physical pages.
++    full = FullAttentionSpec(block_size=2, num_kv_heads=1, head_size=8, dtype=dtype)
++    sliding = SlidingWindowSpec(block_size=4, num_kv_heads=1, head_size=4, dtype=dtype, sliding_window=8)
++    assert full.page_size_bytes == sliding.page_size_bytes
++    num_blocks = 8
++    layer_size = num_blocks * full.page_size_bytes
++    groups = []
++    descriptors = []
++    for group_index, spec in enumerate([full, *[sliding] * sliding_groups]):
++        names = [f"model.layers.{2 * group_index + index}.self_attn.attn" for index in range(2)]
++        groups.append(KVCacheGroupSpec(layer_names=names, kv_cache_spec=spec))
++        # Split the descriptor to exercise a nonzero offset as well as aliasing.
++        for index, name in enumerate(names):
++            descriptors.append(
++                KVCacheTensor(
++                    size=2 * layer_size,
++                    layers=[name],
++                    offset=index * layer_size,
++                    layer_stride=layer_size,
++                    block_stride=spec.page_size_bytes,
++                )
++            )
++    return KVCacheConfig(num_blocks=num_blocks, kv_cache_tensors=descriptors, kv_cache_groups=groups)
++
++
++def _specs(cache_config):
++    return {name: group.kv_cache_spec for group in cache_config.kv_cache_groups for name in group.layer_names}
++
++
++@pytest.mark.parametrize(
++    "config",
++    [
++        SimpleNamespace(),
++        SimpleNamespace(model_config=SimpleNamespace()),
++        SimpleNamespace(model_config=SimpleNamespace(hf_text_config=SimpleNamespace())),
++    ],
++)
++def test_partial_model_configs_keep_existing_path(config):
++    assert not can_share_full_and_sliding_kv_cache(config, _specs(_cache_config()).values())
++
++
++@pytest.mark.parametrize("use_v2", [False, True])
++@pytest.mark.parametrize("sliding_groups", [4, 5])
++@pytest.mark.parametrize("supports_shared", [False, True])
++@pytest.mark.parametrize("model_type", ["gemma4_text", "other_full_sliding_model", "step3p5", "step3p7"])
++def test_budget_tracks_physical_shared_allocation(monkeypatch, sliding_groups, supports_shared, model_type, use_v2):
++    config = _config()
++    config.model_config.hf_text_config.model_type = model_type
++    cache = _cache_config(sliding_groups)
++    worker = worker_module.NPUWorker.__new__(worker_module.NPUWorker)
++    worker.vllm_config = config
++    worker.use_v2_model_runner = use_v2
++    worker.model_config = config.model_config
++    worker.get_kv_cache_spec = lambda: _specs(cache)
++    worker.model_runner = SimpleNamespace(
++        supports_standardized_shared_kv_backing=supports_shared, use_sparse=False, use_compress=False
++    )
++    monkeypatch.setattr(worker_module, "get_kv_cache_groups", lambda *_: cache.kv_cache_groups)
++    # Divisible by both five and six; the unsupported runner must retain scaling.
++    available = 60 * cache.kv_cache_tensors[0].size
++    shares_pool = supports_shared and (model_type in ("step3p5", "step3p7") or (use_v2 and model_type == "gemma4_text"))
++    expected = available if shares_pool else available // (sliding_groups + 1)
++    assert worker._scale_kv_cache_memory_for_multi_group(available) == expected
++
++
++@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
++@pytest.mark.parametrize("kernel_block_size", [1, 2])
++def test_v2_shares_storage_and_keeps_distinct_blocks_isolated(monkeypatch, dtype, kernel_block_size):
++    config = _config()
++    cache = _cache_config(dtype=dtype)
++    backend = SimpleNamespace(
++        get_kv_cache_shape=lambda blocks, block_size, heads, head_size, *_: (2, blocks, block_size, heads, head_size)
++    )
++    groups = [
++        SimpleNamespace(
++            kv_cache_group_id=index,
++            kv_cache_spec=group.kv_cache_spec,
++            layer_names=group.layer_names,
++            backend=backend,
++        )
++        for index, group in enumerate(cache.kv_cache_groups)
++    ]
++    kernel_sizes = [kernel_block_size] * len(groups)
++    allocate = Mock(side_effect=lambda size: torch.zeros(size, dtype=torch.int8))
++    monkeypatch.setattr(attn_utils, "get_current_vllm_config", lambda: config)
++    monkeypatch.setattr(attn_utils.KVPPConfig, "from_vllm_config", lambda _: SimpleNamespace(size=1))
++    monkeypatch.setattr(attn_utils, "_is_dsv4_model", lambda _: False)
++    monkeypatch.setattr(attn_utils, "enable_sfa", lambda _: False)
++    monkeypatch.setattr(attn_utils, "_allocate_int8_cache_tensor", lambda size, *_: allocate(size))
++    raw = attn_utils._allocate_kv_cache(cache, {}, torch.device("cpu"))
++    reshaped = attn_utils._reshape_kv_cache_v2(
++        groups, raw, "auto", kernel_sizes, {"shared_layer": groups[0].layer_names[0]}, cache
++    )
++    assert reshaped["shared_layer"] is reshaped[groups[0].layer_names[0]]
++    allocate.assert_called_once_with(cache.kv_cache_tensors[0].size)
++    assert len({tensor.untyped_storage().data_ptr() for pair in raw.values() for tensor in pair}) == 1
++    specs = _specs(cache)
++    views = {
++        name: tuple(
++            tensor.view(cache.num_blocks, spec.block_size, spec.num_kv_heads, spec.head_size)
++            for tensor in reshaped[name]
++        )
++        for name, spec in specs.items()
++    }
++    # Each group owns a distinct block ID in the common pool. All six groups
++    # can write both K and V without modifying another group's live block.
++    for group_id, group in enumerate(cache.kv_cache_groups):
++        for slot, name in enumerate(group.layer_names):
++            k_cache, v_cache = views[name]
++            assert k_cache.is_contiguous() and v_cache.is_contiguous()
++            k_cache[group_id].fill_(10 * group_id + slot + 1)
++            v_cache[group_id].fill_(-10 * group_id - slot - 1)
++    for group_id, group in enumerate(cache.kv_cache_groups):
++        for slot, name in enumerate(group.layer_names):
++            k_cache, v_cache = views[name]
++            assert torch.all(k_cache[group_id] == 10 * group_id + slot + 1)
++            assert torch.all(v_cache[group_id] == -10 * group_id - slot - 1)
++            assert torch.count_nonzero(k_cache[-1]) == 0
++            assert torch.count_nonzero(v_cache[-1]) == 0
++    first, second = cache.kv_cache_groups[0].layer_names
++    alias = cache.kv_cache_groups[1].layer_names[0]
++    assert raw[first][0].data_ptr() == raw[alias][0].data_ptr()
++    assert raw[first][0].data_ptr() != raw[second][0].data_ptr()
++
++
++def test_uniform_group_wrappers_share_the_same_pool():
++    cache = _cache_config()
++    for group in cache.kv_cache_groups:
++        group.kv_cache_spec = UniformTypeKVCacheSpecs(
++            block_size=group.kv_cache_spec.block_size,
++            kv_cache_specs={name: group.kv_cache_spec for name in group.layer_names},
++        )
++    allocate = Mock(side_effect=lambda size: torch.zeros(size, dtype=torch.int8))
++    raw = allocate_shared_attention_kv_cache(cache, allocate)
++    allocate.assert_called_once_with(cache.kv_cache_tensors[0].size)
++    assert len({tensor.untyped_storage().data_ptr() for pair in raw.values() for tensor in pair}) == 1
++
++
++def test_group_descriptors_with_multiple_layers():
++    cache = _cache_config()
++    cache.kv_cache_tensors = [
++        replace(descriptor, layers=group.layer_names)
++        for descriptor, group in zip(cache.kv_cache_tensors[::2], cache.kv_cache_groups)
++    ]
++    raw = allocate_shared_attention_kv_cache(cache, lambda size: torch.zeros(size, dtype=torch.int8))
++    first, second = cache.kv_cache_groups[0].layer_names
++    assert raw[second][0].data_ptr() - raw[first][0].data_ptr() == cache.kv_cache_tensors[0].layer_stride
++    assert raw[first][0].data_ptr() == raw[cache.kv_cache_groups[-1].layer_names[0]][0].data_ptr()
++
++
++@pytest.mark.parametrize(
++    "unsupported",
++    [
++        "empty",
++        "full_only",
++        "transfer",
++        "dcp",
++        "pcp",
++        "layout",
++        "padding",
++        "quantized",
++        "unequal_kv",
++        "other_model",
++        "custom_cache_dtype",
++    ],
++)
++def test_unsupported_layouts_keep_private_allocation(unsupported):
++    config = _config()
++    specs = list(_specs(_cache_config()).values())
++    if unsupported == "empty":
++        specs = []
++    elif unsupported == "full_only":
++        specs = specs[:2]
++    elif unsupported == "transfer":
++        config.kv_transfer_config = object()
++    elif unsupported in ("dcp", "pcp"):
++        field = "decode_context_parallel_size" if unsupported == "dcp" else "prefill_context_parallel_size"
++        setattr(config.parallel_config, field, 2)
++    elif unsupported == "layout":
++        config.cache_config.get_resolved_kv_cache_layout().is_layer_compact = False
++    elif unsupported == "padding":
++        specs = [replace(spec, page_size_padded=spec.page_size_bytes * 2) for spec in specs]
++    elif unsupported == "quantized":
++        specs = [replace(spec, kv_quant_mode=KVQuantMode.FP8_PER_TENSOR) for spec in specs]
++    elif unsupported == "other_model":
++        config.model_config.hf_text_config.model_type = "other_full_sliding_model"
++    elif unsupported == "custom_cache_dtype":
++        config.cache_config.cache_dtype = "mxfp8"
++    else:
++        specs[0] = replace(specs[0], head_size_v=4)
++    assert not can_share_full_and_sliding_kv_cache(config, specs)
++
++
++@pytest.mark.parametrize("invalid", ["size", "layer_stride", "block_stride", "zero"])
++def test_invalid_descriptors_fail_before_allocating(invalid):
++    cache = _cache_config()
++    descriptor = cache.kv_cache_tensors[0]
++    if invalid == "size":
++        descriptor.size += 1
++    elif invalid in ("layer_stride", "block_stride"):
++        setattr(descriptor, invalid, 1)
++    else:
++        cache.num_blocks = 0
++    allocate = Mock()
++    with pytest.raises(ValueError, match="Shared attention|Invalid shared attention"):
++        allocate_shared_attention_kv_cache(cache, allocate)
++    allocate.assert_not_called()
+diff --git a/vllm_ascend/worker/v2/attn_utils.py b/vllm_ascend/worker/v2/attn_utils.py
+index a2ff03800..47455dd71 100644
+--- a/vllm_ascend/worker/v2/attn_utils.py
++++ b/vllm_ascend/worker/v2/attn_utils.py
+@@ -18,7 +18,7 @@
+ #
+ 
+ import math
+-from collections.abc import Mapping, Sequence
++from collections.abc import Callable, Iterable, Mapping, Sequence
+ from contextlib import contextmanager
+ from contextvars import ContextVar
+ from copy import copy
+@@ -49,6 +49,7 @@ from vllm.v1.kv_cache_interface import (
+     FullAttentionSpec,
+     KVCacheConfig,
+     KVCacheSpec,
++    KVQuantMode,
+     MambaSpec,
+     MLAAttentionSpec,
+     SlidingWindowSpec,
+@@ -974,6 +975,91 @@ def _uses_single_raw_mla_cache(
+     return supports_strided_mla_cache(vllm_config, attn_module, kv_cache_spec)
+ 
+ 
++def can_share_full_and_sliding_kv_cache(vllm_config: VllmConfig, specs: Iterable[KVCacheSpec]) -> bool:
++    """Keep Gemma 4's budget and the V2 runner on the same dense layout.
++
++    Equal physical pages let full and sliding-window groups overlay the same
++    pool even when their head dimensions and tokens per block differ. Keep
++    specialized/quantized caches and distributed transfer on their existing
++    allocation paths. Limit this regression fix to Gemma 4 so other models
++    retain their existing allocation behavior.
++    """
++    model_config = getattr(vllm_config, "model_config", None)
++    text_config = getattr(model_config, "hf_text_config", None)
++    if getattr(text_config, "model_type", None) != "gemma4_text":
++        return False
++    if vllm_config.cache_config.cache_dtype not in ("auto", "float16", "bfloat16"):
++        return False
++    specs = tuple(specs)
++    if {type(spec) for spec in specs} != {FullAttentionSpec, SlidingWindowSpec}:
++        return False
++    if vllm_config.kv_transfer_config is not None:
++        return False
++    parallel_config = vllm_config.parallel_config
++    if parallel_config.decode_context_parallel_size != 1 or parallel_config.prefill_context_parallel_size != 1:
++        return False
++    layout = vllm_config.cache_config.get_resolved_kv_cache_layout()
++    if not (layout.is_layer_compact and layout.is_block_compact):
++        return False
++    return len({spec.page_size_bytes for spec in specs}) == 1 and all(
++        spec.dtype in (torch.float16, torch.bfloat16)
++        and spec.kv_quant_mode == KVQuantMode.NONE
++        and spec.head_size == spec.head_size_v
++        and spec.page_size_bytes == spec.real_page_size_bytes
++        and spec.tokens_per_state == 1
++        and spec.num_head_slots is None
++        and spec.state_content_bytes is None
++        for spec in specs
++    )
++
++
++def allocate_shared_attention_kv_cache(
++    kv_cache_config: KVCacheConfig,
++    allocate: Callable[[int], torch.Tensor],
++) -> dict[str, tuple[torch.Tensor, torch.Tensor]]:
++    """Materialize overlay descriptors as contiguous K/V views of one pool.
++
++    Groups share block IDs from one scheduler pool, so the same ID cannot be
++    live in two groups at once. Split each layer slot into K and V halves;
++    equal, unpadded pages and equal K/V widths make this mapping identical
++    across groups while preserving the contiguous layout required by PA.
++    Upstream constructs the layer coverage, offsets and allocation bounds.
++    Check only the shared backing and contiguous strides required here:
++    upstream permits alignment padding that this K/V split cannot consume.
++    """
++    descriptors = kv_cache_config.kv_cache_tensors
++    specs = {
++        name: (
++            group.kv_cache_spec.kv_cache_specs[name]
++            if isinstance(group.kv_cache_spec, UniformTypeKVCacheSpecs)
++            else group.kv_cache_spec
++        )
++        for group in kv_cache_config.kv_cache_groups
++        for name in group.layer_names
++    }
++    sizes = {descriptor.size for descriptor in descriptors}
++    if len(sizes) != 1 or kv_cache_config.num_blocks <= 0:
++        raise ValueError("Shared attention KV cache requires one nonempty backing allocation.")
++    backing_size = sizes.pop()
++    regions: dict[str, tuple[int, int]] = {}
++    for descriptor in descriptors:
++        for index, name in enumerate(descriptor.layers):
++            spec = specs[name]
++            layer_size = kv_cache_config.num_blocks * spec.page_size_bytes
++            start = descriptor.offset + index * descriptor.layer_stride
++            if descriptor.layer_stride != layer_size or descriptor.block_stride != spec.page_size_bytes:
++                raise ValueError(f"Invalid shared attention KV cache descriptor for {name}.")
++            regions[name] = (start, layer_size)
++    backing = allocate(backing_size)
++    return {
++        name: (
++            backing[start : start + layer_size // 2],
++            backing[start + layer_size // 2 : start + layer_size],
++        )
++        for name, (start, layer_size) in regions.items()
++    }
++
++
+ def _allocate_kv_cache(
+     kv_cache_config: KVCacheConfig,
+     shared_layers: dict[str, str],
+@@ -1010,6 +1096,13 @@ def _allocate_kv_cache(
+     alignment = 2 * 1024 * 1024
+     layer_kv_cache_spec = _get_layer_kv_cache_specs(kv_cache_config)
+     attn_layers: dict[str, AttentionLayerBase] | None = None
++    # Gemma 4 full/sliding groups share one pool while retaining contiguous
++    # K/V views. The worker keeps the full budget only for this V2 path.
++    if not enable_sfa(vllm_config) and can_share_full_and_sliding_kv_cache(vllm_config, layer_kv_cache_spec.values()):
++        return allocate_shared_attention_kv_cache(
++            kv_cache_config,
++            lambda size: _allocate_int8_cache_tensor(size, alignment, device),
++        )
+     if is_deepseek_v41_cache(layer_kv_cache_spec):
+         for allocation in kv_cache_config.kv_cache_tensors:
+             backing = _allocate_int8_cache_tensor(allocation.size, alignment, device)
+diff --git a/vllm_ascend/worker/worker.py b/vllm_ascend/worker/worker.py
+index a1d481027..da32b330b 100644
+--- a/vllm_ascend/worker/worker.py
++++ b/vllm_ascend/worker/worker.py
+@@ -774,8 +774,8 @@ class NPUWorker(WorkerBase):
+ 
+         # vLLM #51718 overlays KV cache groups in one standardized backing
+         # allocation. For the default layer/block-compact layout, Ascend can
+-        # preserve that contract for hybrid attention/Mamba models while still
+-        # exposing contiguous per-layer views to its existing backends. Do not
++        # preserve that contract for attention/Mamba and eligible full/sliding
++        # attention models while exposing contiguous per-layer views. Do not
+         # shrink the planner budget when the runner can consume that layout.
+         per_layer_specs = []
+         for group in kv_cache_groups:
+@@ -788,13 +788,20 @@ class NPUWorker(WorkerBase):
+         has_mamba = any(isinstance(spec, MambaSpec) for spec in per_layer_specs)
+         model_runner = getattr(self, "model_runner", None)
+         layout = self.vllm_config.cache_config.get_resolved_kv_cache_layout()
++        shares_attention_pool = False
++        if getattr(self, "use_v2_model_runner", False):
++            # Load V2 helpers only for V2 workers; V1 retains private allocation
++            # and must keep its original multi-group budget scaling.
++            from vllm_ascend.worker.v2.attn_utils import can_share_full_and_sliding_kv_cache
++
++            shares_attention_pool = can_share_full_and_sliding_kv_cache(self.vllm_config, per_layer_specs)
+         # TODO: The Step-3.5/3.7 models will be sunset in the future. Once they
+         # are, remove this is_step_model exemption: this line and the
+         # `or is_step_model` budget gate below.
+         is_step_model = self.model_config.hf_text_config.model_type in ("step3p5", "step3p7")
+         if (
+             has_attention
+-            and (has_mamba or is_step_model)
++            and (has_mamba or is_step_model or shares_attention_pool)
+             and layout.is_layer_compact
+             and layout.is_block_compact
+             and getattr(model_runner, "supports_standardized_shared_kv_backing", False)

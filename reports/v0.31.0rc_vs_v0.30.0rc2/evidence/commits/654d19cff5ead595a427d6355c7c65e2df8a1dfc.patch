@@ -1,0 +1,1336 @@
+commit 654d19cff5ead595a427d6355c7c65e2df8a1dfc
+Author:     LostFox11 <140548160+LostFox11@users.noreply.github.com>
+AuthorDate: Mon Oct 12 17:27:30 2026 +0800
+Commit:     GitHub <noreply@github.com>
+CommitDate: Mon Oct 12 17:27:30 2026 +0800
+
+    [Refactor][Worker] Remove legacy speculative PP compatibility (#17500)
+    
+    ### What this PR does / why we need it?
+    
+    Retire the obsolete Model Runner V2 speculative pipeline-parallel
+    compatibility code for vLLM 0.28/0.29. The supported vLLM 0.30 release
+    and verified main already implement PP sampled-token/draft-token
+    transport and deferred request-state updates natively;
+    `use_legacy_spec_pp()` on Ascend main already returns `False`.
+    
+    This PR is now **cleanup only**. The earlier "Skip PP token broadcast
+    when no consumer exists" optimization has been removed entirely.
+    
+    - Delete `patch_spec_pp.py` rather than replace it with
+    `patch_pp_handler.py`. No Ascend override of `PPHandler.receive`,
+    `broadcast`, `broadcast_drafts`, or deferred writeback remains.
+    - Remove the legacy selector, temporary PP=1 runner initialization, PP
+    restoration, obsolete validation bypass, extra draft broadcast, and
+    legacy DSpark loader overrides.
+    - Remove tests for the retired paths and retain CPU regression coverage
+    for native initialization/validation, draft loading, aux/TopK transport,
+    PCP, and V1 PP+MTP.
+    - Preserve active Ascend aux/TopK transport, target quantization
+    inheritance, draft partition isolation, the existing PP embedding
+    safeguard, CPU count synchronization, and V1 behavior.
+    
+    ### Does this PR introduce _any_ user-facing change?
+    
+    No new API, configuration, or broadcast optimization. On supported vLLM
+    versions, PP token communication uses the unchanged upstream
+    implementation. In particular, this PR no longer skips broadcasts for
+    final prefill chunks with `max_tokens=1`.
+    
+    ### How was this patch tested?
+    
+    - **521 CPU tests passed** against verified vLLM
+    `ced6857afa0ea7b2e3f0846a62e1394e90f15607`, using the existing container
+    runtime with the repository's CPU-only NPU mocks. No NPU execution,
+    reinstall, or running-service changes.
+    - Coverage: `test_patch_use_v2_model_runner`, `test_patch_deepseek_v2`,
+    `test_patch_dspark_pp`, `test_model_runner_v2`, `test_pcp_manager_v2`,
+    `test_pp_transport`, `test_kimi_k3_pp_sp`, `test_patch_pp_mtp`,
+    `test_spec_pp_cpu_counts`, and `test_dspark_model_loading`.
+    - Repository formatting hooks passed with `gitleaks-offline-scan` and
+    `shellcheck` skipped because the required local tools are unavailable.
+    `git diff --check` passed, and no production/test references to the
+    retired transport or bypass helpers remain.
+    - NPU inference and performance benchmarks were not rerun for this
+    cleanup revision. Earlier results for the removed broadcast optimization
+    are not claimed as validation of this revision.
+    
+    - vLLM main:
+    https://github.com/vllm-project/vllm/commit/ced6857afa0ea7b2e3f0846a62e1394e90f15607
+    
+    Signed-off-by: LostFox11 <wangziyue17@huawei.com>
+    Co-authored-by: LostFox11 <wangziyue17@huawei.com>
+
+diff --git a/tests/ut/models/test_kimi_k3_pp_sp.py b/tests/ut/models/test_kimi_k3_pp_sp.py
+index a8fff98ed..9399d697a 100644
+--- a/tests/ut/models/test_kimi_k3_pp_sp.py
++++ b/tests/ut/models/test_kimi_k3_pp_sp.py
+@@ -544,7 +544,6 @@ def test_pp_cpu_count_sync_is_scoped(architecture, use_pp, num_speculative_steps
+ 
+ 
+ @pytest.mark.parametrize("architecture", ["KimiK3ForCausalLM", "DeepseekV4ForCausalLM"])
+-@pytest.mark.parametrize("legacy_transport", [False, True])
+ @pytest.mark.parametrize(
+     "use_pp,num_speculative_steps,owns_speculator,prefill_chunk",
+     [
+@@ -559,7 +558,7 @@ def test_pp_cpu_count_sync_is_scoped(architecture, use_pp, num_speculative_steps
+     ],
+ )
+ def test_host_positions_after_rejection_or_chunk(
+-    architecture, legacy_transport, use_pp, num_speculative_steps, owns_speculator, prefill_chunk
++    architecture, use_pp, num_speculative_steps, owns_speculator, prefill_chunk
+ ):
+     events = []
+ 
+@@ -587,7 +586,6 @@ def test_host_positions_after_rejection_or_chunk(
+     )
+     runner = namespace["NPUModelRunner"]()
+     runner.speculator = object() if owns_speculator else None
+-    runner.use_spec_pp = use_pp and num_speculative_steps > 0 and legacy_transport
+     runner.use_pp = use_pp
+     runner.is_last_pp_rank = not use_pp
+     runner.model_state = object()
+diff --git a/tests/ut/patch/platform/test_patch_use_v2_model_runner.py b/tests/ut/patch/platform/test_patch_use_v2_model_runner.py
+index 1520b8bce..509ace2c1 100644
+--- a/tests/ut/patch/platform/test_patch_use_v2_model_runner.py
++++ b/tests/ut/patch/platform/test_patch_use_v2_model_runner.py
+@@ -1,3 +1,9 @@
++from types import SimpleNamespace
++
++import pytest
++from vllm.config.compilation import CompilationMode
++from vllm.config.vllm import VllmConfig
++
+ from vllm_ascend.patch.platform import patch_use_v2_model_runner
+ 
+ 
+@@ -18,20 +24,22 @@ def test_ascend_v1_supported_features_are_not_rejected(monkeypatch):
+     assert unsupported == ["prefill context parallel", "diffusion models"]
+ 
+ 
+-def test_release_pcp_is_not_rejected_as_v2_unsupported_feature(monkeypatch):
+-    monkeypatch.setattr(
+-        patch_use_v2_model_runner,
+-        "_original_get_unsupported_features",
+-        lambda _: ["prefill context parallelism", "diffusion models"],
++@pytest.mark.parametrize("method", ["eagle3", "mtp", "dspark"])
++@pytest.mark.parametrize("enable_sp", [False, True])
++def test_native_v2_spec_pp_validation(method, enable_sp):
++    config = SimpleNamespace(
++        model_config=None,
++        speculative_config=SimpleNamespace(method=method, parallel_drafting=False),
++        compilation_config=SimpleNamespace(mode=CompilationMode.NONE, pass_config=SimpleNamespace(enable_sp=enable_sp)),
++        parallel_config=SimpleNamespace(
++            pipeline_parallel_size=2,
++            tensor_parallel_size=4,
++            distributed_executor_backend="mp",
++            use_ubatching=False,
++            enable_elastic_ep=False,
++        ),
++        cache_config=SimpleNamespace(mamba_cache_mode="none"),
+     )
+-    monkeypatch.setattr(
+-        patch_use_v2_model_runner,
+-        "resolve_spec_pp_support",
+-        lambda _: None,
+-    )
+-
+-    unsupported = patch_use_v2_model_runner._patched_get_unsupported_features(object())
+-
+-    # Both supported pins delegate PCP checks to the manager (#53853).
+-    # The Ascend wrapper must preserve any remaining upstream restriction.
+-    assert unsupported == ["prefill context parallelism", "diffusion models"]
++    unsupported = VllmConfig._get_v2_model_runner_unsupported_features(config)
++    # Spec+PP is natively supported; unrelated upstream guards still apply.
++    assert unsupported == (["sequence parallelism"] if enable_sp else [])
+diff --git a/tests/ut/patch/worker/test_patch_deepseek_v2.py b/tests/ut/patch/worker/test_patch_deepseek_v2.py
+index b08b63c1c..3914c997f 100644
+--- a/tests/ut/patch/worker/test_patch_deepseek_v2.py
++++ b/tests/ut/patch/worker/test_patch_deepseek_v2.py
+@@ -194,17 +194,16 @@ def test_aux_relay_matches_unpartitioned_forward(monkeypatch, native, boundaries
+         torch.testing.assert_close(actual, expected)
+ 
+ 
+-@pytest.mark.parametrize("legacy,v2", [(True, True), (False, True), (False, False)])
+-def test_aux_buffer_factory_uses_one_protocol(monkeypatch, legacy, v2):
++@pytest.mark.parametrize("v2", [False, True])
++def test_aux_buffer_factory_uses_one_protocol(monkeypatch, v2):
+     factory = object()
+     model = SimpleNamespace(layers=[], make_empty_intermediate_tensors=factory)
+     monkeypatch.setattr(patch_deepseek_v2, "_original_deepseek_v2_model_init", lambda *args, **kwargs: None)
+-    monkeypatch.setattr(patch_deepseek_v2.pp_transport, "use_legacy_spec_pp", lambda: legacy)
+     wrapped = object()
+     wrap_factory = Mock(return_value=wrapped)
+     monkeypatch.setattr(patch_deepseek_v2.pp_transport, "make_empty_intermediate_tensors", wrap_factory)
+     patch_deepseek_v2._patched_deepseek_v2_model_init(model, vllm_config=SimpleNamespace(use_v2_model_runner=v2))
+-    assert model._use_upstream_aux_relay is (v2 and not legacy)
++    assert model._use_upstream_aux_relay is v2
+     expected_data_types: tuple[PPTransportDataType, ...] = (PPTransportDataType.TOPK_INDICES,)
+     if not model._use_upstream_aux_relay:
+         expected_data_types = (PPTransportDataType.AUX_HIDDEN_STATES, *expected_data_types)
+@@ -246,7 +245,6 @@ def test_model_init_adds_pp_topk_receive_buffer(monkeypatch):
+         "_original_deepseek_v2_model_init",
+         original_init,
+     )
+-    monkeypatch.setattr(patch_deepseek_v2.pp_transport, "use_legacy_spec_pp", lambda: False)
+     model = SimpleNamespace()
+ 
+     _patched_deepseek_v2_model_init(
+diff --git a/tests/ut/patch/worker/test_patch_dspark_pp.py b/tests/ut/patch/worker/test_patch_dspark_pp.py
+index 7df22a14b..befd5e2a6 100644
+--- a/tests/ut/patch/worker/test_patch_dspark_pp.py
++++ b/tests/ut/patch/worker/test_patch_dspark_pp.py
+@@ -3,44 +3,46 @@
+ from types import SimpleNamespace
+ 
+ import pytest
++import vllm.envs as vllm_envs
++from vllm.v1.worker.gpu.spec_decode.eagle import utils as eagle_utils
+ 
+ from vllm_ascend.patch.worker.patch_v2 import patch_dspark
+-from vllm_ascend.worker.v2 import pp_transport
+ 
+ 
+-@pytest.mark.parametrize("legacy", [True, False])
++@pytest.mark.parametrize("inherits_quant", [True, False])
+ @pytest.mark.parametrize("pp_size", [1, 2])
+ @pytest.mark.parametrize("fail", [True, False])
+-def test_dspark_draft_partition_isolation(monkeypatch, legacy, pp_size, fail):
+-    bypass_pp_guard = legacy and pp_size > 1
++def test_dspark_draft_partition_isolation(monkeypatch, inherits_quant, pp_size, fail):
+     config = SimpleNamespace(
+         parallel_config=SimpleNamespace(pipeline_parallel_size=pp_size),
+         model_config=SimpleNamespace(model="target", architecture="GlmMoeDsaForCausalLM"),
+-        speculative_config=SimpleNamespace(method="dspark", draft_model_config=SimpleNamespace(model="draft")),
++        speculative_config=SimpleNamespace(
++            method="dspark", draft_model_config=SimpleNamespace(model="target" if inherits_quant else "draft")
++        ),
++        quant_config=object(),
+     )
+-    monkeypatch.setattr(pp_transport, "use_legacy_spec_pp", lambda: legacy)
+-    monkeypatch.setattr(patch_dspark, "use_legacy_spec_pp", lambda: legacy)
+     get_pp_group = lambda: SimpleNamespace(world_size=pp_size)
+     monkeypatch.setattr(patch_dspark.dspark_utils, "get_pp_group", get_pp_group, raising=False)
+-    monkeypatch.setattr(pp_transport.vllm_envs, "VLLM_PP_LAYER_PARTITION", "42,36")
+-    should_share = patch_dspark.eagle_utils._should_share
++    monkeypatch.setattr(vllm_envs, "VLLM_PP_LAYER_PARTITION", "42,36")
++    should_share = eagle_utils._should_share
++    get_quant_config = patch_dspark.model_utils.get_draft_quant_config
+     assert "_should_share" not in vars(patch_dspark.dspark_utils)
+ 
+     def load(target, received_config):
+         assert received_config is config
+-        assert config.parallel_config.pipeline_parallel_size == (1 if bypass_pp_guard else pp_size)
++        assert config.parallel_config.pipeline_parallel_size == pp_size
+         expected_partition = None if pp_size > 1 else "42,36"
+-        assert expected_partition == pp_transport.vllm_envs.VLLM_PP_LAYER_PARTITION
+-        assert patch_dspark.dspark_utils.get_pp_group().world_size == (1 if bypass_pp_guard else pp_size)
+-        # Both upstream loaders resolve this helper inside load_dspark_model.
++        assert expected_partition == vllm_envs.VLLM_PP_LAYER_PARTITION
++        assert patch_dspark.dspark_utils.get_pp_group().world_size == pp_size
++        # Native PP loading and sharing are not overridden.
+         from vllm.v1.worker.gpu.spec_decode.eagle.utils import _should_share
+ 
+-        assert _should_share is patch_dspark.eagle_utils._should_share
++        assert _should_share is should_share
+         assert "_should_share" not in vars(patch_dspark.dspark_utils)
+-        if bypass_pp_guard:
+-            assert _should_share is not should_share
++        if inherits_quant:
++            assert patch_dspark.model_utils.get_draft_quant_config(config) is config.quant_config
+         else:
+-            assert _should_share is should_share
++            assert patch_dspark.model_utils.get_draft_quant_config is get_quant_config
+         if fail:
+             raise RuntimeError("draft load failed")
+         return target
+@@ -53,7 +55,8 @@ def test_dspark_draft_partition_isolation(monkeypatch, legacy, pp_size, fail):
+     else:
+         assert patch_dspark._load_dspark_model_with_target_quant(target, config) is target
+     assert config.parallel_config.pipeline_parallel_size == pp_size
+-    assert pp_transport.vllm_envs.VLLM_PP_LAYER_PARTITION == "42,36"
+-    assert patch_dspark.eagle_utils._should_share is should_share
++    assert vllm_envs.VLLM_PP_LAYER_PARTITION == "42,36"
++    assert eagle_utils._should_share is should_share
++    assert patch_dspark.model_utils.get_draft_quant_config is get_quant_config
+     assert patch_dspark.dspark_utils.get_pp_group is get_pp_group
+     assert "_should_share" not in vars(patch_dspark.dspark_utils)
+diff --git a/tests/ut/patch/worker/test_patch_spec_pp.py b/tests/ut/patch/worker/test_patch_spec_pp.py
+deleted file mode 100644
+index e31c65e90..000000000
+--- a/tests/ut/patch/worker/test_patch_spec_pp.py
++++ /dev/null
+@@ -1,188 +0,0 @@
+-# SPDX-License-Identifier: Apache-2.0
+-
+-from dataclasses import dataclass
+-from types import SimpleNamespace
+-
+-import numpy as np
+-
+-from vllm_ascend.patch.worker.patch_v2.patch_spec_pp import (
+-    SpecPPPendingRecv,
+-    compute_need_sampled_mask,
+-    install_upstream_spec_pp_protocol,
+-)
+-
+-
+-@dataclass
+-class _InputBatch:
+-    num_computed_tokens_np: np.ndarray
+-    num_scheduled_tokens: np.ndarray
+-    prefill_len_np: np.ndarray
+-    # Rank-local bound consulted by the release gate; the vendored 0.30
+-    # gate must ignore it entirely.
+-    max_seq_len_np: np.ndarray | None = None
+-
+-
+-class TestPureParticipationGate:
+-    def test_matches_release_gate_for_regular_decode(self):
+-        batch = _InputBatch(
+-            num_computed_tokens_np=np.array([56, 0], dtype=np.int32),
+-            num_scheduled_tokens=np.array([8, 25], dtype=np.int32),
+-            prefill_len_np=np.array([25, 50], dtype=np.int32),
+-        )
+-        np.testing.assert_array_equal(
+-            compute_need_sampled_mask(batch),
+-            np.array([True, False]),
+-        )
+-
+-    def test_ignores_rank_local_max_seq_len_bound(self):
+-        """The release gate drops requests whose next token may hit
+-        max_seq_len; two ranks with different views of that bound must
+-        still compute the same mask here."""
+-        base = dict(
+-            num_computed_tokens_np=np.array([56], dtype=np.int32),
+-            num_scheduled_tokens=np.array([8], dtype=np.int32),
+-            prefill_len_np=np.array([25], dtype=np.int32),
+-        )
+-        tight = _InputBatch(max_seq_len_np=np.array([57]), **base)
+-        loose = _InputBatch(max_seq_len_np=np.array([98304]), **base)
+-        np.testing.assert_array_equal(
+-            compute_need_sampled_mask(tight),
+-            compute_need_sampled_mask(loose),
+-        )
+-        assert compute_need_sampled_mask(tight) is not None
+-
+-    def test_all_prefill_chunks_only_returns_none(self):
+-        batch = _InputBatch(
+-            num_computed_tokens_np=np.array([0, 8], dtype=np.int32),
+-            num_scheduled_tokens=np.array([8, 8], dtype=np.int32),
+-            prefill_len_np=np.array([1024, 512], dtype=np.int32),
+-        )
+-        assert compute_need_sampled_mask(batch) is None
+-
+-
+-class _FakeTensor:
+-    def __init__(self, shape):
+-        self.shape = shape
+-
+-    def unbind(self, dim=0):
+-        return _FakeTensor((self.shape[1],)), _FakeTensor((self.shape[1],))
+-
+-    def record_stream(self, stream):
+-        pass
+-
+-
+-class _StreamStub:
+-    def wait_stream(self, other):
+-        pass
+-
+-    def record_event(self):
+-        return object()
+-
+-
+-class _StreamCtx:
+-    def __enter__(self):
+-        return None
+-
+-    def __exit__(self, *exc):
+-        return False
+-
+-
+-class TestProtocolInstall:
+-    def _handler(self):
+-        return SimpleNamespace(
+-            is_last_rank=False,
+-            device="npu:0",
+-            max_sample_len=8,
+-            last_rank=1,
+-            broadcast_group=object(),
+-            broadcast_stream=_StreamStub(),
+-            main_stream=_StreamStub(),
+-            req_idx_gen_np=np.zeros(4, dtype=np.int64),
+-            queue=[None],
+-        )
+-
+-    def _patch_transport(self, monkeypatch, sent):
+-        """Swap the module-global ``torch`` for a stub namespace.  Patching
+-        ``torch.distributed`` attributes directly is unreliable once
+-        vllm-ascend has rebinded collectives onto torch_npu."""
+-        from types import SimpleNamespace as NS
+-
+-        import vllm_ascend.patch.worker.patch_v2.patch_spec_pp as mod
+-
+-        def fake_broadcast(tensor, src=None, group=None):
+-            sent.append(tuple(tensor.shape))
+-
+-        fake_torch = NS(
+-            distributed=NS(broadcast=fake_broadcast),
+-            cuda=NS(stream=lambda _s: _StreamCtx()),
+-            empty=lambda *a, **k: _FakeTensor((a[0], a[1])),
+-            int64=object(),
+-            int32=object(),
+-        )
+-        monkeypatch.setattr(mod, "torch", fake_torch)
+-
+-    def test_installs_and_is_idempotent(self, monkeypatch):
+-        handler = self._handler()
+-        req_states = SimpleNamespace()
+-        install_upstream_spec_pp_protocol(handler, req_states, num_speculative_steps=7)
+-        installed = (handler.receive, handler.broadcast, handler.broadcast_drafts)
+-        install_upstream_spec_pp_protocol(handler, req_states, num_speculative_steps=7)
+-        assert (handler.receive, handler.broadcast, handler.broadcast_drafts) == installed
+-        assert handler.broadcast_draft_tokens is handler.broadcast_drafts
+-
+-    def test_receive_issues_three_broadcasts_and_reserves_slot(self, monkeypatch):
+-        handler = self._handler()
+-        req_states = SimpleNamespace()
+-        install_upstream_spec_pp_protocol(handler, req_states, num_speculative_steps=7)
+-
+-        batch = _InputBatch(
+-            num_computed_tokens_np=np.array([56], dtype=np.int32),
+-            num_scheduled_tokens=np.array([8], dtype=np.int32),
+-            prefill_len_np=np.array([25], dtype=np.int32),
+-        )
+-        batch.num_reqs = 1  # type: ignore[attr-defined]
+-        batch.idx_mapping_np = np.array([2], dtype=np.int64)  # type: ignore[attr-defined]
+-        batch.idx_mapping = object()  # type: ignore[attr-defined]
+-
+-        sent: list[tuple[int, ...]] = []
+-        self._patch_transport(monkeypatch, sent)
+-        gather_all = handler.receive(batch)
+-
+-        # sampled tokens, combined and drafts: three broadcasts, in order.
+-        assert sent == [(1, 8), (2, 1), (1, 7)]
+-        assert gather_all is True
+-        slot = handler.queue[-1]
+-        assert isinstance(slot, SpecPPPendingRecv)
+-        assert slot.draft_tokens is not None
+-
+-    def test_receive_without_sample_needs_skips_transport(self, monkeypatch):
+-        handler = self._handler()
+-        req_states = SimpleNamespace()
+-        install_upstream_spec_pp_protocol(handler, req_states, num_speculative_steps=7)
+-
+-        batch = _InputBatch(
+-            num_computed_tokens_np=np.array([0], dtype=np.int32),
+-            num_scheduled_tokens=np.array([8], dtype=np.int32),
+-            prefill_len_np=np.array([1024], dtype=np.int32),
+-        )
+-        sent: list[tuple[int, ...]] = []
+-        self._patch_transport(monkeypatch, sent)
+-        assert handler.receive(batch) is False
+-        assert sent == []
+-        assert handler.queue[-1] is None
+-
+-    def test_pending_recv_extends_release_fields_with_drafts(self):
+-        fields = SpecPPPendingRecv.__dataclass_fields__
+-        release_fields = (
+-            "event",
+-            "sampled_tokens",
+-            "num_sampled",
+-            "num_rejected",
+-            "idx_mapping",
+-            "idx_mapping_np",
+-            "need_sampled_mask",
+-            "gen_at_receive_np",
+-        )
+-        for name in release_fields:
+-            assert name in fields
+-        assert fields["draft_tokens"].default is None
+diff --git a/tests/ut/worker/test_model_runner_v2.py b/tests/ut/worker/test_model_runner_v2.py
+index 3d88cd52f..f5162dca6 100644
+--- a/tests/ut/worker/test_model_runner_v2.py
++++ b/tests/ut/worker/test_model_runner_v2.py
+@@ -363,7 +363,6 @@ def test_sample_tokens_restores_replicated_draft_hidden_states():
+     runner = _make_runner(need_timing=False)
+     runner.is_last_pp_rank = True
+     runner.speculator = SimpleNamespace(replicated_pcp=True)
+-    runner.use_spec_pp = False
+ 
+     hidden_states = torch.arange(6, dtype=torch.float32).reshape(2, 3)
+     aux_hidden_states = torch.ones(2, 3)
+@@ -577,6 +576,7 @@ def test_pcp_manager_cls():
+ 
+ 
+ def _parent_init(self, vllm_config, device, *, full_graph=False, speculative=False, use_pp=False):
++    assert vllm_config.parallel_config.pipeline_parallel_size == (2 if use_pp else 1)
+     self.vllm_config = vllm_config
+     self.device = device
+     self.compilation_config = SimpleNamespace(
+@@ -588,7 +588,7 @@ def _parent_init(self, vllm_config, device, *, full_graph=False, speculative=Fal
+     self.speculative_config = object() if speculative else None
+     self.use_pp = use_pp
+     self.is_last_pp_rank = True
+-    self.pp_handler = MagicMock()
++    self.pp_handler = SimpleNamespace() if use_pp else None
+     self.max_num_reqs = 2
+     self.max_model_len = 32
+     self.max_num_tokens = 8
+@@ -600,8 +600,11 @@ def _parent_init(self, vllm_config, device, *, full_graph=False, speculative=Fal
+     self.speculator = object()
+ 
+ 
+-def test_init_without_spec_pp():
+-    vllm_config = SimpleNamespace(parallel_config=SimpleNamespace(enable_eplb=False))
++@pytest.mark.parametrize("use_pp", [False, True])
++def test_init_without_speculation(use_pp):
++    vllm_config = SimpleNamespace(
++        parallel_config=SimpleNamespace(enable_eplb=False, pipeline_parallel_size=2 if use_pp else 1)
++    )
+     ascend_config = SimpleNamespace(eplb_config=SimpleNamespace(load_collection_phase="all"))
+ 
+     # Complete the fake with the fields NPUModelRunner reads (mirrors FinegrainedTPConfig).
+@@ -616,11 +619,7 @@ def test_init_without_spec_pp():
+         patch("vllm_ascend.worker.v2.model_runner.set_potential_max_tokens"),
+         patch("vllm_ascend.worker.v2.model_runner.resolve_spec_pp_support", return_value=None),
+         patch("vllm_ascend.worker.v2.model_runner.torch_cuda_wrapper", return_value=nullcontext()),
+-        patch(
+-            "vllm_ascend.worker.v2.model_runner.bypass_upstream_spec_pp_guard",
+-            return_value=nullcontext(False),
+-        ),
+-        patch.object(GPUModelRunner, "__init__", lambda self, cfg, dev: _parent_init(self, cfg, dev)),
++        patch.object(GPUModelRunner, "__init__", lambda self, cfg, dev: _parent_init(self, cfg, dev, use_pp=use_pp)),
+         patch("vllm_ascend.worker.v2.model_runner.AscendEPLBController", return_value="eplb"),
+         patch("vllm_ascend.worker.v2.model_runner.AscendRequestState", return_value="req"),
+         patch("vllm_ascend.worker.v2.model_runner.AscendInputBuffers", return_value="buf"),
+@@ -644,13 +643,16 @@ def test_init_without_spec_pp():
+     assert runner.req_states == "req"
+     assert runner.input_buffers == "buf"
+     assert runner.speculator is None
+-    assert runner.use_spec_pp is False
+     assert runner.sync_spec_pp_cpu_counts is False
+     assert runner.decode_query_len == 1
++    if use_pp:
++        assert vars(runner.pp_handler) == {}
++    else:
++        assert runner.pp_handler is None
+ 
+ 
+ def test_init_spec_pp_full_graph_and_speculator():
+-    vllm_config = SimpleNamespace(parallel_config=SimpleNamespace(enable_eplb=True))
++    vllm_config = SimpleNamespace(parallel_config=SimpleNamespace(enable_eplb=True, pipeline_parallel_size=2))
+     ascend_config = SimpleNamespace(eplb_config=SimpleNamespace(load_collection_phase="decode"))
+ 
+     # Complete the fake with the fields NPUModelRunner reads (mirrors FinegrainedTPConfig).
+@@ -667,11 +669,6 @@ def test_init_spec_pp_full_graph_and_speculator():
+         patch("vllm_ascend.worker.v2.model_runner.set_potential_max_tokens"),
+         patch("vllm_ascend.worker.v2.model_runner.resolve_spec_pp_support", return_value=spec_pp),
+         patch("vllm_ascend.worker.v2.model_runner.torch_cuda_wrapper", return_value=nullcontext()),
+-        patch(
+-            "vllm_ascend.worker.v2.model_runner.bypass_upstream_spec_pp_guard",
+-            return_value=nullcontext(True),
+-        ),
+-        patch("vllm_ascend.worker.v2.model_runner.restore_pp_after_upstream_init") as restore_pp,
+         patch.object(
+             GPUModelRunner,
+             "__init__",
+@@ -684,7 +681,6 @@ def test_init_spec_pp_full_graph_and_speculator():
+         patch("vllm_ascend.worker.v2.model_runner.set_cos_and_sin"),
+         patch("vllm_ascend.worker.v2.model_runner.set_mc2_tokens_capacity"),
+         patch("vllm_ascend.worker.v2.model_runner.set_mc2_mask"),
+-        patch("vllm_ascend.patch.worker.patch_v2.patch_spec_pp.install_upstream_spec_pp_protocol") as install_pp,
+         patch("torch.npu.Stream", return_value="stream"),
+         patch("torch.npu.Event", return_value="event"),
+         patch("torch.empty", return_value=torch.zeros(2, dtype=torch.int32)),
+@@ -698,15 +694,13 @@ def test_init_spec_pp_full_graph_and_speculator():
+         ),
+     ):
+         runner = NPUModelRunner(vllm_config, torch.device("cpu"))
+-    restore_pp.assert_called_once()
+     assert eplb_cls.call_args.args[2] is ascend_config.eplb_config
+     assert runner.use_aclgraph is True
+     assert runner.use_aux_hidden_state_outputs is True
+     assert runner.speculator is speculator
+     assert speculator.update_stream is runner.update_stream
+-    assert runner.use_spec_pp is False
+     assert runner.sync_spec_pp_cpu_counts is True
+-    install_pp.assert_not_called()
++    assert vars(runner.pp_handler) == {}
+     assert runner.update_stream is not None
+     assert runner.decode_query_len == 2
+ 
+@@ -714,7 +708,6 @@ def test_init_spec_pp_full_graph_and_speculator():
+ def test_sample_tokens_non_last_pp_uses_global_batch():
+     runner = _make_runner()
+     runner.is_last_pp_rank = False
+-    runner.use_spec_pp = False
+     runner.speculator = None
+     global_batch = object()
+     runner.pcp_manager = MagicMock(spec=AscendPCPManager)
+@@ -730,18 +723,15 @@ def test_sample_tokens_non_last_pp_uses_global_batch():
+     parent.assert_called_once_with(None)
+ 
+ 
+-def test_sample_tokens_spec_pp_broadcasts_draft_tokens():
++def test_sample_tokens_leaves_draft_broadcast_to_upstream():
+     runner = _make_runner()
+     runner.is_last_pp_rank = True
+-    runner.use_spec_pp = True
+     runner.speculator = None
+     runner.pcp_manager = None
+     runner.pp_handler = MagicMock()
+     with patch.object(GPUModelRunner, "sample_tokens", return_value="out"):
+         assert runner.sample_tokens("g") == "out"
+-    # sample_tokens always calls broadcast_drafts when legacy spec PP is on.
+-    # broadcast_draft_tokens is only an alias installed on the real PP handler.
+-    runner.pp_handler.broadcast_drafts.assert_called_once_with()
++    runner.pp_handler.broadcast_drafts.assert_not_called()
+ 
+ 
+ @pytest.mark.parametrize("a5", [False, True])
+diff --git a/tests/ut/worker/test_pcp_manager_v2.py b/tests/ut/worker/test_pcp_manager_v2.py
+index aecc807c7..ae064e3b2 100644
+--- a/tests/ut/worker/test_pcp_manager_v2.py
++++ b/tests/ut/worker/test_pcp_manager_v2.py
+@@ -1065,7 +1065,6 @@ def test_sample_tokens_uses_global_batch_only_on_non_last_pp_rank(
+     runner.pcp_manager = manager
+     runner.is_last_pp_rank = is_last_pp_rank
+     runner.speculator = None
+-    runner.use_spec_pp = False
+     runner.prompt_logprobs_worker = None
+     # vLLM main added these ExecuteModelState fields.
+     state_kwargs: dict = {}
+diff --git a/tests/ut/worker/v2/test_pp_transport.py b/tests/ut/worker/v2/test_pp_transport.py
+index e8181a6c3..8a163fa41 100644
+--- a/tests/ut/worker/v2/test_pp_transport.py
++++ b/tests/ut/worker/v2/test_pp_transport.py
+@@ -1,32 +1,14 @@
+ # SPDX-License-Identifier: Apache-2.0
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM Ascend project
+ 
+-import os
+ from types import SimpleNamespace
+ 
+ import pytest
+-import vllm.envs as vllm_envs
+-from vllm.distributed.utils import get_pp_indices
++import torch
++from vllm.sequence import IntermediateTensors
+ 
+ from vllm_ascend.worker.v2 import pp_transport
+-from vllm_ascend.worker.v2.pp_transport import (
+-    SpecPPSupport,
+-    bypass_upstream_spec_pp_guard,
+-    resolve_spec_pp_support,
+-)
+-
+-
+-@pytest.fixture(autouse=True)
+-def _clear_partition_cache():
+-    """Drop a cached VLLM_PP_LAYER_PARTITION left by other test modules."""
+-    vllm_envs.__dict__.pop("VLLM_PP_LAYER_PARTITION", None)
+-    yield
+-    vllm_envs.__dict__.pop("VLLM_PP_LAYER_PARTITION", None)
+-
+-
+-def test_spec_pp_uses_native_protocol():
+-    """The supported release shares the upstream sampled-token protocol."""
+-    assert pp_transport.use_legacy_spec_pp() is False
++from vllm_ascend.worker.v2.pp_transport import resolve_spec_pp_support
+ 
+ 
+ @pytest.mark.parametrize(
+@@ -52,65 +34,49 @@ def test_topk_boundary_combines_indexshare_and_indexcache(indexer_type, use_inde
+     assert not pp_transport.pp_stage_requires_topk_indices(config, config.num_hidden_layers)
+ 
+ 
+-@pytest.mark.parametrize("cached", [False, True])
+-@pytest.mark.parametrize("partition", [None, "42,36"])
+-@pytest.mark.parametrize("fail", [False, True])
+-def test_unsharded_draft_preserves_target_partition(monkeypatch, cached, partition, fail):
+-    monkeypatch.setattr(pp_transport, "use_legacy_spec_pp", lambda: True)
+-    was_cached = vllm_envs._is_envs_cache_enabled()
+-    vllm_envs.disable_envs_cache()
+-    if partition is None:
+-        monkeypatch.delenv("VLLM_PP_LAYER_PARTITION", raising=False)
++@pytest.mark.parametrize(
++    "method,architecture,needs_aux",
++    [
++        ("mtp", "Qwen3_5ForConditionalGeneration", False),
++        ("eagle3", "MiniMaxM3SparseForCausalLM", True),
++        ("eagle3", "MiniMaxM3SparseForConditionalGeneration", True),
++        ("dspark", "DeepseekV4ForCausalLM", True),
++        ("dspark", "GlmMoeDsaForCausalLM", True),
++    ],
++)
++@pytest.mark.parametrize("pp_size", [1, 2])
++def test_resolve_spec_pp_support(method, architecture, needs_aux, pp_size):
++    config = SimpleNamespace(
++        parallel_config=SimpleNamespace(pipeline_parallel_size=pp_size),
++        model_config=SimpleNamespace(architecture=architecture),
++        speculative_config=SimpleNamespace(method=method),
++    )
++    support = resolve_spec_pp_support(config)
++    if pp_size == 1:
++        assert support is None
+     else:
+-        monkeypatch.setenv("VLLM_PP_LAYER_PARTITION", partition)
+-    config = SimpleNamespace(parallel_config=SimpleNamespace(pipeline_parallel_size=2))
+-    support = SpecPPSupport(bypass_upstream_pp_guard=True)
+-
+-    def initialize():
+-        with bypass_upstream_spec_pp_guard(config, support) as bypassed:
+-            assert bypassed
+-            assert config.parallel_config.pipeline_parallel_size == 1
+-            assert vllm_envs.VLLM_PP_LAYER_PARTITION is None
+-            assert os.environ.get("VLLM_PP_LAYER_PARTITION") == partition
+-            assert get_pp_indices(78, 0, 1) == (0, 78)
+-            with bypass_upstream_spec_pp_guard(config, support):
+-                assert get_pp_indices(78, 0, 1) == (0, 78)
+-            assert vllm_envs.VLLM_PP_LAYER_PARTITION is None
+-            if fail:
+-                raise RuntimeError("draft initialization failed")
+-
+-    try:
+-        if cached:
+-            vllm_envs.enable_envs_cache()
+-        if fail:
+-            with pytest.raises(RuntimeError, match="draft initialization failed"):
+-                initialize()
+-        else:
+-            initialize()
+-        assert config.parallel_config.pipeline_parallel_size == 2
+-        assert partition == vllm_envs.VLLM_PP_LAYER_PARTITION
+-        if partition is not None:
+-            assert get_pp_indices(78, 0, 2) == (0, 42)
+-            assert get_pp_indices(78, 1, 2) == (42, 78)
+-    finally:
+-        vllm_envs.disable_envs_cache()
+-        monkeypatch.undo()
+-        if was_cached:
+-            vllm_envs.enable_envs_cache()
++        assert support.needs_aux_hidden_states is needs_aux
+ 
+ 
+-@pytest.mark.parametrize(
+-    "legacy,support",
+-    [(True, None), (True, SpecPPSupport()), (False, SpecPPSupport(bypass_upstream_pp_guard=True))],
+-)
+-def test_pp_guard_noop_preserves_partition(monkeypatch, legacy, support):
+-    monkeypatch.setattr(pp_transport, "use_legacy_spec_pp", lambda: legacy)
+-    monkeypatch.setattr(vllm_envs, "VLLM_PP_LAYER_PARTITION", "42,36")
+-    config = SimpleNamespace(parallel_config=SimpleNamespace(pipeline_parallel_size=2))
+-    with bypass_upstream_spec_pp_guard(config, support) as bypassed:
+-        assert not bypassed
+-        assert config.parallel_config.pipeline_parallel_size == 2
+-        assert vllm_envs.VLLM_PP_LAYER_PARTITION == "42,36"
++@pytest.mark.parametrize("method", [None, "ngram", "eagle3"])
++def test_unregistered_spec_pp_support(method):
++    config = SimpleNamespace(
++        parallel_config=SimpleNamespace(pipeline_parallel_size=2),
++        model_config=SimpleNamespace(architecture="OtherModel"),
++        speculative_config=SimpleNamespace(method=method) if method else None,
++    )
++    assert resolve_spec_pp_support(config) is None
++
++
++def test_aux_buffer_includes_stage_boundary():
++    model = SimpleNamespace(config=SimpleNamespace(hidden_size=4), start_layer=2, aux_hidden_state_layers=(0, 2, 4))
++    factory = pp_transport.make_empty_intermediate_tensors(
++        model, lambda batch, dtype, device: IntermediateTensors({"hidden_states": torch.zeros(batch, 4)})
++    )
++    tensors = factory(3, torch.float32, torch.device("cpu"))
++    aux = pp_transport.get_pp_transport_tensors(tensors, pp_transport.PPTransportDataType.AUX_HIDDEN_STATES)
++    assert len(aux) == 2
++    assert all(t.shape == (3, 4) for t in aux)
+ 
+ 
+ def _make_config(
+@@ -141,7 +107,6 @@ def test_kimi_k3_dspark_pp_supports_all_target_aliases(architecture):
+ 
+     assert support is not None
+     assert support.needs_aux_hidden_states
+-    assert support.bypass_upstream_pp_guard
+ 
+ 
+ @pytest.mark.parametrize(
+diff --git a/vllm_ascend/patch/__init__.py b/vllm_ascend/patch/__init__.py
+index d9e55aab7..88e4ab15b 100644
+--- a/vllm_ascend/patch/__init__.py
++++ b/vllm_ascend/patch/__init__.py
+@@ -1404,22 +1404,6 @@
+ #    Future Plan:
+ #       remove this when vllm-ascend's attention metadata is align with vllm.
+ #
+-# ** 27a. File: worker/patch_v2/patch_spec_pp.py**
+-# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+-#   1. PPHandler sampled-token broadcast methods
+-#    Why:
+-#       Target-driven speculative decoding generates next-step draft tokens
+-#       after target sampling. Non-last PP ranks need both results for the same
+-#       delayed request-state update.
+-#    How:
+-#       Defer the target-token broadcast until drafting finishes, then carry
+-#       accepted target tokens and next-step draft tokens in the same V2 PP
+-#       queue slot.
+-#    Related PR (if no, explain why):
+-#       No, this enables the Ascend MRV2 implementation.
+-#    Future Plan:
+-#       Remove when vLLM natively transports draft tokens through PP.
+-#
+ # ** 28. File: worker/patch_v2/patch_triton.py**
+ # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+ #   1. `vllm.v1.worker.gpu.sample.logprob`, `vllm.v1.worker.gpu.sample.penalties.apply_penalties`,
+diff --git a/vllm_ascend/patch/platform/patch_use_v2_model_runner.py b/vllm_ascend/patch/platform/patch_use_v2_model_runner.py
+index 1add32098..63bd4206d 100644
+--- a/vllm_ascend/patch/platform/patch_use_v2_model_runner.py
++++ b/vllm_ascend/patch/platform/patch_use_v2_model_runner.py
+@@ -2,10 +2,8 @@ import vllm.envs as envs
+ from vllm.config.vllm import VllmConfig
+ 
+ from vllm_ascend.device.hardware_profile import HardwareCapability, get_current_hardware_profile
+-from vllm_ascend.worker.v2.pp_transport import resolve_spec_pp_support
+ 
+ _original_validate_v2_model_runner = VllmConfig._validate_v2_model_runner
+-_original_get_unsupported_features = VllmConfig._get_v2_model_runner_unsupported_features
+ 
+ _ASCEND_V1_SUPPORTED_FEATURES = frozenset(
+     {
+@@ -30,17 +28,7 @@ def _patched_use_v2_model_runner(self) -> bool:
+     return False
+ 
+ 
+-def _patched_get_unsupported_features(self) -> list[str]:
+-    unsupported = _original_get_unsupported_features(self)
+-    support = resolve_spec_pp_support(self)
+-    unsupported_feature = support.unsupported_feature if support is not None else None
+-    if unsupported_feature is not None and unsupported_feature in unsupported:
+-        unsupported.remove(unsupported_feature)
+-    return unsupported
+-
+-
+ VllmConfig.use_v2_model_runner = property(_patched_use_v2_model_runner)
+-VllmConfig._get_v2_model_runner_unsupported_features = _patched_get_unsupported_features
+ 
+ 
+ def _patched_validate_v2_model_runner(self) -> None:
+diff --git a/vllm_ascend/patch/worker/patch_deepseek_v2.py b/vllm_ascend/patch/worker/patch_deepseek_v2.py
+index 229eeaabc..203a34eb2 100644
+--- a/vllm_ascend/patch/worker/patch_deepseek_v2.py
++++ b/vllm_ascend/patch/worker/patch_deepseek_v2.py
+@@ -31,6 +31,7 @@ from vllm.model_executor.models.deepseek_v2 import (
+     _get_llama_4_scaling,
+     yarn_get_mscale,
+ )
++from vllm.model_executor.models.interfaces import EagleModelMixin
+ from vllm.model_executor.models.utils import extract_layer_index
+ from vllm.sequence import IntermediateTensors
+ from vllm.v1.attention.backends.mla.index_group import SparseMLAIndexGroupBuilder
+@@ -288,7 +289,6 @@ def _deepseek_v2_mla_attention_init(
+ DeepseekV2MLAAttention.__init__ = _deepseek_v2_mla_attention_init
+ 
+ 
+-# TODO: Retire the legacy aux transport when vLLM 0.28/0.29 are no longer supported.
+ _original_deepseek_v2_model_init = DeepseekV2Model.__init__
+ 
+ 
+@@ -303,8 +303,8 @@ def _find_topk_indices_buffer(layers: Iterable[object]) -> torch.Tensor | None:
+ 
+ def _patched_deepseek_v2_model_init(self, *args, **kwargs):
+     _original_deepseek_v2_model_init(self, *args, **kwargs)
+-    # Legacy Spec+PP (0.28/0.29 only): 0.30+ uses the upstream aux relay.
+-    self._use_upstream_aux_relay = kwargs["vllm_config"].use_v2_model_runner and not pp_transport.use_legacy_spec_pp()
++    # V2 relays aux slots upstream; V1 still uses the Ascend tensor payload.
++    self._use_upstream_aux_relay = kwargs["vllm_config"].use_v2_model_runner
+     self.topk_indices_buffer = _find_topk_indices_buffer(self.layers)
+     transport_data_type_list = [PPTransportDataType.TOPK_INDICES]
+     if not self._use_upstream_aux_relay:
+@@ -321,31 +321,28 @@ def _patched_deepseek_v2_model_init(self, *args, **kwargs):
+ DeepseekV2Model.__init__ = _patched_deepseek_v2_model_init
+ 
+ 
+-# Legacy Spec+PP (0.28/0.29 only); the upstream branch below is for 0.30+.
+-if not pp_transport.use_legacy_spec_pp():
+-    # Release versions do not expose this interface. Reuse only upstream's
+-    # slot bookkeeping; the Ascend forward still owns capture and TP gathering.
+-    from vllm.model_executor.models.interfaces import EagleModelMixin
+-
+-    for _member in (
+-        "AUX_HIDDEN_STATE_KEY",
+-        "_aux_slot_base_cached",
+-        "_aux_upstream_total_cached",
+-        "_set_aux_hidden_state_layers",
+-        "_cache_aux_pp_layout",
+-        "pack_local_aux_hidden_states",
+-        "collect_remote_aux_hidden_states",
+-    ):
+-        setattr(DeepseekV2Model, _member, getattr(EagleModelMixin, _member))
+-    DeepseekV2Model.supports_aux_hidden_states_over_pp = True
++# Reuse upstream slot bookkeeping; Ascend owns capture and TP gathering.
++for _member in (
++    "AUX_HIDDEN_STATE_KEY",
++    "_aux_slot_base_cached",
++    "_aux_upstream_total_cached",
++    "_set_aux_hidden_state_layers",
++    "_cache_aux_pp_layout",
++    "pack_local_aux_hidden_states",
++    "collect_remote_aux_hidden_states",
++):
++    setattr(DeepseekV2Model, _member, getattr(EagleModelMixin, _member))
++DeepseekV2Model.supports_aux_hidden_states_over_pp = True
++
++
++def _set_aux_hidden_state_layers(self, layers: tuple[int, ...]) -> None:
++    if self.model._use_upstream_aux_relay:
++        self.model._set_aux_hidden_state_layers(layers)
++    else:
++        self.model.aux_hidden_state_layers = layers
+ 
+-    def _set_aux_hidden_state_layers(self, layers: tuple[int, ...]) -> None:
+-        if self.model._use_upstream_aux_relay:
+-            self.model._set_aux_hidden_state_layers(layers)
+-        else:
+-            self.model.aux_hidden_state_layers = layers
+ 
+-    DeepseekV2ForCausalLM.set_aux_hidden_state_layers = _set_aux_hidden_state_layers
++DeepseekV2ForCausalLM.set_aux_hidden_state_layers = _set_aux_hidden_state_layers
+ 
+ 
+ def _capture_aux_hidden_state(self, aux_hidden_states, layer_id, hidden_states, residual, positions):
+diff --git a/vllm_ascend/patch/worker/patch_v2/patch_dspark.py b/vllm_ascend/patch/worker/patch_v2/patch_dspark.py
+index 7f69fe1f5..258b1e95a 100644
+--- a/vllm_ascend/patch/worker/patch_v2/patch_dspark.py
++++ b/vllm_ascend/patch/worker/patch_v2/patch_dspark.py
+@@ -34,7 +34,6 @@ it upstream to ``load_dspark_model``.
+ """
+ 
+ from contextlib import AbstractContextManager, nullcontext
+-from types import SimpleNamespace
+ from typing import cast
+ from unittest.mock import patch
+ 
+@@ -45,11 +44,7 @@ import vllm.v1.worker.gpu.spec_decode.dspark.utils as dspark_utils
+ import vllm.v1.worker.gpu.spec_decode.eagle.utils as eagle_utils
+ from vllm.distributed.parallel_state import get_pp_group
+ 
+-from vllm_ascend.worker.v2.pp_transport import (
+-    bypass_upstream_spec_pp_guard,
+-    resolve_spec_pp_support,
+-    use_legacy_spec_pp,
+-)
++from vllm_ascend.worker.v2.pp_transport import resolve_spec_pp_support
+ 
+ _original_get_draft_quant_config = model_utils.get_draft_quant_config
+ _original_load_dspark_model = dspark_utils.load_dspark_model
+@@ -79,44 +74,21 @@ def _load_dspark_model_with_target_quant(target_model, vllm_config):
+     draft_model_config = speculative_config.draft_model_config
+     inherits_target_quant = draft_model_config.model == vllm_config.model_config.model
+     spec_pp_support = resolve_spec_pp_support(vllm_config)
+-    # Legacy Spec+PP loader bypass, retained behind the release selector; the
+-    # supported release uses the native protocol so this is currently inactive.
+-    bypass_pp_guard = spec_pp_support is not None and use_legacy_spec_pp()
+-    if bypass_pp_guard:
+-        # Release binds get_pp_group globally and imports _should_share locally.
+-        original_eagle_should_share = eagle_utils._should_share
+-        original_get_pp_group = dspark_utils.get_pp_group
+-        single_rank_pp_group = SimpleNamespace(world_size=1)
+-        dspark_utils.get_pp_group = lambda: single_rank_pp_group
+-
+-        def should_share(eagle, flag, draft, target):
+-            # Non-owning PP ranks expose embed / lm_head as PPMissingLayer
+-            # (no ``weight``). Keep the draft's own copy instead of sharing.
+-            if flag == "has_own_embed_tokens":
+-                return False
+-            if target is not None and not hasattr(target, "weight"):
+-                return False
+-            return original_eagle_should_share(eagle, flag, draft, target)
+-
+-        eagle_utils._should_share = should_share
+     if inherits_target_quant:
+         model_utils.get_draft_quant_config = lambda _vllm_config: vllm_config.quant_config
+     eagle_utils.maybe_share_target_embed = _pp_safe_maybe_share_target_embed
+     try:
+         # Native draft loading already sets PP=1, but still reads the target's
+-        # manual layer partition. Mask that partition on both version paths.
++        # manual layer partition. Keep it scoped to the target model.
+         partition_mask = cast(AbstractContextManager[None], nullcontext())
+         if spec_pp_support is not None:
+             partition_mask = patch.object(vllm_envs, "VLLM_PP_LAYER_PARTITION", None)
+-        with partition_mask, bypass_upstream_spec_pp_guard(vllm_config, spec_pp_support):
++        with partition_mask:
+             return _original_load_dspark_model(target_model, vllm_config)
+     finally:
+         eagle_utils.maybe_share_target_embed = _original_maybe_share_target_embed
+         if inherits_target_quant:
+             model_utils.get_draft_quant_config = _original_get_draft_quant_config
+-        if bypass_pp_guard:
+-            eagle_utils._should_share = original_eagle_should_share
+-            dspark_utils.get_pp_group = original_get_pp_group
+ 
+ 
+ # The speculator binds ``load_dspark_model`` by name at import time, so both
+diff --git a/vllm_ascend/patch/worker/patch_v2/patch_spec_pp.py b/vllm_ascend/patch/worker/patch_v2/patch_spec_pp.py
+deleted file mode 100644
+index 27639a427..000000000
+--- a/vllm_ascend/patch/worker/patch_v2/patch_spec_pp.py
++++ /dev/null
+@@ -1,174 +0,0 @@
+-# SPDX-License-Identifier: Apache-2.0
+-# Copyright (c) 2026 Huawei Technologies Co., Ltd. All Rights Reserved.
+-"""0.30 PP sampled-token protocol for release trains.
+-
+-Replaces the deferred-broadcast transport that deadlocked under KV
+-saturation with async EPLB.  Delete once the paired vLLM version ships
+-the protocol natively.
+-"""
+-
+-from dataclasses import dataclass
+-
+-import numpy as np
+-import torch
+-
+-# vLLM main (#56888) replaced buffer_utils.async_copy_to_gpu with
+-# torch_utils.async_tensor_h2d (gaining out=/device=None support).
+-from vllm.utils.torch_utils import async_tensor_h2d as async_copy_to_gpu
+-
+-_INSTALLED = "_vllm_ascend_upstream_spec_pp_installed"
+-
+-
+-def compute_need_sampled_mask(input_batch):
+-    """Participation gate: pure function of the shared batch (no
+-    rank-local max_seq_len bound).  Finished requests are filtered on
+-    the receive side via generation counters."""
+-    old_computed = input_batch.num_computed_tokens_np
+-    prefill_len = input_batch.prefill_len_np
+-    produces_sample = old_computed + input_batch.num_scheduled_tokens >= prefill_len
+-    return produces_sample if produces_sample.any() else None
+-
+-
+-@dataclass
+-class SpecPPPendingRecv:
+-    """Per-step slot: release fields plus the received draft rows."""
+-
+-    event: torch.cuda.Event
+-    sampled_tokens: torch.Tensor  # [num_reqs, max_sample_len]
+-    num_sampled: torch.Tensor  # [num_reqs]
+-    num_rejected: torch.Tensor  # [num_reqs]
+-    idx_mapping: torch.Tensor  # [num_reqs]
+-    idx_mapping_np: np.ndarray  # [num_reqs]
+-    need_sampled_mask: np.ndarray  # [num_reqs]
+-    gen_at_receive_np: np.ndarray  # [num_reqs]
+-    draft_tokens: torch.Tensor | None = None  # [num_reqs, num_speculative_steps]
+-
+-
+-def install_upstream_spec_pp_protocol(pp_handler, req_states, num_speculative_steps) -> None:
+-    """Bind the 0.30 broadcast/receive/consume methods onto the release
+-    PPHandler, adapted to fetch draft rows from ``req_states``."""
+-    if getattr(pp_handler, _INSTALLED, False):
+-        return
+-
+-    device = pp_handler.device
+-    captured_batch = [None]
+-
+-    def receive(input_batch):
+-        assert not pp_handler.is_last_rank
+-        need_sampled_mask = compute_need_sampled_mask(input_batch)
+-        if need_sampled_mask is None:
+-            return False
+-
+-        gen_at_receive_np = pp_handler.req_idx_gen_np[input_batch.idx_mapping_np]
+-
+-        num_reqs = input_batch.num_reqs
+-        with torch.cuda.stream(pp_handler.broadcast_stream):
+-            pp_handler.broadcast_stream.wait_stream(pp_handler.main_stream)
+-            sampled_tokens = torch.empty(num_reqs, pp_handler.max_sample_len, dtype=torch.int64, device=device)
+-            combined = torch.empty(2, num_reqs, dtype=torch.int32, device=device)
+-            torch.distributed.broadcast(sampled_tokens, src=pp_handler.last_rank, group=pp_handler.broadcast_group)
+-            torch.distributed.broadcast(combined, src=pp_handler.last_rank, group=pp_handler.broadcast_group)
+-            draft_tokens = None
+-            if num_speculative_steps > 0:
+-                draft_tokens = torch.empty(num_reqs, num_speculative_steps, dtype=torch.int64, device=device)
+-                torch.distributed.broadcast(draft_tokens, src=pp_handler.last_rank, group=pp_handler.broadcast_group)
+-            event = pp_handler.broadcast_stream.record_event()
+-            num_sampled, num_rejected = combined.unbind(dim=0)
+-            sampled_tokens.record_stream(pp_handler.main_stream)
+-            combined.record_stream(pp_handler.main_stream)
+-            if draft_tokens is not None:
+-                draft_tokens.record_stream(pp_handler.main_stream)
+-        pp_handler.queue[-1] = SpecPPPendingRecv(
+-            event,
+-            sampled_tokens,
+-            num_sampled,
+-            num_rejected,
+-            input_batch.idx_mapping,
+-            input_batch.idx_mapping_np,
+-            need_sampled_mask,
+-            gen_at_receive_np,
+-            draft_tokens,
+-        )
+-        return bool(need_sampled_mask.all())
+-
+-    def broadcast(sampled_token_ids, num_sampled, num_rejected, input_batch):
+-        assert pp_handler.is_last_rank
+-        if compute_need_sampled_mask(input_batch) is None:
+-            captured_batch[0] = None
+-            return
+-        captured_batch[0] = input_batch
+-
+-        assert sampled_token_ids.dtype == torch.int64
+-        with torch.cuda.stream(pp_handler.broadcast_stream):
+-            pp_handler.broadcast_stream.wait_stream(pp_handler.main_stream)
+-            send_tokens = torch.nn.functional.pad(
+-                sampled_token_ids,
+-                (0, pp_handler.max_sample_len - sampled_token_ids.shape[-1]),
+-            )
+-            torch.distributed.broadcast(
+-                send_tokens.contiguous(),
+-                src=pp_handler.last_rank,
+-                group=pp_handler.broadcast_group,
+-            )
+-            combined = torch.stack((num_sampled, num_rejected), dim=0)
+-            torch.distributed.broadcast(combined, src=pp_handler.last_rank, group=pp_handler.broadcast_group)
+-            for tensor in (sampled_token_ids, num_sampled, num_rejected):
+-                tensor.record_stream(pp_handler.broadcast_stream)
+-
+-    def broadcast_drafts(draft_tokens=None, input_batch=None):
+-        assert pp_handler.is_last_rank
+-        if input_batch is None:
+-            input_batch = captured_batch[0]
+-        if input_batch is None or compute_need_sampled_mask(input_batch) is None:
+-            return
+-        if draft_tokens is None:
+-            draft_tokens = req_states.draft_tokens[input_batch.idx_mapping]
+-        with torch.cuda.stream(pp_handler.broadcast_stream):
+-            pp_handler.broadcast_stream.wait_stream(pp_handler.main_stream)
+-            send = draft_tokens.contiguous()
+-            input_batch.idx_mapping.record_stream(pp_handler.broadcast_stream)
+-            torch.distributed.broadcast(send, src=pp_handler.last_rank, group=pp_handler.broadcast_group)
+-
+-    def get_prev_sampled_outputs(draft_tokens_to_update=None):
+-        if not pp_handler.queue:
+-            return None
+-        slot = pp_handler.queue.popleft()
+-        pp_handler.queue.append(None)
+-        if slot is None:
+-            return None
+-
+-        freed = pp_handler.req_idx_gen_np[slot.idx_mapping_np] != slot.gen_at_receive_np
+-        exclude_mask = freed | ~slot.need_sampled_mask
+-        idx_mapping = slot.idx_mapping
+-        if exclude_mask.any():
+-            if exclude_mask.all():
+-                return None
+-            idx_mapping_np = np.where(exclude_mask, -1, slot.idx_mapping_np)
+-            idx_mapping = async_copy_to_gpu(idx_mapping_np, device=device)
+-
+-        pp_handler.main_stream.wait_event(slot.event)
+-        if draft_tokens_to_update is None:
+-            draft_tokens_to_update = req_states.draft_tokens
+-        if slot.draft_tokens is not None and draft_tokens_to_update is not None:
+-            draft_tokens = slot.draft_tokens
+-            draft_idx_mapping = slot.idx_mapping
+-            if exclude_mask.any():
+-                keep = ~exclude_mask
+-                keep_t = torch.as_tensor(keep, device=device)
+-                draft_tokens = draft_tokens[keep_t]
+-                draft_idx_mapping = async_copy_to_gpu(slot.idx_mapping_np[keep], device=device)
+-            draft_tokens_to_update[draft_idx_mapping] = draft_tokens
+-
+-        return dict(
+-            sampled_tokens=slot.sampled_tokens,
+-            num_sampled=slot.num_sampled,
+-            num_rejected=slot.num_rejected,
+-            idx_mapping=idx_mapping,
+-        )
+-
+-    pp_handler.receive = receive
+-    pp_handler.broadcast = broadcast
+-    pp_handler.broadcast_drafts = broadcast_drafts
+-    pp_handler.broadcast_draft_tokens = broadcast_drafts
+-    pp_handler.get_prev_sampled_outputs = get_prev_sampled_outputs
+-    setattr(pp_handler, _INSTALLED, True)
+diff --git a/vllm_ascend/worker/v2/model_runner.py b/vllm_ascend/worker/v2/model_runner.py
+index 83f089d5e..285be7f08 100644
+--- a/vllm_ascend/worker/v2/model_runner.py
++++ b/vllm_ascend/worker/v2/model_runner.py
+@@ -113,12 +113,7 @@ from vllm_ascend.worker.v2.eplb import AscendEPLBController
+ from vllm_ascend.worker.v2.input_batch import AscendInputBatch, AscendInputBuffers
+ from vllm_ascend.worker.v2.kvpp import KVPPRuntime
+ from vllm_ascend.worker.v2.pcp_manager import AscendPCPManager
+-from vllm_ascend.worker.v2.pp_transport import (
+-    bypass_upstream_spec_pp_guard,
+-    resolve_spec_pp_support,
+-    restore_pp_after_upstream_init,
+-    use_legacy_spec_pp,
+-)
++from vllm_ascend.worker.v2.pp_transport import resolve_spec_pp_support
+ from vllm_ascend.worker.v2.spec_decode import init_speculator
+ from vllm_ascend.worker.v2.spec_decode.eagle.speculator import AscendEagleSpeculator
+ from vllm_ascend.worker.v2.states import AscendRequestState
+@@ -153,16 +148,9 @@ class NPUModelRunner(GPUModelRunner):
+         set_potential_max_tokens(vllm_config)
+         parallel_config = vllm_config.parallel_config
+ 
+-        # Only release versions need PP hidden during upstream initialization.
+         spec_pp_support = resolve_spec_pp_support(vllm_config)
+         with torch_cuda_wrapper():
+-            with bypass_upstream_spec_pp_guard(vllm_config, spec_pp_support) as pp_disabled:
+-                super().__init__(vllm_config, device)
+-            if pp_disabled:
+-                restore_pp_after_upstream_init(self, vllm_config)
+-        # Native PP owns token broadcast/writeback; only releases use our packing.
+-        # Legacy Spec+PP transport (0.28/0.29 only); deleted when 0.30+ is the floor.
+-        self.use_spec_pp = spec_pp_support is not None and use_legacy_spec_pp()
++            super().__init__(vllm_config, device)
+         # These FIA models need post-rejection host counts on every PP stage.
+         # TODO: Remove this extra PP sync when FIA and its metadata builders
+         # use device lengths instead of exact CPU lengths.
+@@ -233,13 +221,6 @@ class NPUModelRunner(GPUModelRunner):
+             vocab_size=self.vocab_size,
+             device=self.device,
+         )
+-        if self.use_spec_pp:
+-            from vllm_ascend.patch.worker.patch_v2.patch_spec_pp import (
+-                install_upstream_spec_pp_protocol,
+-            )
+-
+-            assert self.pp_handler is not None
+-            install_upstream_spec_pp_protocol(self.pp_handler, self.req_states, self.num_speculative_steps)
+         # AscendInputBuffers has extra `seq_lens_cpu` attribute.
+         # so reinitialize input_buffers here.
+         self.input_buffers: AscendInputBuffers = AscendInputBuffers(
+@@ -351,11 +332,7 @@ class NPUModelRunner(GPUModelRunner):
+         if pcp_manager is not None and isinstance(pcp_manager, AscendPCPManager):
+             pcp_manager._sampling_hidden_restored = False
+         self._restore_replicated_draft_target_states()
+-        output = super().sample_tokens(grammar_output)
+-        if self.use_spec_pp and self.is_last_pp_rank:
+-            assert self.pp_handler is not None
+-            self.pp_handler.broadcast_drafts()
+-        return output
++        return super().sample_tokens(grammar_output)
+ 
+     def get_kv_cache_spec(self) -> dict[str, KVCacheSpec]:
+         return apply_dspark_resident_kv_specs(
+diff --git a/vllm_ascend/worker/v2/pp_transport.py b/vllm_ascend/worker/v2/pp_transport.py
+index 10d796d03..1eabe880a 100644
+--- a/vllm_ascend/worker/v2/pp_transport.py
++++ b/vllm_ascend/worker/v2/pp_transport.py
+@@ -2,16 +2,13 @@
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM Ascend project
+ """Common Model Runner V2 pipeline-parallel utilities."""
+ 
+-from collections.abc import Callable, Iterator, Mapping, Sequence
+-from contextlib import contextmanager
++from collections.abc import Callable, Mapping, Sequence
+ from dataclasses import dataclass
+ from enum import Enum
+ from types import MappingProxyType
+ from typing import TYPE_CHECKING, Protocol
+-from unittest.mock import patch
+ 
+ import torch
+-import vllm.envs as vllm_envs
+ from vllm.config import VllmConfig
+ from vllm.sequence import IntermediateTensors
+ 
+@@ -19,21 +16,10 @@ from vllm_ascend.utils import should_reuse_topk
+ 
+ if TYPE_CHECKING:
+     from transformers import PretrainedConfig
+-    from vllm.v1.worker.gpu.model_runner import GPUModelRunner
+ 
+ _PP_TRANSPORT_PREFIX = "pp_transport"
+ 
+ 
+-def use_legacy_spec_pp() -> bool:
+-    """Whether Ascend's legacy Spec+PP transport workaround is required.
+-
+-    The supported release (v0.30.0) and the pinned main commit share the
+-    upstream sampled-token protocol, so the Ascend transport and loader
+-    bypasses are no longer used.
+-    """
+-    return False
+-
+-
+ class _PPTransportModel(Protocol):
+     config: "PretrainedConfig"
+     start_layer: int
+@@ -50,8 +36,6 @@ class SpecPPSupport:
+ 
+     architectures: frozenset[str] | None = None
+     needs_aux_hidden_states: bool = False
+-    bypass_upstream_pp_guard: bool = False
+-    unsupported_feature: str | None = None
+ 
+ 
+ _SPEC_PP_SUPPORT_BY_METHOD: Mapping[str, SpecPPSupport] = MappingProxyType(
+@@ -65,8 +49,6 @@ _SPEC_PP_SUPPORT_BY_METHOD: Mapping[str, SpecPPSupport] = MappingProxyType(
+                 }
+             ),
+             needs_aux_hidden_states=True,
+-            bypass_upstream_pp_guard=True,
+-            unsupported_feature="EAGLE3 with pipeline parallelism",
+         ),
+         "dspark": SpecPPSupport(
+             architectures=frozenset(
+@@ -79,7 +61,6 @@ _SPEC_PP_SUPPORT_BY_METHOD: Mapping[str, SpecPPSupport] = MappingProxyType(
+                 }
+             ),
+             needs_aux_hidden_states=True,
+-            bypass_upstream_pp_guard=True,
+         ),
+     }
+ )
+@@ -103,49 +84,6 @@ def resolve_spec_pp_support(vllm_config: VllmConfig) -> SpecPPSupport | None:
+     return support
+ 
+ 
+-@contextmanager
+-def bypass_upstream_spec_pp_guard(
+-    vllm_config: VllmConfig,
+-    support: SpecPPSupport | None,
+-) -> Iterator[bool]:
+-    """Bypass the legacy Spec+PP guard, leaving native PP initialization intact."""
+-    bypass_guard = support.bypass_upstream_pp_guard if support is not None else False
+-    if not bypass_guard or not use_legacy_spec_pp():
+-        yield False
+-        return
+-
+-    parallel_config = vllm_config.parallel_config
+-    original_pp_size = parallel_config.pipeline_parallel_size
+-    parallel_config.pipeline_parallel_size = 1
+-    try:
+-        # The unsharded draft must not inherit the target's manual PP split.
+-        with patch.object(vllm_envs, "VLLM_PP_LAYER_PARTITION", None):
+-            yield True
+-    finally:
+-        parallel_config.pipeline_parallel_size = original_pp_size
+-
+-
+-def restore_pp_after_upstream_init(
+-    model_runner: "GPUModelRunner",
+-    vllm_config: VllmConfig,
+-) -> None:
+-    """Restore PP state skipped while the upstream runner initialized as PP=1."""
+-    from vllm.v1.worker.gpu.buffer_utils import set_default_max_concurrency
+-    from vllm.v1.worker.gpu.pp_utils import PPHandler
+-
+-    model_runner.use_pp = vllm_config.parallel_config.pipeline_parallel_size > 1
+-    assert model_runner.use_pp and model_runner.pp_handler is None
+-
+-    # The parent sizes UVA pools before constructing request state and the
+-    # speculator. Ascend rebuilds both after this helper returns.
+-    set_default_max_concurrency(vllm_config.max_concurrent_batches)
+-    model_runner.pp_handler = PPHandler(
+-        max_num_reqs=model_runner.max_num_reqs,
+-        num_speculative_steps=model_runner.num_speculative_steps,
+-        device=model_runner.device,
+-    )
+-
+-
+ class PPTransportDataType(str, Enum):
+     """Data types carried between PP ranks via ``IntermediateTensors``."""
+ 

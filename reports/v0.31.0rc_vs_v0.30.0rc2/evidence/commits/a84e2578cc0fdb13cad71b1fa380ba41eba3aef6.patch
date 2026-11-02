@@ -1,0 +1,200 @@
+commit a84e2578cc0fdb13cad71b1fa380ba41eba3aef6
+Author:     recky-c <ruiqicheng510@gmail.com>
+AuthorDate: Wed Oct 14 14:37:05 2026 +0800
+Commit:     GitHub <noreply@github.com>
+CommitDate: Wed Oct 14 14:37:05 2026 +0800
+
+    [Bugfix][KVPP] Support MultiConnector in KVPP validation (#18632)
+    
+    ### What this PR does / why we need it?
+    
+    KVPP rejects a top-level `MultiConnector` even when its children are
+    supported `MooncakeConnectorV2` and `AscendStoreConnector`
+    configurations.
+    
+    Normalize a direct connector into a one-entry list, or read the
+    configured children of a single-level `MultiConnector`. Validate every
+    entry against the two supported connector names and reject the V2
+    decode-consumer role. Reject empty connector lists. This keeps the check
+    flat and follows existing single-level connector checks in the
+    repository; no recursive helper or dict/object dual handling is
+    introduced.
+    
+    Add regression tests for direct/combined configurations, connector
+    order, unsupported children, consumers and empty lists, plus a combined
+    configuration example. Nested MultiConnector wrappers remain
+    unsupported.
+    
+    ### Does this PR introduce _any_ user-facing change?
+    
+    Supported KVPP connectors can be combined in a single-level
+    `MultiConnector`. Unsupported children remain rejected with their names
+    in the error.
+    
+    ### How was this patch tested?
+    
+    - Both final branches: 6 TestKVPPConfig methods pass on the remote
+    Ascend runtime with their officially pinned vLLM sources. Executed via
+    unittest to avoid the container npu-smi/conftest startup issue; no test
+    assertions are skipped.
+    - Two Ascend A3 devices, DeepSeek-V2-Lite BF16, TP2, MRV1/eager;
+    inference matrix uses the v0.30.0 branch. Main has configuration-test
+    coverage.
+    - 270 short/mid outputs: 18 cases x 3 cache phases x 5 configurations
+    (plain, KVPP-only, default MultiConnector, async MultiConnector, direct
+    Store). Every configuration scores 17/18 per phase, with the same
+    baseline extract_code failure and no new expected-answer failures.
+    Includes 128-token cache boundaries through 1024 tokens.
+    - 48 long/batch outputs: 64/512/4096/8192-token single-occurrence facts,
+    batch 1 and mixed batch 4, cold/prefix/reset-reload. All expected
+    answers correct.
+    - The reference configuration disables KVPP and has no KV connector.
+    These runs compare configuration combinations; they are not an isolated
+    KVPP on/off comparison with identical MultiConnector settings. Full P/D
+    producer-consumer transfer has not been tested.
+    - All runtime and unit-test jobs exit 0; task container stopped. Tracked
+    Python hashes verified (1717 main Ascend, 1653 release Ascend, 2566 main
+    vLLM). Native runtime binaries reused, not rebuilt.
+    - Ruff lint/format and diff checks pass. Full format.sh ci was attempted
+    but pre-commit is unavailable locally.
+    
+    The optional load_async line is omitted from the new combined-connector
+    example; default and explicit async modes were both tested.
+    
+    ---------
+    
+    Signed-off-by: chengruiqi (C) <c00913489@china.huawei.com>
+    Co-authored-by: chengruiqi (C) <c00913489@china.huawei.com>
+
+diff --git a/docs/source/user_guide/feature_guide/kvpp.md b/docs/source/user_guide/feature_guide/kvpp.md
+index 76482f313..317d327a6 100644
+--- a/docs/source/user_guide/feature_guide/kvpp.md
++++ b/docs/source/user_guide/feature_guide/kvpp.md
+@@ -121,6 +121,39 @@ Use `MooncakeConnectorV2` with `kv_producer` on the prefill node and `kv_consume
+ 
+ Each worker uses a handshake port derived from `kv_port` and its parallel rank. Choose non-overlapping port ranges when both nodes run on one host.
+ 
++### Combining Connectors
++
++Use `MultiConnector` to combine `MooncakeConnectorV2` with `AscendStoreConnector`.
++KVPP validates the type and role of each child connector.
++Set the P/D connector to `kv_producer` and enable KVPP only on the prefill node;
++child roles are configured independently of the wrapper role.
++The pooling backend still requires its own SDK and service configuration.
++
++```json
++{
++  "kv_connector": "MultiConnector",
++  "kv_role": "kv_producer",
++  "kv_connector_extra_config": {
++    "connectors": [
++      {
++        "kv_connector": "MooncakeConnectorV2",
++        "kv_role": "kv_producer",
++        "kv_port": 37000
++      },
++      {
++        "kv_connector": "AscendStoreConnector",
++        "kv_role": "kv_producer",
++        "kv_connector_extra_config": {
++          "backend": "memcache",
++          "lookup_rpc_port": "0",
++          "use_layerwise": false
++        }
++      }
++    ]
++  }
++}
++```
++
+ ### Memcache Pooling
+ 
+ KVPP supports `kv_producer` and `kv_both` for Memcache pooling. `kv_consumer` has not been tested and is outside the validated support scope.
+diff --git a/tests/ut/test_ascend_config.py b/tests/ut/test_ascend_config.py
+index 6edb49916..9fbd6ebbf 100644
+--- a/tests/ut/test_ascend_config.py
++++ b/tests/ut/test_ascend_config.py
+@@ -2045,6 +2045,46 @@ class TestKVPPConfig(TestBase):
+                     with self.assertRaisesRegex(ValueError, "PIECEWISE"):
+                         KVPPConfig.from_vllm_config(config).validate(config)
+ 
++    def test_kv_transfer_connectors(self):
++        from copy import deepcopy
++
++        from vllm.config import KVTransferConfig
++
++        from tests.ut.kvpp_utils import make_kvpp_config
++
++        mooncake = {"kv_connector": "MooncakeConnectorV2", "kv_role": "kv_producer"}
++        store = {"kv_connector": "AscendStoreConnector", "kv_role": "kv_both"}
++
++        def multi(children):
++            return {
++                "kv_connector": "MultiConnector",
++                "kv_role": "kv_producer",
++                "kv_connector_extra_config": {"connectors": children},
++            }
++
++        for transfer in (mooncake, store, multi([mooncake, store]), multi([store, mooncake])):
++            with self.subTest(transfer=transfer):
++                config = make_kvpp_config()
++                config.kv_transfer_config = KVTransferConfig(**deepcopy(transfer))
++                KVPPConfig.from_vllm_config(config).validate(config)
++
++        consumer = {**mooncake, "kv_role": "kv_consumer"}
++        unsupported = {**mooncake, "kv_connector": "MooncakeConnectorV1"}
++        cases = (
++            (consumer, "decode-only"),
++            (multi([store, consumer]), "decode-only"),
++            (unsupported, "MooncakeConnectorV1"),
++            (multi([mooncake, unsupported]), "MooncakeConnectorV1"),
++            (multi([]), "non-empty"),
++            (multi([multi([mooncake])]), "MultiConnector"),
++        )
++        for transfer, message in cases:
++            with self.subTest(transfer=transfer):
++                config = make_kvpp_config()
++                config.kv_transfer_config = KVTransferConfig(**deepcopy(transfer))
++                with self.assertRaisesRegex(ValueError, message):
++                    KVPPConfig.from_vllm_config(config).validate(config)
++
+     def test_enable_switch_uses_tp_size(self):
+         from tests.ut.kvpp_utils import make_kvpp_config
+         from vllm_ascend.ascend_config import KVPPConfig
+diff --git a/vllm_ascend/ascend_config.py b/vllm_ascend/ascend_config.py
+index f015f1cbc..003923aae 100644
+--- a/vllm_ascend/ascend_config.py
++++ b/vllm_ascend/ascend_config.py
+@@ -34,6 +34,7 @@ from vllm_ascend.device.hardware_profile import DeviceAdaptorFamily, HardwareCap
+ if TYPE_CHECKING:
+     from vllm.config import VllmConfig
+ 
++_KVPP_SUPPORTED_CONNECTORS = ("MooncakeConnectorV2", "AscendStoreConnector")
+ _MEGA_MOE_SUPPORTED = None
+ 
+ 
+@@ -83,11 +84,19 @@ class KVPPConfig:
+         if parallel_config.decode_context_parallel_size != 1:
+             raise ValueError("KVPP and DCP cannot be enabled at the same time.")
+         kv_transfer_config = vllm_config.kv_transfer_config
+-        if kv_transfer_config is not None and kv_transfer_config.kv_connector != "AscendStoreConnector":
+-            if kv_transfer_config.kv_connector != "MooncakeConnectorV2":
+-                raise ValueError("KVPP PD disaggregation requires MooncakeConnectorV2.")
+-            if kv_transfer_config.kv_role == "kv_consumer":
+-                raise ValueError("KVPP must be disabled on the decode-only node.")
++        if kv_transfer_config is not None:
++            if kv_transfer_config.kv_connector == "MultiConnector":
++                connectors = kv_transfer_config.kv_connector_extra_config.get("connectors", [])
++                if not connectors:
++                    raise ValueError("KVPP MultiConnector requires a non-empty connectors list.")
++            else:
++                connectors = [{"kv_connector": kv_transfer_config.kv_connector, "kv_role": kv_transfer_config.kv_role}]
++            for connector in connectors:
++                name = connector.get("kv_connector")
++                if name not in _KVPP_SUPPORTED_CONNECTORS:
++                    raise ValueError(f"KVPP does not support kv connector {name!r}.")
++                if name == "MooncakeConnectorV2" and connector.get("kv_role") == "kv_consumer":
++                    raise ValueError("KVPP must be disabled on the decode-only node.")
+ 
+         model_config = vllm_config.model_config
+         if not model_config.enforce_eager:

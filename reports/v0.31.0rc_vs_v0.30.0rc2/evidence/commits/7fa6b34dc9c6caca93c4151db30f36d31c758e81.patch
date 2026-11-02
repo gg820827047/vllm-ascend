@@ -1,0 +1,192 @@
+commit 7fa6b34dc9c6caca93c4151db30f36d31c758e81
+Author:     Li Shuai <lishuailsh@qq.com>
+AuthorDate: Sun Oct 11 17:40:16 2026 +0800
+Commit:     GitHub <noreply@github.com>
+CommitDate: Sun Oct 11 17:40:16 2026 +0800
+
+    [BugFix] Pin EC cache load device to correct NPU index in TP>1 (#18284)
+    
+    ## What this PR does / why we need it?
+    
+    Fixes a prefill-worker crash (NPU AI Core errcode=95, MTE DDR address
+    out of range) on EC consumer nodes in disaggregated EPD deployments with
+    **tensor parallelism > 1**.
+    
+    **Root cause**: upstream `ECExampleConnector.start_load_caches` only
+    appends the device index to the safetensors load device when
+    `current_platform.is_cuda_alike()` is True:
+    
+    ```python
+    device = current_platform.device_type          # "npu"
+    if current_platform.is_cuda_alike():           # False on Ascend NPU
+        device = f"{device}:{current_platform.current_device()}"
+    ```
+    
+    `is_cuda_alike()` returns False on Ascend NPU, so the device string
+    stays a bare `"npu"`. Consequently, **every TP rank loads the EC
+    (encoder) cache onto the default device `npu:0`**, regardless of the
+    device it is actually bound to. With TP=2, rank 1 executes
+    `inputs_embeds[is_multimodal] = mm_embeds_flat` on its own device while
+    `mm_embeds_flat` still lives on `npu:0` — the cross-device MTE access
+    trips errcode=95 and crashes the worker. TP=1 masks the bug because the
+    single rank resides on `npu:0` anyway.
+    
+    **Fix**: patch `start_load_caches` via the vllm-ascend platform patch
+    mechanism so the device index is also appended on Ascend NPU (`device ==
+    "npu"`), matching the behavior CUDA already has. The patch only takes
+    effect when the connector acts as an **EC consumer** (where the crash
+    occurs); EC producer nodes and non-EC deployments fall through to the
+    original upstream implementation unchanged.
+    
+    An upstream vLLM fix is planned separately; this patch unblocks Ascend
+    users until it lands in a released vLLM version.
+    
+    ## Does this PR introduce any user-facing change?
+    
+    No. The patch is transparent to users:
+    - Non-EC deployments and EC producer nodes: behavior is byte-for-byte
+    identical to upstream.
+    - EC consumer nodes: the EC cache is now loaded onto each rank's bound
+    device instead of `npu:0`. No CLI flags, configs, or APIs change; the
+    previously-crashing TP>1 multimodal prefill scenario now succeeds, and
+    TP=1 behavior is unchanged.
+    
+    ## How was this patch tested?
+    
+    - **Reproduction setup**: EPD disaggregated deployment on Ascend 950DT —
+    E node (TP=1, ec_producer), P node (TP=2, ec_consumer + kv_producer), D
+    node (TP=2, kv_consumer), model Qwen3.6-27B, multimodal (image) requests
+    over the EC path.
+    - **Before fix**: rank 1 of the P node crashes with `RuntimeError: NPU
+    function error: device error type 3, error code 507035, errcode=95` in
+    `_merge_multimodal_embeddings` (`inputs_embeds[is_multimodal] =
+    mm_embeds_flat`); located with debug probes +
+    `ASCEND_LAUNCH_BLOCKING=1`.
+    - **After fix**: multimodal request completes end-to-end (first-token
+    latency ~1.3 s, full response 1888 chars, correct image analysis).
+    - **Regression check**: TP=1 EC path unchanged (loads land on `npu:0` as
+    before); non-EC paths unaffected (patch is a no-op for them).
+    ---
+    
+    - vLLM main:
+    https://github.com/vllm-project/vllm/commit/ced6857afa0ea7b2e3f0846a62e1394e90f15607
+    
+    ---------
+    
+    Signed-off-by: Li Shuai <lishuailsh@qq.com>
+
+diff --git a/vllm_ascend/patch/platform/__init__.py b/vllm_ascend/patch/platform/__init__.py
+index 685e5aa77..356545556 100644
+--- a/vllm_ascend/patch/platform/__init__.py
++++ b/vllm_ascend/patch/platform/__init__.py
+@@ -56,8 +56,29 @@ import vllm_ascend.patch.platform.patch_engram_config  # noqa
+ import vllm_ascend.patch.platform.patch_glm5next_config  # noqa
+ import vllm_ascend.patch.platform.patch_indexer_kv_dtype  # noqa
+ import vllm_ascend.patch.platform.patch_kv_cache_dtype  # noqa
++import vllm_ascend.patch.platform.patch_example_connector  # noqa
+ import vllm_ascend.patch.platform.patch_swa_bounded_replay  # noqa
+ 
++# ** File: platform/patch_example_connector.py **
++# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
++#   1. `vllm.distributed.ec_transfer.ec_connector.example_connector.ECExampleConnector.start_load_caches`
++#    Why:
++#       The upstream method only qualifies the safetensors load device with an
++#       index when `current_platform.is_cuda_alike()` returns True. Ascend NPU
++#       returns False, so in TP>1 every rank loads the EC cache to the default
++#       device (npu:0), causing rank 1 to access cross-device tensors and
++#       trigger NPU AI Core errcode=95 (MTE DDR address out of range).
++#    How:
++#       Monkey-patch `start_load_caches` to extend the device-index
++#       qualification to `device == "npu"`. The patch only takes effect on EC
++#       consumer nodes; producers and non-EC deployments fall through to the
++#       original upstream behavior.
++#    Related PR (if no, explain why):
++#       No upstream PR currently covers this Ascend-specific behavior.
++#    Future Plan:
++#       Remove this patch when upstream's `is_cuda_alike()` covers Ascend NPU
++#       or when the device-index qualification is applied unconditionally.
++#
+ # ** File: platform/patch_kv_cache_utils.py **
+ # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+ #   1. `vllm.v1.core.kv_cache_utils`
+diff --git a/vllm_ascend/patch/platform/patch_example_connector.py b/vllm_ascend/patch/platform/patch_example_connector.py
+new file mode 100644
+index 000000000..4d49a335c
+--- /dev/null
++++ b/vllm_ascend/patch/platform/patch_example_connector.py
+@@ -0,0 +1,75 @@
++#
++# Copyright (c) 2025 Huawei Technologies Co., Ltd. All Rights Reserved.
++# This file is a part of the vllm-ascend project.
++#
++# Licensed under the Apache License, Version 2.0 (the "License");
++# you may not use this file except in compliance with the License.
++# You may obtain a copy of the License at
++#
++#     http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS,
++# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++# See the License for the specific language governing permissions and
++# limitations under the License.
++#
++# Patch vLLM's ECExampleConnector.start_load_caches so that safetensors
++# loads are pinned to the correct NPU device index in TP>1 deployments.
++#
++# Background:
++# The upstream method only qualifies the load device with an index when
++# current_platform.is_cuda_alike() returns True. Ascend NPU returns False,
++# so in TP>1 every rank loads the EC cache to the default device (npu:0),
++# causing rank 1 to access cross-device tensors and trigger NPU AI Core
++# errcode=95 (MTE DDR address out of range).
++#
++# The patch only takes effect when the connector is acting as an EC
++# consumer. Non-EC deployments and EC producer nodes fall through to the
++# original upstream implementation unchanged.
++
++from vllm.distributed.ec_transfer.ec_connector.example_connector import ECExampleConnector
++
++_original_start_load_caches = ECExampleConnector.start_load_caches
++
++
++def _patched_start_load_caches(self, encoder_cache, **kwargs):
++    # Only apply the NPU device-index fix on EC consumer nodes. Producers
++    # and non-EC deployments keep the original upstream behavior.
++    if not getattr(self, "is_consumer", False):
++        return _original_start_load_caches(self, encoder_cache, **kwargs)
++
++    import logging
++
++    import safetensors.torch
++    from vllm.distributed.ec_transfer.ec_connector.example_connector import ECExampleConnectorMetadata
++    from vllm.platforms import current_platform
++    from vllm.utils.gpu_sync_debug import gpu_sync_allowed
++
++    logger = logging.getLogger(__name__)
++
++    metadata = self._get_connector_metadata()
++    assert isinstance(metadata, ECExampleConnectorMetadata)
++    assert encoder_cache is not None
++    if metadata is None:
++        logger.warning("In connector.start_load_caches, but the connector metadata is None")
++        return
++
++    # Pin the load to the selected device so tensor-parallel workers load
++    # the cache locally. On Ascend NPU, is_cuda_alike() returns False but
++    # we still need the device index.
++    device = current_platform.device_type
++    if current_platform.is_cuda_alike() or device == "npu":
++        device = f"{device}:{current_platform.current_device()}"
++
++    for mm_data in metadata.mm_datas:
++        if mm_data.mm_hash in encoder_cache:
++            continue
++        filename = self._generate_filename_debug(mm_data.mm_hash)
++        with gpu_sync_allowed():
++            ec_cache = safetensors.torch.load_file(filename, device=device)["ec_cache"]
++        encoder_cache[mm_data.mm_hash] = ec_cache
++        logger.debug("Success load encoder cache for hash %s", mm_data.mm_hash)
++
++
++ECExampleConnector.start_load_caches = _patched_start_load_caches

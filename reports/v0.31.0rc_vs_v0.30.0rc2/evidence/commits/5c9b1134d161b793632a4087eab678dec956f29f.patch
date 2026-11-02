@@ -1,0 +1,165 @@
+commit 5c9b1134d161b793632a4087eab678dec956f29f
+Author:     leolee <83689697+li1how@users.noreply.github.com>
+AuthorDate: Mon Oct 19 10:00:59 2026 +0800
+Commit:     GitHub <noreply@github.com>
+CommitDate: Mon Oct 19 10:00:59 2026 +0800
+
+    [BugFix][PCP] Size DSV4.1 replay metadata for local segments (#19034)
+    
+    ### What this PR does / why we need it?
+    
+    PCP splits a prefill request into front/back local segments, so a rank's
+    local batch can contain up to twice `max_num_seqs` entries. DSV4.1
+    Engram gathers replay metadata using these local entries but allocates
+    its CPU/GPU replay buffer for only the global request count. With
+    `max_num_seqs=16`, a local batch of 27 or 29 entries fails in
+    `prepare_attn` with a NumPy broadcasting error.
+    
+    The replay buffer and its unconditional local-batch assignment were
+    introduced in #17742 (commit
+    `3a2e4a057cf9a84d62b84444d0a5f92298ab74fc`). The current
+    `releases/v0.30.0` branch does not contain that path, so this fix does
+    not require a release backport.
+    
+    Allocate the gathered replay buffer for twice the request capacity when
+    PCP is enabled. Keep the global replay history and lookback state at
+    their existing capacities.
+    
+    ### Does this PR introduce _any_ user-facing change?
+    
+    Fixes DSV4.1 model runner V2 failures when PCP produces more local
+    segments than the global request capacity. No new configuration is
+    required.
+    
+    ### How was this patch tested?
+    
+    - `./format.sh ci`: passed for this patch.
+    - Added six regression cases in
+    `tests/ut/worker/v2/test_deepseek_v41_engram_state.py`: PCP sizes 1/2/4
+    with eager and FULL graph metadata, reordered/duplicated request
+    indices, local capacity boundaries, mixed prefill/decode entries,
+    padding, and unchanged global history. Executed the complete test file
+    in the paired A3 container: **12 passed**, including all six new cases.
+    - A3 baseline `fc600000e23153f83a6468b5b4f3d66c0d89222a` **reproduced**
+    the capacity failure: local batches of 25 and 27 entries attempted to
+    write into capacity 16. The first worker exception was the NumPy
+    broadcast in `EngramModelState.prepare_attn`; pytest exited 1 after
+    862.70 seconds.
+    - Candidate `b78214ae292193a1b85b743ad22fcb28f5a9c9e0` completed model
+    loading and graph capture. The original broadcast error did not recur.
+    - Both rounds used the same A3 container, vLLM
+    `c4df37dfcc7f72ca41cd43801a468526ecf99a2b`, DP2 × TP2 × PCP4, MRV2,
+    DSpark 5, `max_num_seqs=16`, and full GPQA Diamond 198 questions at
+    client batch size 32. The available checkpoint is the similar DSV4.1
+    Flash W8A8 no-wq-wkv variant. Accuracy and speculative acceptance gates
+    were unchanged.
+    
+    ---
+    
+    ### Checklist
+    
+    #### Testing
+    
+    - [x] **Boundary / edge-case coverage**: Added local capacity and
+    padding cases.
+    - [x] **Regression test**: Added a regression case that exceeds the
+    previous PCP replay buffer capacity.
+    - [ ] **Error / failure path coverage**
+    - [x] **Meaningful & reliable tests**: Assert gathered replay values and
+    preservation of global history.
+    - [ ] **Performance impact**: No performance benchmark was run; the
+    change increases one persistent metadata buffer at initialization.
+    
+    - vLLM main:
+    https://github.com/vllm-project/vllm/commit/c4df37dfcc7f72ca41cd43801a468526ecf99a2b
+    
+    Signed-off-by: leolee <yihao.li@huawei.com>
+
+diff --git a/tests/ut/worker/v2/test_deepseek_v41_engram_state.py b/tests/ut/worker/v2/test_deepseek_v41_engram_state.py
+index c6b762c01..22b42b990 100644
+--- a/tests/ut/worker/v2/test_deepseek_v41_engram_state.py
++++ b/tests/ut/worker/v2/test_deepseek_v41_engram_state.py
+@@ -38,8 +38,9 @@ class EngramModel(torch.nn.Module):
+ 
+ 
+ @pytest.fixture
+-def state(monkeypatch):
++def state(monkeypatch, request):
+     def init(self, config, model, encoder_cache, device):
++        self.vllm_config = config
+         self.model = model
+         self.max_num_reqs = 4
+ 
+@@ -47,7 +48,10 @@ def state(monkeypatch):
+     monkeypatch.setattr(DefaultModelState, "prepare_inputs", lambda *args: {})
+     monkeypatch.setattr(DefaultModelState, "prepare_dummy_inputs", lambda *args: {})
+     monkeypatch.setattr(deepseek_v41, "ring_state_update_skipped", lambda: False)
+-    return deepseek_v41.EngramModelState(None, EngramModel(), None, torch.device("cpu"))
++    config = SimpleNamespace(
++        parallel_config=SimpleNamespace(prefill_context_parallel_size=getattr(request, "param", 1))
++    )
++    return deepseek_v41.EngramModelState(config, EngramModel(), None, torch.device("cpu"))
+ 
+ 
+ def batch():
+@@ -143,6 +147,42 @@ def test_eager_hook_forwards_lookup_events(state):
+     state.model.prepare_engram_inputs.assert_called_once()
+ 
+ 
++@pytest.mark.parametrize("state", [1, 2, 4], indirect=True)
++@pytest.mark.parametrize("mode", [CUDAGraphMode.NONE, CUDAGraphMode.FULL])
++def test_replay_metadata_follows_local_segments_and_preserves_global_history(state, mode, monkeypatch):
++    state._replay_start_np[:] = [11, 22, 33, 44]
++    state._replay_groups = (128, torch.empty(0, dtype=torch.int32))
++    pcp_enabled = state.vllm_config.parallel_config.prefill_context_parallel_size > 1
++    local_capacity = 8 if pcp_enabled else 4
++    # Reordered, duplicated global indices model PCP's local segments.
++    mapping = np.array([3, 1, 3, 1, 0, 2, 0, 2] if pcp_enabled else [3, 1, 0])
++    if pcp_enabled and mode == CUDAGraphMode.FULL:
++        mapping = np.array([3, 1, 3, 1, 0, 0, 2])
++    is_prefilling = np.ones(mapping.size, dtype=np.bool_)
++    if not pcp_enabled or mode == CUDAGraphMode.FULL:
++        is_prefilling[-1] = False
++    batch = SimpleNamespace(
++        num_reqs=mapping.size,
++        num_reqs_after_padding=local_capacity,
++        is_prefilling_np=is_prefilling,
++        idx_mapping_np=mapping,
++    )
++
++    def prepare_attn(self, *args, model_specific_attn_metadata=None, **kwargs):
++        return {"replay_start": model_specific_attn_metadata.replay_start}
++
++    monkeypatch.setattr(AscendModelState, "prepare_attn", prepare_attn)
++    # Stale metadata and FULL padding must be cleared on every preparation.
++    state._replay_start.np.fill(-1)
++    result = state.prepare_attn(batch, mode, (), torch.empty((0, 1), dtype=torch.int32), [], None)
++    expected = np.where(is_prefilling, state._replay_start_np[mapping], 0)
++    if mode == CUDAGraphMode.FULL:
++        expected = np.pad(expected, (0, local_capacity - mapping.size))
++    torch.testing.assert_close(result["replay_start"], torch.from_numpy(expected))
++    assert state._replay_start_np.tolist() == [11, 22, 33, 44]
++    assert state.lookback_token_ids.shape == (4, 3)
++
++
+ def test_full_graph_replay_metadata_is_padded_and_inactive_without_replay(monkeypatch):
+     """FULL graph metadata must cover padded rows and skip inactive replay."""
+ 
+diff --git a/vllm_ascend/models/deepseek_v41/engram/model_state.py b/vllm_ascend/models/deepseek_v41/engram/model_state.py
+index 5ff4e22e5..e04dcf28b 100644
+--- a/vllm_ascend/models/deepseek_v41/engram/model_state.py
++++ b/vllm_ascend/models/deepseek_v41/engram/model_state.py
+@@ -84,7 +84,12 @@ class EngramModelState(AscendModelState):
+     def __init__(self, vllm_config, model, encoder_cache, device):
+         super().__init__(vllm_config, model, encoder_cache, device)
+         self._replay_start_np = np.zeros(self.max_num_reqs, dtype=np.int32)
+-        self._replay_start = CpuGpuBuffer(self.max_num_reqs, dtype=torch.int32, device=device, pin_memory=False)
++        # PCP represents each prefill's front/back chunks as separate local
++        # requests. Only the gathered replay metadata uses that local layout.
++        max_num_local_reqs = self.max_num_reqs
++        if vllm_config.parallel_config.prefill_context_parallel_size > 1:
++            max_num_local_reqs *= 2
++        self._replay_start = CpuGpuBuffer(max_num_local_reqs, dtype=torch.int32, device=device, pin_memory=False)
+         self._replay_groups: tuple[int, torch.Tensor] | None = None
+         layers = getattr(model, "decoder_replay_layers", None)
+         self.decoder_replay = DecoderReplayState(vllm_config, layers, device) if layers is not None else None

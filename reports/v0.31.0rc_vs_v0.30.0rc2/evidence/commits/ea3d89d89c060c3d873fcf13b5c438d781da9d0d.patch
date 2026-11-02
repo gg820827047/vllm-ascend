@@ -1,0 +1,147 @@
+commit ea3d89d89c060c3d873fcf13b5c438d781da9d0d
+Author:     liuhanhui <1114603590@qq.com>
+AuthorDate: Tue Oct 13 19:20:51 2026 +0800
+Commit:     GitHub <noreply@github.com>
+CommitDate: Tue Oct 13 19:20:51 2026 +0800
+
+    [BugFix][310P] Fix W8A8SC ND activations and sharded-state save (#18542)
+    
+    ### What this PR does / why we need it?
+    
+    - `npu_matmul_compress_dequant` only accepts 2D activations. Vision
+    towers pass `[B, S, K]` into W8A8SC linear, so flatten before the kernel
+    and restore the leading dimensions on the output.
+    - `examples/save_sharded_state_310.py` built the engine from
+    `dataclasses.asdict(EngineArgs)`, which keeps nested `None` defaults
+    that pydantic `CompilationConfig` rejects. Those `None` values are now
+    dropped before constructing the LLM.
+    
+    ### Does this PR introduce _any_ user-facing change?
+    
+    W8A8SC linear on 310P now accepts activations with more than two
+    dimensions, which unblocks vision-tower layers. The 310 sharded-state
+    save script can start when `EngineArgs` contains nested `None` defaults.
+    
+    ### How was this patch tested?
+    
+    - Added
+    `tests/ut/_310p/quantization/test_w8a8sc_310.py::TestAscendW8A8SCLinearMethod310.test_apply_reshapes_nd_activation_310`
+    to cover flattening `[B, S, K]` and restoring `[B, S, N]`.
+    - The save-script change is a local argument filter around `LLM`
+    construction and was not covered by an automated test.
+    
+    Made with [Cursor](https://cursor.com)
+    
+    - vLLM main:
+    https://github.com/vllm-project/vllm/commit/8cc9aa5ad350f6f80cf3bebb298d410803ff75a9
+    
+    ---------
+    
+    Signed-off-by: shengtining7185 <liuhanhui2@huawei.com>
+    Signed-off-by: liuhanhui <1114603590@qq.com>
+    Co-authored-by: shengtining7185 <liuhanhui2@huawei.com>
+    Co-authored-by: Cursor <cursoragent@cursor.com>
+    Co-authored-by: gemini-code-assist[bot] <176961590+gemini-code-assist[bot]@users.noreply.github.com>
+
+diff --git a/examples/save_sharded_state_310.py b/examples/save_sharded_state_310.py
+index 0787ae175..dab040f3c 100644
+--- a/examples/save_sharded_state_310.py
++++ b/examples/save_sharded_state_310.py
+@@ -233,7 +233,22 @@ def main(args):
+ 
+     # 2. Run VLLM Engine and save sharded states
+     engine_args = EngineArgs.from_cli_args(args)
+-    llm = LLM(**dataclasses.asdict(engine_args))
++
++    def _drop_none(obj):
++        if isinstance(obj, dict):
++            return {k: _drop_none(v) for k, v in obj.items() if v is not None}
++        if isinstance(obj, (list, tuple)):
++            return type(obj)(_drop_none(v) for v in obj)
++        return obj
++
++    engine_kwargs = dataclasses.asdict(engine_args)
++    # asdict() fills CompilationConfig with nested None defaults that pydantic
++    # rejects. Only that field is sanitized; other explicit Nones stay, because
++    # omitting a key is not the same as passing None.
++    compilation_config = engine_kwargs.get("compilation_config")
++    if isinstance(compilation_config, dict):
++        engine_kwargs["compilation_config"] = _drop_none(compilation_config)
++    llm = LLM(**engine_kwargs)
+ 
+     output_dir.mkdir(parents=True, exist_ok=True)
+     llm.llm_engine.engine_core.save_sharded_state(path=str(output_dir))
+diff --git a/tests/ut/_310p/quantization/test_w8a8sc_310.py b/tests/ut/_310p/quantization/test_w8a8sc_310.py
+index 8dfe55e6a..724cc2629 100644
+--- a/tests/ut/_310p/quantization/test_w8a8sc_310.py
++++ b/tests/ut/_310p/quantization/test_w8a8sc_310.py
+@@ -106,3 +106,33 @@ class TestAscendW8A8SCLinearMethod310(TestBase):
+         mock_quantize.assert_not_called()
+         mock_matmul_compress_dequant.assert_called_with(x, layer.weight, layer.index, layer.quant_bias, layer.deq_scale)
+         self.assertTrue(torch.equal(output, expected_y_output))
++
++    @patch("torch.ops.vllm.quantize")
++    @patch("torch_npu.npu_matmul_compress_dequant", create=True)
++    def test_apply_reshapes_nd_activation_310(self, mock_matmul_compress_dequant, mock_quantize):
++        layer = MagicMock()
++        layer.aclnn_input_scale = torch.randn(256)
++        layer.aclnn_input_scale_reciprocal = 1.0 / layer.aclnn_input_scale
++        layer.aclnn_input_offset = torch.randint(-128, 127, (256,), dtype=torch.int8)
++        layer.weight = torch.randint(-128, 127, (256 * 128,), dtype=torch.int8)
++        layer.index = torch.randint(-128, 127, (8,), dtype=torch.int8)
++        layer.deq_scale = torch.randn(128)
++        layer.quant_bias = torch.randint(-128, 127, (256,))
++        layer.params_dtype = torch.float16
++
++        batch_size, seq_len, hidden_size, out_size = 2, 4, 128, 256
++        x = torch.randn(batch_size, seq_len, hidden_size)
++        quantized_x = torch.randint(-128, 127, (batch_size * seq_len, hidden_size), dtype=torch.int8)
++        mock_quantize.return_value = quantized_x
++        flat_output = torch.randn(batch_size * seq_len, out_size)
++        mock_matmul_compress_dequant.return_value = flat_output
++
++        output = self.method.apply(layer, x, tp_rank=0)
++
++        quant_input = mock_quantize.call_args.args[0]
++        self.assertEqual(tuple(quant_input.shape), (batch_size * seq_len, hidden_size))
++        mock_matmul_compress_dequant.assert_called_once_with(
++            quantized_x, layer.weight, layer.index, layer.quant_bias, layer.deq_scale
++        )
++        self.assertEqual(tuple(output.shape), (batch_size, seq_len, out_size))
++        self.assertTrue(torch.equal(output, flat_output.reshape(batch_size, seq_len, out_size)))
+diff --git a/vllm_ascend/_310p/quantization/methods/w8a8sc.py b/vllm_ascend/_310p/quantization/methods/w8a8sc.py
+index fe9a27d2a..014e8b70c 100644
+--- a/vllm_ascend/_310p/quantization/methods/w8a8sc.py
++++ b/vllm_ascend/_310p/quantization/methods/w8a8sc.py
+@@ -76,6 +76,13 @@ class AscendW8A8SCLinearMethod310(AscendW8A8Linear310pScheme):
+         bias: torch.Tensor | None = None,
+         tp_rank: int | None = 0,
+     ) -> torch.Tensor:
++        # npu_matmul_compress_dequant requires 2D activations; vision tower
++        # passes [B, S, K] which must be flattened then restored.
++        orig_shape = x.shape
++        need_reshape = x.ndim > 2
++        if need_reshape:
++            x = x.reshape(-1, orig_shape[-1])
++
+         if x.dtype != torch.int8:
+             x = torch.ops.vllm.quantize(
+                 x,
+@@ -84,13 +91,16 @@ class AscendW8A8SCLinearMethod310(AscendW8A8Linear310pScheme):
+                 layer.aclnn_input_offset,
+             )
+ 
+-        return torch_npu.npu_matmul_compress_dequant(
++        out = torch_npu.npu_matmul_compress_dequant(
+             x,
+             layer.weight,
+             layer.index,
+             layer.quant_bias,
+             layer.deq_scale,
+         )
++        if need_reshape:
++            out = out.reshape(*orig_shape[:-1], out.shape[-1])
++        return out
+ 
+     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+         layer.aclnn_input_scale = layer.input_scale.data.repeat(self.input_size)

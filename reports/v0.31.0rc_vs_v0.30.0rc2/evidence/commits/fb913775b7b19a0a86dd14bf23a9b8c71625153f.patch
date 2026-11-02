@@ -1,0 +1,337 @@
+commit fb913775b7b19a0a86dd14bf23a9b8c71625153f
+Author:     dwoai22 <devwoai@gmail.com>
+AuthorDate: Mon Oct 12 09:58:13 2026 +0300
+Commit:     GitHub <noreply@github.com>
+CommitDate: Mon Oct 12 14:58:13 2026 +0800
+
+    [BugFix][Ops] Fix the SiluAndMulWithClamp OOT registration and route it to npu_clipped_swiglu (#17830)
+    
+    ### What this PR does / why we need it?
+    
+    `CustomOp.__new__` resolves an out-of-tree override by the **upstream
+    class name**, but `REGISTERED_ASCEND_OPS` registered this one as
+    `"SiluAndMulClamp"` while the upstream class is `SiluAndMulWithClamp`.
+    The lookup never matched, so the upstream class was instantiated,
+    `forward_oot` fell through to `CustomOp.forward_oot` → `forward_native`,
+    and `AscendSiluAndMulWithClamp` has been **dead code on every Ascend
+    device**.
+    
+    The visible cost is in the decode profile of GLM-5.3-Flash,
+    `forward_native` expands into seven sequential `AI_VECTOR_CORE` kernels
+    per MLP, per layer, per step: 2× `aclnnClamp`, `aclnnMuls`,
+    `aclnnSigmoid`, 2× `aclnnMul`, `aclnnAdds`.
+    
+    Three changes:
+    
+    1. **Fix the registry key** (`vllm_ascend/utils.py`) -
+    `"SiluAndMulClamp"` → `"SiluAndMulWithClamp"`. Nothing else registers
+    that name, so the duplicate assert in `CustomOp.register_oot` does not
+    fire.
+    
+    2. **Reimplement the override** (`vllm_ascend/ops/activation.py`) on the
+    fused kernel, via the device adaptor:
+    
+       ```python
+       class AscendSiluAndMulWithClamp(SiluAndMulWithClamp):
+           def forward_oot(self, x: torch.Tensor) -> torch.Tensor:
+               out = DeviceOperator.clipped_swiglu(
+                   x,
+                   swiglu_limit=self.swiglu_limit,
+                   swiglu_alpha=self.alpha,
+                   swiglu_beta=self.beta,
+               )
+               return out
+       ```
+    
+    `npu_clipped_swiglu` computes `clamp(gate, max=limit) * sigmoid(alpha *
+    gate) * (clamp(up, ±limit) + bias)` exactly `forward_native` in one
+    kernel. The previous body clamped both halves, materialised a `[T, 2·d]`
+    concat and called `npu_swiglu`, and it **ignored `alpha` and `beta`**:
+    harmless for today's Ascend consumers (all use the defaults 1.0 / 0.0)
+    but wrong by construction, so fixing the key without fixing the body
+    would have shipped that bug.
+    
+    3. **Keep the eager path on 310P** (`vllm_ascend/device/device_op.py`) -
+    a new `Ascend310PDeviceAdaptor clipped_swiglu`. The entry lives in the
+    base `REGISTERED_ASCEND_OPS` and the 310P branch only `.update()`s its
+    own keys, so without this 310P would start calling a kernel that is
+    unverified there; the sibling `AscendSiluAndMul310` already guards
+    `npu_swiglu` behind `x.shape[-1] % 32 == 0`.
+    
+    **Why `DeviceOperator` rather than calling `torch_npu` directly.** Two
+    places already route **A5** away from this kernel:
+    `A5DeviceAdaptor.clipped_swiglu` keeps the eager math while the base
+    adaptor calls the fused op, and `MiniMaxM3SwiGLUOAI.forward` branches on
+    `AscendDeviceType.A5`. A5 takes the base `REGISTERED_ASCEND_OPS` entry
+    (only 310P carries `COMPATIBILITY_OP_IMPLEMENTATIONS`) and its
+    `AUTO_ENABLE_CUSTOM_OPS` forces `custom_ops = ["all"]`, so `forward_oot`
+    runs there unconditionally, a direct `torch_npu` call would have put A5
+    on an unvalidated kernel with no opt-out. Dispatching through the
+    adaptor inherits each device's existing decision, and `device_op.py`
+    stays the single table for this kernel:
+    
+    | adaptor | `clipped_swiglu` |
+    |---|---|
+    | `BaseDeviceAdaptor` (A2/A3) | `npu_clipped_swiglu` (pre-existing) |
+    | `A5DeviceAdaptor` | eager clamp/sigmoid (pre-existing) |
+    | `Ascend310PDeviceAdaptor` | eager clamp/sigmoid (**added here**) |
+    
+    This also matches how `AscendGemmaRMSNorm.forward_oot` already
+    dispatches (`vllm_ascend/ops/layernorm.py`), one of seven
+    `DeviceOperator` call sites under `vllm_ascend/ops/`.
+    
+    **Call sites flipped onto the Ascend path for the first time** (all
+    construct the op with `swiglu_limit` only, i.e. alpha=1.0 / beta=0.0):
+    
+    - GLM-5.3-Flash dense MLP + shared experts:
+    `vllm_ascend/models/glm5next/model.py`
+    - GLM-5.3-Flash vision MLP and vision merger:
+    `vllm_ascend/models/glm5next/multimodal.py`
+    - DeepSeek-V4: `vllm_ascend/models/deepseek_v4/model.py`
+    - DeepSeek-V4.1: `vllm_ascend/models/deepseek_v41/model.py`
+    - EXAONE-4: generic upstream MLP, not overridden here
+    
+    MiniMax-M3 is unaffected: its Ascend override calls `npu_clipped_swiglu`
+    directly and never goes through this CustomOp. The kernel itself is not
+    new to Ascend, it already ships via MiniMax-M3, the W8A8 MoE prefill
+    path and the LoRA MoE path.
+    
+    ### Does this PR introduce _any_ user-facing change?
+    
+    No API or interface change. Behaviour changes on A2/A3:
+    
+    - The six call sites above move from vLLM's native activation to the
+    fused Ascend kernel. Measured on Atlas A2, TP8 + EP, GLM-5.3-Flash W8A8,
+    decode step: **7 kernels → 1, 15.63 µs → 9.27 µs per call (~41% on that
+    segment)**.
+    - Models that set `alpha`/`beta` now get them honoured instead of
+    silently dropped. No current Ascend consumer does, so this is latent-bug
+    prevention.
+    
+    **A5 and 310P are unchanged**: both keep the eager path, which is
+    `forward_native` by another name.
+    
+    ### How was this patch tested?
+    
+    Unit tests (added):
+    
+    ```bash
+    pytest -sv tests/ut/ops/test_activation.py::test_SiluAndMulWithClamp_forward
+    pytest -sv tests/ut/device/test_device_op.py::test_clipped_swiglu_kernel_selection_per_adaptor
+    ```
+    
+    - `test_SiluAndMulWithClamp_forward` asserts the layer resolves to
+    `AscendSiluAndMulWithClamp` (pinning the registry key, i.e. the
+    regression test for the bug) and that the kernel receives
+    `interleaved=False` plus alpha/limit/bias. It uses non-default
+    alpha/beta on purpose, with the defaults 1.0 / 0.0 the test cannot
+    distinguish an implementation that honours them from one that drops
+    them.
+    - `test_clipped_swiglu_kernel_selection_per_adaptor` pins all three
+    adaptors: base calls the kernel with exact kwargs, A5 and 310P call it
+    not at all and match independently computed math. A5 had no coverage for
+    this before.
+    
+    Kernel probe (standalone, no vLLM), fused vs `forward_native` in bf16 at
+    `(8, 4096)`, `(2048, 4096)` and `(32242, 8192)`: correct output shape,
+    memory proportional to one output tensor, `max_abs_diff = 0.0625`, one
+    bf16 ULP at magnitude 8–16.
+    
+    End-to-end, Atlas A2, TP8 + EP, `FULL_DECODE_ONLY`:
+    
+    ```bash
+    vllm serve <GLM-5.3-Flash-W8A8> \
+      --tensor-parallel-size 8 --enable-expert-parallel \
+      --quantization ascend --trust-remote-code \
+      --max-num-seqs 8 --max-num-batched-tokens 2048 \
+      --compilation-config '{"cudagraph_mode":"FULL_DECODE_ONLY","cudagraph_capture_sizes":[1,2,4,8,16]}'
+    ```
+    
+    The seven-op `AI_VECTOR_CORE` group is replaced by a single
+    `ClippedSwiglu` kernel in the decode profile, and per-call wall time on
+    that segment drops from 15.63 µs to 9.28 µs.
+    
+    | Base | This PR |
+    | --- | --- |
+    | <img width="700" height="109" alt="base_computation"
+    src="https://github.com/user-attachments/assets/2c2ad63d-aad3-45b4-b42a-abb8ad73e0e3"
+    /> | <img width="473" height="115" alt="PR_computation"
+    src="https://github.com/user-attachments/assets/0d2b9041-197c-42a1-915d-ebb6133c3fe2"
+    /> |
+    
+    Accuracy, GLM-5.3-Flash W8A8, HumanEval pass@1: **95.73 (base) → 96.95
+    (this PR)**, i.e. 157/164 → 159/164, where base is `main` and the
+    mismatched key selects `forward_native`. The two-problem difference is
+    within run-to-run noise at this sample size; the point is that no
+    regression appears, which is consistent with the kernel probe measuring
+    a one-bf16-ULP difference in the more accurate direction.
+    
+    **Not tested on 310P or A5 hardware.** Both keep the eager path, so
+    behaviour on those devices is unchanged by construction and covered by
+    the adaptor unit test.
+    
+    - vLLM main:
+    https://github.com/vllm-project/vllm/commit/ced6857afa0ea7b2e3f0846a62e1394e90f15607
+    
+    Signed-off-by: dwoai22 <devwoai@gmail.com>
+
+diff --git a/tests/ut/device/test_device_op.py b/tests/ut/device/test_device_op.py
+index 4c3c63888..333541fb9 100644
+--- a/tests/ut/device/test_device_op.py
++++ b/tests/ut/device/test_device_op.py
+@@ -4,7 +4,7 @@ from unittest import mock
+ import pytest
+ import torch
+ 
+-from vllm_ascend.device.device_op import A5DeviceAdaptor, BaseDeviceAdaptor
++from vllm_ascend.device.device_op import A5DeviceAdaptor, Ascend310PDeviceAdaptor, BaseDeviceAdaptor
+ from vllm_ascend.device.hardware import AscendDeviceType
+ from vllm_ascend.device.hardware_profile import get_hardware_profile
+ 
+@@ -305,3 +305,29 @@ def test_v41_runner_support_is_hardware_scoped(packed_cache, use_v2, architectur
+                 _validate_model_runner_config(config)
+         else:
+             _validate_model_runner_config(config)
++
++
++@pytest.mark.parametrize(
++    ("adaptor", "uses_fused_kernel"),
++    [
++        (BaseDeviceAdaptor, True),
++        (A5DeviceAdaptor, False),
++        (Ascend310PDeviceAdaptor, False),
++    ],
++)
++def test_clipped_swiglu_kernel_selection_per_adaptor(adaptor, uses_fused_kernel):
++    limit, alpha, beta = 7.0, 1.702, 1.0
++    x = torch.randn(2, 8)
++
++    with mock.patch("vllm_ascend.device.device_op.torch_npu.npu_clipped_swiglu") as mock_kernel:
++        out = adaptor.clipped_swiglu(x, swiglu_limit=limit, swiglu_alpha=alpha, swiglu_beta=beta)
++
++    if uses_fused_kernel:
++        mock_kernel.assert_called_once_with(x, interleaved=False, alpha=alpha, limit=limit, bias=beta)
++        return
++
++    mock_kernel.assert_not_called()
++    d = x.shape[-1] // 2
++    gate = torch.clamp(x[..., :d], max=limit)
++    up = torch.clamp(x[..., d:], min=-limit, max=limit)
++    torch.testing.assert_close(out, gate * torch.sigmoid(alpha * gate) * (up + beta))
+diff --git a/tests/ut/ops/test_activation.py b/tests/ut/ops/test_activation.py
+index cee29cb1c..e3cd8378d 100644
+--- a/tests/ut/ops/test_activation.py
++++ b/tests/ut/ops/test_activation.py
+@@ -18,7 +18,9 @@ from unittest.mock import MagicMock, patch
+ import pytest
+ import torch
+ from vllm.config import set_current_vllm_config
+-from vllm.model_executor.layers.activation import QuickGELU, SiluAndMul
++from vllm.model_executor.layers.activation import QuickGELU, SiluAndMul, SiluAndMulWithClamp
++
++from vllm_ascend.ops.activation import AscendSiluAndMulWithClamp
+ 
+ 
+ @pytest.fixture
+@@ -66,3 +68,30 @@ def test_SiluAndMul_forward(
+ 
+     expected_out = dummy_tensor + 1
+     assert torch.allclose(out, expected_out)
++
++
++@patch("torch_npu.npu_clipped_swiglu", side_effect=lambda x, **kwargs: x[..., : x.shape[-1] // 2] + 1)
++def test_SiluAndMulWithClamp_forward(
++    mock_clipped_swiglu,
++    dummy_tensor,
++    default_vllm_config,
++):
++    layer = SiluAndMulWithClamp(swiglu_limit=7.0, alpha=1.702, beta=1.0)
++
++    assert isinstance(layer, AscendSiluAndMulWithClamp)
++
++    out = layer.forward(dummy_tensor)
++
++    mock_clipped_swiglu.assert_called_once()
++
++    actual_arg = mock_clipped_swiglu.call_args[0][0]
++    assert torch.allclose(actual_arg, dummy_tensor), "npu_clipped_swiglu called with unexpected input"
++    assert mock_clipped_swiglu.call_args[1] == {
++        "interleaved": False,
++        "alpha": 1.702,
++        "limit": 7.0,
++        "bias": 1.0,
++    }
++
++    expected_out = dummy_tensor[..., : dummy_tensor.shape[-1] // 2] + 1
++    assert torch.allclose(out, expected_out)
+diff --git a/vllm_ascend/device/device_op.py b/vllm_ascend/device/device_op.py
+index 710cef370..ae0cd9a3a 100644
+--- a/vllm_ascend/device/device_op.py
++++ b/vllm_ascend/device/device_op.py
+@@ -2028,6 +2028,21 @@ class Ascend310PDeviceAdaptor(BaseDeviceAdaptor):
+         tensor[tuple(idx)] = value
+         return tensor
+ 
++    @staticmethod
++    def clipped_swiglu(
++        hidden_states: torch.Tensor,
++        swiglu_limit: float,
++        swiglu_alpha: float,
++        swiglu_beta: float,
++    ) -> torch.Tensor:
++        hidden_size = hidden_states.shape[-1] // 2
++        gate = hidden_states[..., :hidden_size].clamp(max=swiglu_limit)
++        up = hidden_states[..., hidden_size:].clamp(
++            min=-swiglu_limit,
++            max=swiglu_limit,
++        )
++        return gate * torch.sigmoid(swiglu_alpha * gate) * (up + swiglu_beta)
++
+ 
+ def get_device_adaptor() -> type["BaseDeviceAdaptor"]:
+     adaptor_by_family = {
+diff --git a/vllm_ascend/ops/activation.py b/vllm_ascend/ops/activation.py
+index aeb2eb465..9d8a23a5f 100644
+--- a/vllm_ascend/ops/activation.py
++++ b/vllm_ascend/ops/activation.py
+@@ -25,6 +25,8 @@ from vllm.model_executor.layers.activation import (
+     SwigluStepAndMul,
+ )
+ 
++from vllm_ascend.device.device_op import DeviceOperator
++
+ 
+ class AscendQuickGELU(QuickGELU):
+     def forward_oot(self, x: torch.tensor) -> torch.Tensor:
+@@ -40,11 +42,13 @@ class AscendSiluAndMul(SiluAndMul):
+ 
+ class AscendSiluAndMulWithClamp(SiluAndMulWithClamp):
+     def forward_oot(self, x: torch.Tensor) -> torch.Tensor:
+-        d = x.shape[-1] // 2
+-        gate = torch.clamp(x[..., :d], max=self.swiglu_limit)
+-        up = torch.clamp(x[..., d:], min=-self.swiglu_limit, max=self.swiglu_limit)
+-        x = torch.cat([gate, up], dim=-1)
+-        out = torch_npu.npu_swiglu(x)
++        # Dispatched through the device adaptor: A5 and 310P keep an eager fallback here.
++        out = DeviceOperator.clipped_swiglu(
++            x,
++            swiglu_limit=self.swiglu_limit,
++            swiglu_alpha=self.alpha,
++            swiglu_beta=self.beta,
++        )
+         return out
+ 
+ 
+diff --git a/vllm_ascend/utils.py b/vllm_ascend/utils.py
+index bb8c795e1..2a13fa9f7 100644
+--- a/vllm_ascend/utils.py
++++ b/vllm_ascend/utils.py
+@@ -867,7 +867,7 @@ def register_ascend_customop(vllm_config: VllmConfig | None = None):
+     REGISTERED_ASCEND_OPS = {
+         "QuickGELU": AscendQuickGELU,
+         "SiluAndMul": AscendSiluAndMul,
+-        "SiluAndMulClamp": AscendSiluAndMulWithClamp,
++        "SiluAndMulWithClamp": AscendSiluAndMulWithClamp,
+         "RotaryEmbedding": AscendRotaryEmbedding,
+         "Gemma4RotaryEmbedding": AscendGemma4RotaryEmbedding,
+         "MRotaryEmbedding": AscendMRotaryEmbedding,

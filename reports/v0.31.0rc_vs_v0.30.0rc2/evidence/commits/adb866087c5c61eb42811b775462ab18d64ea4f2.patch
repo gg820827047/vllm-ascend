@@ -1,0 +1,321 @@
+commit adb866087c5c61eb42811b775462ab18d64ea4f2
+Author:     AuroraEmiya <92282919+AuroraEmiya@users.noreply.github.com>
+AuthorDate: Wed Oct 14 12:00:18 2026 +0800
+Commit:     GitHub <noreply@github.com>
+CommitDate: Wed Oct 14 12:00:18 2026 +0800
+
+    [BugFix][CI] Fix cross-runner csrc L1 cache transport (#18123)
+    
+    ### What this PR does / why we need it?
+    
+    Fix cross-runner L1 snapshot reuse by giving every producer/consumer the
+    same workspace-relative transport path: `csrc/build_cache`.
+    
+    The cache action's storage version includes the **literal path input**,
+    in addition to the logical key. Previously the CPU producer saved with
+    `/tmp/vllm-ascend-incremental-build-cache`, while consumers restored
+    with a runner-specific `runner.temp` path. Otherwise compatible logical
+    keys therefore searched different OBS namespaces. The archive also
+    records paths relative to `GITHUB_WORKSPACE`, so a shared relative path
+    ensures extraction into the consumer's own workspace rather than the
+    producer's physical location.
+    
+    Production evidence:
+    - [Producer
+    save](https://github.com/vllm-project/vllm-ascend/actions/runs/37869628129/job/113624720466)
+    - [Consumer miss with the same compatibility
+    prefix](https://github.com/vllm-project/vllm-ascend/actions/runs/37905719842/job/113746143445)
+    
+    This patch:
+    - aligns all current L1 workflow callers on `csrc/build_cache`;
+    - preserves the helper-exported **absolute** build-time directory
+    instead of overriding it with the relative transport input;
+    - documents the transport-path contract and adds regression checks for
+    callers and nonfatal transport steps.
+    
+    No cache-engine/CMake identity, schema (still 4), locks, L0, OBS
+    authorization, or ordinary-build fallback changes. Restore/save
+    transport errors remain nonfatal. This does not claim every unrelated
+    local filesystem/build error is nonfatal.
+    
+    ### Does this PR introduce _any_ user-facing change?
+    
+    No runtime API change. CI L1 snapshots use a new path-version namespace.
+    Existing snapshots are not migrated, so the first run can be cold;
+    subsequently compatible producer/consumer snapshots can be reused across
+    different physical runner roots.
+    
+    ### How was this patch tested?
+    
+    - Cache-engine, concurrency and restore-helper suite: **95 passed, 2
+    skipped**:
+      ```bash
+      python -m pytest --confcutdir=tests/ut/_tools -q \
+        tests/ut/_tools/test_build_cache.py \
+        tests/ut/_tools/test_build_cache_concurrency.py \
+        tests/ut/_tools/test_prepare_csrc_l1_restore.py
+      ```
+    - Caller-path regression fails against the old workflows and passes
+    after this fix.
+    - Full `pre-commit run --all-files`, manual Markdown hook, workflow YAML
+    parsing, actionlint and `git diff --check`: PASS.
+    - Independent review of the patch and pinned cache action's
+    path/version/archive behavior: no new blocking defect found.
+    - Isolated transport integration and fault-injection tests: PASS. A
+    container producer and independent host consumers used different
+    physical workspaces but the same relative transport path. Both
+    same-source and compatibility-fallback restores recovered the producer
+    snapshot, yielded **3 inner HIT / 0 MISS / 0 BYPASS / lock_timeout=0**,
+    and verified restored artifact bytes with the compiler guard never
+    invoked. Cold producer: **3 MISS / 3 SAVED**. With an unreachable
+    backend, ordinary build and downstream workflow steps still succeeded
+    after restore/save connection errors.
+    
+    These are deterministic compiler-action transport tests, **not a new
+    AscendC/NPU hardware matrix or production warm-build result**. Test-only
+    instrumentation is excluded from this PR. Actual production native warm
+    reuse will be observed after merge.
+    
+    - vLLM main:
+    https://github.com/vllm-project/vllm/commit/8cc9aa5ad350f6f80cf3bebb298d410803ff75a9
+    
+    ---------
+    
+    Signed-off-by: AuroraEmiya <Sakura.iostream@gmail.com>
+
+diff --git a/.github/actions/csrc-l1-restore/action.yaml b/.github/actions/csrc-l1-restore/action.yaml
+index 83252f452..0e11f93a4 100644
+--- a/.github/actions/csrc-l1-restore/action.yaml
++++ b/.github/actions/csrc-l1-restore/action.yaml
+@@ -4,7 +4,7 @@ description: Restore a persistent snapshot for the content-addressed local csrc
+ inputs:
+   cache-dir:
+     required: true
+-    description: Directory exported as VLLM_ASCEND_BUILD_CACHE_DIR.
++    description: Stable workspace-relative transport path; exported as an absolute VLLM_ASCEND_BUILD_CACHE_DIR.
+   architecture:
+     required: true
+     description: Build architecture (x64 or arm64; common runner aliases are accepted).
+@@ -23,6 +23,9 @@ inputs:
+     default: ''
+ 
+ outputs:
++  cache-dir:
++    description: Original relative transport path; use for save instead of the exported absolute build directory.
++    value: ${{ inputs.cache-dir }}
+   supported:
+     value: ${{ steps.key.outputs.supported }}
+   primary-key:
+@@ -70,6 +73,8 @@ runs:
+         AWS_REGION: ap-southeast-1
+         RUNS_ON_RUNNER_NAME: ""
+       with:
++        # The literal path versions the OBS namespace and archive layout.
++        # Use the same relative spelling in every producer/consumer.
+         path: ${{ inputs.cache-dir }}
+         key: ${{ steps.key.outputs.primary_key }}
+         restore-keys: |
+diff --git a/.github/actions/csrc-l1-save/action.yaml b/.github/actions/csrc-l1-save/action.yaml
+index 9b1de1e38..fb60bdbd0 100644
+--- a/.github/actions/csrc-l1-save/action.yaml
++++ b/.github/actions/csrc-l1-save/action.yaml
+@@ -4,6 +4,7 @@ description: Persist the updated content-addressed local csrc cache.
+ inputs:
+   cache-dir:
+     required: true
++    description: Same workspace-relative transport path used by the restore action.
+   primary-key:
+     required: true
+   access-key-id:
+diff --git a/.github/workflows/_build_csrc_cache.yaml b/.github/workflows/_build_csrc_cache.yaml
+index 4425a5a2c..cdafb25de 100644
+--- a/.github/workflows/_build_csrc_cache.yaml
++++ b/.github/workflows/_build_csrc_cache.yaml
+@@ -78,7 +78,11 @@ env:
+ 
+   # L1: persistent fine-grained build cache. L0 remains the exact final-artifact
+   # cache consumed by test jobs.
+-  INCREMENTAL_BUILD_CACHE_DIR: /tmp/vllm-ascend-incremental-build-cache
++  # runs-on/cache includes the literal path in its remote namespace. Every
++  # L1 caller must use this workspace-relative path, not runner.temp or /tmp.
++  # Restore exports its absolute equivalent for compilation. Save must use
++  # restore's original cache-dir output, not this subsequently updated env.
++  VLLM_ASCEND_BUILD_CACHE_DIR: csrc/build_cache
+   RUNS_ON_S3_BUCKET_CACHE: ascend-ci-cache-hk
+   RUNS_ON_S3_BUCKET_ENDPOINT: https://obs.ap-southeast-1.myhuaweicloud.com
+   RUNS_ON_S3_FORCE_PATH_STYLE: "false"
+@@ -186,7 +190,7 @@ jobs:
+         id: incremental-cache-restore
+         uses: $/.github/actions/csrc-l1-restore
+         with:
+-          cache-dir: ${{ env.INCREMENTAL_BUILD_CACHE_DIR }}
++          cache-dir: ${{ env.VLLM_ASCEND_BUILD_CACHE_DIR }}
+           architecture: ${{ fromJSON(inputs.target).cache_arch }}
+           soc-version: ${{ fromJSON(inputs.target).soc_version }}
+           csrc-hash: ${{ inputs.csrc_hash }}
+@@ -195,7 +199,6 @@ jobs:
+         env:
+           SOC_VERSION: ${{ fromJSON(inputs.target).soc_version }}
+           MAX_JOBS: '16'
+-          VLLM_ASCEND_BUILD_CACHE_DIR: ${{ env.INCREMENTAL_BUILD_CACHE_DIR }}
+         run: |
+           mkdir -p "$VLLM_ASCEND_BUILD_CACHE_DIR"
+           rm -f "$VLLM_ASCEND_BUILD_CACHE_EVENT_LOG"
+@@ -229,7 +232,7 @@ jobs:
+       - name: Save incremental build cache
+         uses: $/.github/actions/csrc-l1-save
+         with:
+-          cache-dir: ${{ env.INCREMENTAL_BUILD_CACHE_DIR }}
++          cache-dir: ${{ steps.incremental-cache-restore.outputs.cache-dir }}
+           primary-key: ${{ steps.incremental-cache-restore.outputs.primary-key }}
+           access-key-id: ${{ env.OBS_CACHE_WRITE_ACCESS_KEY_ID }}
+           secret-access-key: ${{ env.OBS_CACHE_WRITE_SECRET_ACCESS_KEY }}
+diff --git a/.github/workflows/_e2e_nightly_single_node.yaml b/.github/workflows/_e2e_nightly_single_node.yaml
+index 555a94a22..e5a1a21e4 100644
+--- a/.github/workflows/_e2e_nightly_single_node.yaml
++++ b/.github/workflows/_e2e_nightly_single_node.yaml
+@@ -195,7 +195,7 @@ jobs:
+         if: ${{ inputs.request_id != '' }}
+         uses: $/.github/actions/csrc-l1-restore
+         with:
+-          cache-dir: ${{ runner.temp }}/vllm-ascend-incremental-build-cache
++          cache-dir: csrc/build_cache
+           architecture: ${{ runner.arch }}
+           soc-version: ${{ inputs.soc_version }}
+           source-root: ./temp-vllm-ascend
+diff --git a/.github/workflows/_e2e_nightly_single_node_560t.yaml b/.github/workflows/_e2e_nightly_single_node_560t.yaml
+index 7f7f82a04..800cf66e6 100644
+--- a/.github/workflows/_e2e_nightly_single_node_560t.yaml
++++ b/.github/workflows/_e2e_nightly_single_node_560t.yaml
+@@ -194,7 +194,7 @@ jobs:
+         if: ${{ inputs.request_id != '' }}
+         uses: $/.github/actions/csrc-l1-restore
+         with:
+-          cache-dir: ${{ runner.temp }}/vllm-ascend-incremental-build-cache
++          cache-dir: csrc/build_cache
+           architecture: ${{ runner.arch }}
+           soc-version: ${{ inputs.soc_version }}
+           source-root: ./temp-vllm-ascend
+diff --git a/.github/workflows/_e2e_nightly_single_node_models.yaml b/.github/workflows/_e2e_nightly_single_node_models.yaml
+index 3182a53fa..8090e6597 100644
+--- a/.github/workflows/_e2e_nightly_single_node_models.yaml
++++ b/.github/workflows/_e2e_nightly_single_node_models.yaml
+@@ -122,7 +122,7 @@ jobs:
+         if: ${{ inputs.request_id != '' }}
+         uses: $/.github/actions/csrc-l1-restore
+         with:
+-          cache-dir: ${{ runner.temp }}/vllm-ascend-incremental-build-cache
++          cache-dir: csrc/build_cache
+           architecture: ${{ runner.arch }}
+           soc-version: ${{ inputs.soc_version }}
+           source-root: ./temp-vllm-ascend
+diff --git a/.github/workflows/_selected_tests.yaml b/.github/workflows/_selected_tests.yaml
+index d4aa47bbf..bdb8a6eb0 100644
+--- a/.github/workflows/_selected_tests.yaml
++++ b/.github/workflows/_selected_tests.yaml
+@@ -217,7 +217,7 @@ jobs:
+         if: ${{ matrix.group.npu_type != 'cpu' && steps.cache-csrc.outputs.cache-hit != 'true' }}
+         uses: $/.github/actions/csrc-l1-restore
+         with:
+-          cache-dir: ${{ runner.temp }}/vllm-ascend-incremental-build-cache
++          cache-dir: csrc/build_cache
+           architecture: ${{ steps.get_arch.outputs.arch }}
+           soc-version: ${{ matrix.group.npu_type }}
+           source-root: .
+diff --git a/.github/workflows/schedule_doc_getting_started_test.yaml b/.github/workflows/schedule_doc_getting_started_test.yaml
+index 786526d5c..a424d841c 100644
+--- a/.github/workflows/schedule_doc_getting_started_test.yaml
++++ b/.github/workflows/schedule_doc_getting_started_test.yaml
+@@ -202,7 +202,7 @@ jobs:
+         if: ${{ matrix.method == 'source' }}
+         uses: $/.github/actions/csrc-l1-restore
+         with:
+-          cache-dir: ${{ runner.temp }}/vllm-ascend-incremental-build-cache
++          cache-dir: csrc/build_cache
+           architecture: ${{ runner.arch }}
+           soc-version: a2
+       - name: Run Installation doctest
+diff --git a/.github/workflows/schedule_main2main.yaml b/.github/workflows/schedule_main2main.yaml
+index 2328b3159..2f5ac6e10 100644
+--- a/.github/workflows/schedule_main2main.yaml
++++ b/.github/workflows/schedule_main2main.yaml
+@@ -486,7 +486,7 @@ jobs:
+         if: ${{ steps.cache-csrc.outputs.cache-hit != 'true' }}
+         uses: $/.github/actions/csrc-l1-restore
+         with:
+-          cache-dir: ${{ runner.temp }}/vllm-ascend-incremental-build-cache
++          cache-dir: csrc/build_cache
+           architecture: ${{ runner.arch }}
+           soc-version: a3
+           source-root: .
+diff --git a/docs/source/developer_guide/Design_Documents/persistent_csrc_build_cache.md b/docs/source/developer_guide/Design_Documents/persistent_csrc_build_cache.md
+index 08fa53abd..3c1788e82 100644
+--- a/docs/source/developer_guide/Design_Documents/persistent_csrc_build_cache.md
++++ b/docs/source/developer_guide/Design_Documents/persistent_csrc_build_cache.md
+@@ -372,8 +372,9 @@ Ordinary local source builds use the same action cache in the repository's
+ ignored `csrc/build_cache` directory. This is local-only acceleration: no OBS
+ credentials or remote snapshot transport are involved. Set
+ `VLLM_ASCEND_BUILD_CACHE_DIR` to an absolute path to override this local
+-default; CI supplies an explicit directory and is unaffected by the
+-repository-local location. Deleting the local directory causes a cold build;
++default. CI uses the same workspace-relative `csrc/build_cache` transport
++path, which the restore helper resolves to an absolute directory for builds.
++Deleting the local directory causes a cold build;
+ it does not change the compiled source or CI's persistent snapshot.
+ 
+ ### Central producer
+@@ -382,6 +383,21 @@ The reusable producer restores L1, performs the ordinary source build, verifies
+ final native artifacts, publishes changed L1 state, and then publishes the
+ exact L0 artifact.
+ 
++All L1 producers and consumers must pass the same literal relative
++`cache-dir: csrc/build_cache` to the restore/save actions. `runs-on/cache`
++includes that path in its remote cache version: using `/tmp` on one runner
++and `runner.temp` on another separates otherwise compatible keys into
++different OBS namespaces. The relative archive layout also restores under
++each consumer's own workspace, not the producer's absolute directory.
++The producer initially sets `VLLM_ASCEND_BUILD_CACHE_DIR=csrc/build_cache`.
++Restore exports its absolute equivalent through `GITHUB_ENV` for compilation
++and preserves the original spelling in its `cache-dir` output. Save consumes
++that output, not the updated environment variable: using the absolute build
++directory as the save input would split the OBS namespace again.
++Restore/save transport failures remain nonfatal; ordinary source compilation
++is still the fallback. Existing snapshots under the old path namespaces are
++not migrated, so the first build with the shared path may be cold.
++
+ ### Historical sources
+ 
+ Main2Main and bisect-style builds keep current workflow helpers separate from
+diff --git a/tests/ut/_tools/test_prepare_csrc_l1_restore.py b/tests/ut/_tools/test_prepare_csrc_l1_restore.py
+index f723fff79..0238a1080 100644
+--- a/tests/ut/_tools/test_prepare_csrc_l1_restore.py
++++ b/tests/ut/_tools/test_prepare_csrc_l1_restore.py
+@@ -83,6 +83,28 @@ def test_prepare_uses_engine_output_and_exports_environment(tmp_path: Path, monk
+     assert f"VLLM_ASCEND_BUILD_CACHE_EVENT_LOG={runner_temp / 'csrc-l1-selected_a2.jsonl'}" in exported
+ 
+ 
++def test_prepare_relative_cache_dir_across_workspaces(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
++    helper = _load_helper("prepare_csrc_l1_restore_relative")
++    monkeypatch.setattr(
++        helper.subprocess,
++        "run",
++        lambda command, **_kwargs: subprocess.CompletedProcess(command, 0, stdout="primary\nsame\ncompat\n"),
++    )
++    for name in ("producer", "consumer"):
++        workspace = tmp_path / name
++        workspace.mkdir()
++        source_root = _source_root(workspace)
++        environment = workspace / "github-env"
++        monkeypatch.chdir(workspace)
++        monkeypatch.setenv("GITHUB_ENV", str(environment))
++        args = _args(workspace, source_root)
++        args.cache_dir = "csrc/build_cache"
++
++        assert helper.prepare(args)["supported"] == "true"
++        assert (workspace / args.cache_dir).is_dir()
++        assert f"VLLM_ASCEND_BUILD_CACHE_DIR={workspace / args.cache_dir}\n" in environment.read_text()
++
++
+ @pytest.mark.parametrize("entrypoint", ["engine", "restore-helper"])
+ def test_snapshot_key_before_build_dependencies(tmp_path: Path, entrypoint: str):
+     # Restore runs before project dependencies are installed. Exercise the real

@@ -1,0 +1,114 @@
+commit d0b633b5ef6d1289dbf0433075b10188c19c9214
+Author:     XuChi <xuchicolson@163.com>
+AuthorDate: Fri Oct 9 22:53:51 2026 +0800
+Commit:     GitHub <noreply@github.com>
+CommitDate: Fri Oct 9 14:53:51 2026 +0000
+
+    [BugFix][Model] Point users at the recipe fix when oproj capacity is exceeded (#18126)
+    
+    ### What this PR does / why we need it?
+    
+    Improves the `ValueError` raised in `dsa_v1.py::_forward_o_proj` when
+    the fine-grained oproj TP static exchange capacity cannot cover the
+    local token count. The old message only echoed two numbers:
+    
+    ```
+    ValueError: oproj static exchange capacity must cover local tokens, got 16 and 240.
+    ```
+    
+    Real user case: DeepSeek-V4-Flash + PD disaggregation (decode dp16×tp1)
+    with `--max-num-batched-tokens 240 --max-num-seqs 4`, speculative
+    decoding (dql=4), and `finegrained_tp_config
+    {"oproj_tensor_parallel_size": 8}` crashed at startup with the message
+    above. The capacity is `max(largest capture bucket,
+    min(max_num_batched_tokens, max_num_seqs * decode_query_len))` = 16
+    while the profiling/warmup dummy batch equals `max_num_batched_tokens` =
+    240, so the raise fired — but users could not tell (a) that this is a
+    fine-grained-TP recipe constraint rather than an engine bug, or (b) how
+    to fix the config.
+    
+    The new message states the constraint (`capacity >=
+    max_num_batched_tokens`) and both fixes — set `--max-num-batched-tokens`
+    to `max_num_seqs * decode_query_len`, or raise the largest entry of
+    `cudagraph_capture_sizes` — with the user's `max_num_seqs` inlined.
+    Rendered at the user's numbers:
+    
+    ```
+    oproj static exchange capacity (16) must cover local tokens (240). Fine-grained oproj TP requires capacity >= max_num_batched_tokens. Please set --max-num-batched-tokens to max_num_seqs * decode_query_len (currently max_num_seqs=4), or raise the largest cudagraph_capture_sizes entry.
+    ```
+    
+    Message style follows the repo's existing compound-error precedent
+    (`profiling_chunk_config` in `ascend_config.py`: fact + numbers +
+    "Please set X, or Y"; the second fix names the actual config key,
+    matching the knob-naming style of the `potential_max_tokens` warning in
+    `utils.py`). `scheduler_config` is read from `self.vllm_config` — the
+    same object the capacity computation three lines above already uses —
+    inside the failure branch only, so there is zero hot-path cost.
+    
+    ### Does this PR introduce _any_ user-facing change?
+    
+    Only the error message text, which becomes actionable. No behavior
+    change.
+    
+    ### How was this patch tested?
+    
+    - `ruff format --check` and `ruff check` pass locally, and the rendered
+    message was verified by local string simulation (pasted above).
+    - The existing UT `test_o_proj_capacity_covers_profile_and_decode`
+    asserted the old message text, so its `pytest.raises` match is updated
+    to the new core fragment and now also asserts the inlined numbers
+    (`capacity (N) must cover local tokens (M)`); its `scheduler_config`
+    mock gains the `max_num_seqs` attribute the raise path now reads. No
+    vllm/torch environment on this machine, so UT verification relies on CI;
+    the change is a single error-message edit and needs no NPU run.
+    
+    - vLLM main:
+    https://github.com/vllm-project/vllm/commit/ced6857afa0ea7b2e3f0846a62e1394e90f15607
+    
+    Signed-off-by: xuchi <xuchicolson@163.com>
+
+diff --git a/tests/ut/attention/test_dsa_v1.py b/tests/ut/attention/test_dsa_v1.py
+index 3477a7ac1..8d3561bb3 100644
+--- a/tests/ut/attention/test_dsa_v1.py
++++ b/tests/ut/attention/test_dsa_v1.py
+@@ -2659,7 +2659,9 @@ def test_o_proj_capacity_covers_profile_and_decode(tp_size, decode_capacity, sch
+     impl.support_fp8_attention = False
+     impl.wo_a = SimpleNamespace(weight=torch.ones(1, 2, 2))
+     impl.wo_b = lambda x: x
+-    impl.vllm_config = SimpleNamespace(scheduler_config=SimpleNamespace(max_num_batched_tokens=scheduler_capacity))
++    impl.vllm_config = SimpleNamespace(
++        scheduler_config=SimpleNamespace(max_num_batched_tokens=scheduler_capacity, max_num_seqs=4)
++    )
+     group = SimpleNamespace(world_size=tp_size, device_group=object())
+     capacity = max(decode_capacity, scheduler_capacity)
+ 
+@@ -2698,7 +2700,7 @@ def test_o_proj_capacity_covers_profile_and_decode(tp_size, decode_capacity, sch
+             else:
+                 assert all(current is original for current, original in zip(current_buffers, buffers))
+ 
+-        with pytest.raises(ValueError, match="static exchange capacity must cover local tokens"):
++        with pytest.raises(ValueError, match=r"capacity \(\d+\) must cover local tokens \(\d+\)"):
+             impl._forward_o_proj(torch.zeros(capacity + 1, tp_size, 2), torch.empty(capacity + 1, 2))
+ 
+     assert a2a.call_count == rs.call_count == 3
+diff --git a/vllm_ascend/attention/dsa_v1.py b/vllm_ascend/attention/dsa_v1.py
+index 1b4b9b81b..eb2f4b6b5 100644
+--- a/vllm_ascend/attention/dsa_v1.py
++++ b/vllm_ascend/attention/dsa_v1.py
+@@ -1787,9 +1787,14 @@ class AscendDSAImpl(AttentionImplBase[Any]):
+                     self.vllm_config.scheduler_config.max_num_batched_tokens,
+                 )
+             if exchange_num_tokens < num_tokens:
++                scheduler_config = self.vllm_config.scheduler_config
+                 raise ValueError(
+-                    "oproj static exchange capacity must cover local tokens, "
+-                    f"got {exchange_num_tokens} and {num_tokens}."
++                    f"oproj static exchange capacity ({exchange_num_tokens}) must cover "
++                    f"local tokens ({num_tokens}). Fine-grained oproj TP requires "
++                    "capacity >= max_num_batched_tokens. Please set --max-num-batched-"
++                    "tokens to max_num_seqs * decode_query_len "
++                    f"(currently max_num_seqs={scheduler_config.max_num_seqs}), or "
++                    "raise the largest cudagraph_capture_sizes entry."
+                 )
+             # Lazily allocate static send/recv buffers on first call. The
+             # profiling run hits this path before ACL graph capture, so the

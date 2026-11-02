@@ -1,0 +1,294 @@
+commit 06c14a321dcd3f7a6c9b2e7813e02d7f36b02824
+Author:     ZYang6263 <50876451+ZYang6263@users.noreply.github.com>
+AuthorDate: Thu Oct 22 16:56:11 2026 +0800
+Commit:     GitHub <noreply@github.com>
+CommitDate: Thu Oct 22 16:56:11 2026 +0800
+
+    [Performance][GLM] Reuse convolution output buffers and remove redundant KDA clears (#19408)
+    
+    ### What this PR does / why we need it?
+    
+    Reuse a fixed convolution output buffer across layers in each GLM-5.3
+    Flash attention group, clearing it once during metadata preparation.
+    Preserve zero decode padding and remove redundant KDA output pre-clears.
+    
+    ### Does this PR introduce _any_ user-facing change?
+    
+    No API or configuration changes.
+    
+    ### How was this patch tested?
+    
+    - Existing dispatch/metadata tests, lint and mypy passed in
+    [CI](https://github.com/vllm-project/vllm-ascend/actions/runs/39715018881);
+    CPU tests passed with vLLM main and v0.31.0.
+    - Selected GDN NPU regressions are running; GLM shared-buffer hardware
+    validation is pending.
+    
+    Accuracy results supplied for the preceding output-clear removal
+    revision:
+    
+    | Dataset | PR accuracy | Baseline accuracy |
+    | --- | --- | --- |
+    | GPQA-Diamond | 175/198 (88.38%) | 175/198 (88.38%) |
+    | AIME26 | 29/30 (96.67%) | 29/30 (96.67%) |
+    
+    - vLLM main:
+    https://github.com/vllm-project/vllm/commit/a98247ab4db686ee03c66d5feb3c761e52a2f8ab
+    
+    ---------
+    
+    Signed-off-by: ZYang6263 <50876451+ZYang6263@users.noreply.github.com>
+
+diff --git a/release_notes/fragments/19408.yaml b/release_notes/fragments/19408.yaml
+new file mode 100644
+index 000000000..9dc8a7fea
+--- /dev/null
++++ b/release_notes/fragments/19408.yaml
+@@ -0,0 +1,5 @@
++pr: 19408
++entries:
++  - category: performance
++    text: Reduced GLM-5.3 Flash initialization overhead by reusing metadata-owned convolution output buffers and removing redundant KDA output clears.
++    model: glm-5.3-flash
+diff --git a/tests/ut/models/test_glm5next_kda_dispatch.py b/tests/ut/models/test_glm5next_kda_dispatch.py
+index 562d596e2..745f515d1 100644
+--- a/tests/ut/models/test_glm5next_kda_dispatch.py
++++ b/tests/ut/models/test_glm5next_kda_dispatch.py
+@@ -80,6 +80,7 @@ def test_decode_and_prefill_use_their_own_metadata_and_merge_outputs(monkeypatch
+                 query_start_loc=metadata.spec_query_start_loc,
+                 cache_indices=metadata.spec_state_indices_tensor,
+                 num_accepted_tokens=metadata.num_accepted_tokens,
++                output_buffer=torch.zeros(tokens + 1, 384, dtype=torch.bfloat16),
+             )
+         )
+     monkeypatch.setattr(model_kda, "get_forward_context", lambda: SimpleNamespace(attn_metadata={"layer": metadata}))
+@@ -135,6 +136,8 @@ def test_decode_and_prefill_use_their_own_metadata_and_merge_outputs(monkeypatch
+         )
+ 
+     def fla_update(x, conv_state, weight, bias=None, **kwargs):
++        expected_buffer = metadata.spec_decode_metadata.spec_causal_conv1d.output_buffer
++        assert kwargs["out"].data_ptr() == expected_buffer.data_ptr()
+         return conv(
+             torch.zeros_like(x),
+             x,
+@@ -154,7 +157,7 @@ def test_decode_and_prefill_use_their_own_metadata_and_merge_outputs(monkeypatch
+         "vllm_ascend.models.glm5next.ops.causal_conv1d.causal_conv1d_update",
+         fla_update,
+     )
+-    calls = []
++    calls: list[str] = []
+ 
+     def recurrent(q, k, v, gate, beta, state, starts, indices, *args, **kwargs):
+         events.append("state_write")
+@@ -180,7 +183,8 @@ def test_decode_and_prefill_use_their_own_metadata_and_merge_outputs(monkeypatch
+     expected = torch.arange(1, tokens + 1, dtype=torch.bfloat16) * 3
+     expected[: 2 if speculative else 1] = torch.arange(1, 3 if speculative else 2) * 2
+     torch.testing.assert_close(out[0, :tokens, 0, 0], expected)
+-    assert torch.count_nonzero(out[:, tokens:]) == 0
++    # Rows outside the scheduled token groups are left untouched.
++    assert torch.isnan(out[:, tokens:]).all()
+     assert calls == (["recurrent"] if spec_only else ["recurrent", "prefill"])
+     assert conv_calls == ([1] if spec_only else ([1, 0] if speculative else [0]))
+     assert events == [("load", "layer"), "compute", *(["state_write"] * len(calls)), "save"]
+@@ -249,7 +253,7 @@ def test_plain_decode_writes_padded_destination_directly(monkeypatch, empty):
+         num_decodes=0 if empty else 3,
+         num_decode_tokens=3,
+         non_spec_decode_metadata=SimpleNamespace(
+-            causal_conv1d=SimpleNamespace(query_start_loc=starts, cache_indices=ids[:, None])
++            causal_conv1d=SimpleNamespace(query_start_loc=starts, cache_indices=ids[:, None], output_buffer=None)
+         ),
+     ).items():
+         setattr(metadata, key, value)
+@@ -280,7 +284,7 @@ def test_plain_decode_writes_padded_destination_directly(monkeypatch, empty):
+     assert events == (["load", "compute", "save"] if empty else ["load", "compute", "state_write", "save"])
+     if empty:
+         assert calls == []
+-        assert torch.count_nonzero(target) == 0
++        assert torch.isnan(target).all()
+         return
+     assert calls == [True]
+     torch.testing.assert_close(target[0, :3, 0], qkv[:3, :128] * 2)
+diff --git a/tests/ut/ops/test_gdn_attn_builder.py b/tests/ut/ops/test_gdn_attn_builder.py
+index 36a649318..4b0cea1ae 100644
+--- a/tests/ut/ops/test_gdn_attn_builder.py
++++ b/tests/ut/ops/test_gdn_attn_builder.py
+@@ -1124,8 +1124,13 @@ def test_full_graph_without_runtime_spec_resets_captured_spec_inputs(builder_cls
+         builder_cls=builder_cls,
+     )
+     if builder_cls is AscendGDNHostMetadataBuilder:
++        builder.vllm_config.model_config.dtype = torch.bfloat16
+         builder.compilation_config.static_forward_context = {
+-            "layer0": SimpleNamespace(use_contiguous_conv_indices=True),
++            "layer0": SimpleNamespace(
++                use_contiguous_conv_indices=True,
++                use_shared_conv_output=True,
++                local_projection_size=8,
++            ),
+         }
+     captured_metadata = builder.build(
+         0,
+@@ -1139,6 +1144,9 @@ def test_full_graph_without_runtime_spec_resets_captured_spec_inputs(builder_cls
+     if builder_cls is AscendGDNHostMetadataBuilder:
+         assert captured_conv1d_metadata.cache_indices.is_contiguous()
+         assert captured_conv1d_metadata.cache_indices.tolist() == [10, 20, NULL_BLOCK_ID, NULL_BLOCK_ID]
++        captured_output = captured_conv1d_metadata.output_buffer
++        assert captured_output is not None
++        captured_output.fill_(float("nan"))
+     assert torch.count_nonzero(captured_conv1d_metadata.query_start_loc) > 0
+     assert torch.count_nonzero(captured_spec_metadata.actual_seq_lengths) > 0
+ 
+@@ -1168,6 +1176,9 @@ def test_full_graph_without_runtime_spec_resets_captured_spec_inputs(builder_cls
+     assert torch.count_nonzero(captured_conv1d_metadata.query_start_loc) == 0
+     assert torch.count_nonzero(captured_conv1d_metadata.num_accepted_tokens) == 0
+     assert torch.count_nonzero(captured_spec_metadata.actual_seq_lengths) == 0
++    if builder_cls is AscendGDNHostMetadataBuilder:
++        assert torch.count_nonzero(captured_output) == 0
++        assert replay_metadata.non_spec_decode_metadata.causal_conv1d.output_buffer is captured_output
+ 
+ 
+ def test_full_graph_idle_dummy_uses_zero_length_recurrent_metadata():
+diff --git a/vllm_ascend/models/glm5next/kda.py b/vllm_ascend/models/glm5next/kda.py
+index b32a042f3..d9810326f 100644
+--- a/vllm_ascend/models/glm5next/kda.py
++++ b/vllm_ascend/models/glm5next/kda.py
+@@ -111,6 +111,7 @@ class _Glm5NextMergedColumnParallelLinear(MergedColumnParallelLinear):
+ 
+ class Glm5NextLinearAttention(GatedDeltaNetAttention):
+     use_contiguous_conv_indices = True
++    use_shared_conv_output = True
+ 
+     head_dim: int
+     num_heads: int
+@@ -449,6 +450,7 @@ class Glm5NextLinearAttention(GatedDeltaNetAttention):
+                 conv_meta.cache_indices,
+                 run_mode=1,
+                 num_accepted_tokens=conv_meta.num_accepted_tokens,
++                output_buffer=conv_meta.output_buffer,
+             )
+             q_spec, k_spec, v_spec = qkv_spec.split(self.local_projection_size, dim=-1)
+ 
+@@ -477,6 +479,7 @@ class Glm5NextLinearAttention(GatedDeltaNetAttention):
+                 conv_meta.query_start_loc,
+                 conv_meta.cache_indices,
+                 run_mode=1,
++                output_buffer=conv_meta.output_buffer,
+             )
+             q_ns, k_ns, v_ns = qkv_ns.split(self.local_projection_size, dim=-1)
+ 
+@@ -487,8 +490,8 @@ class Glm5NextLinearAttention(GatedDeltaNetAttention):
+         direct_output = (
+             not use_spec and attn_metadata_narrowed.num_prefills == 0 and attn_metadata_narrowed.num_decodes > 0
+         )
+-        if not direct_output:
+-            core_attn_out.zero_()
++        # Prefill copies its output and speculative dispatch scatters both token
++        # groups. Recurrent writeback handles decode padding without a pre-clear.
+         if use_spec:
+             spec_output = recurrent_kda(
+                 rearrange(q_spec),
+diff --git a/vllm_ascend/models/glm5next/ops/causal_conv1d.py b/vllm_ascend/models/glm5next/ops/causal_conv1d.py
+index c890cd34c..f29d85eab 100644
+--- a/vllm_ascend/models/glm5next/ops/causal_conv1d.py
++++ b/vllm_ascend/models/glm5next/ops/causal_conv1d.py
+@@ -19,12 +19,16 @@ def causal_conv1d(
+     run_mode: int,
+     initial_state_mode: torch.Tensor | None = None,
+     num_accepted_tokens: torch.Tensor | None = None,
++    output_buffer: torch.Tensor | None = None,
+ ) -> torch.Tensor:
+     """Consume GDN metadata and update the caller's [cache, state_len, dim] state."""
+-    # Padded requests can be skipped by the kernel; their output must stay zero.
+-    output = torch.zeros_like(x)
++    output = None
++    if output_buffer is not None:
++        output = output_buffer[: x.shape[0]]
++        if output.shape != x.shape:
++            raise ValueError("Convolution output buffer must cover the input rows and match its feature shape")
+     if cache_indices.shape[0] == 0:
+-        return output
++        return torch.zeros_like(x) if output is None else output
+     kernel_state = conv_state
+     # GLM metadata shares a contiguous vector across this group's layers.
+     # Standalone callers can still pass a matrix, using its first column.
+@@ -58,6 +62,10 @@ def causal_conv1d(
+             null_block_id=null_block_id,
+         )
+     else:
++        # Metadata resets the shared destination once per step. Standalone
++        # callers retain the original zero-initialized padding behavior.
++        if output is None:
++            output = torch.zeros_like(x)
+         result = causal_conv1d_update(
+             x,
+             kernel_state,
+diff --git a/vllm_ascend/ops/gdn_attn_builder.py b/vllm_ascend/ops/gdn_attn_builder.py
+index 250ae06c1..f2cb0068a 100644
+--- a/vllm_ascend/ops/gdn_attn_builder.py
++++ b/vllm_ascend/ops/gdn_attn_builder.py
+@@ -135,6 +135,7 @@ class GDNCausalConv1dMetadata:
+     query_start_loc: torch.Tensor
+     cache_indices: torch.Tensor
+     initial_state_mode: torch.Tensor | None
++    output_buffer: torch.Tensor | None = None
+ 
+ 
+ @dataclass
+@@ -142,6 +143,7 @@ class GDNSpecCausalConv1dMetadata:
+     query_start_loc: torch.Tensor
+     cache_indices: torch.Tensor
+     num_accepted_tokens: torch.Tensor
++    output_buffer: torch.Tensor | None = None
+ 
+ 
+ @dataclass
+@@ -1012,6 +1014,26 @@ class AscendGDNHostMetadataBuilder(AscendGDNAttentionMetadataBuilder):
+         self._conv_layer_name = layer_names[0] if layer_names else None
+         self._spec_conv_indices: torch.Tensor | None = None
+         self._non_spec_conv_indices: torch.Tensor | None = None
++        self._conv_output_buffer: torch.Tensor | None = None
++
++    def _ensure_conv_output_buffer(self) -> None:
++        if self._conv_output_buffer is not None:
++            return
++        layers = getattr(self.compilation_config, "static_forward_context", {})
++        layer = layers.get(self._conv_layer_name)
++        if layer is None or not getattr(layer, "use_shared_conv_output", False):
++            return
++        # Decode needs at most K+1 tokens per request; prefill does not use this
++        # buffer. Include graph padding without reserving the prefill token budget.
++        token_capacity = max(
++            self.vllm_config.scheduler_config.max_num_seqs * (self.num_spec + 1),
++            self.decode_cudagraph_max_bs,
++        )
++        self._conv_output_buffer = torch.empty(
++            (token_capacity, 3 * layer.local_projection_size),
++            dtype=self.vllm_config.model_config.dtype,
++            device=self.spec_sequence_masks.device,
++        )
+ 
+     def _ensure_conv_index_buffers(self) -> None:
+         if self._spec_conv_indices is not None:
+@@ -1055,6 +1077,7 @@ class AscendGDNHostMetadataBuilder(AscendGDNAttentionMetadataBuilder):
+         num_actual_reqs: int | None = None,
+     ) -> GDNAttentionMetadata:
+         self._ensure_conv_index_buffers()
++        self._ensure_conv_output_buffer()
+         metadata = super().build(
+             common_prefix_len,
+             common_attn_metadata,
+@@ -1063,6 +1086,15 @@ class AscendGDNHostMetadataBuilder(AscendGDNAttentionMetadataBuilder):
+             fast_build=fast_build,
+             num_actual_reqs=num_actual_reqs,
+         )
++        if self._conv_output_buffer is not None:
++            # Layers in this group consume the same decode rows in sequence.
++            # Clear once per step, including inactive captured branches: rows
++            # that were active on the previous replay can now be padding.
++            self._conv_output_buffer.zero_()
++            if metadata.spec_decode_metadata is not None:
++                metadata.spec_decode_metadata.spec_causal_conv1d.output_buffer = self._conv_output_buffer
++            if metadata.non_spec_decode_metadata is not None:
++                metadata.non_spec_decode_metadata.causal_conv1d.output_buffer = self._conv_output_buffer
+         if self._spec_conv_indices is None:
+             return metadata
+         assert self._non_spec_conv_indices is not None

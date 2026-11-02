@@ -1,0 +1,380 @@
+commit 1c29071a167af050270d50f5344c484b642fe570
+Author:     Wyz-134 <13455969105@163.com>
+AuthorDate: Wed Oct 21 21:16:52 2026 +0800
+Commit:     GitHub <noreply@github.com>
+CommitDate: Wed Oct 21 21:16:52 2026 +0800
+
+    [BugFix] Preserve full MRV1 PP intermediates with MoE sequence parallelism (#19347)
+    
+    ### What this PR does / why we need it?
+    
+    Fix MRV1 pipeline-parallel buffer sizing and token truncation when
+    global MoE sequence parallelism is enabled but PP boundaries carry full
+    token tensors.
+    
+    The actual vLLM runtime (`db9527a`) disables
+    `DeepseekV2DecoderLayer.use_sequence_parallel_moe` when PP > 1. MoE can
+    still use internal SP and gather its output back; the global
+    `parallel_config.use_sequence_parallel_moe` predicate therefore does not
+    describe the PP payload layout. GLM-5.3 inherits this path.
+    
+    The profiling context added by #18224 exposed a mismatch: a TP16 profile
+    buffer could contain only 1024 rows while the PP sender produced 16384
+    rows. Selecting the global SP predicate consistently at runtime hid that
+    copy error by taking `v[:1024]`, silently discarding token rows. The fix
+    must preserve the full MRV1 PP contract rather than force the payload
+    into a sequence shard.
+    
+    - Allocate and reuse full-token MRV1 PP buffers through
+    `_get_pp_intermediate_tensors`, used for both dummy/profile execution
+    and runtime views. The allocation no longer depends on ambient vLLM
+    config or global MoE SP.
+    - Copy and slice all scheduled token rows, including residual and
+    additional transported tensors.
+    - Keep MRV1 PP send/receive on the existing TP scatter/all-gather
+    transport optimization, which reconstructs the full payload. Retain the
+    existing MRV2 SP transport selection separately.
+    - Keep the profiling `set_current_vllm_config` context and internal
+    FlashComm/MoE configuration. No model, benchmark, DSA-CP or parallelism
+    flags are changed.
+    
+    The affected case is four-node A3 GLM-5.3 PP/PD: Prefill PP2/TP16,
+    Decode DP16/TP2. Full buffers require more profile memory than an
+    erroneous 1/TP allocation; memory profiling now accounts for the actual
+    PP layout. No new device synchronization or extra model operators are
+    introduced.
+    
+    ### Does this PR introduce _any_ user-facing change?
+    
+    Yes. Prevents MRV1 PP shape errors and silent token truncation. Includes
+    `release_notes/fragments/19347.yaml`.
+    
+    ### How was this patch tested?
+    
+    - Added CPU regression coverage in
+    `tests/ut/worker/test_model_runner_v1.py`: full PP allocation/reuse with
+    global SP=True and PP2/TP16; full tensor values and row counts for
+    1/17/16384 tokens, SP enabled/disabled, sync/no-sync, lazy residual
+    allocation and untouched buffer tails.
+    - Worker tests cover MRV1 and MRV2, SP enabled/disabled and
+    forward/no-forward calls, asserting PP send/receive transport arguments.
+    - Executed all three new test methods through an isolated CPU PyTorch
+    2.10.0 harness that AST-loads the actual production methods and test
+    classes, stubbing only unavailable vLLM/NPU dependency imports and
+    transport containers. The previously tested head `f9d028b` fails (six
+    assertion failures and one missing-helper error); corrected methods
+    pass. The copy/slice assertions independently expose the full-payload
+    truncation, rather than relying only on the helper's presence.
+    - Ruff check, Ruff format, codespell, typos and `git diff --check`
+    passed on changed files.
+    - Required `bash format.sh ci` was attempted; full hook setup remains
+    blocked installing actionlint. Full repository pytest dependencies are
+    unavailable locally; the isolated harness is not a full pytest run.
+    - **Corrected-head four-node A3 validation is pending before merge.**
+    The earlier run
+    [39562392428/job119098519155](https://github.com/vllm-project/vllm-ascend/actions/runs/39562392428/job/119098519155)
+    tested `f9d028b`, not this correction: 96/96 performance requests
+    succeeded but throughput was 477.6709 token/s; AIME2025 was 3.33% with
+    four HTTP failures and additional wrong/garbled successful outputs.
+    Those results do not validate this correction or establish its
+    throughput. Rerun the same case to verify full model correctness, P/D
+    transfer, request counts and performance.
+    - No model service or NPU benchmark was started locally. The earlier
+    ordinary E2E mypy failure on unmodified `mooncake.engine` import stubs
+    is separate from hardware validation.
+    
+    ---
+    
+    ### Checklist
+    
+    #### Testing
+    
+    - [x] **Boundary / edge-case coverage**: Single token, non-divisible
+    token count, full profile batch, allocation reuse and no-forward calls.
+    - [x] **Regression test**: The full-payload assertions fail on the prior
+    PR implementation and pass after correction.
+    - [ ] **Error / failure path coverage**: NPU/cluster failure paths
+    require hardware validation.
+    - [x] **Meaningful & reliable tests**: Assert contents, shapes, buffer
+    reuse/tails and MRV1/MRV2 transport behavior.
+    - [ ] **Performance impact**: Corrected-head A3 benchmark and memory
+    validation remain pending.
+    
+    - vLLM main:
+    https://github.com/vllm-project/vllm/commit/a98247ab4db686ee03c66d5feb3c761e52a2f8ab
+    
+    ---------
+    
+    Signed-off-by: Wyz-134 <298144151+Wyz-134@users.noreply.github.com>
+    Co-authored-by: Wyz-134 <298144151+Wyz-134@users.noreply.github.com>
+
+diff --git a/release_notes/fragments/19347.yaml b/release_notes/fragments/19347.yaml
+new file mode 100644
+index 000000000..7743e4533
+--- /dev/null
++++ b/release_notes/fragments/19347.yaml
+@@ -0,0 +1,4 @@
++pr: 19347
++entries:
++  - category: bugfix
++    text: Fixed Model Runner V1 pipeline-parallel buffer sizing and token truncation when internal MoE sequence parallelism is enabled but PP intermediates use the full token layout.
+diff --git a/tests/ut/worker/test_model_runner_v1.py b/tests/ut/worker/test_model_runner_v1.py
+index 59eeacb40..d22c008a1 100644
+--- a/tests/ut/worker/test_model_runner_v1.py
++++ b/tests/ut/worker/test_model_runner_v1.py
+@@ -13,6 +13,7 @@ from vllm.model_executor.layers.linear import UnquantizedLinearMethod
+ from vllm.model_executor.models.deepseek_v2 import DeepseekV32IndexerCache
+ from vllm.model_executor.offloader.base import NoopOffloader
+ from vllm.sampling_params import SamplingParams
++from vllm.sequence import IntermediateTensors
+ from vllm.v1.attention.backends.utils import reorder_batch_to_split_decodes_and_prefills
+ from vllm.v1.cudagraph_dispatcher import CudagraphDispatcher
+ from vllm.v1.kv_cache_interface import (
+@@ -61,6 +62,72 @@ from vllm_ascend.worker.v1.model_runner import NPUModelRunner
+ from vllm_ascend.worker.v2.kvpp import KVPPRuntime
+ 
+ 
++class TestPPSequenceParallelLayout(unittest.TestCase):
++    def test_profile_allocates_full_pp_buffers(self):
++        runner = NPUModelRunner.__new__(NPUModelRunner)
++        runner.vllm_config = SimpleNamespace(
++            parallel_config=SimpleNamespace(
++                tensor_parallel_size=16, pipeline_parallel_size=2, use_sequence_parallel_moe=True
++            )
++        )
++        runner.max_num_tokens = 16384
++        runner.dtype = torch.float32
++        runner.device = torch.device("cpu")
++        runner.intermediate_tensors = None
++        factory = MagicMock(
++            side_effect=lambda batch_size, dtype, device: IntermediateTensors(
++                {"hidden_states": torch.zeros(batch_size, 4, dtype=dtype, device=device)}
++            )
++        )
++        runner.model = SimpleNamespace(make_empty_intermediate_tensors=factory)
++        for num_tokens in (17, runner.max_num_tokens):
++            dummy = runner._get_pp_intermediate_tensors(num_tokens)
++            self.assertEqual(dummy["hidden_states"].shape, (num_tokens, 4))
++            assert runner.intermediate_tensors is not None
++            self.assertEqual(runner.intermediate_tensors["hidden_states"].shape, (runner.max_num_tokens, 4))
++        factory.assert_called_once_with(batch_size=runner.max_num_tokens, dtype=runner.dtype, device=runner.device)
++
++    @patch("vllm.config.get_current_vllm_config", side_effect=AssertionError("No current config"))
++    def test_full_pp_buffers_with_global_sp_enabled(self, _current_config):
++        max_tokens = 16384
++        tp_size = 16
++        for sp_enabled in (False, True):
++            capacity = max_tokens
++            for num_tokens in (1, 17, max_tokens):
++                rows = num_tokens
++                for sync_self in (False, True):
++                    with self.subTest(sp=sp_enabled, tokens=num_tokens, sync=sync_self):
++                        runner = NPUModelRunner.__new__(NPUModelRunner)
++                        runner.vllm_config = SimpleNamespace(
++                            parallel_config=SimpleNamespace(
++                                tensor_parallel_size=tp_size,
++                                pipeline_parallel_size=2,
++                                use_sequence_parallel_moe=sp_enabled,
++                            )
++                        )
++                        buffer = torch.full((capacity, 4), -1.0)
++                        runner.intermediate_tensors = IntermediateTensors({"hidden_states": buffer})
++                        received = IntermediateTensors(
++                            {
++                                "hidden_states": torch.arange(rows * 4).reshape(rows, 4).float(),
++                                "residual": torch.ones(rows, 4),
++                            }
++                        )
++                        result = runner.sync_and_slice_intermediate_tensors(
++                            num_tokens, received if sync_self else None, sync_self=sync_self
++                        )
++                        self.assertEqual(result["hidden_states"].shape, (rows, 4))
++                        self.assertEqual(result["hidden_states"].data_ptr(), buffer.data_ptr())
++                        if sync_self:
++                            for key, value in received.items():
++                                torch.testing.assert_close(result[key], value)
++                            self.assertEqual(runner.intermediate_tensors["residual"].shape, (capacity, 4))
++                        else:
++                            torch.testing.assert_close(result["hidden_states"], torch.full((rows, 4), -1.0))
++                        # Copying a shorter batch must leave the reusable buffer tail alone.
++                        torch.testing.assert_close(buffer[rows:], torch.full((capacity - rows, 4), -1.0))
++
++
+ class DenseAttentionBackend(AscendAttentionBackend):
+     pass
+ 
+diff --git a/tests/ut/worker/test_worker_v1.py b/tests/ut/worker/test_worker_v1.py
+index 5bc6258a8..3fb8999ce 100644
+--- a/tests/ut/worker/test_worker_v1.py
++++ b/tests/ut/worker/test_worker_v1.py
+@@ -5,6 +5,7 @@ from unittest.mock import ANY, MagicMock, patch
+ 
+ import torch
+ from vllm.config import CacheConfig, ModelConfig, ParallelConfig, ProfilerConfig, VllmConfig
++from vllm.sequence import IntermediateTensors
+ from vllm.v1.kv_cache_interface import (
+     FullAttentionSpec,
+     KVCacheGroupSpec,
+@@ -22,6 +23,51 @@ init_cached_hf_modules_path = "vllm.utils.import_utils.init_cached_hf_modules"
+ kw_module = importlib.import_module("vllm_ascend.model_executor.warmup.kernel_warmup")
+ 
+ 
++class TestPPSequenceParallelTransport(unittest.TestCase):
++    @patch("vllm.config.get_current_vllm_config", side_effect=AssertionError("No current config"))
++    @patch("vllm_ascend.worker.worker.get_ascend_config")
++    @patch("vllm_ascend.worker.worker.get_pp_group")
++    @patch("vllm_ascend.worker.worker.get_tp_group")
++    def test_transport_without_current_config(self, tp_group, pp_group, ascend_config, _current_config):
++        from vllm_ascend.worker.worker import NPUWorker
++
++        ascend_config.return_value.msmonitor_use_daemon = False
++        pp_group.return_value.is_first_rank = False
++        pp_group.return_value.is_last_rank = False
++        pp_group.return_value.irecv_tensor_dict.return_value = ({"hidden_states": torch.ones(2, 4)}, [], [])
++        for sp_enabled, use_v2 in ((False, False), (True, False), (False, True), (True, True)):
++            for forward_pass in (False, True):
++                with self.subTest(sp=sp_enabled, v2=use_v2, forward=forward_pass):
++                    pp_group.return_value.reset_mock()
++                    worker = NPUWorker.__new__(NPUWorker)
++                    worker.vllm_config = SimpleNamespace(
++                        parallel_config=SimpleNamespace(
++                            use_sequence_parallel_moe=sp_enabled,
++                            distributed_executor_backend="mp",
++                        )
++                    )
++                    worker.log_memory_stats = MagicMock()
++                    worker._pp_send_work = []
++                    worker.profiler = None
++                    worker.use_v2_model_runner = use_v2
++                    output = IntermediateTensors({"hidden_states": torch.ones(2, 4)})
++                    output.kv_connector_output = None
++                    worker.model_runner = MagicMock()
++                    worker.model_runner.execute_model.return_value = output
++                    scheduler_output = SimpleNamespace(total_num_scheduled_tokens=int(forward_pass))
++
++                    self.assertIsNone(worker.execute_model(scheduler_output))
++
++                    group = None if use_v2 and sp_enabled else tp_group.return_value
++                    if forward_pass:
++                        pp_group.return_value.irecv_tensor_dict.assert_called_once_with(all_gather_group=group)
++                    else:
++                        pp_group.return_value.irecv_tensor_dict.assert_not_called()
++                    pp_group.return_value.isend_tensor_dict.assert_called_once_with(
++                        output.tensors, all_gather_group=group
++                    )
++
++
+ class TestNPUWorker(TestBase):
+     def setUp(self):
+         """Setup test environment"""
+diff --git a/vllm_ascend/worker/v1/model_runner.py b/vllm_ascend/worker/v1/model_runner.py
+index 5c1f7d505..cb605d649 100644
+--- a/vllm_ascend/worker/v1/model_runner.py
++++ b/vllm_ascend/worker/v1/model_runner.py
+@@ -41,7 +41,6 @@ from vllm.compilation.cuda_graph import CUDAGraphStat
+ from vllm.config import CompilationMode, CUDAGraphMode, VllmConfig, get_layers_from_vllm_config
+ from vllm.distributed import (
+     get_tensor_model_parallel_rank,
+-    get_tensor_model_parallel_world_size,
+ )
+ from vllm.distributed.ec_transfer import get_ec_transfer, has_ec_transfer
+ from vllm.distributed.kv_transfer import get_kv_transfer_group, has_kv_transfer_group
+@@ -3584,7 +3583,16 @@ class NPUModelRunner(GPUModelRunner):
+             return round_up(num_scheduled_tokens, tp_size)
+         return num_scheduled_tokens
+ 
+-    # Keep PP intermediate tensors local to the sequence-parallel shard.
++    def _get_pp_intermediate_tensors(self, num_tokens: int) -> IntermediateTensors:
++        # MRV1 transports full PP intermediates. Internal MoE sequence
++        # parallelism does not imply a sharded PP boundary (e.g. DeepSeek/GLM
++        # explicitly disable layer SP when PP > 1).
++        if self.intermediate_tensors is None:
++            self.intermediate_tensors = self.model.make_empty_intermediate_tensors(
++                batch_size=self.max_num_tokens, dtype=self.dtype, device=self.device
++            )
++        return IntermediateTensors({k: v[:num_tokens] for k, v in self.intermediate_tensors.items()})
++
+     def sync_and_slice_intermediate_tensors(
+         self,
+         num_tokens: int,
+@@ -3592,29 +3600,20 @@ class NPUModelRunner(GPUModelRunner):
+         sync_self: bool,
+     ) -> IntermediateTensors:
+         assert self.intermediate_tensors is not None
+-        tp = self.vllm_config.parallel_config.tensor_parallel_size
+ 
+         if sync_self:
+             assert intermediate_tensors is not None
+             for k, v in intermediate_tensors.items():
+-                copy_len = (num_tokens + tp - 1) // tp if enable_sp() else num_tokens
+                 if k not in self.intermediate_tensors.tensors:
+                     base_tensor = self.intermediate_tensors["hidden_states"]
+                     self.intermediate_tensors[k] = v.new_empty(
+                         (base_tensor.shape[0], *v.shape[1:])
+                     )
+-                self.intermediate_tensors[k][:copy_len].copy_(
+-                    v[:copy_len], non_blocking=True
++                self.intermediate_tensors[k][:num_tokens].copy_(
++                    v[:num_tokens], non_blocking=True
+                 )
+ 
+-        return IntermediateTensors(
+-            {
+-                k: v[: (num_tokens + tp - 1) // tp]
+-                if enable_sp()
+-                else v[:num_tokens]
+-                for k, v in self.intermediate_tensors.items()
+-            }
+-        )
++        return self._get_pp_intermediate_tensors(num_tokens)
+ 
+     def sync_and_gather_intermediate_tensors(
+         self,
+@@ -4520,24 +4519,7 @@ class NPUModelRunner(GPUModelRunner):
+             if get_pp_group().is_first_rank:
+                 intermediate_tensors = None
+             else:
+-                # When PP and sequence parallelism are enabled, during dummy_run the estimated space should divide
+-                # num_tokens by
+-                # tp_size; otherwise, on non-first PP ranks it would effectively perform an extra all-gather, leading
+-                # to incorrect memory estimation and potentially causing OOM.
+-                intermediate_tokens = num_tokens_padded
+-                if enable_sp():
+-                    tp_size = get_tensor_model_parallel_world_size()
+-                    intermediate_tokens = (num_tokens_padded + tp_size - 1) // tp_size
+-                if self.intermediate_tensors is None:
+-                    max_actual_tokens = self.max_num_tokens
+-                    if enable_sp():
+-                        max_actual_tokens = (self.max_num_tokens + tp_size - 1) // tp_size
+-                    self.intermediate_tensors = self.model.make_empty_intermediate_tensors(
+-                        batch_size=max_actual_tokens, dtype=self.dtype, device=self.device
+-                    )
+-                intermediate_tensors = IntermediateTensors(
+-                    {k: v[:intermediate_tokens] for k, v in self.intermediate_tensors.items()}
+-                )
++                intermediate_tensors = self._get_pp_intermediate_tensors(num_tokens_padded)
+ 
+             need_dummy_logits = not is_profile and lmhead_tp_enable()
+             max_num_reqs_across_dp = max_num_reqs * self.uniform_decode_query_len
+diff --git a/vllm_ascend/worker/worker.py b/vllm_ascend/worker/worker.py
+index 2abeaf4a0..a1d481027 100644
+--- a/vllm_ascend/worker/worker.py
++++ b/vllm_ascend/worker/worker.py
+@@ -858,7 +858,7 @@ class NPUWorker(WorkerBase):
+         intermediate_tensors = None
+         forward_pass = scheduler_output.total_num_scheduled_tokens > 0
+         if forward_pass and not get_pp_group().is_first_rank:
+-            if enable_sp():
++            if self.use_v2_model_runner and enable_sp(self.vllm_config):
+                 all_gather_group = None
+             else:
+                 all_gather_group = get_tp_group()
+@@ -884,7 +884,7 @@ class NPUWorker(WorkerBase):
+         assert isinstance(output, IntermediateTensors)
+         parallel_config = self.vllm_config.parallel_config
+         assert parallel_config.distributed_executor_backend != ("external_launcher") and not get_pp_group().is_last_rank
+-        if enable_sp():
++        if self.use_v2_model_runner and enable_sp(self.vllm_config):
+             all_gather_group = None
+         else:
+             all_gather_group = get_tp_group()

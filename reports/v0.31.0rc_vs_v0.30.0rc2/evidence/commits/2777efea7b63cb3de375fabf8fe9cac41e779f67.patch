@@ -1,0 +1,309 @@
+commit 2777efea7b63cb3de375fabf8fe9cac41e779f67
+Author:     zhao-stack <80399320+zhao-stack@users.noreply.github.com>
+AuthorDate: Thu Oct 15 17:58:00 2026 +0800
+Commit:     GitHub <noreply@github.com>
+CommitDate: Thu Oct 15 17:58:00 2026 +0800
+
+    [BugFix][KVTransfer] Report Mooncake HMA receive failures by request (#18823)
+    
+    ### What this PR does / why we need it?
+    
+    Report P2P Mooncake receive failures through
+    `KVConnectorTransferResults.failed_recving` when the logical cache has
+    multiple groups or requires HMA. Flat block IDs do not identify the
+    affected request across independent cache groups; vLLM 0.31 rejects such
+    reports and can terminate Decode EngineCore after a receive failure.
+    
+    Preserve the existing block-level failure reporting and valid-prefix
+    recovery for ordinary non-HMA caches with one logical group. Select the
+    reporting mode from the logical cache configuration and HMA state
+    **before** registration expands `_is_hma_required` for group-aware wire
+    transfers: splitting one shared block table into several transfer groups
+    must not change its recovery semantics.
+    
+    Retain each failed request until all local pull/reformat tasks have
+    finished, then return its failure together with receive completion.
+    Delegate the connector's `get_transfer_results()` to the worker so
+    upstream receives the failure IDs; keep the legacy `get_finished()`
+    tuple API available. No scheduler changes are needed.
+    
+    This follows the request-level HMA / block-level non-HMA split in
+    [upstream vLLM #56855](https://github.com/vllm-project/vllm/pull/56855),
+    with an explicit check for multiple logical groups to satisfy the 0.31
+    scheduler guard. This is a separate fix from the release upgrade in
+    #18229 and applies on the current Ascend main base.
+    
+    ### Does this PR introduce _any_ user-facing change?
+    
+    On the affected asynchronous receive-failure path, upstream can apply
+    the configured `fail` or `recompute` policy to the request instead of
+    rejecting an ambiguous block-level report. Successful transfers and
+    ordinary non-HMA single-group block-level recovery retain their existing
+    behavior. This does not repair transport/backend configuration problems.
+    
+    ### How was this patch tested?
+    
+    CPU validation in an isolated A3-host container with no NPU device
+    mappings and no network:
+    
+    ```bash
+    python -m pytest -q --tb=short \
+      tests/ut/distributed/kv_transfer/kv_p2p/test_mooncake_connector.py \
+      tests/ut/distributed/kv_transfer/kv_p2p/test_remote_prefill_lifecycle.py \
+      tests/ut/kv_offload
+    bash format.sh ci
+    ```
+    
+    - Before rebase, the two connector/lifecycle target suites: **192
+    passed, 14 skipped on each** of verified vLLM main `c4df37d`, vLLM
+    0.31.0 `db9527a`, and vLLM 0.30.0 `ced6857`. The 0.30 source checkout
+    uses `VLLM_VERSION=0.30.0` because its generated `_version.py` is
+    absent.
+    - After rebase onto Ascend main
+    `8a8e1e05ecb64a30804c99c8f362909f9a0cb5bf` (including the 0.31.0
+    upgrade), the connector/lifecycle suites plus all of
+    `tests/ut/kv_offload`: **1125 passed, 14 skipped per lane**, on verified
+    vLLM main `c4df37d` and vLLM 0.31.0 `db9527a`.
+    - Fixed the four CI failures by adding the missing error-mode fields to
+    two existing test fixtures that use `__new__` and bypass constructors
+    (two initialization lines). Adapted existing failure-state and
+    worker-polling tests; **no new test functions or parametrized cases**.
+    Existing block-error and real descriptor-to-transfer CPU tests remain
+    enabled.
+    - Additional submission-time runtime checks, kept outside the PR: eight
+    layout/HMA combinations per version, checking deferred failure draining,
+    completed/failed receive propagation, preservation of non-HMA invalid
+    block IDs, and independence from the transfer-only HMA flag.
+    - Full `bash format.sh ci` and `git diff --check` passed.
+    - No NPU model/fault-injection rerun for this final conditional variant;
+    the 14 existing skips and the mocked CPU transport are not end-to-end
+    NPU coverage.
+    
+    - vLLM main:
+    https://github.com/vllm-project/vllm/commit/c4df37dfcc7f72ca41cd43801a468526ecf99a2b
+    
+    ---------
+    
+    Signed-off-by: zhao-stack <80399320+zhao-stack@users.noreply.github.com>
+
+diff --git a/tests/ut/distributed/kv_transfer/kv_p2p/test_mooncake_connector.py b/tests/ut/distributed/kv_transfer/kv_p2p/test_mooncake_connector.py
+index f4326a40b..c9c7eec79 100644
+--- a/tests/ut/distributed/kv_transfer/kv_p2p/test_mooncake_connector.py
++++ b/tests/ut/distributed/kv_transfer/kv_p2p/test_mooncake_connector.py
+@@ -855,15 +855,25 @@ class TestKVCacheRecvingThreadBasic(unittest.TestCase):
+         self.assertEqual(queued["num_computed_tokens"], 0)
+ 
+     def test_mark_and_is_failed(self):
+-        self.thread._mark_failed_recv_request("req1", [[10, 20]])
+-        self.assertTrue(self.thread._is_failed_recv_request("req1"))
+-        self.assertIn(10, self.thread.invalid_block_ids)
+-        self.assertIn(20, self.thread.invalid_block_ids)
+-
+-    def test_clear_failed_recv_request(self):
+-        self.thread._mark_failed_recv_request("req2", [[30]])
+-        self.thread._clear_failed_recv_request("req2")
+-        self.assertFalse(self.thread._is_failed_recv_request("req2"))
++        for request_level in (False, True):
++            with self.subTest(request_level=request_level):
++                self.thread.use_request_level_recv_errors = request_level
++                self.thread._mark_failed_recv_request("req1", [[10, 20]])
++                self.assertTrue(self.thread._is_failed_recv_request("req1"))
++                self.assertEqual(self.thread.get_and_clear_invalid_block_ids(), set() if request_level else {10, 20})
++
++    def test_get_and_clear_failed_recv_requests(self):
++        for request_level in (False, True):
++            with self.subTest(request_level=request_level):
++                self.thread.use_request_level_recv_errors = request_level
++                self.thread._mark_failed_recv_request("req2", [[30]])
++                self.assertEqual(self.thread.get_and_clear_failed_recv_requests(set()), set())
++                self.assertTrue(self.thread._is_failed_recv_request("req2"))
++                self.assertEqual(
++                    self.thread.get_and_clear_failed_recv_requests({"req2"}), {"req2"} if request_level else set()
++                )
++                self.assertFalse(self.thread._is_failed_recv_request("req2"))
++                self.assertEqual(self.thread.get_and_clear_failed_recv_requests({"req2"}), set())
+ 
+     def test_get_and_clear_invalid_block_ids(self):
+         self.thread.invalid_block_ids = {1, 2, 3}
+@@ -2236,17 +2246,27 @@ def test_worker_role_drains_only_its_completion_and_error_channel(role):
+     worker.kv_recv_thread = receiver
+     sender.get_and_clear_finished_requests.side_effect = [{"sent"}, set()]
+     receiver.get_and_clear_finished_requests.side_effect = [{"received"}, set()]
++    receiver.get_and_clear_failed_recv_requests.side_effect = [{"received"}, set()]
+     receiver.get_and_clear_invalid_block_ids.side_effect = [{7}, set()]
+ 
+-    assert worker.get_finished() == (({"sent"}, set()) if role == "kv_producer" else (set(), {"received"}))
++    results = worker.get_transfer_results()
++    assert (results.finished_sending, results.finished_recving) == (
++        ({"sent"}, set()) if role == "kv_producer" else (set(), {"received"})
++    )
++    assert results.failed_recving == (set() if role == "kv_producer" else {"received"})
+     assert worker.get_finished() == (set(), set())
+     assert worker.get_block_ids_with_load_errors() == (set() if role == "kv_producer" else {7})
+     assert worker.get_block_ids_with_load_errors() == set()
+     if role == "kv_producer":
+         receiver.get_and_clear_finished_requests.assert_not_called()
++        receiver.get_and_clear_failed_recv_requests.assert_not_called()
+         receiver.get_and_clear_invalid_block_ids.assert_not_called()
+     else:
+         sender.get_and_clear_finished_requests.assert_not_called()
++        assert [call.args[0] for call in receiver.get_and_clear_failed_recv_requests.call_args_list] == [
++            {"received"},
++            set(),
++        ]
+ 
+ 
+ def test_tracker_completion_is_consumed_by_only_one_reader():
+diff --git a/tests/ut/kv_offload/test_d2rh_pp_inheritance.py b/tests/ut/kv_offload/test_d2rh_pp_inheritance.py
+index 458e7582d..d12255e03 100644
+--- a/tests/ut/kv_offload/test_d2rh_pp_inheritance.py
++++ b/tests/ut/kv_offload/test_d2rh_pp_inheritance.py
+@@ -47,6 +47,7 @@ def make_worker(worker_cls, role):
+     worker.kv_role = role
+     worker.use_hybrid = False
+     worker._is_hma_required = True
++    worker._use_request_level_recv_errors = True
+     worker.engine_id = "engine"
+     worker.engine = object()
+     worker.te_rpc_port = 1234
+diff --git a/tests/ut/kv_offload/test_d2rh_pp_lifetime.py b/tests/ut/kv_offload/test_d2rh_pp_lifetime.py
+index 29e2815c3..806970655 100644
+--- a/tests/ut/kv_offload/test_d2rh_pp_lifetime.py
++++ b/tests/ut/kv_offload/test_d2rh_pp_lifetime.py
+@@ -109,6 +109,7 @@ class TestH2DCompletionOwnership(unittest.TestCase):
+         obj.task_tracker = KVCacheTaskTracker()
+         obj.task_tracker.add_req_to_process("D-request")
+         obj.failed_recv_requests = set()
++        obj.use_request_level_recv_errors = False
+         obj.failed_recv_requests_lock = threading.Lock()
+         obj.invalid_block_ids = set()
+         obj.pending_reformat = {}
+diff --git a/vllm_ascend/distributed/kv_transfer/kv_p2p/mooncake_connector.py b/vllm_ascend/distributed/kv_transfer/kv_p2p/mooncake_connector.py
+index e31a2e808..5aa91a1f4 100644
+--- a/vllm_ascend/distributed/kv_transfer/kv_p2p/mooncake_connector.py
++++ b/vllm_ascend/distributed/kv_transfer/kv_p2p/mooncake_connector.py
+@@ -32,6 +32,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.base import (
+     KVConnectorHandshakeMetadata,
+     KVConnectorMetadata,
+     KVConnectorRole,
++    KVConnectorTransferResults,
+     SupportsHMA,
+ )
+ from vllm.distributed.parallel_state import (
+@@ -437,6 +438,7 @@ class KVCacheRecvingThread(threading.Thread):
+         prefill_pp_layer_partition: str | None = None,
+         kv_group2layeridx: dict[int, tuple[dict[str, Any], list[int]]] | None = None,
+         block_size_scale: list[list[int]] | None = None,
++        use_request_level_recv_errors: bool = False,
+     ):
+         super().__init__(daemon=True, name="KVCacheRecvingThread")
+         self.tp_rank = tp_rank
+@@ -524,6 +526,7 @@ class KVCacheRecvingThread(threading.Thread):
+         self.use_mla = self.model_config.is_deepseek_mla
+         self.enable_sfa_dcp_replicated_indexer = enable_sfa_dcp_replicated_indexer(self.vllm_config)
+         self.is_hma_required = is_hma_required
++        self.use_request_level_recv_errors = use_request_level_recv_errors
+         self.block_size = self.vllm_config.cache_config.block_size
+         try:
+             hf_text_config = self.model_config.hf_text_config
+@@ -625,14 +628,18 @@ class KVCacheRecvingThread(threading.Thread):
+         with self.failed_recv_requests_lock:
+             return request_id in self.failed_recv_requests
+ 
+-    def _mark_failed_recv_request(self, request_id: str, local_block_ids: BlockIds) -> None:
++    def get_and_clear_failed_recv_requests(self, finished_req_ids: set[str]) -> set[str]:
++        """Retain failures until every local pull and reformat has finished."""
+         with self.failed_recv_requests_lock:
+-            self.failed_recv_requests.add(request_id)
+-            self.invalid_block_ids.update(local_block_ids[0])
++            failed_req_ids = self.failed_recv_requests & finished_req_ids
++            self.failed_recv_requests.difference_update(failed_req_ids)
++        return failed_req_ids if self.use_request_level_recv_errors else set()
+ 
+-    def _clear_failed_recv_request(self, request_id: str) -> None:
++    def _mark_failed_recv_request(self, request_id: str, local_block_ids: BlockIds) -> None:
+         with self.failed_recv_requests_lock:
+-            self.failed_recv_requests.discard(request_id)
++            self.failed_recv_requests.add(request_id)
++            if not self.use_request_level_recv_errors:
++                self.invalid_block_ids.update(local_block_ids[0])
+ 
+     def run(self):
+         """Run the thread to handle KV cache transfer requests."""
+@@ -758,10 +765,10 @@ class KVCacheRecvingThread(threading.Thread):
+                             remote_request_id,
+                             e,
+                         )
++                # Drain the failure with completion, after all local writes end.
+                 self.task_tracker.update_done_task_count(request_id)
+                 with self.proc_not_transfer_request_lock:
+                     self.proc_not_transfer_request.pop(remote_request_id, None)
+-                self._clear_failed_recv_request(request_id)
+             self.request_queue.task_done()
+             self._send_done_signal_to_free_remote_port(remote_request_id, remote_host, remote_port_send_num)
+             # Always send the done signal to the remote host to ensure proper
+@@ -1683,6 +1690,10 @@ class MooncakeConnector(KVConnectorBase_V1, SupportsHMA):
+         assert self.connector_worker is not None
+         return self.connector_worker.get_block_ids_with_load_errors()
+ 
++    def get_transfer_results(self, finished_req_ids: set[str]) -> KVConnectorTransferResults:
++        assert self.connector_worker is not None
++        return self.connector_worker.get_transfer_results()
++
+     def start_load_kv(self, forward_context: "ForwardContext", **kwargs) -> None:
+         assert self.connector_worker is not None
+         assert isinstance(self._connector_metadata, MooncakeConnectorMetadata)
+@@ -2179,6 +2190,9 @@ class MooncakeConnectorWorker:
+         self._is_hma_required = not vllm_config.scheduler_config.disable_hybrid_kv_cache_manager and not all(
+             _is_fullattn_group
+         )
++        # Use the logical cache layout and HMA state, before registration expands
++        # _is_hma_required for transfer-only groups sharing one block table.
++        self._use_request_level_recv_errors = self._is_hma_required or len(kv_cache_config.kv_cache_groups) > 1
+         self._layer_specs = self._build_layer_specs_from_kv_cache_config(kv_cache_config)
+ 
+         # Handshake base port
+@@ -2741,6 +2755,7 @@ class MooncakeConnectorWorker:
+                 self._prefill_pp_layer_partition,
+                 self.kv_group2layeridx,
+                 self.block_size_scale,
++                use_request_level_recv_errors=self._use_request_level_recv_errors,
+             )
+             self.kv_recv_thread.start()
+         start_wait_time = time.time()
+@@ -2754,6 +2769,10 @@ class MooncakeConnectorWorker:
+             time.sleep(3)
+ 
+     def get_finished(self) -> tuple[set[str], set[str]]:
++        results = self.get_transfer_results()
++        return results.finished_sending, results.finished_recving
++
++    def get_transfer_results(self) -> KVConnectorTransferResults:
+         done_sending = (
+             self.kv_send_thread.get_and_clear_finished_requests(  # type: ignore[union-attr]
+             )
+@@ -2766,6 +2785,11 @@ class MooncakeConnectorWorker:
+             if self.kv_role == "kv_consumer"
+             else set()
+         )
++        failed_recving = (
++            self.kv_recv_thread.get_and_clear_failed_recv_requests(done_recving)  # type: ignore[union-attr]
++            if self.kv_role == "kv_consumer"
++            else set()
++        )
+         if self.tp_rank == 0:
+             if logger.isEnabledFor(logging.DEBUG):
+                 logger.debug(
+@@ -2773,7 +2797,11 @@ class MooncakeConnectorWorker:
+                     len(done_sending),
+                     len(done_recving),
+                 )
+-        return done_sending, done_recving
++        return KVConnectorTransferResults(
++            finished_sending=done_sending,
++            finished_recving=done_recving,
++            failed_recving=failed_recving,
++        )
+ 
+     def get_block_ids_with_load_errors(self) -> set[int]:
+         if self.kv_role == "kv_consumer" and self.kv_recv_thread is not None:

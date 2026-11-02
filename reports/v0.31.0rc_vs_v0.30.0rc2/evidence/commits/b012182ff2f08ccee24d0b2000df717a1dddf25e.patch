@@ -1,0 +1,1076 @@
+commit b012182ff2f08ccee24d0b2000df717a1dddf25e
+Author:     CaranLic <lichenhan2@huawei.com>
+AuthorDate: Thu Oct 22 11:46:38 2026 +0800
+Commit:     GitHub <noreply@github.com>
+CommitDate: Thu Oct 22 11:46:38 2026 +0800
+
+    [BugFix][WeightTransfer] Fix basic packed tensor storage and edge cases (#19164)
+    
+    ### What this PR does / why we need it?
+    
+    This PR extracts basic packed-transfer correctness fixes from #18078 and
+    adds validation and failure handling. Only `packed_tensor.py` and its
+    existing unit tests are modified.
+    
+    The changes address storage aliasing, unaligned dtype views, HCCL
+    ordering, edge-case inputs:
+    
+    - **Storage ownership and alignment:** Clone unpacked byte slices before
+    reinterpreting their dtype. This handles unaligned offsets in
+    mixed-dtype payloads and ensures unpacked tensors own independent
+    storage, so callbacks can safely retain or modify them without aliasing
+    the packed buffer.
+    
+    - **HCCL ordering:** Submit broadcasts on the packing stream and wait
+    for the preceding broadcast before submitting another collective on the
+    same communicator. Packing the next chunk can still overlap the previous
+    transfer. Preserve the receive → synchronize → unpack/load barrier:
+    hardware A/B tests showed that passing the same stream alone was
+    insufficient to reliably establish receive-before-unpack ordering.
+    
+    - **Scalar and empty tensors:** Preserve IPC metadata for nonempty
+    iterators containing only zero-element tensors, while keeping empty
+    iterators empty.
+    
+    - **Post-processing contract:** Reject non-Tensor callback results and
+    changes to the declared dtype or element count.
+    
+    - **Configuration and metadata validation:** Reject nonpositive buffer
+    sizes and HCCL buffer counts, negative HCCL shapes, and invalid IPC
+    metadata before rebuilding storage. IPC checks cover metadata lengths,
+    dtype names, shapes, byte counts, device indices, and rebuild-argument
+    length. After rebuilding, reject payloads larger than the actual buffer.
+    
+    - **Shared asynchronous cleanup:** Use one cleanup helper for HCCL
+    producer and consumer on both normal and exceptional exits. Attempt to
+    drain every stream even if an earlier drain fails. Retain nonempty
+    buffers from failed slots until process exit and report their slot
+    indices and byte counts at error level, including when the transfer body
+    succeeded. Preserve the original ordinary exception, prioritize
+    termination signals over ordinary exceptions, and prevent ordinary
+    logging failures from masking the primary error.
+    
+    - **Regression coverage:** Cover storage ownership, deterministic
+    unaligned offsets, scalar/empty inputs, invalid callbacks and metadata,
+    receive-before-unpack ordering, broadcast ordering with one/two/three
+    buffers, and cleanup failures and exception precedence.
+    
+    Layerwise weight-loading dependencies across chunk boundaries and packed
+    related refactor are outside this PR's scope. That follow-up is planned
+    in #19127 after the IPC (#18848) and HCCL (#18944) changes are
+    integrated.
+    
+    ### How was this patch tested?
+    
+    - Related weight-transfer unit tests passed
+    - IPC capacity-overflow regression fails on the previous implementation
+    and passes after this fix
+    - Real NPU transport: HCCL packed/unpacked and IPC packed/unpacked — all
+    four configurations passed, three rounds each.
+    
+    Full-model validation:
+    
+    **Qwen3-30B-A3B, BF16, TP2, eager and full-decode-only graph mode:**
+    HCCL packed and IPC packed both passed, with two complete checkpoint
+    updates each.
+    
+    After each update, generated text and token logprobs for two fixed
+    prompts exactly matched an independently generated reference from a
+    normally loaded model in the same isolated test environment. The
+    reference was reused from the preceding validation run.
+    
+    ### Checklist
+    
+    - [x] Boundary and edge-case coverage.
+    - [x] Regression tests fail before the corresponding fixes.
+    - [x] Error and failure-path coverage.
+    - [x] Real NPU tensor transport and repeated-update regression.
+    - [x] Full-model end-to-end validation of the corrected implementation.
+    - [ ] Performance validation and required CI.
+    
+    
+    - vLLM main:
+    https://github.com/vllm-project/vllm/commit/a98247ab4db686ee03c66d5feb3c761e52a2f8ab
+    
+    ---------
+    
+    Signed-off-by: Liccol <lichenhan2@huawei.com>
+    Co-authored-by: Windfeng8 <126474910+Windfeng8@users.noreply.github.com>
+
+diff --git a/tests/ut/distributed/weight_transfer/test_packed_tensor.py b/tests/ut/distributed/weight_transfer/test_packed_tensor.py
+index e94e7ac10..f9e649a62 100644
+--- a/tests/ut/distributed/weight_transfer/test_packed_tensor.py
++++ b/tests/ut/distributed/weight_transfer/test_packed_tensor.py
+@@ -25,7 +25,10 @@ data correctness is verified end-to-end.
+ 
+ from __future__ import annotations
+ 
++import sys
+ import types
++import weakref
++from typing import Any
+ from unittest.mock import MagicMock, patch
+ 
+ import pytest
+@@ -87,7 +90,8 @@ def _stub_torch_npu():
+     original_empty = torch.empty
+ 
+     def _fake_empty(*args, **kwargs):
+-        if kwargs.get("device") == "npu":
++        device = kwargs.get("device")
++        if getattr(device, "type", None) == "npu" or (isinstance(device, str) and device.split(":", 1)[0] == "npu"):
+             kwargs["device"] = "cpu"
+         return original_empty(*args, **kwargs)
+ 
+@@ -95,6 +99,16 @@ def _stub_torch_npu():
+         yield
+ 
+ 
++@pytest.mark.parametrize(
++    "device",
++    ["npu", "npu:0", types.SimpleNamespace(type="npu")],
++    ids=["unindexed-string", "indexed-string", "device-type"],
++)
++def test_cpu_fixture_redirects_all_npu_device_forms(device):
++    """Guard test infrastructure against indexed/device-object allocations."""
++    assert torch.empty(1, device=device).device.type == "cpu"
++
++
+ # ---------------------------------------------------------------------------
+ # packed_broadcast_producer
+ # ---------------------------------------------------------------------------
+@@ -526,8 +540,6 @@ def test_packed_npu_ipc_consumer_overwrites_device_index():
+             device_index=5,
+         )
+         # Capture the args passed to rebuild_npu_tensor while patch is active.
+-        import sys
+-
+         fake_mod = sys.modules["torch_npu.multiprocessing.reductions"]
+         fake_rebuild = fake_mod.rebuild_npu_tensor  # type: ignore[attr-defined]
+         rebuilt_args = fake_rebuild.call_args.args
+@@ -889,3 +901,451 @@ def test_packed_npu_ipc_consumer_clones_each_slice_independently():
+ 
+     ptrs = [w[1].storage().data_ptr() for w in weights]
+     assert len(set(ptrs)) == 3, f"expected 3 distinct storage ptrs, got {ptrs}"
++
++
++def _assert_packed_roundtrip(backend, tensors, buffer_size):
++    """Check values and ownership after overwriting the transport storage."""
++    buffers: list[torch.Tensor] = []
++    received: list[tuple[str, torch.Tensor]] = []
++    if backend == "hccl":
++        group = _make_group_mock()
++        packed_broadcast_producer(iter(tensors), group, 0, lambda item: item[1], buffer_size)
++        payloads = iter(call.args[0].clone() for call in group.broadcast.call_args_list)
++        chunk_count = group.broadcast.call_count
++
++        def receive(packed, **kwargs):
++            packed.copy_(next(payloads))
++            buffers.append(packed)
++
++        packed_broadcast_consumer(
++            iter((name, (list(tensor.shape), tensor.dtype)) for name, tensor in tensors),
++            types.SimpleNamespace(broadcast=receive),
++            0,
++            received.extend,
++            buffer_size,
++        )
++    else:
++
++        def export(tensor):
++            buffers.append(tensor)
++            return None, (0,) * 7
++
++        with patch(f"{_MODULE}.reduce_tensor", side_effect=export):
++            chunks = list(packed_npu_ipc_producer(iter(tensors), "node-0", lambda item: item[1], buffer_size))
++        assert len(chunks) == 1  # IPC callers here deliberately fit in one chunk.
++        chunk_count = len(chunks)
++        chunk = chunks[0]
++        assert isinstance(chunk, dict)  # Keep the existing IPC wire representation.
++        with _install_fake_rebuild_npu_tensor(buffers[0]):
++            received = packed_npu_ipc_consumer(
++                chunk["ipc_handle"],
++                "node-0",
++                chunk["names"],
++                chunk["shapes"],
++                chunk["dtype_names"],
++                chunk["tensor_sizes"],
++                0,
++            )
++    for buffer in buffers:
++        buffer.zero_()
++    assert [name for name, _ in received] == [name for name, _ in tensors]
++    for (_, actual), (_, expected) in zip(received, tensors):
++        assert actual.shape == expected.shape
++        assert actual.dtype == expected.dtype
++        assert torch.equal(actual, expected)
++    return chunk_count
++
++
++@pytest.mark.parametrize("buffer_size", [1, 8, 128])
++def test_packed_broadcast_roundtrip_mixed_scalar_empty_and_unaligned(buffer_size):
++    tensors = [
++        ("byte", torch.tensor([7], dtype=torch.uint8)),
++        ("scalar", torch.tensor(2.5)),
++        ("empty", torch.empty(0, 3, dtype=torch.float16)),
++        ("matrix", torch.arange(6, dtype=torch.bfloat16).reshape(2, 3).t()),
++    ]
++    _assert_packed_roundtrip("hccl", tensors, buffer_size)
++
++
++@pytest.mark.parametrize("empty_only", [False, True])
++def test_packed_ipc_roundtrip_scalar_empty_and_unaligned(empty_only):
++    tensors = [("empty", torch.empty(0, 3, dtype=torch.float16))]
++    if not empty_only:
++        tensors = [("byte", torch.tensor([7], dtype=torch.uint8)), ("scalar", torch.tensor(2.5)), *tensors]
++    _assert_packed_roundtrip("ipc", tensors, 128)
++
++
++@pytest.mark.parametrize("producer", [False, True])
++def test_packed_transfer_drains_storage_before_propagating_error(producer):
++    import vllm_ascend.distributed.weight_transfer.packed_tensor as packed_module
++
++    events: list[str] = []
++    pinned: list[torch.Tensor] = []
++
++    class TrackingStream(_FakeNpuStream):
++        buffer = None
++        pending = None
++
++        def synchronize(self):
++            if self.pending is not None:
++                events.append("drain")
++                self.pending = None
++
++    stream = TrackingStream()
++
++    def broadcast(packed, **kwargs):
++        stream.buffer = weakref.ref(packed)
++        if producer:
++            stream.pending = stream.buffer
++            events.append("error")
++            raise ValueError("transfer rejected")
++
++    def reject_load(weights):
++        # Receive-before-unpack synchronization must not satisfy this check:
++        # only finally can drain work queued by the failing loader.
++        stream.pending = stream.buffer
++        events.append("error")
++        raise ValueError("transfer rejected")
++
++    group = types.SimpleNamespace(broadcast=broadcast)
++    with (
++        patch.object(torch.npu, "Stream", return_value=stream),
++        patch.object(packed_module, "_UNSYNCHRONIZED_BUFFERS", pinned),
++        pytest.raises(ValueError, match="transfer rejected"),
++    ):
++        if producer:
++            packed_broadcast_producer(iter([("w", torch.ones(1))]), group, 0, lambda item: item[1], 4, 1)
++        else:
++            packed_broadcast_consumer(
++                iter([("w", ([1], torch.float32))]),
++                group,
++                0,
++                reject_load,
++                4,
++                1,
++            )
++    assert events == ["error", "drain"]
++    assert pinned == []
++
++
++def test_packed_consumer_waits_for_receive_before_unpacking():
++    """An external HCCL receive must finish before torch queues unpack clones."""
++    events = []
++    original = torch.tensor([2.5])
++
++    class ReceiveStream(_FakeNpuStream):
++        pending = None
++
++        def synchronize(self):
++            if self.pending is not None:
++                self.pending()
++                self.pending = None
++                events.append("ready")
++
++    stream = ReceiveStream()
++
++    def receive(packed, **kwargs):
++        assert kwargs["stream"] is stream
++        stream.pending = lambda: packed.copy_(original.view(torch.uint8))
++        events.append("receive")
++
++    def load(weights):
++        assert events == ["receive", "ready"]
++        assert torch.equal(weights[0][1], original)
++        events.append("load")
++
++    with patch.object(torch.npu, "Stream", return_value=stream):
++        packed_broadcast_consumer(
++            iter([("w", ([1], torch.float32))]), types.SimpleNamespace(broadcast=receive), 0, load, 4, 1
++        )
++    assert events == ["receive", "ready", "load"]
++
++
++@pytest.mark.parametrize("backend", ["hccl", "ipc"])
++@pytest.mark.parametrize("change", ["dtype", "numel", "none"])
++def test_packed_producer_rejects_invalid_callback_result(backend, change):
++    original = torch.ones(2)
++    returned = {"dtype": original.to(torch.int32), "numel": original[:1], "none": None}[change]
++    message = " returned.*expected dtype=.*numel=2" if change in ("dtype", "numel") else ".*must return a torch.Tensor"
++    group = _make_group_mock()
++    patcher, _ = _install_fake_reduce_tensor()
++    with patcher, pytest.raises(ValueError, match=f"post_iter_func{message}"):
++        if backend == "hccl":
++            packed_broadcast_producer(iter([("w", original)]), group, 0, lambda _: returned, 16)
++        else:
++            list(packed_npu_ipc_producer(iter([("w", original)]), "node-0", lambda _: returned, 16))
++    group.broadcast.assert_not_called()
++
++
++@pytest.mark.parametrize(
++    "changes",
++    [
++        {"device_index": -1},
++        {"device_index": None},
++        {"device_index": "0"},
++        {"device_index": 0.0},
++        {"device_index": True},
++        {"ipc_handle": {"node-0": (0,)}},
++        {"dtype_names": ["not_a_dtype"]},
++        {"dtype_names": ["Tensor"]},
++        {"names": ["w", "extra"]},
++        {"shapes": [[-1]]},
++        {"tensor_sizes": [-4]},
++        {"tensor_sizes": [8]},
++    ],
++    ids=[
++        "device",
++        "none-device",
++        "string-device",
++        "float-device",
++        "bool-device",
++        "handle",
++        "unknown-dtype",
++        "non-dtype",
++        "lengths",
++        "shape",
++        "negative-size",
++        "byte-count",
++    ],
++)
++def test_packed_ipc_consumer_rejects_invalid_metadata_before_rebuild(changes):
++    kwargs: dict[str, Any] = dict(
++        ipc_handle={"node-0": (0,) * 7},
++        physical_npu_id="node-0",
++        names=["w"],
++        shapes=[[1]],
++        dtype_names=["float32"],
++        tensor_sizes=[4],
++        device_index=0,
++    )
++    kwargs.update(changes)
++    with _install_fake_rebuild_npu_tensor(torch.zeros(8, dtype=torch.uint8)):
++        rebuild = sys.modules["torch_npu.multiprocessing.reductions"].rebuild_npu_tensor
++        with pytest.raises(ValueError):
++            packed_npu_ipc_consumer(**kwargs)
++        rebuild.assert_not_called()
++
++
++def test_packed_hccl_consumer_rejects_negative_shape_before_broadcast():
++    group = _make_group_mock()
++    with pytest.raises(ValueError, match="negative shape"):
++        packed_broadcast_consumer(iter([("w", ([-1], torch.float32))]), group, 0, MagicMock(), 4)
++    group.broadcast.assert_not_called()
++
++
++@pytest.mark.parametrize("producer", [False, True])
++@pytest.mark.parametrize(
++    "logging_error,num_buffers",
++    [
++        (None, 1),
++        (RuntimeError("logging failed"), 1),
++        (KeyboardInterrupt(), 1),
++        (SystemExit(2), 1),
++        (None, 2),
++    ],
++)
++def test_packed_drain_failure_keeps_storage_and_original_error(producer, logging_error, num_buffers):
++    import vllm_ascend.distributed.weight_transfer.packed_tensor as packed_module
++
++    class FailedStream(_FakeNpuStream):
++        failed = False
++
++        def synchronize(self):
++            if self.failed:
++                raise RuntimeError("drain failed")
++
++    stream = FailedStream()
++    pinned: list[torch.Tensor] = []
++    original_error = ValueError("transfer rejected")
++
++    def broadcast(*args, **kwargs):
++        stream.failed = True
++        raise original_error
++
++    expected_type = ValueError if logging_error is None or isinstance(logging_error, Exception) else type(logging_error)
++    with (
++        patch.object(torch.npu, "Stream", return_value=stream),
++        patch.object(packed_module, "_UNSYNCHRONIZED_BUFFERS", pinned),
++        patch.object(packed_module.logger, "error", side_effect=logging_error) as log_error,
++        pytest.raises(expected_type) as error,
++    ):
++        group = types.SimpleNamespace(broadcast=broadcast)
++        if producer:
++            packed_broadcast_producer(iter([("w", torch.ones(1))]), group, 0, lambda item: item[1], 4, num_buffers)
++        else:
++            packed_broadcast_consumer(iter([("w", ([1], torch.float32))]), group, 0, MagicMock(), 4, num_buffers)
++    if logging_error is None or isinstance(logging_error, Exception):
++        assert error.value is original_error
++    else:
++        assert error.value is logging_error
++    assert len(pinned) == 1
++    assert pinned[0].numel() == 4
++    log_error.assert_called_once()
++    message, retained_slots, cleanup_error = log_error.call_args.args
++    assert "(slot, bytes)" in message
++    assert retained_slots == [(0, 4)]
++    assert str(cleanup_error) == "drain failed"
++    assert not log_error.call_args.kwargs
++
++
++def test_packed_ipc_consumer_rejects_payload_larger_than_rebuilt_buffer():
++    with (
++        _install_fake_rebuild_npu_tensor(torch.zeros(3, dtype=torch.uint8)),
++        pytest.raises(ValueError, match="metadata declares 4 bytes, buffer has 3"),
++    ):
++        packed_npu_ipc_consumer({"node-0": (0,) * 7}, "node-0", ["w"], [[1]], ["float32"], [4], 0)
++
++
++@pytest.mark.parametrize("backend", ["hccl-producer", "hccl-consumer", "ipc-producer"])
++@pytest.mark.parametrize("capacity", [0, -1])
++def test_packed_transfer_rejects_nonpositive_capacity(backend, capacity):
++    with pytest.raises(ValueError, match="positive"):
++        if backend == "hccl-producer":
++            packed_broadcast_producer(iter([]), _make_group_mock(), 0, lambda item: item[1], capacity)
++        elif backend == "hccl-consumer":
++            packed_broadcast_consumer(iter([]), _make_group_mock(), 0, MagicMock(), capacity)
++        else:
++            list(packed_npu_ipc_producer(iter([]), "node-0", lambda item: item[1], capacity))
++
++
++@pytest.mark.parametrize("producer", [False, True])
++@pytest.mark.parametrize("num_buffers", [0, -1])
++def test_packed_hccl_rejects_nonpositive_buffer_count(producer, num_buffers):
++    with pytest.raises(ValueError, match="positive"):
++        if producer:
++            packed_broadcast_producer(iter([]), _make_group_mock(), 0, lambda item: item[1], 4, num_buffers)
++        else:
++            packed_broadcast_consumer(iter([]), _make_group_mock(), 0, MagicMock(), 4, num_buffers)
++
++
++@pytest.mark.parametrize("num_buffers", [1, 2, 3])
++def test_packed_producer_passes_packing_stream_to_broadcast(num_buffers):
++    pending: list[_FakeNpuStream] = []
++
++    class BroadcastStream(_FakeNpuStream):
++        def synchronize(self):
++            if pending == [self]:
++                pending.clear()
++
++    streams = [BroadcastStream() for _ in range(num_buffers)]
++    active: list[_FakeNpuStream] = []
++
++    class StreamContext:
++        def __init__(self, stream):
++            self.stream = stream
++
++        def __enter__(self):
++            active.append(self.stream)
++
++        def __exit__(self, *exc):
++            active.pop()
++
++    def broadcast(tensor, *, src, stream):
++        assert active == [stream]
++        assert not pending, "previous broadcast must complete before the next collective"
++        pending.append(stream)
++
++    group = types.SimpleNamespace(broadcast=MagicMock(side_effect=broadcast))
++    with (
++        patch.object(torch.npu, "Stream", side_effect=streams),
++        patch.object(torch.npu, "stream", side_effect=StreamContext) as context,
++    ):
++        packed_broadcast_producer(
++            iter((f"w{i}", torch.ones(1)) for i in range(7)), group, 0, lambda item: item[1], 1, num_buffers
++        )
++    expected = [streams[i % num_buffers] for i in range(7)]
++    assert [call.kwargs["stream"] for call in group.broadcast.call_args_list] == expected
++    assert [call.args[0] for call in context.call_args_list[:7]] == expected
++    assert active == []
++    assert pending == []
++
++
++@pytest.mark.parametrize("producer", [False, True])
++@pytest.mark.parametrize(
++    "body_error,second_error",
++    [
++        (None, None),
++        (None, KeyboardInterrupt()),
++        (None, SystemExit(2)),
++        (ValueError("body failed"), KeyboardInterrupt()),
++        (ValueError("body failed"), SystemExit(2)),
++        (KeyboardInterrupt(), None),
++        (SystemExit(2), None),
++    ],
++)
++def test_packed_cleanup_drains_all_slots_reports_retention_and_prioritizes_signals(producer, body_error, second_error):
++    import vllm_ascend.distributed.weight_transfer.packed_tensor as packed_module
++
++    failure = RuntimeError("cleanup failed")
++    failures = [failure, second_error, None]
++    drained = []
++    armed = False
++
++    class CleanupStream(_FakeNpuStream):
++        def __init__(self, index):
++            self.index = index
++
++        def synchronize(self):
++            if armed:
++                drained.append(self.index)
++                if failures[self.index] is not None:
++                    raise failures[self.index]
++
++    streams = [CleanupStream(index) for index in range(3)]
++    pinned: list[torch.Tensor] = []
++
++    def finish(*args, **kwargs):
++        nonlocal armed
++        armed = True
++        if body_error is not None:
++            raise body_error
++
++    errors = [error for error in (body_error, *failures) if error is not None]
++    expected = next((error for error in errors if not isinstance(error, Exception)), errors[0])
++    group = types.SimpleNamespace(broadcast=finish if producer else lambda *args, **kwargs: None)
++    with (
++        patch.object(torch.npu, "Stream", side_effect=streams),
++        patch.object(packed_module, "_UNSYNCHRONIZED_BUFFERS", pinned),
++        patch.object(packed_module.logger, "error") as log_error,
++        pytest.raises(type(expected)) as error,
++    ):
++        # One tensor below the threshold reaches finally without another slot wait.
++        if producer:
++            packed_broadcast_producer(iter([("w", torch.ones(1))]), group, 0, lambda item: item[1], 8, 3)
++        else:
++            packed_broadcast_consumer(iter([("w", ([1], torch.float32))]), group, 0, finish, 8, 3)
++    assert error.value is expected
++    assert drained == [0, 1, 2]
++    assert len(pinned) == 1
++    assert pinned[0].numel() == 4
++    log_error.assert_called_once()
++    assert log_error.call_args.args[1] == [(0, 4)]
++
++
++@pytest.mark.parametrize("producer", [False, True])
++def test_packed_drain_failure_does_not_retain_unused_empty_slots(producer):
++    import vllm_ascend.distributed.weight_transfer.packed_tensor as packed_module
++
++    class FailedStream(_FakeNpuStream):
++        def synchronize(self):
++            raise RuntimeError("stream unavailable")
++
++    pinned: list[torch.Tensor] = []
++    with (
++        patch.object(torch.npu, "Stream", return_value=FailedStream()),
++        patch.object(packed_module, "_UNSYNCHRONIZED_BUFFERS", pinned),
++        pytest.raises(RuntimeError, match="stream unavailable"),
++    ):
++        if producer:
++            packed_broadcast_producer(iter([]), _make_group_mock(), 0, lambda item: item[1], 4, 2)
++        else:
++            packed_broadcast_consumer(iter([]), _make_group_mock(), 0, MagicMock(), 4, 2)
++    assert pinned == []
++
++
++@pytest.mark.parametrize("backend", ["hccl", "ipc"])
++def test_packed_roundtrip_odd_bf16_followed_by_unaligned_int64(backend):
++    tensors = [("bf16", torch.tensor([1, 2, 3], dtype=torch.bfloat16)), ("i64", torch.tensor([7], dtype=torch.int64))]
++    # Three BF16 elements put int64 at byte offset 6, not divisible by 8.
++    assert tensors[0][1].numel() * tensors[0][1].element_size() == 6
++    assert _assert_packed_roundtrip(backend, tensors, 32) == 1
+diff --git a/vllm_ascend/distributed/weight_transfer/packed_tensor.py b/vllm_ascend/distributed/weight_transfer/packed_tensor.py
+index a35d9af8d..b9e0cfb7d 100644
+--- a/vllm_ascend/distributed/weight_transfer/packed_tensor.py
++++ b/vllm_ascend/distributed/weight_transfer/packed_tensor.py
+@@ -4,16 +4,59 @@
+ 
+ import math
+ from collections.abc import Callable, Iterator
++from contextlib import suppress
+ from typing import Any
+ 
+ import torch
+ from torch.multiprocessing.reductions import reduce_tensor
++from vllm.logger import logger
+ 
+ # Default values for packed tensor configuration.
+ # These are imported by HCCLWeightTransferUpdateInfo and trainer_send_weights.
+ DEFAULT_PACKED_BUFFER_SIZE_BYTES = 1024 * 1024 * 1024  # 1GB
+ DEFAULT_PACKED_NUM_BUFFERS = 2
+ 
++# On a failed stream drain, keep storage alive until process exit. Its async
++# users may still be running, so returning it to the allocator is unsafe.
++# torch_npu's getStreamFromPool uses process-global native streams (see
++# NPUStream.cpp / LeakyStreamInternals). Dropping a Python Stream wrapper is
++# not a completion barrier. This failed-drain path has no completion proof.
++# This failure-only list is intentionally unbounded: retries after a drain
++# failure can exhaust device memory. Do not clear it to recover memory while
++# work may still be pending. Transfers must not concurrently share a communicator
++# or its buffers; this list only holds references, it does not serialize them.
++_UNSYNCHRONIZED_BUFFERS: list[torch.Tensor] = []
++
++
++def _drain_packed_streams(
++    streams: list[Any], packed_tensors: list[torch.Tensor], body_error: BaseException | None
++) -> None:
++    """Drain every slot, retaining failed storage and prioritizing termination."""
++    cleanup_error: BaseException | None = None
++    retained_slots: list[tuple[int, int]] = []
++    for index, stream in enumerate(streams):
++        try:
++            stream.synchronize()
++        except BaseException as exc:
++            # Empty placeholders have no payload storage to protect.
++            if packed_tensors[index].numel():
++                _UNSYNCHRONIZED_BUFFERS.append(packed_tensors[index])
++                retained_slots.append((index, packed_tensors[index].numel() * packed_tensors[index].element_size()))
++            if cleanup_error is None or (isinstance(cleanup_error, Exception) and not isinstance(exc, Exception)):
++                cleanup_error = exc
++    if cleanup_error is not None:
++        with suppress(Exception):
++            logger.error(
++                "Failed to drain a packed HCCL stream; "
++                "retaining buffers until process exit (slot, bytes): %s; cleanup error: %s",
++                retained_slots,
++                cleanup_error,
++            )
++        # A pending body exception propagates unless cleanup raised a higher-
++        # priority termination signal. Never skip draining other slots for it.
++        if body_error is None or (isinstance(body_error, Exception) and not isinstance(cleanup_error, Exception)):
++            raise cleanup_error
++
+ 
+ def packed_broadcast_producer(
+     iterator: Iterator[tuple[str, torch.Tensor]],
+@@ -30,63 +73,90 @@ def packed_broadcast_producer(
+         group: Process group (PyHcclCommunicator)
+         src: Source rank (0 in current implementation)
+         post_iter_func: Function to apply to each (name, tensor) pair before
+-                       packing, should return a tensor
++                       packing. Must return a Tensor with the source dtype and
++                       element count, or raises ValueError. Flattened element
++                       positions must still match the source metadata: values,
++                       device and strides may change, but elements must not be
++                       reordered (e.g. by transposing). Order is a caller contract,
++                       not checked here.
+         buffer_size_bytes: Size in bytes for each packed tensor buffer.
+                           Both producer and consumer must use the same value.
+         num_buffers: Number of buffers for double/triple buffering.
+                     Both producer and consumer must use the same value.
+     """
++    if buffer_size_bytes <= 0 or num_buffers <= 0:
++        raise ValueError(
++            f"buffer_size_bytes and num_buffers must be positive, got "
++            f"buffer_size_bytes={buffer_size_bytes}, num_buffers={num_buffers}"
++        )
+     target_packed_tensor_size = buffer_size_bytes
+ 
+     streams = [torch.npu.Stream() for _ in range(num_buffers)]
+     buffer_idx = 0
++    previous_broadcast_stream = None
+ 
+     packing_tensor_list: list[list[torch.Tensor]] = [[] for _ in range(num_buffers)]
+     packing_tensor_sizes: list[int] = [0 for _ in range(num_buffers)]
+     packed_tensors: list[torch.Tensor] = [torch.empty(0, dtype=torch.uint8, device="npu") for _ in range(num_buffers)]
+ 
+-    done = False
+-    while not done:
+-        # Synchronize the current stream (waits for previous
+-        # iteration's work on this buffer to finish)
+-        streams[buffer_idx].synchronize()
+-        # Start tasks for the new buffer in a new stream
+-        with torch.npu.stream(streams[buffer_idx]):
+-            # Initialize the packing tensor list and sizes
+-            packing_tensor_list[buffer_idx] = []
+-            packing_tensor_sizes[buffer_idx] = 0
+-            # Pack the tensors
+-            while True:
+-                try:
+-                    item = next(iterator)
+-                except StopIteration:
+-                    done = True
+-                    break
+-                # Apply post processing and convert to linearized uint8 tensor
+-                tensor = post_iter_func(item).contiguous().view(torch.uint8).view(-1)
+-                packing_tensor_list[buffer_idx].append(tensor)
+-                packing_tensor_sizes[buffer_idx] += tensor.numel()
+-                if packing_tensor_sizes[buffer_idx] > target_packed_tensor_size:
+-                    break
+-            if len(packing_tensor_list[buffer_idx]) > 0:
++    body_error: BaseException | None = None
++    try:
++        done = False
++        while not done:
++            # Synchronize the current stream (waits for previous
++            # iteration's work on this buffer to finish)
++            streams[buffer_idx].synchronize()
++            # Start tasks for the new buffer in a new stream
++            with torch.npu.stream(streams[buffer_idx]):
++                # Initialize the packing tensor list and sizes
++                packing_tensor_list[buffer_idx] = []
++                packing_tensor_sizes[buffer_idx] = 0
+                 # Pack the tensors
+-                packed_tensors[buffer_idx] = torch.cat(packing_tensor_list[buffer_idx], dim=0)
+-
+-        if len(packing_tensor_list[buffer_idx]) == 0:
+-            # No more tensors — nothing left to broadcast
+-            break
+-
+-        # torch.cat runs on the custom stream.  Synchronize before
+-        # broadcasting on the default stream so the packed data is ready.
+-        streams[buffer_idx].synchronize()
+-        group.broadcast(packed_tensors[buffer_idx], src=src)
+-
+-        # Move to the next buffer
+-        buffer_idx = (buffer_idx + 1) % num_buffers
+-
+-    # Ensure the last broadcast on the default stream has completed
+-    # before returning, so NPU tensor cleanup at exit doesn't hang.
+-    torch.npu.current_stream().synchronize()
++                while True:
++                    try:
++                        item = next(iterator)
++                    except StopIteration:
++                        done = True
++                        break
++                    # Apply post processing and convert to linearized uint8 tensor
++                    tensor = post_iter_func(item)
++                    if not isinstance(tensor, torch.Tensor):
++                        raise ValueError(f"post_iter_func for tensor {item[0]!r} must return a torch.Tensor")
++                    tensor = tensor.contiguous()
++                    original = item[1]
++                    if tensor.dtype != original.dtype or tensor.numel() != original.numel():
++                        raise ValueError(
++                            f"post_iter_func returned tensor {item[0]!r} with dtype={tensor.dtype}, "
++                            f"numel={tensor.numel()}; expected dtype={original.dtype}, numel={original.numel()}"
++                        )
++                    tensor = tensor.reshape(-1).view(torch.uint8)
++                    packing_tensor_list[buffer_idx].append(tensor)
++                    packing_tensor_sizes[buffer_idx] += tensor.numel()
++                    if packing_tensor_sizes[buffer_idx] > target_packed_tensor_size:
++                        break
++                if len(packing_tensor_list[buffer_idx]) > 0:
++                    # Pack the tensors
++                    packed_tensors[buffer_idx] = torch.cat(packing_tensor_list[buffer_idx], dim=0)
++                    # Packing can overlap the previous transfer, but collectives
++                    # on this communicator must not overlap across streams.
++                    if previous_broadcast_stream is not None and previous_broadcast_stream is not streams[buffer_idx]:
++                        previous_broadcast_stream.synchronize()
++                    # Match the active packing stream and the explicit native
++                    # HCCL stream; wait for both before reusing this slot.
++                    group.broadcast(packed_tensors[buffer_idx], src=src, stream=streams[buffer_idx])
++                    previous_broadcast_stream = streams[buffer_idx]
++
++            if len(packing_tensor_list[buffer_idx]) == 0:
++                # No more tensors — nothing left to broadcast
++                break
++
++            # Move to the next buffer
++            buffer_idx = (buffer_idx + 1) % num_buffers
++    except BaseException as exc:
++        body_error = exc
++        raise
++    finally:
++        _drain_packed_streams(streams, packed_tensors, body_error)
+ 
+ 
+ def packed_broadcast_consumer(
+@@ -99,12 +169,17 @@ def packed_broadcast_consumer(
+ ) -> None:
+     """Consume packed tensors and unpack them into a list of tensors.
+ 
++    Unpacking clones one actual chunk's payload in addition to the receive
++    buffer and loader copies. A HCCL chunk may exceed buffer_size_bytes; peak
++    memory also depends on in-flight slots and tensors retained by the loader.
++
+     Args:
+         iterator: Iterator of parameter metadata. Returns (name, (shape, dtype))
+         group: Process group (PyHcclCommunicator)
+         src: Source rank (0 in current implementation)
+         post_unpack_func: Function to apply to each list of (name, tensor) after
+-                         unpacking
++                         unpacking. Tensors own independent storage and may be
++                         retained or modified without aliasing the packed buffer.
+         buffer_size_bytes: Size in bytes for each packed tensor buffer.
+                           Both producer and consumer must use the same value.
+         num_buffers: Number of buffers for double/triple buffering.
+@@ -118,81 +193,90 @@ def packed_broadcast_consumer(
+         dtypes: list[torch.dtype],
+         tensor_sizes: list[int],
+     ) -> list[tuple[str, torch.Tensor]]:
+-        """Unpack a packed uint8 tensor into a list of typed tensors."""
++        """Unpack named tensors with their declared dtypes and shapes."""
+         unpacked_tensors = packed_tensor.split(tensor_sizes)
+         unpacked_list = [
+-            (name, tensor.contiguous().view(dtype).view(*shape))
++            # Preserve independent storage for callbacks that retain or mutate
++            # inputs. Cloning bytes first also fixes unaligned dtype views.
++            (name, tensor.clone().view(dtype).reshape(shape))
+             for name, shape, dtype, tensor in zip(names, shapes, dtypes, unpacked_tensors)
+         ]
+         return unpacked_list
+ 
++    if buffer_size_bytes <= 0 or num_buffers <= 0:
++        raise ValueError(
++            f"buffer_size_bytes and num_buffers must be positive, got "
++            f"buffer_size_bytes={buffer_size_bytes}, num_buffers={num_buffers}"
++        )
+     target_packed_tensor_size = buffer_size_bytes
+ 
+     streams = [torch.npu.Stream() for _ in range(num_buffers)]
+-    default_stream = torch.npu.current_stream()
+     buffer_idx = 0
+ 
+     packing_tensor_meta_data: list[list[tuple[str, list[int], torch.dtype, int]]] = [[] for _ in range(num_buffers)]
+     packing_tensor_sizes: list[int] = [0 for _ in range(num_buffers)]
+     packed_tensors: list[torch.Tensor] = [torch.empty(0, dtype=torch.uint8, device="npu") for _ in range(num_buffers)]
+ 
+-    done = False
+-    while not done:
+-        # Synchronize the current stream (waits for previous
+-        # iteration's load_weights on this buffer to finish)
+-        streams[buffer_idx].synchronize()
+-        with torch.npu.stream(streams[buffer_idx]):
+-            # Collect parameter metadata for this buffer
+-            packing_tensor_meta_data[buffer_idx] = []
+-            packing_tensor_sizes[buffer_idx] = 0
+-            while True:
+-                try:
+-                    name, (shape, dtype) = next(iterator)
+-                except StopIteration:
+-                    done = True
+-                    break
+-                tensor_size = math.prod(shape) * dtype.itemsize
+-                packing_tensor_meta_data[buffer_idx].append((name, shape, dtype, tensor_size))
+-                packing_tensor_sizes[buffer_idx] += tensor_size
+-                if packing_tensor_sizes[buffer_idx] > target_packed_tensor_size:
+-                    break
+-            if len(packing_tensor_meta_data[buffer_idx]) > 0:
+-                packed_tensors[buffer_idx] = torch.empty(
+-                    packing_tensor_sizes[buffer_idx],
+-                    dtype=torch.uint8,
+-                    device="npu",
+-                )
+-
+-        if len(packing_tensor_meta_data[buffer_idx]) == 0:
+-            break
+-
+-        # Broadcast on the default stream.
+-        group.broadcast(packed_tensors[buffer_idx], src=src)
+-
+-        # Synchronize the default stream so broadcast completes before
+-        # load_weights (running on the custom stream) reads the data.
+-        default_stream.synchronize()
+-
+-        # Unpack and load weights on the custom stream
+-        with torch.npu.stream(streams[buffer_idx]):
+-            names, shapes, dtypes, tensor_sizes = zip(*packing_tensor_meta_data[buffer_idx])
+-            post_unpack_func(
+-                unpack_tensor(
+-                    packed_tensors[buffer_idx],
+-                    list(names),
+-                    list(shapes),
+-                    list(dtypes),
+-                    list(tensor_sizes),
++    body_error: BaseException | None = None
++    try:
++        done = False
++        while not done:
++            # Synchronize the current stream (waits for previous
++            # iteration's load_weights on this buffer to finish)
++            streams[buffer_idx].synchronize()
++            with torch.npu.stream(streams[buffer_idx]):
++                # Collect parameter metadata for this buffer
++                packing_tensor_meta_data[buffer_idx] = []
++                packing_tensor_sizes[buffer_idx] = 0
++                while True:
++                    try:
++                        name, (shape, dtype) = next(iterator)
++                    except StopIteration:
++                        done = True
++                        break
++                    if any(dimension < 0 for dimension in shape):
++                        raise ValueError(f"tensor {name!r} has a negative shape: {shape}")
++                    tensor_size = math.prod(shape) * dtype.itemsize
++                    packing_tensor_meta_data[buffer_idx].append((name, shape, dtype, tensor_size))
++                    packing_tensor_sizes[buffer_idx] += tensor_size
++                    if packing_tensor_sizes[buffer_idx] > target_packed_tensor_size:
++                        break
++                if len(packing_tensor_meta_data[buffer_idx]) > 0:
++                    packed_tensors[buffer_idx] = torch.empty(
++                        packing_tensor_sizes[buffer_idx],
++                        dtype=torch.uint8,
++                        device="npu",
++                    )
++
++            if len(packing_tensor_meta_data[buffer_idx]) == 0:
++                break
++
++            # Broadcast, unpack clones and load_weights share one ordered stream.
++            group.broadcast(packed_tensors[buffer_idx], src=src, stream=streams[buffer_idx])
++            # Match #18078: external HCCL work must finish before torch unpacks.
++            streams[buffer_idx].synchronize()
++
++            # Unpack and load weights on the custom stream
++            with torch.npu.stream(streams[buffer_idx]):
++                names, shapes, dtypes, tensor_sizes = zip(*packing_tensor_meta_data[buffer_idx])
++                post_unpack_func(
++                    unpack_tensor(
++                        packed_tensors[buffer_idx],
++                        list(names),
++                        list(shapes),
++                        list(dtypes),
++                        list(tensor_sizes),
++                    )
+                 )
+-            )
+ 
+-        # Move to the next buffer
+-        buffer_idx = (buffer_idx + 1) % num_buffers
++            # Move to the next buffer
++            buffer_idx = (buffer_idx + 1) % num_buffers
+ 
+-    # Wait for all in-flight load_weights (on custom streams) to finish.
+-    # Otherwise NPU tensor cleanup at exit may hang.
+-    for s in streams:
+-        s.synchronize()
++    except BaseException as exc:
++        body_error = exc
++        raise
++    finally:
++        _drain_packed_streams(streams, packed_tensors, body_error)
+ 
+ 
+ # ── NPU IPC packed transfer ────────────────────────────────────────────
+@@ -210,13 +294,21 @@ def packed_npu_ipc_producer(
+     it for IPC once via ``reduce_tensor``.  Each chunk's packed data is
+     copied into this buffer before yielding, so only one IPC-shared
+     allocation exists for the lifetime of the transfer.
++    A nonempty iterator containing only zero-element tensors still yields a
++    chunk so its names, shapes and dtypes are delivered; an empty iterator does not.
+ 
+     Args:
+         iterator: Iterator of (name, tensor) pairs.
+         npu_uuid: Physical NPU UUID string for this rank.
+-        post_iter_func: Applied to each (name, tensor) before packing.
++        post_iter_func: Applied to each (name, tensor) before packing. Must return
++            a Tensor with the source dtype and element count, or raises ValueError.
++            Flattened element positions must match the source metadata: values,
++            device and strides may change, but elements must not be reordered
++            (e.g. by transposing). Order is a caller contract, not checked here.
+         buffer_size_bytes: Exact capacity of the reusable IPC buffer.
+     """
++    if buffer_size_bytes <= 0:
++        raise ValueError(f"buffer_size_bytes must be positive, got {buffer_size_bytes}")
+     ipc_buffer = torch.empty(buffer_size_bytes, dtype=torch.uint8, device="npu")
+     # Store only the rebuild args (drop the func); the consumer rebuilds with
+     # the well-known ``rebuild_npu_tensor``, mirroring upstream's CUDA IPC engine.
+@@ -229,7 +321,16 @@ def packed_npu_ipc_producer(
+     total_bytes = 0
+ 
+     for name, orig_tensor in iterator:
+-        flat = post_iter_func((name, orig_tensor)).contiguous().view(torch.uint8).view(-1)
++        tensor = post_iter_func((name, orig_tensor))
++        if not isinstance(tensor, torch.Tensor):
++            raise ValueError(f"post_iter_func for tensor {name!r} must return a torch.Tensor")
++        tensor = tensor.contiguous()
++        if tensor.dtype != orig_tensor.dtype or tensor.numel() != orig_tensor.numel():
++            raise ValueError(
++                f"post_iter_func returned tensor {name!r} with dtype={tensor.dtype}, "
++                f"numel={tensor.numel()}; expected dtype={orig_tensor.dtype}, numel={orig_tensor.numel()}"
++            )
++        flat = tensor.reshape(-1).view(torch.uint8)
+ 
+         if flat.numel() > buffer_size_bytes:
+             raise ValueError(
+@@ -257,7 +358,7 @@ def packed_npu_ipc_producer(
+         tensor_sizes.append(flat.numel())
+         total_bytes += flat.numel()
+ 
+-    if total_bytes:
++    if names:
+         torch.npu.current_stream().synchronize()
+         yield {
+             "names": names,
+@@ -283,6 +384,9 @@ def packed_npu_ipc_consumer(
+     individual tensors, and clones each into independent storage before
+     returning.  The clone is required because the producer reuses one
+     IPC buffer across chunks.
++    Clones add one chunk's payload storage on top of the shared buffer and any
++    loader-owned copies. Returned tensors may be retained or modified without
++    aliasing that buffer.
+ 
+     Args:
+         ipc_handle: Mapping of NPU UUID to a ``rebuild_npu_tensor`` args tuple
+@@ -298,27 +402,47 @@ def packed_npu_ipc_consumer(
+     # imported at module load time on non-NPU hosts.
+     from torch_npu.multiprocessing.reductions import rebuild_npu_tensor
+ 
++    if not isinstance(device_index, int) or isinstance(device_index, bool) or device_index < 0:
++        raise ValueError(f"device_index must be a non-negative integer, got {device_index!r}")
+     if physical_npu_id not in ipc_handle:
+         raise ValueError(
+             f"IPC handle not found for NPU UUID {physical_npu_id}. Available UUIDs: {list(ipc_handle.keys())}"
+         )
+ 
++    dtypes = []
++    for dtype_name in dtype_names:
++        dtype = getattr(torch, dtype_name, None)
++        if not isinstance(dtype, torch.dtype):
++            raise ValueError(f"unknown torch dtype name {dtype_name!r}")
++        dtypes.append(dtype)
++    if not (len(names) == len(shapes) == len(dtypes) == len(tensor_sizes)):
++        raise ValueError("packed IPC metadata lengths disagree")
++    for name, shape, dtype, size in zip(names, shapes, dtypes, tensor_sizes):
++        if any(dimension < 0 for dimension in shape) or size < 0:
++            raise ValueError(f"invalid metadata for tensor {name!r}")
++        expected = math.prod(shape) * dtype.itemsize
++        if size != expected:
++            raise ValueError(f"tensor {name!r} metadata says {size} bytes but requires {expected} bytes")
++
+     args = ipc_handle[physical_npu_id]
+     list_args = list(args)
+     # Index 6 of the args from reduce_tensor is the device_index.
+     # Overwrite it with the receiver's device index.
++    if len(list_args) <= 6:
++        raise ValueError(f"NPU IPC rebuild arguments do not contain a device index: got {len(list_args)} values")
+     list_args[6] = device_index
+     packed = rebuild_npu_tensor(*list_args)
+ 
+     content_size = sum(tensor_sizes)
++    if content_size > packed.numel():
++        raise ValueError(f"packed IPC metadata declares {content_size} bytes, buffer has {packed.numel()}")
+     packed = packed[:content_size]
+ 
+-    dtypes = [getattr(torch, dn) for dn in dtype_names]
+     weights: list[tuple[str, torch.Tensor]] = []
+     offset = 0
+     for name, shape, dtype, size in zip(names, shapes, dtypes, tensor_sizes):
+         raw = packed[offset : offset + size]
+-        tensor = raw.contiguous().view(dtype).view(*shape).clone()
++        tensor = raw.clone().view(dtype).reshape(shape)
+         weights.append((name, tensor))
+         offset += size
+ 

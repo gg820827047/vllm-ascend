@@ -1,0 +1,215 @@
+commit 666162ccacad9ee928f7cf7240580967686805c7
+Author:     wangxiyuan <wangxiyuan1007@gmail.com>
+AuthorDate: Tue Oct 13 19:51:36 2026 +0800
+Commit:     GitHub <noreply@github.com>
+CommitDate: Tue Oct 13 19:51:36 2026 +0800
+
+    [Misc] drop patch_dp_device_ids patch and unify DP device selection (#16601)
+    
+    Remove the v0.24.0-era monkeypatch of
+    get_physical_gpu_ids_for_local_dp_rank. The patch tolerated a
+    pre-sharded ASCEND_RT_VISIBLE_DEVICES env var, but that is not the
+    upstream contract after vllm#45026: vLLM slices the un-sharded env (or
+    the full --device-ids list) per DP rank itself. The patch silently
+    turned device misconfiguration into a successful-looking startup and
+    replaced upstream error context with a raw IndexError.
+    
+    - Delete vllm_ascend/patch/platform/patch_dp_device_ids.py and its
+      registration and documentation entry.
+    - tests/e2e/conftest.py: pass the full un-sharded device_ids list for
+      every executor backend in _run_vllm_runner_dp_worker, so vLLM's
+      per-rank slicing never relies on the env var offset. The Ray branch
+      still pre-slices ASCEND_RT_VISIBLE_DEVICES per DP rank because each
+      DP worker starts its own local Ray instance, which must only see its
+      own NPUs; otherwise independent Ray instances can bind two ranks to
+      the same physical NPU (HCCL EI0015). The full device_ids is passed
+      alongside, so the pre-sharded env needs no patch.
+    
+    Migration:
+    - Affected: application-level DP that pre-shards
+      ASCEND_RT_VISIBLE_DEVICES per rank without passing --device-ids.
+      Ranks > 0 now fail fast with the upstream "Error computing device
+      indices ..." message instead of silently using wrong devices.
+    - Fix: stop pre-sharding the env and let vLLM slice the full device
+      list per DP rank, or pass the full device list via --device-ids /
+      LLM(device_ids=[...]).
+    - Ray: if the env is pre-sharded per DP rank, also pass the full
+    device_ids; single-server Ray DP scheduling does not need env sharding.
+    - Unaffected: single-instance serving, one process per DP instance, and
+      setups that already pass device_ids.
+    
+    ---
+    
+    - vLLM main:
+    https://github.com/vllm-project/vllm/commit/8cc9aa5ad350f6f80cf3bebb298d410803ff75a9
+    
+    Signed-off-by: wangxiyuan <wangxiyuan1007@gmail.com>
+
+diff --git a/tests/e2e/conftest.py b/tests/e2e/conftest.py
+index f0dca4a60..ce784e908 100644
+--- a/tests/e2e/conftest.py
++++ b/tests/e2e/conftest.py
+@@ -917,13 +917,23 @@ def _run_vllm_runner_dp_worker(conn, llm_kwargs: dict[str, Any], dp_rank: int, d
+         if not full_device_ids:
+             full_device_ids = [str(i) for i in range(torch.npu.device_count())]
+ 
++        # Pass the full (un-sharded) device list for every backend. vLLM
++        # slices it per DP rank internally via assigned_physical_gpu_ids
++        # (see get_physical_gpu_ids_for_local_dp_rank).
++        llm_kwargs["device_ids"] = full_device_ids
++
++        # The Ray backend starts a node-local Ray instance per DP worker and
++        # binds its workers to the devices visible to that instance. Shard
++        # ASCEND_RT_VISIBLE_DEVICES per DP rank so each engine's Ray instance
++        # only sees its own slice; with the full list the independent Ray
++        # instances can bind workers of different DP ranks (or of several PP
++        # ranks) to the same physical NPU. The device_ids above stays the
++        # complete list, so vLLM's per-rank slicing does not rely on the env
++        # var.
+         if llm_kwargs.get("distributed_executor_backend") == "ray":
+-            devs = full_device_ids
+-            chunk = max(len(devs) // dp_size, 1)
++            chunk = max(len(full_device_ids) // dp_size, 1)
+             start = dp_rank * chunk
+-            os.environ["ASCEND_RT_VISIBLE_DEVICES"] = ",".join(devs[start : start + chunk])
+-        else:
+-            llm_kwargs["device_ids"] = full_device_ids
++            os.environ["ASCEND_RT_VISIBLE_DEVICES"] = ",".join(full_device_ids[start : start + chunk])
+ 
+         llm = LLM(**llm_kwargs)
+         conn.send({"status": "ready", "rank": dp_rank})
+diff --git a/vllm_ascend/patch/__init__.py b/vllm_ascend/patch/__init__.py
+index 67d13dc48..2de0c3324 100644
+--- a/vllm_ascend/patch/__init__.py
++++ b/vllm_ascend/patch/__init__.py
+@@ -83,31 +83,7 @@
+ #    Future Plan:
+ #       Find a better way to support tensor alignment for 310p without this patch.
+ #
+-# ** 4. File: platform/patch_dp_device_ids.py**
+-# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+-#   1. `vllm.v1.core.dp_utils.get_physical_gpu_ids_for_local_dp_rank`
+-#    Why:
+-#       PR #45026 removed the per-process device isolation that older vLLM
+-#       versions performed internally. Application-level DP (e.g.
+-#       `offline_data_parallel.py`) now has to slice ASCEND_RT_VISIBLE_DEVICES
+-#       per rank itself, but the upstream helper still expects the env var to
+-#       contain ALL devices for ALL ranks and tries to read it with the
+-#       `local_dp_rank * world_size` offset. With a sharded env var, that
+-#       offset is out of range and the helper raises IndexError (wrapped in the
+-#       user-facing "Error computing device indices for ..." message).
+-#    How：
+-#       Patch `get_physical_gpu_ids_for_local_dp_rank` so it tolerates a
+-#       pre-sharded ASCEND_RT_VISIBLE_DEVICES env var (one slice per DP rank),
+-#       instead of unconditionally applying `local_dp_rank * world_size` as an
+-#       offset into it.
+-#    Related PR (if no, explain why):
+-#       https://github.com/vllm-project/vllm/pull/45026
+-#    Future Plan:
+-#       Remove this patch once upstream `get_physical_gpu_ids_for_local_dp_rank`
+-#       handles a pre-sharded visible-devices env var, or vLLM-Ascend stops
+-#       relying on application-level device slicing for DP.
+-#
+-# ** 5. File: platform/patch_dyntra_lb_core.py**
++# ** 4. File: platform/patch_dyntra_lb_core.py**
+ # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+ #   1. `vllm.v1.engine.core.DPEngineCoreProc` (class provided only; the swap
+ #      is performed by patch_engine_core.py when dyntra-lb is enabled)
+@@ -262,7 +238,7 @@
+ #       Remove this patch and its platform import once all supported vLLM
+ #       release tags and verified main pins include the upstream fix.
+ #
+-# ** 7a. File: platform/patch_glm5next_config.py**
++# ** 7. File: platform/patch_glm5next_config.py**
+ # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+ #   1. `vllm.transformers_utils.config._CONFIG_REGISTRY`
+ #    Why:
+diff --git a/vllm_ascend/patch/platform/__init__.py b/vllm_ascend/patch/platform/__init__.py
+index 95d37ac2d..c860c7de2 100644
+--- a/vllm_ascend/patch/platform/__init__.py
++++ b/vllm_ascend/patch/platform/__init__.py
+@@ -49,7 +49,6 @@ import vllm_ascend.patch.platform.patch_speculative_config  # noqa
+ 
+ import vllm_ascend.patch.platform.patch_eplb  # noqa
+ import vllm_ascend.patch.platform.patch_fused_moe  # noqa
+-import vllm_ascend.patch.platform.patch_dp_device_ids  # noqa
+ 
+ # The Ascend Engram adapter requires `vllm.config.engram` (vLLM main/v0.30.0+).
+ import vllm_ascend.patch.platform.patch_engram_config  # noqa
+diff --git a/vllm_ascend/patch/platform/patch_dp_device_ids.py b/vllm_ascend/patch/platform/patch_dp_device_ids.py
+deleted file mode 100644
+index 8c20474b6..000000000
+--- a/vllm_ascend/patch/platform/patch_dp_device_ids.py
++++ /dev/null
+@@ -1,71 +0,0 @@
+-#
+-# Copyright (c) 2025 Huawei Technologies Co., Ltd. All Rights Reserved.
+-# This file is a part of the vllm-ascend project.
+-#
+-# Licensed under the Apache License, Version 2.0 (the "License");
+-# you may not use this file except in compliance with the License.
+-# You may obtain a copy of the License at
+-#
+-#     http://www.apache.org/licenses/LICENSE-2.0
+-#
+-# Unless required by applicable law or agreed to in writing, software
+-# distributed under the License is distributed on an "AS IS" BASIS,
+-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+-# See the License for the specific language governing permissions and
+-# limitations under the License.
+-#
+-# Patch vLLM v0.24.0+ ``get_physical_gpu_ids_for_local_dp_rank`` so that it
+-# tolerates a pre-sharded ASCEND_RT_VISIBLE_DEVICES env var (one slice per
+-# DP rank), instead of unconditionally applying ``local_dp_rank * world_size``
+-# as an offset into it.
+-#
+-# Background:
+-# PR #45026 removed the per-process device isolation that older vLLM
+-# versions performed internally. Application-level DP (e.g.
+-# ``offline_data_parallel.py``) now has to slice ASCEND_RT_VISIBLE_DEVICES
+-# per rank itself, but the upstream helper still expects the env var to
+-# contain ALL devices for ALL ranks and tries to read it with the
+-# ``local_dp_rank * world_size`` offset. With a sharded env var, that
+-# offset is out of range and the helper raises ``IndexError`` (wrapped in
+-# the user-facing "Error computing device indices for ..." message).
+-
+-import os
+-
+-from vllm.platforms import current_platform
+-from vllm.v1.engine import utils as _engine_utils
+-
+-_original_get_physical_gpu_ids = _engine_utils.get_physical_gpu_ids_for_local_dp_rank
+-
+-
+-def _patched_get_physical_gpu_ids_for_local_dp_rank(
+-    device_control_env_var,
+-    local_dp_rank,
+-    world_size,
+-    local_world_size=None,
+-    user_assigned_gpu_ids=None,
+-):
+-    if local_world_size is None:
+-        local_world_size = world_size
+-
+-    # If the caller did not pass --device-ids and the env var has
+-    # fewer devices than the full DP range expects, the env var has
+-    # already been pre-sharded per rank by the caller. Use it
+-    # directly from index 0 instead of applying the DP offset again.
+-    if user_assigned_gpu_ids is None and device_control_env_var in os.environ:
+-        visible = [d for d in os.environ[device_control_env_var].split(",") if d]
+-        if local_dp_rank * world_size + local_world_size > len(visible):
+-            return [
+-                current_platform.device_control_id_to_physical_device_id(visible[device_id])
+-                for device_id in range(local_world_size)
+-            ]
+-
+-    return _original_get_physical_gpu_ids(
+-        device_control_env_var,
+-        local_dp_rank,
+-        world_size,
+-        local_world_size,
+-        user_assigned_gpu_ids,
+-    )
+-
+-
+-_engine_utils.get_physical_gpu_ids_for_local_dp_rank = _patched_get_physical_gpu_ids_for_local_dp_rank

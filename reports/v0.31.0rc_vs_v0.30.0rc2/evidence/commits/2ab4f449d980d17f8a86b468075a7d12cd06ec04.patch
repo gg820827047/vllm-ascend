@@ -1,0 +1,373 @@
+commit 2ab4f449d980d17f8a86b468075a7d12cd06ec04
+Author:     Angazenn <92204292+Angazenn@users.noreply.github.com>
+AuthorDate: Fri Oct 16 16:59:28 2026 +0800
+Commit:     GitHub <noreply@github.com>
+CommitDate: Fri Oct 16 16:59:28 2026 +0800
+
+    [Bugfix] Ensure full range load of kv pool when enabling prefill layerwise offload (#18987)
+    
+    ### What this PR does / why we need it?
+    This PR fixes the following 2 bugs when enabling layerwise prefill
+    offload:
+    
+    1.
+    #16947 introduces a special mechanism for optimize KV pool: a block's
+    all-rank presence is cached per (group, block_hash) with a 30s TTL and a
+    200k-entry cap, and a cached miss short-circuits the whole group with
+    zero RPCs. This is reasonable for ordinary layerwise kvpool, but causes
+    trouble when enabling layerwise reuse for prefill offload in cases that
+    some requests hit prefix cache. The key difference is that:
+    
+    - Ordinary layerwise AscendStore still assumes that every layer has its
+    own device cache tensor. So hit blocks from device and kvpool are
+    essentially different. The hit blocks from device can be safely
+    retrieved, while the missed blocks from kvpool can be recomputed by
+    model forward.
+    - However, when enabling layerwise reuse, the cache tensors are sharing
+    a small number of buffers (for example 3). So "hitting blocks from
+    device" still needs to be retrieved from kvpool. And if these blocks are
+    missed, there is no recomputation guaranteed.
+    
+    In conclustion, this PR proposes to disable this mechanism for layerwise
+    offload. The behavior of ordinary layerwise kvpool is kept unchanged.
+    
+    2.
+    Layerwise offload introduces independent layers and shared buffer
+    layers. When we set independent layers to be layer 0, we cannot simply
+    share the metadata across all layers as they might have different load
+    ranges. Thus this PR also proposes to dispatch the share metadata build
+    between these two components.
+    
+    ### Does this PR introduce _any_ user-facing change?
+    
+    ### How was this patch tested?
+    
+    ---
+    
+    ### Checklist
+    
+    #### Testing
+    
+    - [x] **Boundary / edge-case coverage**: I reviewed whether this change
+    involves
+    boundary conditions (e.g. empty input, single/zero element, min/max
+    values,
+    off-by-one, sequence-length limits, integer overflow). Where applicable,
+    I
+    added unit tests covering these edge cases in `tests/ut/` or
+    `tests/e2e/`.
+    - [x] **Regression test**: If this PR fixes a bug, I added a regression
+    test
+      that would fail without the fix.
+    - [x] **Error / failure path coverage**: I covered abnormal paths
+    (exceptions,
+    timeouts, out-of-range, division by zero) in addition to the happy path.
+    - [x] **Meaningful & reliable tests**: New tests assert real behavior
+    and are
+      not written merely to satisfy CI.
+    - [x] **Performance impact**: If this PR touches a performance-sensitive
+    path,
+      I attached benchmark results and added performance regression tests.
+    
+    - vLLM main:
+    https://github.com/vllm-project/vllm/commit/c4df37dfcc7f72ca41cd43801a468526ecf99a2b
+    
+    ---------
+    
+    Signed-off-by: Angazenn <supperccell@163.com>
+
+diff --git a/tests/ut/distributed/ascend_store/test_pool_scheduler.py b/tests/ut/distributed/ascend_store/test_pool_scheduler.py
+index 526a6376b..da6773912 100644
+--- a/tests/ut/distributed/ascend_store/test_pool_scheduler.py
++++ b/tests/ut/distributed/ascend_store/test_pool_scheduler.py
+@@ -117,12 +117,16 @@ def test_joint_prefix_draft_only_group_uses_companion_keys_without_losing_mixed_
+ 
+ 
+ @pytest.mark.parametrize("cached_hit", [False, True])
+-def test_joint_prefix_lookup_rechecks_after_save_and_eviction_instead_of_using_hit_ttl(cached_hit):
++@pytest.mark.parametrize("mode", ["dspark", "reuse"])
++def test_prefix_lookup_rechecks_after_save_and_eviction_instead_of_using_hit_ttl(cached_hit, mode):
+     scheduler = KVPoolScheduler.__new__(KVPoolScheduler)
+     scheduler.layerwise_keys = SimpleNamespace(make_hit_check_keys=MagicMock(return_value=["target"]))
+     scheduler.tp_size, scheduler.put_step = 4, 4
+     scheduler.num_speculative_blocks_by_group = {}
+-    scheduler.dspark_prefix_keys = DSparkPrefixKeys("draft-contract", pp_size=2, tp_size=4)
++    scheduler.dspark_prefix_keys = (
++        DSparkPrefixKeys("draft-contract", pp_size=2, tp_size=4) if mode == "dspark" else None
++    )
++    scheduler.layerwise_offload = mode == "reuse"
+     scheduler.dspark_draft_only_group_ids = frozenset({1})
+     scheduler.layerwise_max_transfer_blocks = 0
+     scheduler.hash_block_size = 16
+@@ -139,14 +143,15 @@ def test_joint_prefix_lookup_rechecks_after_save_and_eviction_instead_of_using_h
+     )
+ 
+     assert scheduler._lookup_layerwise_contiguous(request, 16, 0) == 0
+-    draft_keys = scheduler.dspark_prefix_keys.make_hit_check_keys("block-hash")
++    draft_keys = scheduler.dspark_prefix_keys.make_hit_check_keys("block-hash") if scheduler.dspark_prefix_keys else []
+     readable_keys.update(["target", *draft_keys])
+     assert scheduler._lookup_layerwise_contiguous(request, 16, 0) == 16
+-    readable_keys.remove(draft_keys[-1])
++    readable_keys.remove(draft_keys[-1] if draft_keys else "target")
+     assert scheduler._lookup_layerwise_contiguous(request, 16, 0) == 0
+     assert scheduler.store_scheduler.batch_is_readable.call_count == 6
+     assert scheduler._lw_block_hit_cache == original_cache
+     scheduler.dspark_prefix_keys = None
++    scheduler.layerwise_offload = False
+     assert scheduler._lookup_layerwise_contiguous(request, 16, 0) == (16 if cached_hit else 0)
+     assert scheduler.store_scheduler.batch_is_readable.call_count == 6
+ 
+diff --git a/tests/ut/distributed/ascend_store/test_pool_worker.py b/tests/ut/distributed/ascend_store/test_pool_worker.py
+index 2c7008ca8..df687389e 100644
+--- a/tests/ut/distributed/ascend_store/test_pool_worker.py
++++ b/tests/ut/distributed/ascend_store/test_pool_worker.py
+@@ -37,6 +37,7 @@ from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.kv_transfer import
+ )
+ from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.metadata import (
+     AscendConnectorMetadata,
++    LayerBlockRange,
+     LayerTransferTask,
+     LoadSpec,
+     ReqMeta,
+@@ -2028,6 +2029,134 @@ class TestKVPoolWorkerProcessLayerData(unittest.TestCase):
+         self.assertEqual((independent_range.start_block, independent_range.end_block), (1, 2))
+         self.assertEqual((reused_range.start_block, reused_range.end_block), (0, 2))
+ 
++    def test_shared_load_data_preserves_layer_specific_blocks(self):
++        from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.kv_transfer import (
++            KVCacheStoreLayerRecvingThread,
++            LayerBatchBuilder,
++        )
++
++        for case in ("prefix", "partial", "request", "group", "empty"):
++            with self.subTest(case=case):
++                worker = self._make_worker()
++                worker.layerwise_offload = True
++                worker.num_layers = 3
++                worker.num_kv_cache_groups = 2
++                request = ReqMeta(
++                    req_id="r1",
++                    token_len_chunk=32,
++                    block_ids=[10, 11],
++                    block_ids_np=np.asarray([10, 11]),
++                    load_block_gvas_np=np.asarray([100, 200]),
++                )
++                request.partial_load_gva_per_group = [300, 400]
++                other_request = ReqMeta(
++                    req_id="r2",
++                    token_len_chunk=32,
++                    block_ids=[20, 21],
++                    block_ids_np=np.asarray([20, 21]),
++                    load_block_gvas_np=np.asarray([500, 600]),
++                )
++                # Start with the wider selection so subsequent builder calls
++                # reuse scratch storage rather than allocate larger arrays.
++                first = LayerTransferTask(0, [LayerBlockRange(request, 0, 2)])
++                selected_request = other_request if case == "request" else request
++                second = LayerTransferTask(
++                    1,
++                    [LayerBlockRange(selected_request, 1 if case == "prefix" else 0, 2)],
++                    group_id=1 if case == "group" else 0,
++                )
++                if case == "partial":
++                    first.block_ranges[0].end_block = 1
++                    second.block_ranges[0].end_block = 1
++                    second.block_ranges[0].partial_block_index = 1
++                if case == "empty":
++                    first.block_ranges = []
++                third = LayerTransferTask(
++                    2,
++                    [
++                        LayerBlockRange(r.request, r.start_block, r.end_block, r.partial_block_index)
++                        for r in second.block_ranges
++                    ],
++                    group_id=second.group_id,
++                )
++                worker.layer_load_tasks = [[first], [second], [third]]
++                database = SimpleNamespace(
++                    group_block_len={0: [8, 8, 8], 1: [8, 8, 8]},
++                    group_kv_caches_base_addr={0: [1000, 2000, 3000], 1: [4000, 5000, 6000]},
++                    group_block_stride={},
++                    group_layer_cache_entry_offsets={},
++                )
++                receiver = object.__new__(KVCacheStoreLayerRecvingThread)
++                receiver.group_builders = {
++                    group: LayerBatchBuilder(database, page_size_bytes=24, num_layers=3, group_id=group)
++                    for group in range(2)
++                }
++                receiver.build_shared_data = MagicMock(wraps=receiver.build_shared_data)
++                worker.kv_recv_thread = receiver
++
++                worker._build_shared_load_data()
++
++                expected_ids = [11] if case == "prefix" else [20, 21] if case == "request" else [10, 11]
++                expected_gvas = [200] if case == "prefix" else [500, 600] if case == "request" else [100, 200]
++                if case == "partial":
++                    expected_gvas = [100, 300]
++                np.testing.assert_array_equal(second.shared_block_data.block_ids_arr, expected_ids)
++                np.testing.assert_array_equal(second.shared_block_data.block_gvas_arr, expected_gvas)
++                self.assertIs(second.shared_block_data, third.shared_block_data)
++                self.assertEqual(receiver.build_shared_data.call_count, 2)
++                if case == "empty":
++                    self.assertIsNone(first.shared_block_data)
++                else:
++                    self.assertIsNot(first.shared_block_data, second.shared_block_data)
++                    np.testing.assert_array_equal(
++                        first.shared_block_data.block_ids_arr, [10] if case == "partial" else [10, 11]
++                    )
++                    np.testing.assert_array_equal(
++                        first.shared_block_data.block_gvas_arr, [100] if case == "partial" else [100, 200]
++                    )
++
++    def test_shared_load_data_without_reuse_keeps_single_build_per_group(self):
++        from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.kv_transfer import (
++            KVCacheStoreLayerRecvingThread,
++        )
++
++        for has_shared_data in (False, True):
++            with self.subTest(has_shared_data=has_shared_data):
++                worker = self._make_worker()
++                worker.layerwise_offload = False
++                worker.num_layers = 2
++                worker.num_kv_cache_groups = 3
++                worker.layer_load_tasks = [
++                    [LayerTransferTask(layer, [], group_id=group) for group in range(2)] for layer in range(2)
++                ]
++                shared = [
++                    SharedBlockData(
++                        block_ids_arr=np.asarray([group]),
++                        block_gvas_arr=np.asarray([100 + group]),
++                        req_ids=["r1"],
++                        is_last_chunks=[True],
++                    )
++                    for group in range(2)
++                ]
++                original_ids = [data.block_ids_arr for data in shared]
++                original_gvas = [data.block_gvas_arr for data in shared]
++                receiver = object.__new__(KVCacheStoreLayerRecvingThread)
++                receiver.build_shared_data = MagicMock(side_effect=shared if has_shared_data else [None, None])
++                worker.kv_recv_thread = receiver
++
++                worker._build_shared_load_data()
++
++                self.assertEqual(receiver.build_shared_data.call_count, 2)
++                for layer in range(2):
++                    for group in range(2):
++                        self.assertIs(
++                            worker.layer_load_tasks[layer][group].shared_block_data,
++                            shared[group] if has_shared_data else None,
++                        )
++                for group in range(2):
++                    self.assertIs(shared[group].block_ids_arr, original_ids[group])
++                    self.assertIs(shared[group].block_gvas_arr, original_gvas[group])
++
+     def test_mtp_load_uses_safe_extent_not_store_skip_extent(self):
+         worker = self._make_worker()
+         worker.use_eagle = True
+diff --git a/vllm_ascend/distributed/kv_transfer/kv_pool/ascend_store/pool_scheduler.py b/vllm_ascend/distributed/kv_transfer/kv_pool/ascend_store/pool_scheduler.py
+index 53880349b..d3ace1b6f 100644
+--- a/vllm_ascend/distributed/kv_transfer/kv_pool/ascend_store/pool_scheduler.py
++++ b/vllm_ascend/distributed/kv_transfer/kv_pool/ascend_store/pool_scheduler.py
+@@ -514,9 +514,11 @@ class KVPoolScheduler:
+             # a sequential prefix scan (stop at first miss), so blocks whose
+             # (group, hash) state is cached are resolved without any RPC.
+             hit_cache = self._lw_block_hit_cache
+-            if self.dspark_prefix_keys is not None:
+-                # A paired prefix may be saved or evicted between requests.
+-                # Recheck target and all draft replicas on every lookup.
++            if self.layerwise_offload or self.dspark_prefix_keys is not None:
++                # Reused buffers do not retain every layer's local prefix KV.
++                # A stale miss would skip its restore; a stale hit may refer
++                # to evicted KV. Recheck host readability on every lookup.
++                # DSpark likewise requires fresh target and draft coverage.
+                 hit_cache = {}
+             now = time.monotonic()
+             if len(hit_cache) > self._lw_hit_cache_max:
+diff --git a/vllm_ascend/distributed/kv_transfer/kv_pool/ascend_store/pool_worker.py b/vllm_ascend/distributed/kv_transfer/kv_pool/ascend_store/pool_worker.py
+index 65cad01aa..fbeb5732f 100644
+--- a/vllm_ascend/distributed/kv_transfer/kv_pool/ascend_store/pool_worker.py
++++ b/vllm_ascend/distributed/kv_transfer/kv_pool/ascend_store/pool_worker.py
+@@ -83,6 +83,7 @@ from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.metadata import (
+     LayerMultiBlockReqMeta,
+     LayerTransferTask,
+     ReqMeta,
++    SharedBlockData,
+     block_hash_to_str,
+     get_block_hashes,
+     get_group_block_size,
+@@ -2537,30 +2538,56 @@ class KVPoolWorker:
+                         task.cached_process_tokens = cached
+ 
+     def _build_shared_load_data(self) -> None:
+-        """Build shared block data once and attach to all layer load tasks.
+-
+-        In multi-group mode, shared data is built per-group because each
+-        group has different block_ranges (different effective_block_size).
+-        """
++        """Share load metadata, preserving layer-specific selections for reuse."""
+         if not isinstance(self.kv_recv_thread, KVCacheStoreLayerRecvingThread):
+             return
+-        for group_id in range(self.num_kv_cache_groups):
+-            first_task = None
+-            for layer_id in range(self.num_layers):
+-                for task in self.layer_load_tasks[layer_id]:
+-                    if task.group_id == group_id:
+-                        first_task = task
+-                        break
+-                if first_task:
+-                    break
+-            if first_task is None:
+-                continue
+-            shared = self.kv_recv_thread.build_shared_data(first_task)
+-            if shared is not None:
++        if not self.layerwise_offload:
++            # Ordinary layerwise storage has the same load range per group.
++            # Preserve its single-build path without selection snapshots.
++            for group_id in range(self.num_kv_cache_groups):
++                first_task = None
+                 for layer_id in range(self.num_layers):
+                     for task in self.layer_load_tasks[layer_id]:
+                         if task.group_id == group_id:
+-                            task.shared_block_data = shared
++                            first_task = task
++                            break
++                    if first_task:
++                        break
++                if first_task is None:
++                    continue
++                shared = self.kv_recv_thread.build_shared_data(first_task)
++                if shared is not None:
++                    for layer_id in range(self.num_layers):
++                        for task in self.layer_load_tasks[layer_id]:
++                            if task.group_id == group_id:
++                                task.shared_block_data = shared
++            return
++        for group_id in range(self.num_kv_cache_groups):
++            shared_by_ranges: dict[
++                tuple[bool, tuple[tuple[int, int, int, int | None], ...]], SharedBlockData | None
++            ] = {}
++            for layer_id in range(self.num_layers):
++                for task in self.layer_load_tasks[layer_id]:
++                    if task.group_id != group_id:
++                        continue
++                    # Independent layers retain local prefix KV, while reused
++                    # layers must restore it, including any partial block.
++                    # Request identity also matters: different requests can
++                    # select the same logical range but different blocks/GVAs.
++                    ranges = tuple(
++                        (id(r.request), r.start_block, r.end_block, r.partial_block_index) for r in task.block_ranges
++                    )
++                    key = (task.use_key_major_ranges, ranges)
++                    if key not in shared_by_ranges:
++                        shared = self.kv_recv_thread.build_shared_data(task)
++                        if shared is not None:
++                            # The builder reuses scratch arrays on the next
++                            # call; retain each selection's own snapshot.
++                            shared.block_ids_arr = shared.block_ids_arr.copy()
++                            if shared.block_gvas_arr is not None:
++                                shared.block_gvas_arr = shared.block_gvas_arr.copy()
++                        shared_by_ranges[key] = shared
++                    task.shared_block_data = shared_by_ranges[key]
+ 
+     def _compute_reachable_store_masks(
+         self,

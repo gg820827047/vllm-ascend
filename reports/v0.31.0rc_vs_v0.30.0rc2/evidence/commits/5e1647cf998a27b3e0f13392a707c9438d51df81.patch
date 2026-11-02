@@ -1,0 +1,241 @@
+commit 5e1647cf998a27b3e0f13392a707c9438d51df81
+Author:     yulun <100981785+Big2Wheel@users.noreply.github.com>
+AuthorDate: Thu Oct 15 09:12:48 2026 +0800
+Commit:     GitHub <noreply@github.com>
+CommitDate: Thu Oct 15 09:12:48 2026 +0800
+
+    [BugFix][Attention] Fix FA3 mixed speculative decode semantics (#18068)
+    
+    ### What this PR does / why we need it?
+    
+    Fix FA3 mixed prefill/speculative-decode semantics:
+    - Slice prefill block-table rows by request count, not decode token
+    count.
+    - Rebase prefill query offsets after slicing; pure prefill reuses the
+    original offsets.
+    - Enable causal attention for multi-token decode verification.
+    
+    Fixes #17991. The independent physical-page addressing fix, including
+    `_as_fa3_paged_cache` and page-ID remapping, has been moved to #18729
+    and is not included in this PR.
+    
+    Credit @rrrinx's #17774 for the overlapping request-based slice
+    correction and its review for the offset-rebasing concern. #18070
+    independently overlaps the mixed-batch fixes. Maintainers can coordinate
+    merge order; we can rebase away overlapping changes.
+    
+    ### Does this PR introduce _any_ user-facing change?
+    
+    Correct mixed-batch metadata and speculative causal semantics in FA3. No
+    new flags, Scheduler/COW changes, allocation changes, or changes to the
+    default FIA path. No FULL_DECODE_ONLY support is added.
+    
+    This PR does not fix strided physical KV pages. Environments
+    encountering that separate bug need #18729 as well; fixing metadata
+    alone is not a claim that every real-model layout works.
+    
+    ### How was this patch tested?
+    
+    2026-10-14 split validation: **7 passed in 20.28s** on A2 device 6 using
+    this PR's own `fa3_v1.py`, without the other PR's fix. Existing nightly
+    runtime retained (not a full latest-main rebuild). No real-model E2E
+    rerun is claimed.
+    
+    - Restored the focused 7-case mixed-batch suite using dense KV and an
+    independent CPU FP32 causal reference: mixed/pure prefill/decode,
+    multi-token verification, block boundaries, variable lengths, and
+    pure-prefill offset reuse. This suite previously passed on A2; reference
+    logic and tolerances are unchanged.
+    - Retained the Qwen3-0.6B ngram-vs-ordinary-decode model regression.
+    Earlier real-model runs passed with both fixes applied (192 token IDs
+    matched); that is combined integration evidence, not standalone
+    certification of this PR.
+    - Full `bash format.sh ci` and CI configuration validation passed after
+    splitting. The focused test file is registered in
+    `estimated_times.yaml`.
+    - Earlier real-model integration used A2 / BF16 / eager / ngram with
+    both fixes; the independent split regression below does not certify
+    standalone real-model E2E.
+    
+    - vLLM main:
+    https://github.com/vllm-project/vllm/commit/c4df37dfcc7f72ca41cd43801a468526ecf99a2b
+    
+    ---------
+    
+    Signed-off-by: Big2Wheel <1404207590@qq.com>
+
+diff --git a/.github/workflows/scripts/estimated_times.yaml b/.github/workflows/scripts/estimated_times.yaml
+index 914c4691a..5eb97f629 100644
+--- a/.github/workflows/scripts/estimated_times.yaml
++++ b/.github/workflows/scripts/estimated_times.yaml
+@@ -57,6 +57,7 @@ estimated_times:
+   tests/e2e/pull_request/one_card/spec_decode/test_ngram_npu.py: 250
+   tests/e2e/pull_request/one_card/spec_decode/test_suffix.py: 220
+   tests/e2e/pull_request/one_card/rlhf/consistency/test_attention_fa3.py: 30
++  tests/e2e/pull_request/one_card/rlhf/consistency/test_fa3_mixed_batches.py: 60
+   tests/e2e/pull_request/one_card/rlhf/test_trace_replay.py: 30
+   tests/e2e/pull_request/one_card/test_completion_with_prompt_embeds.py: 200
+   tests/e2e/pull_request/one_card/test_cpu_offloading.py: 250
+diff --git a/tests/e2e/pull_request/one_card/rlhf/consistency/test_attention_fa3.py b/tests/e2e/pull_request/one_card/rlhf/consistency/test_attention_fa3.py
+index c721623b5..0e1336b6c 100644
+--- a/tests/e2e/pull_request/one_card/rlhf/consistency/test_attention_fa3.py
++++ b/tests/e2e/pull_request/one_card/rlhf/consistency/test_attention_fa3.py
+@@ -156,3 +156,28 @@ def test_fa3_vs_fia_logprobs():
+                     f"'{fia_token_lp[token_id].decoded_token}'): "
+                     f"logprobs differ: FIA {fia_logprob:.6f} vs FA3 {fa3_logprob:.6f}"
+                 )
++
++
++@pytest.mark.skipif(not _fa3_available(), reason="flash_attn_npu_v3 is not installed")
++def test_fa3_mixed_speculative_decoding():
++    """Compare ngram and ordinary decode with short/long prompts."""
++    prompts = ["ab " * 12, "cd " * 12, "The quick brown fox jumps over the lazy dog. " * 30]
++    kwargs = dict(
++        additional_config=FA3_ADDITIONAL_CONFIG,
++        max_num_seqs=4,
++        max_num_batched_tokens=64,
++        enable_prefix_caching=False,
++    )
++    baseline = _generate_with_backend(prompts, max_tokens=24, **kwargs)
++    speculative = _generate_with_backend(
++        prompts,
++        max_tokens=24,
++        speculative_config={
++            "method": "ngram",
++            "num_speculative_tokens": 2,
++            "prompt_lookup_min": 2,
++            "prompt_lookup_max": 4,
++        },
++        **kwargs,
++    )
++    _assert_outputs_match(baseline, speculative, label="[MixedSpeculative] ")
+diff --git a/tests/e2e/pull_request/one_card/rlhf/consistency/test_fa3_mixed_batches.py b/tests/e2e/pull_request/one_card/rlhf/consistency/test_fa3_mixed_batches.py
+new file mode 100644
+index 000000000..01e4368c8
+--- /dev/null
++++ b/tests/e2e/pull_request/one_card/rlhf/consistency/test_fa3_mixed_batches.py
+@@ -0,0 +1,96 @@
++"""Real-NPU regression for FA3 mixed prefill and speculative decode batches."""
++
++from types import SimpleNamespace
++
++import pytest
++import torch
++
++
++@pytest.mark.parametrize(
++    "q_lens,kv_lens,num_decodes",
++    [
++        ([3, 5], [5, 133], 1),
++        ([1, 1], [129, 257], 2),
++        ([3], [5], 1),
++        ([10], [10], 0),
++        ([1, 129], [129, 257], 1),
++        ([3, 1, 7], [129, 257, 133], 2),
++    ],
++)
++def test_fa3_mixed_paged_attention(q_lens, kv_lens, num_decodes):
++    pytest.importorskip("flash_attn_npu_v3")
++    # Import lazily: FA3 is an optional dependency; initialize the ops package
++    # before attention modules to avoid their circular import during collection.
++    import vllm_ascend.ops  # noqa: F401
++    from vllm_ascend.attention.fa3_v1 import AscendFAImpl
++
++    torch.manual_seed(42)
++    block_size, heads, kv_heads, head_size, blocks = 128, 8, 2, 128, 12
++    # Use dense K/V to isolate metadata semantics from physical-page layout.
++    k_cpu = torch.randn(blocks, block_size, kv_heads, head_size, dtype=torch.bfloat16)
++    v_cpu = torch.randn_like(k_cpu)
++    k, v = k_cpu.npu(), v_cpu.npu()
++    table = torch.tensor([[7, 2, 10], [9, 1, 6], [11, 4, 3]][: len(q_lens)], dtype=torch.int32)
++    q_cpu = torch.randn(sum(q_lens), heads, head_size, dtype=torch.bfloat16)
++    expected = []
++    start = 0
++    for i, (nq, nk) in enumerate(zip(q_lens, kv_lens)):
++        keys = (
++            k_cpu[table[i].long()].reshape(-1, kv_heads, head_size)[:nk].float().repeat_interleave(heads // kv_heads, 1)
++        )
++        values = (
++            v_cpu[table[i].long()].reshape(-1, kv_heads, head_size)[:nk].float().repeat_interleave(heads // kv_heads, 1)
++        )
++        logits = torch.einsum("qhd,khd->hqk", q_cpu[start : start + nq].float(), keys) * head_size**-0.5
++        mask = torch.arange(nk)[None, :] > torch.arange(nq)[:, None] + nk - nq
++        logits.masked_fill_(mask[None], float("-inf"))
++        expected.append(torch.einsum("hqk,khd->qhd", logits.softmax(-1), values))
++        start += nq
++    cu = torch.tensor([0, *torch.tensor(q_lens).cumsum(0).tolist()], dtype=torch.int32)
++    meta = SimpleNamespace(
++        actual_seq_lengths_q=cu[1:].tolist(),
++        num_decodes=num_decodes,
++        num_decode_tokens=sum(q_lens[:num_decodes]),
++        num_prefills=len(q_lens) - num_decodes,
++        block_tables=table.npu(),
++        query_start_loc=cu.npu(),
++        seq_lens=torch.tensor(kv_lens, dtype=torch.int32),
++    )
++    impl = AscendFAImpl.__new__(AscendFAImpl)
++    impl.key_cache, impl.value_cache = k, v
++    impl.num_kv_heads, impl.head_size, impl.scale = kv_heads, head_size, head_size**-0.5
++    query = q_cpu.npu()
++    actual = impl.forward_impl(query, None, None, (k, v), meta, torch.empty_like(query))
++    torch.testing.assert_close(actual.float().cpu(), torch.cat(expected), atol=0.02, rtol=0.02)
++
++
++def test_fa3_pure_prefill_reuses_query_offsets(monkeypatch):
++    pytest.importorskip("flash_attn_npu_v3")
++    import vllm_ascend.ops  # noqa: F401
++    from vllm_ascend.attention.fa3_v1 import AscendFAImpl
++
++    query = torch.zeros(8, 2, 128, device="npu", dtype=torch.bfloat16)
++    offsets = torch.tensor([0, 3, 8], device="npu", dtype=torch.int32)
++    meta = SimpleNamespace(
++        actual_seq_lengths_q=[3, 8],
++        num_decodes=0,
++        num_decode_tokens=0,
++        num_prefills=2,
++        block_tables=torch.zeros(2, 1, device="npu", dtype=torch.int32),
++        query_start_loc=offsets,
++        seq_lens=torch.tensor([3, 5], dtype=torch.int32),
++    )
++    impl = AscendFAImpl.__new__(AscendFAImpl)
++    calls = []
++
++    def capture(query, block_table, actual_seq_lengths, seq_lens, is_causal, max_seq_len):
++        # Subtracting zero would allocate a new tensor; pure prefill must pass
++        # the original object straight through to the attention wrapper.
++        assert actual_seq_lengths is offsets
++        assert is_causal
++        calls.append(actual_seq_lengths)
++        return query
++
++    monkeypatch.setattr(impl, "_flash_attn_with_kvcache", capture)
++    impl.forward_impl(query, None, None, (), meta, torch.empty_like(query))
++    assert len(calls) == 1
+diff --git a/vllm_ascend/attention/fa3_v1.py b/vllm_ascend/attention/fa3_v1.py
+index 346c933bb..61e3465bb 100644
+--- a/vllm_ascend/attention/fa3_v1.py
++++ b/vllm_ascend/attention/fa3_v1.py
+@@ -119,17 +119,20 @@ class AscendFAImpl(AscendAttentionBackendImpl):
+                     attn_metadata.block_tables[:num_decodes, :],
+                     attn_metadata.query_start_loc[: num_decodes + 1],
+                     attn_metadata.seq_lens[:num_decodes].npu(),
+-                    False,
++                    num_decode_tokens > num_decodes,
+                     max(attn_metadata.seq_lens[:num_decodes]),
+                 )
+             )
+ 
+         if num_prefills > 0:
++            prefill_query_start_loc = attn_metadata.query_start_loc
++            if num_decode_tokens > 0:
++                prefill_query_start_loc = prefill_query_start_loc[num_decodes:] - num_decode_tokens
+             outputs.append(
+                 self._flash_attn_with_kvcache(
+                     query[num_decode_tokens:],
+-                    attn_metadata.block_tables[num_decode_tokens:, :],
+-                    attn_metadata.query_start_loc[num_decodes:],
++                    attn_metadata.block_tables[num_decodes:, :],
++                    prefill_query_start_loc,
+                     attn_metadata.seq_lens[num_decodes:].npu(),
+                     True,  # enable causal for prefill
+                     max(attn_metadata.seq_lens[num_decodes:]),

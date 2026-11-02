@@ -1,0 +1,154 @@
+commit e5fd02646e2c9bf68c02bceb3e193f852f84e21f
+Author:     weiguihua2 <984323595@qq.com>
+AuthorDate: Tue Oct 20 09:32:31 2026 +0800
+Commit:     GitHub <noreply@github.com>
+CommitDate: Tue Oct 20 09:32:31 2026 +0800
+
+    [BugFix][MRV2] Repair query padding for replicated PCP graph replay (#19192)
+    
+    ### What this PR does / why we need it?
+    
+    Repair stale query offsets in replicated PCP decode batches when
+    upstream has already padded both the token and request counts. For
+    example, a batch captured for 32 query tokens can arrive with offsets
+    ending in `[..., 31, 31]`; the existing early return skips padding
+    because both capacities already match, and FULL graph replay then
+    receives a query length of 31 instead of 32.
+    
+    Check the query-offset extent as well as token and request capacities,
+    so the existing padding path restores the canonical global query layout.
+    Extend the existing unit regression to cover already-padded request
+    metadata and add DCP2 to the existing Qwen3-8B PCP2 Eagle3 accuracy
+    case, keeping its goldens and acceptance thresholds unchanged.
+    
+    ### Does this PR introduce _any_ user-facing change?
+    
+    Fixes FULL graph replay failures for replicated PCP+DCP decode batches,
+    including Eagle3. No public API or configuration changes.
+    
+    ### How was this patch tested?
+    
+    On Ascend A3 with vLLM **v0.31.0 (`db9527a4`)** and Ascend baseline
+    **`836f32777`**, using the exact final files in this branch:
+    
+    ```bash
+    python3 -m pytest -q \
+      tests/ut/worker/test_pcp_manager_v2.py \
+      tests/ut/attention/test_gqa_dcp_split.py \
+      tests/ut/attention/test_attention_v1.py
+    
+    python3 -m pytest -sv \
+      tests/e2e/pull_request/four_card/context_parallel/test_accuracy_v2.py::test_eagle3_gqa_spec_decode_with_pcp
+    ```
+    
+    - Targeted unit suites: **188 passed**.
+    - Four-NPU Qwen3-8B: **1 passed** (99.24 s). TP2, PCP2, DCP2, Model
+    Runner V2, FULL_DECODE_ONLY, Eagle3 with three speculative tokens.
+    Checks the existing five-token golden prefixes after generating 32
+    tokens per prompt, and the existing per-position acceptance assertions.
+    - Per-position acceptance: **54.17%, 27.08%, 18.75%**, satisfying the
+    unchanged minima **54%, 29%, 15%** with the existing 3-percentage-point
+    tolerance.
+    - Logs confirm actual Eagle3 draft graph replay in both prefill and
+    decode phases. Full generated text, token IDs, finish reasons and JUnit
+    results were retained.
+    - Ruff 0.14.0 check, format check and `git diff --check` passed for all
+    three changed files.
+    
+    Validation uses the pinned vLLM 0.31.0 combination above; the current
+    upstream-main dependency combination and other cases in this E2E file
+    were not rerun. Single-rank serving bypasses the PCP manager and cannot
+    exercise this branch.
+    
+    - vLLM main:
+    https://github.com/vllm-project/vllm/commit/c4df37dfcc7f72ca41cd43801a468526ecf99a2b
+    
+    ---------
+    
+    Signed-off-by: weiguihua2 <984323595@qq.com>
+
+diff --git a/tests/e2e/pull_request/four_card/context_parallel/test_accuracy_v2.py b/tests/e2e/pull_request/four_card/context_parallel/test_accuracy_v2.py
+index 2edc4fc11..fec7bf99d 100644
+--- a/tests/e2e/pull_request/four_card/context_parallel/test_accuracy_v2.py
++++ b/tests/e2e/pull_request/four_card/context_parallel/test_accuracy_v2.py
+@@ -450,7 +450,7 @@ MTP_PCP_CASE = AccuracyCase(
+ 
+ 
+ EAGLE3_PCP_CASE = AccuracyCase(
+-    name="eagle3_gqa_pcp",
++    name="eagle3_gqa_pcp_dcp",
+     model=EAGLE3_PCP_TARGET_MODEL,
+     prompts=ACCURACY_PROMPTS,
+     expected_outputs=EAGLE3_PCP_GOLDENS,
+@@ -460,6 +460,7 @@ EAGLE3_PCP_CASE = AccuracyCase(
+     runner_kwargs={
+         "tensor_parallel_size": 2,
+         "prefill_context_parallel_size": 2,
++        "decode_context_parallel_size": 2,
+         "max_model_len": 2048,
+         "max_num_seqs": 256,
+         "distributed_executor_backend": "mp",
+@@ -507,7 +508,7 @@ def test_mtp_mla_spec_decode_with_pcp() -> None:
+ @pytest.mark.e2e_coverage(
+     arch="dense",
+     feature="eagle3,chunked_prefill",
+-    parallel="TP,PCP",
++    parallel="TP,PCP,DCP",
+     deploy="pd_mix",
+     hardware="A3",
+     quantization="BF16",
+@@ -523,7 +524,7 @@ def test_mtp_mla_spec_decode_with_pcp() -> None:
+ )
+ @wait_until_npu_memory_free(target_free_percentage=0.8)
+ def test_eagle3_gqa_spec_decode_with_pcp() -> None:
+-    """Verify MRV2 Eagle3 PCP output accuracy and acceptance in one generation."""
++    """Verify MRV2 Eagle3 PCP+DCP output accuracy and acceptance in one generation."""
+     _run_accuracy_case(EAGLE3_PCP_CASE)
+ 
+ 
+diff --git a/tests/ut/worker/test_pcp_manager_v2.py b/tests/ut/worker/test_pcp_manager_v2.py
+index 90e089c97..678c2e751 100644
+--- a/tests/ut/worker/test_pcp_manager_v2.py
++++ b/tests/ut/worker/test_pcp_manager_v2.py
+@@ -402,7 +402,8 @@ def _make_replicated_pcp_manager():
+     return manager
+ 
+ 
+-def test_partition_batch_pads_decode_requests_when_tokens_are_already_padded():
++@pytest.mark.parametrize("requests_already_padded", [False, True])
++def test_partition_batch_pads_decode_requests_when_tokens_are_already_padded(requests_already_padded):
+     """Keep request metadata aligned when upstream already pads tokens."""
+     input_buffers = AscendInputBuffers(
+         max_num_reqs=4,
+@@ -459,6 +460,13 @@ def test_partition_batch_pads_decode_requests_when_tokens_are_already_padded():
+     input_buffers.is_padding[:4].fill_(False)
+     input_buffers.query_start_loc[:5].copy_(torch.tensor([0, 1, 2, 3, -1], dtype=torch.int32))
+     input_buffers.seq_lens[:4].copy_(torch.tensor([11, 21, 31, 99], dtype=torch.int32))
++    if requests_already_padded:
++        local_batch.num_reqs_after_padding = 4
++        local_batch.query_start_loc = input_buffers.query_start_loc[:5]
++        local_batch.query_start_loc_np = np.array([0, 1, 2, 3, 3], dtype=np.int32)
++        local_batch.query_start_loc.copy_(torch.from_numpy(local_batch.query_start_loc_np))
++        local_batch.seq_lens = input_buffers.seq_lens[:4]
++        local_batch.seq_lens_cpu_upper_bound = torch.tensor([11, 21, 31, 0], dtype=torch.int32)
+ 
+     manager = _make_replicated_pcp_manager()
+     manager._input_buffers = input_buffers
+diff --git a/vllm_ascend/worker/v2/pcp_manager.py b/vllm_ascend/worker/v2/pcp_manager.py
+index 79e9001fc..2fd8a134f 100644
+--- a/vllm_ascend/worker/v2/pcp_manager.py
++++ b/vllm_ascend/worker/v2/pcp_manager.py
+@@ -404,7 +404,12 @@ class AscendPCPManager(PCPManager):
+         # graph capture layout.
+         needs_token_padding = graph_num_tokens > local_batch.num_tokens_after_padding
+         needs_request_padding = graph_num_reqs > local_batch.num_reqs_after_padding
+-        if not is_decode_only or not (needs_token_padding or needs_request_padding):
++        # Upstream may pad request capacity without extending query offsets.
++        needs_query_padding = (
++            global_batch.query_start_loc_np.size > graph_num_reqs
++            and local_batch.query_start_loc_np[-1] != global_batch.query_start_loc_np[graph_num_reqs]
++        )
++        if not is_decode_only or not (needs_token_padding or needs_request_padding or needs_query_padding):
+             return local_batch
+ 
+         assert self._input_buffers is not None

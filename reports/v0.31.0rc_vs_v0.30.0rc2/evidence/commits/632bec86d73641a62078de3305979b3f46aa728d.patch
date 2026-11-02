@@ -1,0 +1,218 @@
+commit 632bec86d73641a62078de3305979b3f46aa728d
+Author:     Tou You <13476117628@163.com>
+AuthorDate: Tue Oct 13 16:50:35 2026 +0800
+Commit:     GitHub <noreply@github.com>
+CommitDate: Tue Oct 13 16:50:35 2026 +0800
+
+    [BugFix][310P] fix Qwen3.5-2B-w8a8 performance issue on the 310P (#18390)
+    
+    ### What this PR does / why we need it?
+    On Ascend 310P MRV2, #17278 restored Qwen3.5-2B MTP decode performance
+    by skipping empty updatable-graph handshakes and avoiding redundant D2H
+    syncs on the FULL ACLGraph path. Later #17461 remapped MTP verify
+    attention state from `SpecDecoding` to `ChunkedPrefill` in shared
+    helpers (validated on 910-class devices, not on 310P). The 310P eager
+    gate still treats any non-`SpecDecoding` MTP batch as unsafe for FULL
+    replay, so every uniform MTP step was forced to `CUDAGraphMode.NONE`.
+    That erased the #17278 gains and regressed 2B-W8A8 decode by ~3× (TPOT
+    ~64ms / ~15 tok/s vs ~22ms / ~45 tok/s) even though draft acceptance
+    stayed healthy.
+    
+    This PR is scoped to `_310p` only: promote uniform MTP verify back to
+    `SpecDecoding` for InputBatch + the eager gate (MRv1 parity), align
+    draft-prefill metadata with SpecDecoding capture, and resolve the GDN
+    chunk FwdH op under both pre-/post-#17997 symbol names for stale
+    extensions.
+    
+    ### Does this PR introduce _any_ user-facing change?
+    No. No new public APIs or config knobs. Behavior change is limited to
+    Ascend 310P MRV2 speculative decoding / GDN chunk-op symbol resolution.
+    
+    ### How was this patch tested?
+    
+    - Unit: tests/ut/_310p/test_model_runner_v2_310p.py (SpecDecoding
+    promote + eager gate); tests/ut/_310p/spec_decode/test_mtp_mrv2_310.py
+    (draft-prefill SpecDecoding).
+    
+    - E2E (310P, NPU, VLLM_USE_V2_MODEL_RUNNER=1, IO=1024, TP1, BS1, 4
+    prompts, --no-enable-prefix-caching):
+    
+    Qwen3.5-2B-W8A8 MTP: TPOT 22.7 ms, output 43.1 tok/s (was ~63.6 ms /
+    ~15.6 tok/s).
+    Same setup no MTP: TPOT 21.9 ms, output 44.6 tok/s (MTP ≈ no-MTP; no
+    severe MTP regression).
+    
+    Other testing results for Qwen3.5-w8a8(MRv2) on the 310P:
+    
+    Qwen3.5 | TP/IO/BS/num | TTFT | TPOT | Out tok/s | Total tok/s
+    -- | -- | -- | -- | -- | --
+    2B-w8a8 | 1-1024-1024-1-4 | 609.4 | 22.2 | 44.0 | 91.6
+    4B-w8a8 | 1-1024-1024-1-4 | 1139.6 | 35.5 | 27.34 | 56.9
+    9B-w8a8 | 2-1024-1024-1-4 | 851.2 | 32.1 | 30.36 | 63.44
+    35B-A3B-w8a8 | 2-1024-1024-1-4 | 1227.8 | 25.1 | 38.02 | 79.20
+    
+    
+    - vLLM main:
+    https://github.com/vllm-project/vllm/commit/8cc9aa5ad350f6f80cf3bebb298d410803ff75a9
+    
+    ---------
+    
+    Signed-off-by: Thiagor2002 <13476117628@163.com>
+
+diff --git a/tests/ut/_310p/test_model_runner_v2_310p.py b/tests/ut/_310p/test_model_runner_v2_310p.py
+index 7bf3659b4..eefbedb37 100644
+--- a/tests/ut/_310p/test_model_runner_v2_310p.py
++++ b/tests/ut/_310p/test_model_runner_v2_310p.py
+@@ -389,6 +389,61 @@ def test_prepare_inputs_dispatches_to_310p_implementation() -> None:
+     prepare_inputs_310p.assert_called_once_with(scheduler_output, batch_desc)
+ 
+ 
++def test_promote_mtp_spec_decoding_keeps_uniform_mtp_on_full_graph() -> None:
++    """Uniform MTP promote to SpecDecoding; non-uniform stays eager-eligible."""
++    from vllm_ascend.attention.attention_v1 import AscendAttentionState
++
++    runner = object.__new__(NPUModelRunner310V2)
++    runner.speculative_config = SimpleNamespace(method="mtp", num_speculative_tokens=1)
++    runner.decode_query_len = 2
++    num_valid = np.array([1, 1], dtype=np.int32)
++
++    # Helper: uniform verify must become SpecDecoding after #17461 ChunkedPrefill.
++    assert (
++        runner._promote_mtp_spec_decoding_attn_state(
++            AscendAttentionState.ChunkedPrefill,
++            num_reqs=2,
++            num_scheduled_tokens=np.array([2, 2], dtype=np.int32),
++            num_valid_tokens=num_valid,
++        )
++        == AscendAttentionState.SpecDecoding
++    )
++    # Helper: mixed lengths must not promote (remain ChunkedPrefill → eager).
++    assert (
++        runner._promote_mtp_spec_decoding_attn_state(
++            AscendAttentionState.ChunkedPrefill,
++            num_reqs=2,
++            num_scheduled_tokens=np.array([2, 3], dtype=np.int32),
++            num_valid_tokens=num_valid,
++        )
++        == AscendAttentionState.ChunkedPrefill
++    )
++
++    # Eager gate must call promote: uniform MTP + ChunkedPrefill → not force eager.
++    runner.compilation_config = SimpleNamespace(
++        cudagraph_mode=SimpleNamespace(has_full_cudagraphs=lambda: True),
++    )
++    runner.kv_cache_config = None
++    runner.vllm_config = _make_vllm_config(speculative_config=runner.speculative_config)
++    runner.req_states = SimpleNamespace(
++        req_id_to_index={"r0": 0},
++        num_computed_tokens_np=np.array([128], dtype=np.int32),
++    )
++    scheduler_output = SimpleNamespace(
++        num_scheduled_tokens={"r0": 2},
++        scheduled_spec_decode_tokens={"r0": [7]},
++        total_num_scheduled_tokens=2,
++        scheduled_new_reqs=[],
++        scheduled_cached_reqs=None,
++    )
++    with patch.object(
++        model_runner_module,
++        "build_attn_state",
++        return_value=AscendAttentionState.ChunkedPrefill,
++    ):
++        assert runner._scheduler_output_needs_spec_eager(scheduler_output) is False
++
++
+ def test_post_update_cpu_matches_upstream_bookkeeping() -> None:
+     idx_mapping_np = np.array([1, 0], dtype=np.int32)
+     query_start_loc_np = np.array([0, 2, 4], dtype=np.int32)
+diff --git a/vllm_ascend/_310p/worker/v2/model_runner.py b/vllm_ascend/_310p/worker/v2/model_runner.py
+index c00aa4f32..4a5325d04 100644
+--- a/vllm_ascend/_310p/worker/v2/model_runner.py
++++ b/vllm_ascend/_310p/worker/v2/model_runner.py
+@@ -249,6 +249,15 @@ class NPUModelRunner310V2(NPUModelRunner):
+             num_valid_tokens,
+             kv_cache_config=self.kv_cache_config,
+         )
++        # Shared build_attn_state (#17461) maps MTP verify → ChunkedPrefill.
++        # 310P FULL capture/replay still uses SpecDecoding (splitfuse); promote
++        # so InputBatch matches ACLGraph make_dummy and pad logic (MRv1 parity).
++        attn_state = self._promote_mtp_spec_decoding_attn_state(
++            attn_state,
++            num_reqs=num_reqs,
++            num_scheduled_tokens=num_scheduled_tokens,
++            num_valid_tokens=num_valid_tokens,
++        )
+         idx_mapping_np = self._idx_mapping.np[:num_reqs]
+         idx_mapping_np[:] = np.fromiter(
+             map(self.req_states.req_id_to_index.get, req_ids),
+@@ -537,8 +546,46 @@ class NPUModelRunner310V2(NPUModelRunner):
+         )
+         from vllm_ascend.attention.attention_v1 import AscendAttentionState
+ 
++        # After #17461, uniform MTP verify is ChunkedPrefill in shared helpers.
++        # Without promotion this gate forced CUDAGraphMode.NONE every decode
++        # step and erased the #17278 FULL-replay gains on small 310P models.
++        attn_state = self._promote_mtp_spec_decoding_attn_state(
++            attn_state,
++            num_reqs=num_reqs,
++            num_scheduled_tokens=num_scheduled,
++            num_valid_tokens=num_valid_tokens,
++        )
+         return attn_state != AscendAttentionState.SpecDecoding
+ 
++    def _promote_mtp_spec_decoding_attn_state(
++        self,
++        attn_state: Any,
++        *,
++        num_reqs: int,
++        num_scheduled_tokens: np.ndarray,
++        num_valid_tokens: np.ndarray,
++    ) -> Any:
++        """Map uniform MTP verify batches back to SpecDecoding on 310P.
++
++        Upstream #17461 intentionally uses ChunkedPrefill for MTP on 910-class
++        devices. 310P ACLGraph capture still tags SpecDecoding (splitfuse) via
++        ``ModelAclGraphManager310.make_dummy``; keep runtime/eager-gate aligned.
++        """
++        if self.speculative_config is None or num_reqs <= 0:
++            return attn_state
++        from vllm_ascend.attention.attention_v1 import AscendAttentionState
++
++        if attn_state not in (
++            AscendAttentionState.ChunkedPrefill,
++            AscendAttentionState.SpecDecoding,
++        ):
++            return attn_state
++        if not np.all(num_valid_tokens == 1):
++            return attn_state
++        if not np.all(num_scheduled_tokens == self.decode_query_len):
++            return attn_state
++        return AscendAttentionState.SpecDecoding
++
+     def _install_pc_eager_cudagraph_dispatch(self) -> None:
+         """Wrap ACLGraph dispatch so PrefillCacheHit cannot replay FULL mixed graphs."""
+         manager = self.cudagraph_manager
+diff --git a/vllm_ascend/_310p/worker/v2/spec_decode/mtp_speculator.py b/vllm_ascend/_310p/worker/v2/spec_decode/mtp_speculator.py
+index 5170fe5db..90e09ab75 100644
+--- a/vllm_ascend/_310p/worker/v2/spec_decode/mtp_speculator.py
++++ b/vllm_ascend/_310p/worker/v2/spec_decode/mtp_speculator.py
+@@ -227,11 +227,17 @@ class AscendMTPSpeculator310(AscendAutoRegressiveSpeculator, MTPSpeculator):
+                     dcp_local_seq_lens=dcp_local_seq_lens,
+                 )
+         if attn_metadata is not None:
+-            # Draft attention uses decode state even during graph capture.
++            # Align with draft ACLGraph capture: q_len>1 / step0 → SpecDecoding
++            # (splitfuse); single-token draft-decode → DecodeOnly (PA).
++            q_len = num_tokens_padded // max(num_reqs_padded, 1) if num_reqs_padded else 1
++            use_spec_decoding = step == 0 or num_query_per_req > 1 or q_len > 1
++            draft_attn_state = (
++                AscendAttentionState.SpecDecoding if use_spec_decoding else AscendAttentionState.DecodeOnly
++            )
+             for metadata in attn_metadata.values():
+                 if metadata is None:
+                     continue
+-                metadata.attn_state = AscendAttentionState.DecodeOnly
++                metadata.attn_state = draft_attn_state
+ 
+             # Step 0 is draft prefill; only decode steps update CPU lengths.
+             if step > 0:

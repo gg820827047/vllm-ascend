@@ -1,0 +1,516 @@
+commit bbbf28c32d2992dda5d7b8650daf469e57ba7fe1
+Author:     Wei Yubo <253558990+wei-yubo@users.noreply.github.com>
+AuthorDate: Tue Oct 20 16:47:46 2026 +0800
+Commit:     GitHub <noreply@github.com>
+CommitDate: Tue Oct 20 16:47:46 2026 +0800
+
+    [BugFix][Core] Validate Score encoder cache embedding counts (#18916)
+    
+    ### What this PR does / why we need it?
+    
+    Fixes #19172.
+    
+    Adapt
+    [[vllm-project/vllm#57696](https://github.com/vllm-project/vllm/pull/57696)](https://github.com/vllm-project/vllm/pull/57696),
+    included in vLLM v0.31.0, to `ScoreEncoderCacheManager`.
+    
+    The score manager stores embedding counts in `CacheEntry.num_embeds`,
+    but inherits `get_cached_num_encoder_embeds()` from upstream, which
+    reads `num_embeds_by_hash`. Since the score manager does not populate
+    this dictionary, the query returns `None` for existing entries, allowing
+    incompatible cache hits to bypass the upstream Scheduler's
+    embedding-count validation.
+    
+    **Fix:** Override `get_cached_num_encoder_embeds()` to retrieve the
+    stored count from the CPU cache, falling back to the NPU cache. This
+    supports all cache residency states, follows existing eviction/reset
+    behavior, and reuses upstream request-error handling without duplicating
+    metadata or modifying the Scheduler.
+    
+    ### Does this PR introduce _any_ user-facing change?
+    
+    Yes. Reusing a cached multimodal identifier with a different embedding
+    count now results in `FINISHED_ERROR` before cache-hit admission.
+    
+    Compatible cache hits remain unaffected. Scheduler references are
+    released for rejected requests, and subsequent healthy requests remain
+    schedulable.
+    
+    ### How was this patch tested?
+    
+    **CPU regression tests and CI**
+    
+    - Complete `tests/ut` passed in CI with both [[vLLM
+    v0.31.0](https://github.com/vllm-project/vllm-ascend/actions/runs/38771814661/job/116551073066)](https://github.com/vllm-project/vllm-ascend/actions/runs/38771814661/job/116551073066)
+    and [[pinned upstream
+    main](https://github.com/vllm-project/vllm-ascend/actions/runs/38771814661/job/116551073102)](https://github.com/vllm-project/vllm-ascend/actions/runs/38771814661/job/116551073102).
+    -
+    [[Pre-commit](https://github.com/vllm-project/vllm-ascend/actions/runs/38771814661/job/116549277388)](https://github.com/vllm-project/vllm-ascend/actions/runs/38771814661/job/116549277388)
+    and local formatting checks passed.
+    - Before the fix, 4 manager and 9 Scheduler regression cases failed.
+    After the fix, 49 targeted tests passed.
+    - Coverage includes mismatch directions, CPU/NPU residency, promotion,
+    eviction/reset, duplicate identifiers, reference accounting, and
+    request-error recovery.
+    
+    **Real-NPU functional validation**
+    
+    Tested on Ascend A3 with Qwen2.5-VL-7B-Instruct, BF16, TP=1, Eager mode,
+    and synchronous MRV1 Engine.
+    
+    - **18 functional cases passed:** 153 healthy requests completed and 31
+    incompatible requests ended with `FINISHED_ERROR`.
+    - Validated both 64→256 and 256→64 embedding-count mismatches across
+    CPU-only, CPU temporary-copy, CPU/NPU dual-tier, and NPU-only cache
+    states.
+    - Verified actual NPU cache eviction/reset, reference cleanup, capacity
+    accounting, and successful inference after rejected requests.
+    
+    **Real-NPU performance validation**
+    
+    - Compared baseline and fixed implementations across **six workloads and
+    35 paired runs**, including 14 newly executed pairs.
+    - All **42 primary metrics** met the predefined regression budgets,
+    using 95% confidence interval upper bounds of ≤3% for throughput loss
+    and ≤5% for latency increases (TTFT, TPOT, and end-to-end P50/P95).
+    - No regression exceeding these budgets was established in the tested
+    workloads.
+    
+    ### Validation boundaries and follow-ups
+    
+    - Real-NPU validation was limited to the stated A3, single-device
+    Eager/MRV1 configuration. Other execution modes, models, and distributed
+    configurations were not validated.
+    - Repository-wide NPU/E2E testing and NPU-eviction performance
+    benchmarks were not performed.
+    - Immediate cleanup of Worker temporary H2D copies after partial-hit
+    errors remains a separate follow-up. Scheduler reference cleanup and
+    subsequent inference were verified.
+    - The performance harness and detailed reports are retained outside this
+    PR; committed regression tests cover the core fix.
+    
+    ---
+    
+    ### Checklist
+    
+    #### Testing
+    
+    - [x] **Boundary / edge-case coverage**: Mismatch directions, cache
+    residency, eviction/reset, and duplicate identifiers.
+    - [x] **Regression test**: Confirmed failures before the fix and passing
+    results afterward.
+    - [x] **Error / failure path coverage**: Request isolation, reference
+    cleanup, and recovery.
+    - [x] **Meaningful & reliable tests**: Core cache queries and Scheduler
+    validation were not mocked.
+    - [x] **Performance impact**: Real-NPU baseline/fixed benchmarks
+    completed; no automated performance gate was added.
+    
+    Upstream baseline:
+    https://github.com/vllm-project/vllm/commit/c4df37dfcc7f72ca41cd43801a468526ecf99a2b
+    
+    Signed-off-by: Wei Yubo <253558990+wei-yubo@users.noreply.github.com>
+
+diff --git a/tests/ut/core/test_score_encoder_cache_manager.py b/tests/ut/core/test_score_encoder_cache_manager.py
+index 8e2743d5f..ad8fd2ee8 100644
+--- a/tests/ut/core/test_score_encoder_cache_manager.py
++++ b/tests/ut/core/test_score_encoder_cache_manager.py
+@@ -4,8 +4,11 @@ from unittest.mock import MagicMock
+ 
+ import pytest
+ from transformers import CLIPVisionConfig, Qwen2_5_VLConfig
++from vllm import SamplingParams
+ from vllm.config import EncoderCacheManagerConfig
++from vllm.multimodal.inputs import MultiModalFeatureSpec, PlaceholderRange
+ from vllm.v1.core.encoder_cache_manager import EncoderCacheManager
++from vllm.v1.request import Request
+ 
+ from vllm_ascend.ec_manager.score_ec_manager import (
+     CacheEntry,
+@@ -37,12 +40,21 @@ def _build_manager(
+     )
+ 
+ 
+-def _build_request(request_id: str, mm_hash: str, num_embeds: int):
+-    request = MagicMock()
+-    request.request_id = request_id
+-    request.mm_features = [SimpleNamespace(identifier=mm_hash)]
+-    request.get_num_encoder_embeds.return_value = num_embeds
+-    return request
++def _build_request(request_id: str, mm_hash: str, num_embeds: int) -> Request:
++    return Request(
++        request_id=request_id,
++        prompt_token_ids=[0] * num_embeds,
++        sampling_params=SamplingParams(max_tokens=1),
++        pooling_params=None,
++        mm_features=[
++            MultiModalFeatureSpec(
++                data=None,
++                modality="image",
++                identifier=mm_hash,
++                mm_position=PlaceholderRange(offset=0, length=num_embeds),
++            )
++        ],
++    )
+ 
+ 
+ def test_qualified_class_name_resolves_score_manager():
+@@ -209,16 +221,20 @@ def test_allocate_reuse_promote_free_and_reset_preserve_invariants():
+     manager = _build_manager(npu_cache_size=4, cpu_cache_size=4)
+     request = _build_request("request", "image", 2)
+ 
++    assert manager.get_cached_num_encoder_embeds(request, 0) is None
+     assert manager.can_allocate(request, 0, 2, 0)
+     manager.allocate(request, 0)
+     manager._check_invariant()
++    assert manager.get_cached_num_encoder_embeds(request, 0) == 2
+ 
+     manager.free_encoder_input(request, 0)
+     manager._check_invariant()
++    assert manager.get_cached_num_encoder_embeds(request, 0) == 2
+ 
+     assert manager.check_and_update_cache(request, 0)
+     manager._check_invariant()
+     assert "image" in manager.npu_cache
++    assert manager.get_cached_num_encoder_embeds(request, 0) == 2
+ 
+     metadata = manager.get_manager_metadata()
+     assert metadata.promoting_mm_hashes == ["image"]
+@@ -229,11 +245,83 @@ def test_allocate_reuse_promote_free_and_reset_preserve_invariants():
+ 
+     manager.reset()
+     manager._check_invariant()
++    assert manager.get_cached_num_encoder_embeds(request, 0) is None
+     metadata = manager.get_manager_metadata()
+     assert metadata.npu_freed == []
+     assert metadata.cpu_freed == []
+ 
+ 
++@pytest.mark.parametrize("promote", [False, True])
++def test_cached_embed_count_survives_cpu_eviction_only_if_npu_resident(promote: bool):
++    manager = _build_manager(npu_cache_size=2, cpu_cache_size=2)
++    owner = _build_request("owner", "shared", 2)
++    manager.allocate(owner, 0)
++    manager.free(owner)
++    if promote:
++        assert manager.check_and_update_cache(owner, 0)
++        manager.free(owner)
++
++    # Pressure evicts the CPU copy; an NPU copy, if present, stays reusable.
++    pressure = _build_request("pressure", "other", 2)
++    assert manager.can_allocate(pressure, 0, 2, 0)
++    manager._check_invariant()
++    assert "shared" not in manager.cpu_cache
++    assert manager.get_cached_num_encoder_embeds(owner, 0) == (2 if promote else None)
++
++    if promote:
++        entry = manager.npu_freeable.pop("shared")
++        manager.evict_from_npu(entry)
++        manager._check_invariant()
++        assert manager.get_cached_num_encoder_embeds(owner, 0) is None
++
++    # After the last copy is evicted, the same identifier can have a new size.
++    replacement = _build_request("replacement", "shared", 1)
++    manager.allocate(replacement, 0)
++    assert manager.get_cached_num_encoder_embeds(replacement, 0) == 1
++    manager.free(replacement)
++    manager._check_invariant()
++
++
++def test_zero_cached_embeds_is_distinct_from_cache_miss():
++    manager = _build_manager()
++    request = _build_request("empty", "empty-image", 0)
++
++    assert manager.get_cached_num_encoder_embeds(request, 0) is None
++    manager.allocate(request, 0)
++    assert manager.get_cached_num_encoder_embeds(request, 0) == 0
++    manager.free(request)
++    assert manager.get_cached_num_encoder_embeds(request, 0) == 0
++    manager.reset()
++    assert manager.get_cached_num_encoder_embeds(request, 0) is None
++    manager._check_invariant()
++
++
++def test_cached_embed_count_survives_npu_eviction_and_repromotion():
++    manager = _build_manager(npu_cache_size=2, cpu_cache_size=2)
++    owner = _build_request("owner", "shared", 2)
++    manager.allocate(owner, 0)
++    manager.free(owner)
++    assert manager.check_and_update_cache(owner, 0)
++    manager.free(owner)
++
++    entry = manager.npu_freeable.pop("shared")
++    manager.evict_from_npu(entry)
++    manager._check_invariant()
++    assert "shared" not in manager.npu_cache
++    assert manager.get_cached_num_encoder_embeds(owner, 0) == 2
++
++    assert manager.check_and_update_cache(owner, 0)
++    assert manager.npu_cache["shared"] is manager.cpu_cache["shared"]
++    assert manager.get_cached_num_encoder_embeds(owner, 0) == 2
++    manager._check_invariant()
++
++    # Reset also invalidates actively referenced entries in both tiers.
++    manager.reset()
++    assert manager.get_cached_num_encoder_embeds(owner, 0) is None
++    assert not manager.request_cached_ids
++    manager._check_invariant()
++
++
+ def test_on_request_does_not_run_full_invariant_check():
+     manager = _build_manager()
+     manager.req_cnt = 999
+diff --git a/tests/ut/core/test_score_encoder_cache_scheduler.py b/tests/ut/core/test_score_encoder_cache_scheduler.py
+new file mode 100644
+index 000000000..a1ff0b98c
+--- /dev/null
++++ b/tests/ut/core/test_score_encoder_cache_scheduler.py
+@@ -0,0 +1,224 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++
++from types import SimpleNamespace
++
++import pytest
++import torch
++from vllm import SamplingParams
++from vllm.multimodal.inputs import MultiModalFeatureSpec, PlaceholderRange
++from vllm.v1.core.sched.scheduler import Scheduler
++from vllm.v1.engine import FinishReason
++from vllm.v1.outputs import ModelRunnerOutput
++from vllm.v1.request import Request, RequestStatus
++
++from tests.ut.kv_offload.utils import create_model_runner_output, create_scheduler, create_vllm_config
++from vllm_ascend.ec_manager.score_ec_manager import ScoreEncoderCacheManager
++
++
++def _make_scheduler(npu_slots: int = 8) -> Scheduler:
++    config = create_vllm_config(max_num_batched_tokens=32, block_size=16)
++    config.kv_transfer_config = None
++    config.cache_config.enable_prefix_caching = False
++    scheduler = create_scheduler(config, num_blocks=32)
++    # Supply encoder metadata directly: these CPU tests exercise the real
++    # scheduler without loading a multimodal model or running its processor.
++    config.model_config.hf_config.vision_config = SimpleNamespace(num_heads=1, hidden_size=1, intermediate_size=1)
++    config.ec_manager_config.manager_config = {"cpu_cache_slots": 8}
++    scheduler.encoder_cache_manager = ScoreEncoderCacheManager(npu_slots, config)
++    scheduler.max_num_encoder_input_tokens = 32
++    return scheduler
++
++
++def _request(request_id: str, items: list[tuple[str, list[bool]]]) -> Request:
++    features = []
++    offset = 0
++    for identifier, is_embed in items:
++        features.append(
++            MultiModalFeatureSpec(
++                data=None,
++                modality="image",
++                identifier=identifier,
++                mm_position=PlaceholderRange(offset=offset, length=len(is_embed), is_embed=torch.tensor(is_embed)),
++            )
++        )
++        offset += len(is_embed)
++    return Request(
++        request_id=request_id,
++        prompt_token_ids=[1] * max(offset, 1),
++        sampling_params=SamplingParams(max_tokens=1),
++        pooling_params=None,
++        mm_features=features,
++    )
++
++
++def _seed(manager: ScoreEncoderCacheManager, identifier: str, count: int) -> None:
++    owner = _request(f"owner-{identifier}", [(identifier, [True] * count + [False])])
++    assert manager.can_allocate(owner, 0, 32, 0)
++    manager.allocate(owner, 0)
++    manager.free(owner)
++
++
++def _seed_residency(scheduler: Scheduler, residency: str) -> None:
++    manager = scheduler.encoder_cache_manager
++    _seed(manager, "shared", 3)
++    if residency in ("cpu-npu", "npu"):
++        promoter = _request("promoter", [("shared", [True] * 3)])
++        assert manager.check_and_update_cache(promoter, 0)
++        manager.free(promoter)
++        assert "shared" in manager.npu_cache
++    if residency == "npu":
++        replacement = _request("replacement", [("replacement", [True] * 8)])
++        assert manager.can_allocate(replacement, 0, 32, 0)
++        assert "shared" not in manager.cpu_cache
++    manager.get_manager_metadata()
++    manager._check_invariant()
++
++
++def _capacity(manager: ScoreEncoderCacheManager) -> tuple[int, int, int, int]:
++    return (
++        manager.cpu_num_free_slots,
++        manager.cpu_num_freeable_slots,
++        manager.npu_num_free_slots,
++        manager.npu_num_freeable_slots,
++    )
++
++
++def _assert_error_and_finish(scheduler: Scheduler, request: Request, scheduler_output) -> None:
++    assert scheduler_output.total_num_scheduled_tokens == 0
++    assert not scheduler_output.scheduled_encoder_inputs
++    outputs = scheduler.update_from_output(scheduler_output, ModelRunnerOutput(req_ids=[], req_id_to_index={}))
++    assert request.status == RequestStatus.FINISHED_ERROR
++    assert request.request_id not in scheduler.requests
++    assert request.request_id not in scheduler.encoder_cache_manager.request_cached_ids
++    assert not scheduler.running
++    assert not scheduler.waiting
++    output = outputs[request.client_index].outputs[0]
++    assert output.request_id == request.request_id
++    assert output.finish_reason == FinishReason.ERROR
++
++
++def _assert_success_and_finish(scheduler: Scheduler, request: Request, scheduler_output) -> None:
++    assert scheduler_output.num_scheduled_tokens[request.request_id] == request.num_prompt_tokens
++    outputs = scheduler.update_from_output(scheduler_output, create_model_runner_output([request]))
++    assert request.status == RequestStatus.FINISHED_LENGTH_CAPPED
++    assert request.request_id not in scheduler.requests
++    assert request.request_id not in scheduler.encoder_cache_manager.request_cached_ids
++    assert outputs[request.client_index].outputs[0].finish_reason == FinishReason.LENGTH
++    scheduler.encoder_cache_manager._check_invariant()
++
++
++@pytest.mark.parametrize("residency", ["cpu", "cpu-no-promotion", "cpu-npu", "npu"])
++@pytest.mark.parametrize("requested_count", [2, 4])
++def test_mismatched_cache_hit_is_request_error(residency: str, requested_count: int):
++    scheduler = _make_scheduler(npu_slots=1 if residency == "cpu-no-promotion" else 8)
++    _seed_residency(scheduler, residency)
++    manager = scheduler.encoder_cache_manager
++    capacity_before = _capacity(manager)
++    request = _request("mismatched", [("shared", [True] * requested_count + [False])])
++    scheduler.add_request(request)
++
++    scheduler_output = scheduler.schedule()
++
++    _assert_error_and_finish(scheduler, request, scheduler_output)
++    assert manager.cached["shared"] == set()
++    assert _capacity(manager) == capacity_before
++    assert not scheduler_output.ec_manager_metadata.promoting_mm_hashes
++    assert not scheduler_output.ec_manager_metadata.cpu_get_encoder_mm_hashes
++    manager._check_invariant()
++
++    # The rejected UUID does not poison later requests, including reuse of the
++    # original entry with the correct embedding count.
++    healthy = _request("healthy", [("shared", [True, False, True, False, True, False, False])])
++    scheduler.add_request(healthy)
++    next_output = scheduler.schedule()
++    assert not next_output.scheduled_encoder_inputs
++    _assert_success_and_finish(scheduler, healthy, next_output)
++    assert manager.cached["shared"] == set()
++
++
++@pytest.mark.parametrize("residency", ["cpu", "cpu-no-promotion", "cpu-npu", "npu"])
++def test_matching_embed_count_accepts_different_placeholder_layout(residency: str):
++    scheduler = _make_scheduler(npu_slots=1 if residency == "cpu-no-promotion" else 8)
++    _seed_residency(scheduler, residency)
++    request = _request("compatible", [("shared", [True, False, True, False, True, False, False])])
++    scheduler.add_request(request)
++
++    scheduler_output = scheduler.schedule()
++
++    assert not scheduler_output.scheduled_encoder_inputs
++    metadata = scheduler_output.ec_manager_metadata
++    if residency == "cpu":
++        assert metadata.promoting_mm_hashes == ["shared"]
++    elif residency == "cpu-no-promotion":
++        assert metadata.cpu_get_encoder_mm_hashes == ["shared"]
++        assert "shared" not in scheduler.encoder_cache_manager.npu_cache
++    _assert_success_and_finish(scheduler, request, scheduler_output)
++
++
++def test_mismatch_preserves_another_request_reference():
++    scheduler = _make_scheduler()
++    manager = scheduler.encoder_cache_manager
++    owner = _request("active-owner", [("shared", [True] * 3)])
++    assert manager.can_allocate(owner, 0, 32, 0)
++    manager.allocate(owner, 0)
++    capacity_before = _capacity(manager)
++    request = _request("mismatched", [("shared", [True] * 4)])
++    scheduler.add_request(request)
++
++    scheduler_output = scheduler.schedule()
++
++    _assert_error_and_finish(scheduler, request, scheduler_output)
++    assert manager.cached["shared"] == {owner.request_id}
++    assert manager.request_cached_ids == {owner.request_id: {0}}
++    assert _capacity(manager) == capacity_before
++    manager._check_invariant()
++    manager.free(owner)
++    manager._check_invariant()
++
++
++@pytest.mark.parametrize("npu_slots", [1, 8])
++def test_mismatch_releases_an_earlier_cache_hit(npu_slots: int):
++    scheduler = _make_scheduler(npu_slots=npu_slots)
++    manager = scheduler.encoder_cache_manager
++    _seed(manager, "valid", 2)
++    _seed(manager, "mismatch", 3)
++    capacity_before = _capacity(manager)
++    request = _request("partial-hit", [("valid", [True, True, False]), ("mismatch", [True] * 4)])
++    scheduler.add_request(request)
++
++    scheduler_output = scheduler.schedule()
++
++    assert manager.cached["valid"] == {request.request_id}
++    assert manager.cpu_num_freeable_slots == capacity_before[1] - 2
++    _assert_error_and_finish(scheduler, request, scheduler_output)
++    assert manager.cached["valid"] == set()
++    assert manager.cached["mismatch"] == set()
++    assert _capacity(manager)[:2] == capacity_before[:2]
++    assert manager.npu_num_freeable_slots == capacity_before[3]
++    metadata = scheduler_output.ec_manager_metadata
++    if npu_slots == 8:
++        # A valid prior hit can promote before the later input is rejected.
++        # Keep that reusable entry while restoring its reclaimable capacity.
++        assert metadata.promoting_mm_hashes == ["valid"]
++        assert manager.npu_num_free_slots == capacity_before[2] - 2
++        assert manager.npu_freeable["valid"].num_embeds == 2
++    else:
++        assert metadata.cpu_get_encoder_mm_hashes == ["valid"]
++        assert manager.npu_num_free_slots == capacity_before[2]
++    manager._check_invariant()
++
++
++def test_same_request_duplicate_identifier_rejects_different_embed_counts():
++    scheduler = _make_scheduler()
++    manager = scheduler.encoder_cache_manager
++    capacity_before = _capacity(manager)
++    request = _request("duplicate", [("shared", [True, True, False]), ("shared", [True, True, True])])
++    scheduler.add_request(request)
++
++    scheduler_output = scheduler.schedule()
++
++    _assert_error_and_finish(scheduler, request, scheduler_output)
++    assert not manager.cached
++    assert _capacity(manager) == capacity_before
++    manager._check_invariant()
+diff --git a/vllm_ascend/ec_manager/score_ec_manager.py b/vllm_ascend/ec_manager/score_ec_manager.py
+index f6bc9fbe1..3bc3b2ff7 100644
+--- a/vllm_ascend/ec_manager/score_ec_manager.py
++++ b/vllm_ascend/ec_manager/score_ec_manager.py
+@@ -239,6 +239,19 @@ class ScoreEncoderCacheManager(EncoderCacheManager):
+ 
+         return True
+ 
++    def get_cached_num_encoder_embeds(self, request: Request, input_id: int) -> int | None:
++        """Return the stored count for a cache hit in either tier.
++
++        CPU-only entries are also reusable, via promotion or temporary device
++        copies. Read the entry itself so eviction and reset need no separate
++        embedding-count bookkeeping.
++        """
++        mm_hash = request.mm_features[input_id].identifier
++        entry = self.cpu_cache.get(mm_hash)
++        if entry is None:
++            entry = self.npu_cache.get(mm_hash)
++        return entry.num_embeds if entry is not None else None
++
+     def check_and_update_cache(self, request: Request, input_id: int) -> bool:
+         """
+         Check whether the multimodal embedding corresponding to the current input

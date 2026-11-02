@@ -1,0 +1,174 @@
+commit 5bcfa4302948a56ee4999d1e1d5865e930073518
+Author:     recky-c <ruiqicheng510@gmail.com>
+AuthorDate: Wed Oct 14 19:07:59 2026 +0800
+Commit:     GitHub <noreply@github.com>
+CommitDate: Wed Oct 14 19:07:59 2026 +0800
+
+    [BugFix] Fix PP MTP token validation API compatibility (#18631)
+    
+    ### What this PR does / why we need it?
+    
+    The MRV1 pipeline-parallel MTP scheduler patch still calls
+    `StructuredOutputManager.should_advance()`. That method was removed by
+    vllm-project/vllm#48200, which is included in vLLM v0.30.0. With PP and
+    MTP enabled, an ordinary generation request can terminate the engine
+    with:
+    
+    ```text
+    AttributeError: 'StructuredOutputManager' object has no attribute 'should_advance'
+    ```
+    
+    Use `StructuredOutputManager.validate_tokens(request, draft_tokens)` to
+    match the v0.30.0 scheduler API and preserve its handling of grammar
+    constraints and the reasoning phase.
+    
+    Update the regression tests to use the real `StructuredOutputManager`,
+    rather than a mock exposing the removed API. Cover
+    synchronous/asynchronous scheduling, grammar-filtered draft tokens, and
+    unconstrained drafts while reasoning is still active.
+    
+    ### Does this PR introduce _any_ user-facing change?
+    
+    PP + MTP generation on MRV1 no longer crashes when updating speculative
+    token IDs. No configuration or public API changes.
+    
+    ### How was this patch tested?
+    
+    - Remote NPU runtime with vLLM v0.30.0
+    (`ced6857afa0ea7b2e3f0846a62e1394e90f15607`): `pytest -q
+    tests/ut/patch/platform/test_patch_pp_mtp.py` — **24 passed**. The
+    updated regression cases produce **4 failures** against the original
+    patch implementation.
+    - Real-model validation on two Ascend 950/A5 hosts (16 NPUs): GLM-5.3
+    W8A8C8, **MRV1, TP8/PP2, EP, MTP1, async scheduling, eager execution**,
+    PP layer partition `42,36`. Applied only this Python fix to the 20261012
+    image (Ascend `6d4339aa1`, vLLM `ced6857af`); its original patch file
+    matches the release baseline exactly.
+    - **6/6 requests passed**: one short request, three concurrent requests,
+    an 8428-token input, and strict JSON-schema output (`{"answer":42}`).
+    Health checks before and after returned HTTP 200. MTP metrics recorded
+    203 drafted and 184 accepted tokens, confirming speculative decoding was
+    active. This was a mixed deployment; PD-separated serving was not
+    tested.
+    - The main PR's two modified files have identical SHA256 hashes to the
+    remotely tested files.
+    - Ruff 0.14.0 lint and formatting checks, plus `git diff --check`,
+    passed. `format.sh ci` could not run locally because `pre-commit` is
+    unavailable; the full hook suite remains for CI.
+    
+    Companion release-branch PR:
+    https://github.com/vllm-project/vllm-ascend/pull/18629
+    
+    - vLLM main:
+    https://github.com/vllm-project/vllm/commit/c4df37dfcc7f72ca41cd43801a468526ecf99a2b
+    
+    Signed-off-by: recky-c <ruiqicheng510@gmail.com>
+
+diff --git a/tests/ut/patch/platform/test_patch_pp_mtp.py b/tests/ut/patch/platform/test_patch_pp_mtp.py
+index 9ac58afa0..1397df920 100644
+--- a/tests/ut/patch/platform/test_patch_pp_mtp.py
++++ b/tests/ut/patch/platform/test_patch_pp_mtp.py
+@@ -9,6 +9,7 @@ from vllm.config.model import ModelConfig
+ from vllm.v1.core.sched.scheduler import Scheduler
+ from vllm.v1.engine.core import EngineCore
+ from vllm.v1.sample.rejection_sampler import PLACEHOLDER_TOKEN_ID
++from vllm.v1.structured_output import StructuredOutputManager
+ 
+ from vllm_ascend.patch.platform.patch_pp_mtp import (
+     _apply_patch,
+@@ -316,15 +317,14 @@ def test_pp_mtp_spec_tokens_are_written_from_model_runner_output_for_sync_and_as
+ ):
+     request = SimpleNamespace(
+         spec_token_ids=[],
++        use_structured_output=False,
+         structured_output_request=None,
+         is_finished=lambda: False,
+     )
+     scheduler = SimpleNamespace(
+         scheduler_config=SimpleNamespace(async_scheduling=async_scheduling),
+         requests={"req-0": request},
+-        structured_output_manager=SimpleNamespace(
+-            should_advance=lambda _request: False,
+-        ),
++        structured_output_manager=StructuredOutputManager.__new__(StructuredOutputManager),
+     )
+     scheduler_output = SimpleNamespace(num_scheduled_tokens={"req-0": 1})
+     model_runner_output = SimpleNamespace(
+@@ -386,15 +386,18 @@ def test_pp_mtp_spec_token_id_edge_cases():
+     advancing = SimpleNamespace(
+         spec_token_ids=[],
+         is_finished=lambda: False,
+-        structured_output_request=SimpleNamespace(grammar=grammar),
++        use_structured_output=True,
++        structured_output_request=SimpleNamespace(grammar=grammar, reasoning_ended=True),
+     )
+     empty_sampled = SimpleNamespace(
+         spec_token_ids=["keep"],
+         is_finished=lambda: False,
+     )
++    manager = StructuredOutputManager.__new__(StructuredOutputManager)
++    manager.enable_in_reasoning = False
+     scheduler = SimpleNamespace(
+         requests={"fin": finished, "adv": advancing, "empty": empty_sampled},
+-        structured_output_manager=SimpleNamespace(should_advance=lambda req: req is advancing),
++        structured_output_manager=manager,
+     )
+     scheduler_output = SimpleNamespace(
+         num_scheduled_tokens={"missing": 1, "fin": 1, "no-index": 1, "empty": 1, "adv": 1},
+@@ -411,6 +414,38 @@ def test_pp_mtp_spec_token_id_edge_cases():
+     assert advancing.spec_token_ids == [401]
+ 
+ 
++def test_pp_mtp_spec_tokens_remain_unconstrained_during_reasoning(monkeypatch):
++    def validate_grammar(_tokens):
++        pytest.fail("Grammar must not constrain tokens before reasoning ends")
++
++    request = SimpleNamespace(
++        spec_token_ids=[],
++        is_finished=lambda: False,
++        use_structured_output=True,
++        all_token_ids=[200],
++        structured_output_request=SimpleNamespace(
++            grammar=SimpleNamespace(validate_tokens=validate_grammar),
++            reasoning_ended=False,
++        ),
++    )
++    manager = StructuredOutputManager.__new__(StructuredOutputManager)
++    manager.enable_in_reasoning = False
++    monkeypatch.setattr(
++        manager,
++        "_get_reasoner",
++        lambda _request: SimpleNamespace(is_reasoning_end_streaming=lambda _ids, _tokens: False),
++    )
++    scheduler = SimpleNamespace(requests={"req-0": request}, structured_output_manager=manager)
++    scheduler_output = SimpleNamespace(num_scheduled_tokens={"req-0": 1})
++    model_runner_output = SimpleNamespace(
++        req_id_to_index={"req-0": 0}, sampled_token_ids=[[200]], spec_token_ids=[[301, 302]]
++    )
++
++    _update_pp_mtp_spec_token_ids(scheduler, scheduler_output, model_runner_output)
++
++    assert request.spec_token_ids == [301, 302]
++
++
+ def test_pp_ipc_cached_request_data_skips_empty_output_tokens():
+     scheduler = Scheduler.__new__(Scheduler)
+     scheduler.use_pp = True
+diff --git a/vllm_ascend/patch/platform/patch_pp_mtp.py b/vllm_ascend/patch/platform/patch_pp_mtp.py
+index 6a3d98226..13d19fa2b 100644
+--- a/vllm_ascend/patch/platform/patch_pp_mtp.py
++++ b/vllm_ascend/patch/platform/patch_pp_mtp.py
+@@ -226,12 +226,7 @@ def _update_pp_mtp_spec_token_ids(scheduler, scheduler_output, model_runner_outp
+             request.spec_token_ids = []
+             continue
+ 
+-        next_spec_token_ids = spec_token_ids[req_index]
+-        if scheduler.structured_output_manager.should_advance(request):
+-            metadata = request.structured_output_request
+-            assert metadata is not None and metadata.grammar is not None
+-            next_spec_token_ids = metadata.grammar.validate_tokens(next_spec_token_ids)
+-        request.spec_token_ids = next_spec_token_ids
++        request.spec_token_ids = scheduler.structured_output_manager.validate_tokens(request, spec_token_ids[req_index])
+ 
+ 
+ def _patch_scheduler_update_from_output() -> None:

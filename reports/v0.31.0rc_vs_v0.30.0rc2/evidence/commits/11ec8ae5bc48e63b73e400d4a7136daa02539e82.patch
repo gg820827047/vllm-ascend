@@ -1,0 +1,573 @@
+commit 11ec8ae5bc48e63b73e400d4a7136daa02539e82
+Author:     lty <linhebiwen@gmail.com>
+AuthorDate: Fri Oct 9 17:27:46 2026 +0800
+Commit:     GitHub <noreply@github.com>
+CommitDate: Fri Oct 9 17:27:46 2026 +0800
+
+    [v0.30.0][Performance]narrow the KV save fence to requests with released blocks (#18094)
+    
+    ## 1. Baseline and conclusion
+    
+    - Baseline: the current save fence in `AscendStoreConnector`.
+    `handle_preemptions()` calls `KVPoolWorker.wait_for_previous_save()`,
+    which blocks the scheduler step until the **entire previous save batch**
+    has drained — i.e. every in-flight put of every request, whether or not
+    this step reuses any of those blocks.
+    - This PR narrows the fence to **exactly the requests whose blocks
+    become reusable this step** (`finished ∪ preempted`), carried through
+    the connector metadata as `released_req_ids`. Immediate block release is
+    kept unchanged.
+    - Measured on Atlas A2 (910B, CANN 9.1.0), Qwen3-32B W8A8, TP4,
+    single-engine `kv_both` with the mooncake backend:
+    - High prefix-hit, high-churn workload (16k input / 1-token output,
+    89.8% external hit): **+49%~52%** Input Token Throughput over the
+    whole-batch fence.
+    - No-hit workload (240 prompts, concurrency 60, ~3.5k input):
+    **+5.3%~5.4%** over the whole-batch fence, and **parity with
+    no-pooling** (±0.5%, within run-to-run noise) — the residual pooling
+    overhead in the no-hit case is eliminated.
+    
+    ## 2. Why the whole-batch fence is expensive
+    
+    The fence exists to protect block reuse: KV blocks are freed immediately
+    when a request finishes or is preempted, so the in-flight puts reading
+    those blocks must complete before the scheduler can hand the blocks to a
+    new request.
+    
+    The baseline enforces this by waiting for the **whole** previous save
+    batch on every step the hook fires. That waits for far more than reuse
+    requires:
+    
+    - Requests that are still running keep their blocks — nobody can
+    overwrite them this step, yet the baseline waits for their puts too.
+    - On workloads with short outputs and high request turnover, many
+    requests finish every step, the fence fires effectively every step, and
+    the engine step gets serialized behind the full drain of in-flight RDMA
+    puts.
+    - The cost scales with in-flight put volume per step, which matches the
+    two measured extremes: a long-prompt no-hit workload (few save
+    completions per step) loses ~4.7% vs no-pooling, while the high-churn
+    hit workload gives up about a third of the achievable throughput (fence
+    29488 vs this patch 44400 avg, −33.6%).
+    
+    ## 3. Design
+    
+    ### 3.1 Carry `released_req_ids` in the connector metadata
+    
+    - `metadata.py` — `AscendConnectorMetadata` gains `released_req_ids:
+    set[str]`, initialized from `preempted_req_ids`.
+    - `pool_scheduler.py` — when building the metadata it is set to
+    `set(scheduler_output.preempted_req_ids) |
+    set(scheduler_output.finished_req_ids)`.
+    
+    ### 3.2 Fence only those requests on the worker
+    
+    - `ascend_store_connector.py` — `handle_preemptions()` now calls
+    `connector_worker.handle_released_saves(meta.released_req_ids)` instead
+    of `wait_for_previous_save()`.
+    - `pool_worker.py` — `handle_released_saves()` forwards to the sending
+    thread's `wait_for_requests_saved()`; the layerwise path is untouched
+    (its saves are already synchronized at each step's final layer).
+    - `kv_transfer.py` —
+    `KVCacheStoreSendingThread.wait_for_requests_saved()` polls
+    `stored_requests` (1 ms interval) until none of the given request ids
+    have a queued save chunk left:
+    
+    ```python
+    def wait_for_requests_saved(self, req_ids: set[str] | None) -> None:
+        if not req_ids:
+            return
+        pending = set(req_ids)
+        while True:
+            self.raise_if_failed()
+            with self.done_task_lock:
+                pending &= self.stored_requests.keys()
+                if not pending:
+                    break
+            time.sleep(SAVE_REQUEST_POLL_INTERVAL_S)
+    ```
+    
+    The common case — no request released this step — costs one empty-set
+    return.
+    
+    ### 3.3 Why draining once is safe
+    
+    1. A request queues no new save chunks after it finishes or is
+    preempted.
+    2. Its terminal state is flushed into exactly one `SchedulerOutput`, so
+    it appears in `released_req_ids` exactly once.
+    3. When the fence observes the request has no queued chunks left, every
+    put it will ever issue has completed — its blocks are safe to reallocate
+    from then on. No later fence needs to consider it again.
+    4. Preempted requests are covered by the same set (`preempted_req_ids`
+    is part of the union), and re-computation re-queues saves under the
+    still-alive request id, which a later release will fence again.
+    
+    ## 4. Test environment
+    
+    - Single Atlas A2 server, 8× Ascend 910B, CANN 9.1.0; two containers
+    from the same image (host network, shared `/data`) used for
+    cross-checks.
+    - Server: Qwen3-32B W8A8 (`--quantization ascend`),
+    `--tensor-parallel-size 4` on NPU 0-3, `--block-size 128`,
+    `--max-model-len 40960`, `AscendStoreConnector` with `kv_role=kv_both`,
+    mooncake backend, `HCCL_INTRA_ROCE_ENABLE=1`, `PYTHONHASHSEED=1`.
+    - Store: fresh `mooncake_master` per leg
+    (`--eviction_high_watermark_ratio 0.9 --eviction_ratio 0.15 --port
+    50088`) with a 20 GB segment config, so every leg starts from an empty
+    pool.
+    - Benchmark: ais_bench; metric is **Input Token Throughput** as reported
+    by the tool.
+    - Fairness: within each matrix all legs ran on the same machine state,
+    same image, fresh master; request success counts and external hit rates
+    are identical across legs, so the deltas are engine-side only.
+    
+    ## 5. Results
+    
+    ### 5.1 High prefix-hit, high-churn workload
+    
+    `python3 aisbench_test.py --input_len 16384 --output_len 1 --data_num
+    160 --concurrency 32 --request_rate 0 --dataset_type prefix_cache
+    --repeat_rate 90% --prefix_num 16 --prefix_test`
+    
+    16 distinct 16k prefixes, 90% repeat rate → external (pool) hit 89.80%
+    on **all** legs; local HBM prefix hit 0%; 160/160 requests succeeded on
+    all legs.
+    
+    | Build | Input Token Throughput | Duration | Success |
+    |---|---|---|---|
+    | fence baseline (whole batch) | 29488.41 | 88.9 s | 160/160 |
+    | this patch, run 1| 44880.02 | 58.4 s | 160/160 |
+    | this patch, run 2 | 43920.74 | 59.7 s | 160/160 |
+    
+    **+49.0% ~ +52.2% vs the fence baseline.** The two patched runs differ
+    by 2.2%, i.e. single-run noise on this ~60 s workload is ±1-2%; both
+    runs sit far above the baseline.
+    
+    ### 5.2 No-hit workload vs fence baseline and vs no-pooling
+    
+    gsm8k 0-shot prompts (mean input ≈ 3500 tokens, no cross-request prefix
+    sharing → external hit ≈ 0), 240 prompts, concurrency 60.
+    
+    | Build | Input Token Throughput | TTFT (mean) | ITL (mean) | vs fence |
+    vs no-pool |
+    |---|---|---|---|---|---|
+    | fence baseline (whole batch) | 2157.02 | 7.34 s | 59.9 ms | — | −4.7%
+    |
+    | this patch, run 1 | 2273.35 | 6.14 s | 57.4 ms | +5.4% | +0.5% |
+    | this patch, run 2 | 2271.33 | — | — | +5.3% | +0.4% |
+    | no-pooling, run 1 | 2262.41 | 6.15 s | 57.7 ms | +4.9% | — |
+    | no-pooling, run 2 | 2268.15 | — | — | +5.2% | — |
+    
+    The two patched runs differ by 0.09%; the two no-pooling runs differ by
+    0.25%. **The patched pool matches no-pooling within ±0.5% (noise), while
+    the fence baseline gives up ~4.7%.** TTFT and ITL of the patched pool
+    are identical to no-pooling (6.14 s / 57.4 ms vs 6.15 s / 57.7 ms); the
+    baseline's TTFT inflation (+1.2 s) is gone.
+    
+    ## 6. Accuracy validation: aisbench GSM8K, 64-way concurrency, pooled vs
+    no-pool parity (single-node P/D, DeepSeek-V4-Flash)
+    
+    **Result: with the KV pool demonstrably participating in every request,
+    pooled accuracy matches no-pooling within sampling noise (max Δ 0.67 pp
+    = 2/300 flips at temperature 0.6).** Six aisbench GSM8K accuracy runs at
+    concurrency 64 / request rate 4: cold and warm passes on the P/D + pool
+    stack, two passes with pool hits on every request, and two no-pooling
+    single-engine baselines. Across all runs: 0 failed requests, 0
+    preemptions, 0 errors / 0 tracebacks on every engine.
+    
+    ### 7.1 Results
+    
+    | # | Stack | Dataset | Accuracy | Pool participation |
+    |---|---|---|---|---|
+    | 1 | P/D + pool, 1st pass (cold) | GSM8K test, 1319 | 85.75 | none
+    (below granularity) |
+    | 2 | P/D + pool, 2nd pass (warm) | GSM8K test, 1319 | 86.50 | none; P
+    local HBM prefix hit 56–68%, P→D transfer on all requests (+1320) |
+    | 3 | no-pool single engine | GSM8K test, 1319 | 86.05 | — |
+    | 4 | P/D + pool, 1st pass | long-prefix, 300 | **90.33** | **300/300
+    requests pool-hit**, each loads 4096 tokens from the pool |
+    | 5 | P/D + pool, 2nd pass (fully warm) | long-prefix, 300 | **89.67** |
+    301/301 pool-hit |
+    | 6 | no-pool single engine | long-prefix, 300 | **90.33** | — |
+    
+    - vLLM main:
+    https://github.com/vllm-project/vllm/commit/ced6857afa0ea7b2e3f0846a62e1394e90f15607
+    
+    ---------
+    
+    Signed-off-by: lty <linhebiwen@gmail.com>
+
+diff --git a/tests/ut/distributed/ascend_store/test_ascend_store_connector.py b/tests/ut/distributed/ascend_store/test_ascend_store_connector.py
+index 59c89eb6b..e4c6582b7 100644
+--- a/tests/ut/distributed/ascend_store/test_ascend_store_connector.py
++++ b/tests/ut/distributed/ascend_store/test_ascend_store_connector.py
+@@ -26,6 +26,7 @@ from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.ascend_store_conne
+     AscendStoreConnector,
+     AscendStoreKVEvents,
+ )
++from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.metadata import AscendConnectorMetadata
+ 
+ # isort: on
+ 
+@@ -285,6 +286,19 @@ class TestAscendStoreConnector(unittest.TestCase):
+         done_s, done_r = connector.get_finished({"r1"})
+         self.assertEqual(done_s, {"r1"})
+ 
++    def test_handle_preemptions_fences_only_released_requests(self):
++        connector = AscendStoreConnector.__new__(AscendStoreConnector)
++        connector.connector_worker = MagicMock()
++        meta = AscendConnectorMetadata(preempted_req_ids={"p1"})
++        connector.handle_preemptions(meta)
++        connector.connector_worker.handle_released_saves.assert_called_once_with({"p1"})
++
++    def test_handle_preemptions_tolerates_metadata_without_released_ids(self):
++        connector = AscendStoreConnector.__new__(AscendStoreConnector)
++        connector.connector_worker = MagicMock()
++        connector.handle_preemptions(types.SimpleNamespace())
++        connector.connector_worker.handle_released_saves.assert_called_once_with(None)
++
+     @patch("vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.ascend_store_connector.LookupKeyServer")
+     @patch("vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.ascend_store_connector.KVPoolWorker")
+     def test_layerwise_methods_return_early(self, mock_worker_cls, mock_lookup_cls):
+diff --git a/tests/ut/distributed/ascend_store/test_glm53_store.py b/tests/ut/distributed/ascend_store/test_glm53_store.py
+index 11615d0e4..b0f0e03a6 100644
+--- a/tests/ut/distributed/ascend_store/test_glm53_store.py
++++ b/tests/ut/distributed/ascend_store/test_glm53_store.py
+@@ -210,7 +210,9 @@ class TestGLM53Store(unittest.TestCase):
+                     self.fill_caches(plan, caches, source, target, rank)
+                     metadata = self.make_metadata(source, hashes)
+                     worker.wait_for_save(metadata)
+-                    worker.wait_for_previous_save()
++                    # Drain this batch under the per-request fence (the
++                    # whole-batch wait_for_previous_save is gone).
++                    worker.kv_send_thread.wait_for_requests_saved({req.req_id for req in metadata.requests})
+                     workers.append((worker, caches))
+                     self.doCleanups()
+ 
+diff --git a/tests/ut/distributed/ascend_store/test_kv_transfer.py b/tests/ut/distributed/ascend_store/test_kv_transfer.py
+index 80adf9d76..f4f9e570d 100644
+--- a/tests/ut/distributed/ascend_store/test_kv_transfer.py
++++ b/tests/ut/distributed/ascend_store/test_kv_transfer.py
+@@ -16,6 +16,7 @@
+ #
+ 
+ import threading
++import time
+ import unittest
+ from unittest.mock import MagicMock, patch
+ 
+@@ -596,6 +597,45 @@ class TestKVCacheStoreSendingThread(unittest.TestCase):
+         t.delete_finished_stored_request("r1")
+         self.assertNotIn("r1", t.stored_requests)
+ 
++    def test_wait_for_requests_saved_returns_immediately_without_released_ids(self):
++        t, _ = self._make_thread()
++        t.wait_for_requests_saved(None)
++        t.wait_for_requests_saved(set())
++
++    def test_wait_for_requests_saved_blocks_until_released_requests_drain(self):
++        t, _ = self._make_thread()
++        t.add_stored_request("r1")
++        t.add_stored_request("r2")
++        entered = threading.Event()
++
++        def wait_released():
++            entered.set()
++            # An unknown id was already drained before this fence started.
++            t.wait_for_requests_saved({"r1", "r2", "ghost"})
++
++        waiter = threading.Thread(target=wait_released)
++        waiter.start()
++        self.assertTrue(entered.wait(timeout=5))
++        time.sleep(0.05)
++        self.assertTrue(waiter.is_alive(), "fence must keep waiting while r1/r2 still have queued saves")
++
++        t.dec_stored_request("r1")
++        t.try_finish_and_delete_stored_request("r1")
++        time.sleep(0.05)
++        self.assertTrue(waiter.is_alive(), "fence must keep waiting until every released request drained")
++
++        t.dec_stored_request("r2")
++        t.try_finish_and_delete_stored_request("r2")
++        waiter.join(timeout=5)
++        self.assertFalse(waiter.is_alive(), "fence must return once all released requests drained")
++
++    def test_wait_for_requests_saved_raises_when_transfer_failed(self):
++        t, _ = self._make_thread()
++        t.add_stored_request("r1")
++        t._fatal_error = RuntimeError("boom")
++        with self.assertRaises(RuntimeError):
++            t.wait_for_requests_saved({"r1"})
++
+     def test_handle_request_sync_and_dcp(self):
+         t, store = self._make_thread([0])
+         event = MagicMock()
+diff --git a/tests/ut/distributed/ascend_store/test_metadata.py b/tests/ut/distributed/ascend_store/test_metadata.py
+index d0e120cf0..af7284823 100644
+--- a/tests/ut/distributed/ascend_store/test_metadata.py
++++ b/tests/ut/distributed/ascend_store/test_metadata.py
+@@ -748,6 +748,12 @@ class TestAscendConnectorMetadata(unittest.TestCase):
+         self.assertEqual(len(meta.requests), 1)
+         self.assertEqual(meta.requests[0].req_id, "r1")
+ 
++    def test_released_req_ids_seed_from_preempted(self):
++        meta = AscendConnectorMetadata(preempted_req_ids={"p1"})
++        self.assertEqual(meta.released_req_ids, {"p1"})
++        self.assertEqual(AscendConnectorMetadata(preempted_req_ids=None).released_req_ids, set())
++        self.assertEqual(AscendConnectorMetadata(preempted_req_ids=set()).released_req_ids, set())
++
+ 
+ class TestLayerMultiBlockReqMeta(unittest.TestCase):
+     def test_fields(self):
+diff --git a/tests/ut/distributed/ascend_store/test_pool_scheduler.py b/tests/ut/distributed/ascend_store/test_pool_scheduler.py
+index c73fc5d0a..ab0c88190 100644
+--- a/tests/ut/distributed/ascend_store/test_pool_scheduler.py
++++ b/tests/ut/distributed/ascend_store/test_pool_scheduler.py
+@@ -880,6 +880,32 @@ class TestKVPoolSchedulerBuildMeta(unittest.TestCase):
+         _meta = scheduler.build_connector_meta(sched_output)
+         self.assertNotIn("r1", scheduler._request_trackers)
+ 
++    @patch("vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.pool_scheduler.LookupKeyClient")
++    def test_build_connector_meta_released_req_ids_union(self, mock_client_cls):
++        config = self._make_config()
++        scheduler = KVPoolScheduler(config, use_layerwise=False)
++
++        from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.metadata import RequestTracker
++
++        for req_id in ("f1", "f2", "p1"):
++            scheduler._request_trackers[req_id] = RequestTracker(
++                req_id=req_id,
++                token_len=32,
++                allocated_block_ids=[0, 1],
++            )
++            scheduler._unfinished_requests[req_id] = (MagicMock(), [0, 1])
++
++        sched_output = MagicMock()
++        sched_output.finished_req_ids = {"f1", "f2"}
++        sched_output.preempted_req_ids = {"p1"}
++        sched_output.scheduled_new_reqs = []
++        sched_output.num_scheduled_tokens = {}
++        sched_output.scheduled_cached_reqs = MagicMock()
++        sched_output.scheduled_cached_reqs.req_ids = []
++
++        meta = scheduler.build_connector_meta(sched_output)
++        self.assertEqual(meta.released_req_ids, {"f1", "f2", "p1"})
++
+ 
+ class TestLookupKeyClient(unittest.TestCase):
+     @patch("vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.pool_scheduler.make_zmq_socket")
+diff --git a/tests/ut/distributed/ascend_store/test_pool_worker.py b/tests/ut/distributed/ascend_store/test_pool_worker.py
+index caa8e05cd..2c8c314e6 100644
+--- a/tests/ut/distributed/ascend_store/test_pool_worker.py
++++ b/tests/ut/distributed/ascend_store/test_pool_worker.py
+@@ -1355,6 +1355,31 @@ class TestKVPoolWorkerRegisterAndTransfer(unittest.TestCase):
+         worker.kv_send_thread.add_stored_request.assert_not_called()
+         worker.kv_send_thread.request_queue.join.assert_not_called()
+ 
++    def test_handle_released_saves_noop_without_send_thread(self):
++        worker = self._make_worker()
++        worker.kv_send_thread = None
++        worker.handle_released_saves({"r1"})
++
++    def test_handle_released_saves_drains_only_released_requests(self):
++        worker = self._make_worker()
++        from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.kv_transfer import KVCacheStoreSendingThread
++
++        worker.kv_send_thread = MagicMock(spec=KVCacheStoreSendingThread)
++        released = {"r1", "r2"}
++        worker.handle_released_saves(released)
++        worker.kv_send_thread.raise_if_failed.assert_called_once_with()
++        worker.kv_send_thread.wait_for_requests_saved.assert_called_once_with(released)
++
++    def test_handle_released_saves_skips_layerwise_thread(self):
++        worker = self._make_worker()
++        from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.kv_transfer import KVCacheStoreLayerSendingThread
++
++        # A spec'd layerwise-thread mock has no wait_for_requests_saved member,
++        # so a wrong dispatch would raise AttributeError here.
++        worker.kv_send_thread = MagicMock(spec=KVCacheStoreLayerSendingThread)
++        worker.handle_released_saves({"r1"})
++        worker.kv_send_thread.raise_if_failed.assert_called_once_with()
++
+     def test_get_finished_producer_clears_synchronous_completions(self):
+         worker = self._make_worker(kv_role="kv_producer")
+ 
+diff --git a/tests/ut/distributed/ascend_store/test_request_lifecycle.py b/tests/ut/distributed/ascend_store/test_request_lifecycle.py
+index c54749301..d27fbd264 100644
+--- a/tests/ut/distributed/ascend_store/test_request_lifecycle.py
++++ b/tests/ut/distributed/ascend_store/test_request_lifecycle.py
+@@ -328,7 +328,9 @@ def test_raw_sequence_lifecycle(
+                         if bid and start < (index + 1) * 128 <= end:
+                             tensor[bid].fill_(payload_value(input_tokens, (index + 1) * 128, name, plane))
+             worker.wait_for_save()
+-            pool.wait_for_previous_save()
++            # Same fence the connector applies at the start of the next step:
++            # drain the saves of requests whose blocks this output released.
++            pool.handle_released_saves(meta.released_req_ids)
+             sending, recving = worker.get_finished(output.finished_req_ids)
+             result = create_model_runner_output([request] if scheduled else [])
+             if scheduled and request.num_computed_tokens < len(tokens):
+@@ -356,6 +358,9 @@ def test_raw_sequence_lifecycle(
+             if req_id not in scheduler.requests:
+                 # Consume the finished-ID notification and release Store references.
+                 output = scheduler.schedule()
++                # The connector fences this output like any other: drain the
++                # finished request's final saves before its blocks are reused.
++                worker.handle_preemptions(output.kv_connector_metadata)
+                 worker.bind_connector_metadata(output.kv_connector_metadata)
+                 worker.get_finished(output.finished_req_ids)
+                 worker.clear_connector_metadata()
+diff --git a/vllm_ascend/distributed/kv_transfer/kv_pool/ascend_store/ascend_store_connector.py b/vllm_ascend/distributed/kv_transfer/kv_pool/ascend_store/ascend_store_connector.py
+index d40dd1a5b..6ccd37e8f 100644
+--- a/vllm_ascend/distributed/kv_transfer/kv_pool/ascend_store/ascend_store_connector.py
++++ b/vllm_ascend/distributed/kv_transfer/kv_pool/ascend_store/ascend_store_connector.py
+@@ -286,13 +286,16 @@ class AscendStoreConnector(KVConnectorBase_V1, SupportsHMA):
+         self.connector_worker.register_kv_caches(kv_caches)
+ 
+     def handle_preemptions(self, kv_connector_metadata: KVConnectorMetadata) -> None:
+-        """Fence the previous save before this step can reuse KV blocks.
++        """Fence only the saves of requests whose blocks this step may reuse.
+ 
+-        This hook is temporarily reused for deferred KV cache save
+-        synchronization and will be replaced by a dedicated mechanism.
++        Blocks are freed immediately when a request finishes or is preempted.
++        Before this step's forward can reallocate them, the in-flight puts of
++        exactly those requests are awaited (released_req_ids carried in the
++        connector metadata), instead of the whole previous save batch.
+         """
+         assert self.connector_worker is not None
+-        self.connector_worker.wait_for_previous_save()
++        released_req_ids = getattr(kv_connector_metadata, "released_req_ids", None)
++        self.connector_worker.handle_released_saves(released_req_ids)
+ 
+     def bind_connector_metadata(self, connector_metadata: KVConnectorMetadata) -> None:
+         super().bind_connector_metadata(connector_metadata)
+diff --git a/vllm_ascend/distributed/kv_transfer/kv_pool/ascend_store/kv_transfer.py b/vllm_ascend/distributed/kv_transfer/kv_pool/ascend_store/kv_transfer.py
+index 0ebefb4e0..a4cf80678 100644
+--- a/vllm_ascend/distributed/kv_transfer/kv_pool/ascend_store/kv_transfer.py
++++ b/vllm_ascend/distributed/kv_transfer/kv_pool/ascend_store/kv_transfer.py
+@@ -881,6 +881,11 @@ class KVCacheStoreBatch:
+         self.done = threading.Event()
+ 
+ 
++# Poll interval for waiting on a specific request's queued save chunks
++# (released-block fence; keep it small so scheduling stays responsive).
++SAVE_REQUEST_POLL_INTERVAL_S = 0.001
++
++
+ class KVCacheStoreSendingThread(KVTransferThread):
+     def __init__(
+         self,
+@@ -932,6 +937,34 @@ class KVCacheStoreSendingThread(KVTransferThread):
+         self.request_queue.put(save_batch)
+         return save_batch
+ 
++    def wait_for_requests_saved(self, req_ids: set[str] | None) -> None:
++        """Block until every queued save chunk of these requests completed.
++
++        Block-reuse fence: the scheduler frees a finished or preempted
++        request's blocks immediately, so before this step's forward may
++        reallocate them, all of that request's queued puts must drain. A
++        request never queues new puts after it finishes or is preempted, so
++        draining it once makes its blocks safe to reuse from then on.
++        """
++        if not req_ids:
++            return
++        pending = set(req_ids)
++        wait_start = time.perf_counter()
++        while True:
++            self.raise_if_failed()
++            with self.done_task_lock:
++                pending &= self.stored_requests.keys()
++                if not pending:
++                    break
++            time.sleep(SAVE_REQUEST_POLL_INTERVAL_S)
++        elapsed = time.perf_counter() - wait_start
++        logger.debug(
++            "Released-block KV save fence (%s) completed after waiting %.3f ms tp_rank=%d",
++            ",".join(sorted(req_ids))[:200],
++            elapsed * 1000,
++            self.tp_rank,
++        )
++
+     def is_stored_request(self, req_id: str) -> bool:
+         with self.done_task_lock:
+             return req_id in self.stored_requests
+diff --git a/vllm_ascend/distributed/kv_transfer/kv_pool/ascend_store/metadata.py b/vllm_ascend/distributed/kv_transfer/kv_pool/ascend_store/metadata.py
+index 0eac1e6af..1b1b1d945 100644
+--- a/vllm_ascend/distributed/kv_transfer/kv_pool/ascend_store/metadata.py
++++ b/vllm_ascend/distributed/kv_transfer/kv_pool/ascend_store/metadata.py
+@@ -1209,6 +1209,9 @@ class AscendConnectorMetadata(KVConnectorMetadata):
+         self.requests: list[ReqMeta] = []
+         self.preempted_req_ids = preempted_req_ids
+         self.loading_req_ids = loading_req_ids or set()
++        # Requests whose blocks became reusable since the previous step
++        # (finished + preempted); the worker fences their in-flight saves.
++        self.released_req_ids: set[str] = set(preempted_req_ids or ())
+ 
+     def add_request(self, req_meta: ReqMeta) -> None:
+         """Add a request to the metadata."""
+diff --git a/vllm_ascend/distributed/kv_transfer/kv_pool/ascend_store/pool_scheduler.py b/vllm_ascend/distributed/kv_transfer/kv_pool/ascend_store/pool_scheduler.py
+index 90014edec..fb6189d45 100644
+--- a/vllm_ascend/distributed/kv_transfer/kv_pool/ascend_store/pool_scheduler.py
++++ b/vllm_ascend/distributed/kv_transfer/kv_pool/ascend_store/pool_scheduler.py
+@@ -1044,6 +1044,12 @@ class KVPoolScheduler:
+             scheduler_output.preempted_req_ids,
+             self._loading_req_ids.copy(),
+         )
++        # Immediate block free: requests finished in the previous output
++        # processing and requests preempted by this schedule released their
++        # blocks; the worker fences their queued saves before reuse.
++        meta.released_req_ids = set(scheduler_output.preempted_req_ids or ()) | set(
++            scheduler_output.finished_req_ids or ()
++        )
+ 
+         for request in scheduler_output.scheduled_new_reqs:
+             req_meta = self._process_new_request(request, scheduler_output, force_skip_save)
+diff --git a/vllm_ascend/distributed/kv_transfer/kv_pool/ascend_store/pool_worker.py b/vllm_ascend/distributed/kv_transfer/kv_pool/ascend_store/pool_worker.py
+index dd7a65349..505ec5a80 100644
+--- a/vllm_ascend/distributed/kv_transfer/kv_pool/ascend_store/pool_worker.py
++++ b/vllm_ascend/distributed/kv_transfer/kv_pool/ascend_store/pool_worker.py
+@@ -2909,25 +2909,23 @@ class KVPoolWorker:
+             if save_finished_events[layer_id].is_set():
+                 save_finished_events[layer_id].clear()
+ 
+-    def wait_for_previous_save(self) -> None:
+-        save_batch = self._previous_save_batch
+-        if save_batch is None:
+-            return
+-
+-        assert self.kv_send_thread is not None
++    def handle_released_saves(self, released_req_ids: set[str] | None) -> None:
++        """Fence only the saves of requests whose blocks this step may reuse.
++
++        Finished and preempted requests' blocks are freed immediately by the
++        scheduler; before this step's forward can reallocate those blocks,
++        every queued save chunk of exactly those requests must have drained.
++        Requests whose blocks were already released in earlier steps were
++        drained by that step's fence and never queue new puts, so they need
++        no further waiting here.
++        """
+         send_thread = self.kv_send_thread
+-        wait_start = time.perf_counter()
+-        while True:
+-            send_thread.raise_if_failed()
+-            if save_batch.done.wait(timeout=SAVE_BATCH_FAILURE_POLL_INTERVAL_S):
+-                break
+-        elapsed = time.perf_counter() - wait_start
+-        logger.debug(
+-            "Previous KV save batch completed after waiting %.3f ms tp_rank=%d",
+-            elapsed * 1000,
+-            self.tp_rank,
+-        )
+-        self._previous_save_batch = None
++        if send_thread is None:
++            return
++        send_thread.raise_if_failed()
++        if isinstance(send_thread, KVCacheStoreSendingThread):
++            send_thread.wait_for_requests_saved(released_req_ids)
++        # Layerwise saves are already synchronized at each step's final layer.
+ 
+     def wait_for_save(self, connector_metadata: AscendConnectorMetadata) -> None:
+         current_event = None

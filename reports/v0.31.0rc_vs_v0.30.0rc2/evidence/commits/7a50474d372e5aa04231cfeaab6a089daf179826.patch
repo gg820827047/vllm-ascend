@@ -1,0 +1,2420 @@
+commit 7a50474d372e5aa04231cfeaab6a089daf179826
+Author:     Zhao Fenglin <lcfenglin@qq.com>
+AuthorDate: Thu Oct 15 14:46:33 2026 +0800
+Commit:     GitHub <noreply@github.com>
+CommitDate: Thu Oct 15 14:46:33 2026 +0800
+
+    [Attention][Feature] Integrate mixed_quant_sparse_flash_mla op for DeepSeek-V4 FP8 KV path (#17354)
+    
+    ### What this PR does / why we need it?
+    
+    Unify the DSV4 sparse attention path on the MixedQuantSparseFlashMla
+    operator family from cann_ops_transformer, replacing the previous
+    in-tree custom operators:
+    - Remove the in-tree KvCompressEpilog custom op
+    (csrc/attention/kv_compress_epilog/ — kernel, tiling, host def, CMake
+    and torch bindings) and switch dsa_kv_compress_scatter to the
+    cann_ops_transformer.kv_compress_epilog op, which writes the PA_BBND
+    quantMode=1 layout (608 B/token: [rope(64 bf16=128B) | nope(448 fp8) |
+    scale(7 bf16=14B) | pad(18B)]) directly.
+    - Replace the npu_kv_quant_sparse_attn_sharedkv(_metadata) ops in the
+    DSV4 FP8 plan with new adapter entry points
+    mixed_quant_sparse_flash_mla_fp8 /
+    mixed_quant_sparse_flash_mla_metadata_fp8 (quantMode=1, PA_BBND), and
+    rename the existing TurboQuant adapters to
+    mixed_quant_sparse_flash_mla_turboquant /
+    mixed_quant_sparse_flash_mla_metadata_turboquant (quantMode=3). Both
+    paths now share the same MixedQuantSparseFlashMla operator.
+    - Match the new cache layout: FP8 SWA cache row shrinks from head_dim +
+    128 to head_dim + 96 (608 B/token), updating deepseek_v4/model.py,
+    layer/attention/layer.py and the DSV4 compressed block-size tables.
+    - Avoid NPU→CPU syncs in the hot path: max_seqlen_cmp_kv and the
+    full-coverage window right edge are derived from host-side max_seqlen_kv
+    / total_q_tokens instead of .item() on device tensors; total_q_tokens is
+    added to the DSA kwargs (dsa_v1.py, context_parallel/dsa_cp.py).
+    
+    ### Does this PR introduce _any_ user-facing change?
+    
+    No. Behavior is preserved for existing DSV4 (FP8) and TurboQuant
+    sparse-attention deployments; the change is internal (operator backend
+    swap + adapter refactor).
+    
+    ### How was this patch tested?
+    
+    
+    - vLLM main:
+    https://github.com/vllm-project/vllm/commit/c4df37dfcc7f72ca41cd43801a468526ecf99a2b
+    
+    ---------
+    
+    Signed-off-by: lcfenglinwan <lcfenglin@qq.com>
+
+diff --git a/csrc/attention/kv_compress_epilog/CMakeLists.txt b/csrc/attention/kv_compress_epilog/CMakeLists.txt
+deleted file mode 100644
+index f9f567228..000000000
+--- a/csrc/attention/kv_compress_epilog/CMakeLists.txt
++++ /dev/null
+@@ -1,19 +0,0 @@
+-# ----------------------------------------------------------------------------
+-# Copyright (c) 2026 Huawei Technologies Co., Ltd.
+-# This program is free software, you can redistribute it and/or modify it under the terms and conditions of
+-# CANN Open Software License Agreement Version 2.0 (the "License").
+-# Please refer to the License for details. You may not use this file except in compliance with the License.
+-# THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
+-# INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
+-# See LICENSE in the root of the software repository for the full text of the License.
+-# -----------------------------------------------------------------------------------------------------------
+-
+-file(GLOB CURRENT_DIRS RELATIVE ${CMAKE_CURRENT_SOURCE_DIR} ${CMAKE_CURRENT_SOURCE_DIR}/*)
+-if(NOT ENABLE_TEST AND NOT BENCHMARK)
+-    list(REMOVE_ITEM CURRENT_DIRS tests)
+-endif()
+-foreach(SUB_DIR ${CURRENT_DIRS})
+-    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/${SUB_DIR}/CMakeLists.txt")
+-        add_subdirectory(${SUB_DIR})
+-    endif()
+-endforeach()
+\ No newline at end of file
+diff --git a/csrc/attention/kv_compress_epilog/op_host/CMakeLists.txt b/csrc/attention/kv_compress_epilog/op_host/CMakeLists.txt
+deleted file mode 100644
+index f44da3162..000000000
+--- a/csrc/attention/kv_compress_epilog/op_host/CMakeLists.txt
++++ /dev/null
+@@ -1,58 +0,0 @@
+-# This program is free software, you can redistribute it and/or modify it.
+-# Copyright (c) 2025 Huawei Technologies Co., Ltd.
+-# This file is a part of the CANN Open Software.
+-# Licensed under CANN Open Software License Agreement Version 2.0 (the "License").
+-# Please refer to the License for details. You may not use this file except in compliance with the License.
+-# THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
+-# See LICENSE in the root of the software repository for the full text of the License.
+-# ======================================================================================================================
+-
+-# add_ops_compile_options(
+-#         OP_NAME KvCompressEpilog
+-#         OPTIONS --cce-auto-sync=off
+-#                 -Wno-deprecated-declarations
+-#                 -Werror
+-#                 -mllvm -cce-aicore-hoist-movemask=false
+-#                 --op_relocatable_kernel_binary=true
+-# )
+-
+-# set(kv_compress_epilog_depends transformer/attention/kv_compress_epilog PARENT_SCOPE)
+-
+-# target_sources(op_host_aclnn PRIVATE
+-#         op_host/kv_compress_epilog_def.cpp
+-# )
+-
+-# target_sources(optiling PRIVATE
+-#         op_host/kv_compress_epilog_tiling_arch35.cpp
+-# )
+-
+-# if (NOT BUILD_OPEN_PROJECT)
+-#     target_sources(opmaster_ct PRIVATE
+-#         op_host/kv_compress_epilog_tiling_arch35.cpp
+-#     )
+-# endif ()
+-
+-# target_include_directories(optiling PRIVATE
+-#         ${CMAKE_CURRENT_SOURCE_DIR}/op_host
+-# )
+-
+-
+-add_op_to_compiled_list()
+-
+-if (BUILD_OPEN_PROJECT)
+-    target_sources(op_host_aclnn PRIVATE
+-        kv_compress_epilog_def.cpp
+-     )
+-endif()
+-
+-add_ops_compile_options(
+-        OP_NAME KvCompressEpilog
+-        OPTIONS --cce-auto-sync=off
+-                -Wno-deprecated-declarations
+-                -mllvm -cce-aicore-hoist-movemask=false
+-                --op_relocatable_kernel_binary=true
+-)
+-
+-if (NOT BUILD_OPS_RTY_KERNEL)
+-    add_modules_sources(OPTYPE kv_compress_epilog ACLNNTYPE aclnn)
+-endif()
+\ No newline at end of file
+diff --git a/csrc/attention/kv_compress_epilog/op_host/kv_compress_epilog_def.cpp b/csrc/attention/kv_compress_epilog/op_host/kv_compress_epilog_def.cpp
+deleted file mode 100644
+index 920b366c7..000000000
+--- a/csrc/attention/kv_compress_epilog/op_host/kv_compress_epilog_def.cpp
++++ /dev/null
+@@ -1,57 +0,0 @@
+-/**
+- * Copyright (c) 2026 Huawei Technologies Co., Ltd.
+- * This program is free software, you can redistribute it and/or modify it under the terms and conditions of
+- * CANN Open Software License Agreement Version 2.0 (the "License").
+- * Please refer to the License for details. You may not use this file except in compliance with the License.
+- * THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
+- * INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
+- * See LICENSE in the root of the software repository for the full text of the License.
+- */
+-
+-/*!
+- * \file kv_compress_epilog_def.cpp
+- * \brief
+- */
+-
+-#include <cstdint>
+-#include "register/op_def_registry.h"
+-
+-namespace ops {
+-class KvCompressEpilog : public OpDef {
+-public:
+-    explicit KvCompressEpilog(const char* name) : OpDef(name)
+-    {
+-        this->Input("kv_compress_cache")
+-            .ParamType(REQUIRED)
+-            .DataType({ge::DT_FLOAT8_E5M2, ge::DT_FLOAT8_E5M2, ge::DT_FLOAT8_E4M3FN, ge::DT_FLOAT8_E4M3FN})
+-            .Format({ge::FORMAT_ND, ge::FORMAT_ND, ge::FORMAT_ND, ge::FORMAT_ND,})
+-            .UnknownShapeFormat({ge::FORMAT_ND, ge::FORMAT_ND, ge::FORMAT_ND, ge::FORMAT_ND,})
+-            .IgnoreContiguous();
+-        this->Input("x")
+-            .ParamType(REQUIRED)
+-            .DataType({ge::DT_BF16, ge::DT_BF16, ge::DT_BF16, ge::DT_BF16})
+-            .Format({ge::FORMAT_ND, ge::FORMAT_ND, ge::FORMAT_ND, ge::FORMAT_ND,})
+-            .UnknownShapeFormat({ge::FORMAT_ND, ge::FORMAT_ND, ge::FORMAT_ND, ge::FORMAT_ND,});
+-        this->Input("slot_mapping")
+-            .ParamType(REQUIRED)
+-            .DataType({ge::DT_INT32, ge::DT_INT64, ge::DT_INT32, ge::DT_INT64})
+-            .Format({ge::FORMAT_ND, ge::FORMAT_ND, ge::FORMAT_ND, ge::FORMAT_ND,})
+-            .UnknownShapeFormat({ge::FORMAT_ND, ge::FORMAT_ND, ge::FORMAT_ND, ge::FORMAT_ND,});
+-        this->Output("kv_compress_cache")
+-            .ParamType(REQUIRED)
+-            .DataType({ge::DT_FLOAT8_E5M2, ge::DT_FLOAT8_E5M2, ge::DT_FLOAT8_E4M3FN, ge::DT_FLOAT8_E4M3FN})
+-            .Format({ge::FORMAT_ND, ge::FORMAT_ND, ge::FORMAT_ND, ge::FORMAT_ND,})
+-            .UnknownShapeFormat({ge::FORMAT_ND, ge::FORMAT_ND, ge::FORMAT_ND, ge::FORMAT_ND,});
+-
+-        this->Attr("quant_group_size").AttrType(OPTIONAL).Int(128);
+-        this->Attr("quant_mode").AttrType(OPTIONAL).Int(1);
+-        this->Attr("round_scale").AttrType(OPTIONAL).Int(1);
+-        this->Attr("layout").AttrType(OPTIONAL).Int(1);
+-        this->Attr("block_stride").AttrType(OPTIONAL).Int(0);
+-
+-        this->AICore().AddConfig("ascend950");
+-    }
+-};
+-
+-OP_ADD(KvCompressEpilog);
+-}  // namespace ops
+diff --git a/csrc/attention/kv_compress_epilog/op_host/kv_compress_epilog_tiling_arch35.cpp b/csrc/attention/kv_compress_epilog/op_host/kv_compress_epilog_tiling_arch35.cpp
+deleted file mode 100644
+index 66d60a35f..000000000
+--- a/csrc/attention/kv_compress_epilog/op_host/kv_compress_epilog_tiling_arch35.cpp
++++ /dev/null
+@@ -1,458 +0,0 @@
+-/**
+- * Copyright (c) 2026 Huawei Technologies Co., Ltd.
+- * This program is free software, you can redistribute it and/or modify it under the terms and conditions of
+- * CANN Open Software License Agreement Version 2.0 (the "License").
+- * Please refer to the License for details. You may not use this file except in compliance with the License.
+- * THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
+- * INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
+- * See LICENSE in the root of the software repository for the full text of the License.
+- */
+-
+-/*!
+- * \file kv_compress_epilog_tiling_arch35.cpp
+- * \brief Architecture-specific tiling implementation for KvCompressEpilog (arch35)
+- */
+-
+-#include <sstream>
+-#include "kv_compress_epilog_tiling_arch35.h"
+-
+-using namespace ge;
+-
+-namespace optiling {
+-
+-template <typename T>
+-static inline T CeilDiv(T num, T rnd)
+-{
+-    return (((rnd) == 0) ? 0 : (((num) + (rnd) - 1) / (rnd)));
+-}
+-
+-int64_t RoundUp(int64_t x, int64_t y) {
+-    return CeilDiv(x, y) * y;
+-}
+-
+-ge::graphStatus KvCompressEpilogTiling::GetPlatformInfo()
+-{
+-    auto platformInfo = context_->GetPlatformInfo();
+-    if (platformInfo == nullptr) {
+-        auto compileInfoPtr = context_->GetCompileInfo<KvCompressEpilogCompileInfo>();
+-        OPS_ERR_IF(compileInfoPtr == nullptr,
+-                  OPS_LOG_E(context_, "compileInfoPtr is null"),
+-                  return ge::GRAPH_FAILED);
+-        coreNum_ = compileInfoPtr->coreNum;
+-        ubSize_ = compileInfoPtr->ubSize;
+-    } else {
+-        auto ascendcPlatform = platform_ascendc::PlatformAscendC(platformInfo);
+-        uint64_t ubSizePlatForm;
+-        ascendcPlatform.GetCoreMemSize(platform_ascendc::CoreMemType::UB, ubSizePlatForm);
+-        ubSize_ = ubSizePlatForm;
+-        coreNum_ = ascendcPlatform.GetCoreNumAiv();
+-    }
+-    return ge::GRAPH_SUCCESS;
+-}
+-
+-ge::graphStatus KvCompressEpilogTiling::GetInputShapes()
+-{
+-    // Get input x shape (2D tensor)
+-    auto shapeX = context_->GetInputShape(X_INPUT_INDEX);
+-    OPS_ERR_IF(shapeX == nullptr,
+-              OPS_LOG_E(context_, "input x shape is null"),
+-              return ge::GRAPH_FAILED);
+-
+-    const gert::Shape& inputShapeX = shapeX->GetStorageShape();
+-    int64_t rankX = inputShapeX.GetDimNum();
+-    OPS_ERR_IF(rankX != 2,
+-              OPS_LOG_E(context_, "input x must be 2D tensor, got rank %ld", rankX),
+-              return ge::GRAPH_FAILED);
+-
+-    bs_ = inputShapeX.GetDim(0);
+-    d_ = inputShapeX.GetDim(1);
+-
+-    OPS_LOG_I(context_->GetNodeName(), "input x shape: [%ld, %ld]",
+-              bs_, d_);
+-
+-    // Get slot_mapping shape
+-    auto shapeSlotMapping = context_->GetInputShape(SLOT_MAPPING_INDEX);
+-    OPS_ERR_IF(shapeSlotMapping == nullptr,
+-              OPS_LOG_E(context_, "slot_mapping shape is null"),
+-              return ge::GRAPH_FAILED);
+-    const gert::Shape& slotMappingShape = shapeSlotMapping->GetStorageShape();
+-    int64_t slotMappingRank = slotMappingShape.GetDimNum();
+-    OPS_ERR_IF(slotMappingRank != 1,
+-              OPS_LOG_E(context_, "slot_mapping must be 1D tensor, got rank %ld", slotMappingRank),
+-              return ge::GRAPH_FAILED);
+-    int64_t slotMappingSize = slotMappingShape.GetDim(0);
+-    OPS_ERR_IF(slotMappingSize != bs_,
+-              OPS_LOG_E(context_, "slot_mapping size must equal x first dimension, got slot_mapping_size=%ld, dimX0=%ld",
+-                       slotMappingSize, bs_),
+-              return ge::GRAPH_FAILED);
+-
+-    OPS_LOG_I(context_->GetNodeName(), "slot_mapping size: %ld", slotMappingSize);
+-
+-    return ge::GRAPH_SUCCESS;
+-}
+-
+-ge::graphStatus KvCompressEpilogTiling::GetAttributes()
+-{
+-    auto* attrs = context_->GetAttrs();
+-    OPS_ERR_IF(attrs == nullptr,
+-              OPS_LOG_E(context_, "get attrs nullptr"),
+-              return ge::GRAPH_FAILED);
+-
+-    const int64_t* attrQuantGroupSize = attrs->GetAttrPointer<int64_t>(QUANT_GROUP_SIZE_ATTR_INDEX);
+-    if (attrQuantGroupSize != nullptr) {
+-        quantGroupSize_ = *attrQuantGroupSize;
+-    } else {
+-        quantGroupSize_ = DEFAULT_QUANT_GROUP_SIZE;
+-    }
+-
+-    const int64_t* attrQuantMode = attrs->GetAttrPointer<int64_t>(QUANT_MODE_ATTR_INDEX);
+-    if (attrQuantMode != nullptr) {
+-        quantMode_ = *attrQuantMode;
+-    }
+-
+-    const int64_t* attrRoundScale = attrs->GetAttrPointer<int64_t>(ROUND_SCALE_ATTR_INDEX);
+-    if (attrRoundScale != nullptr) {
+-        roundScale_ = *attrRoundScale;
+-    }
+-
+-    const int64_t* attrLayout = attrs->GetAttrPointer<int64_t>(LAYOUT_ATTR_INDEX);
+-    if (attrLayout != nullptr) {
+-        layout_ = *attrLayout;
+-    }
+-
+-    const int64_t* attrBlockStride = attrs->GetAttrPointer<int64_t>(BLOCK_STRIDE_ATTR_INDEX);
+-    if (attrBlockStride != nullptr) {
+-        blockStrideAttr_ = *attrBlockStride;
+-    }
+-
+-    OPS_LOG_I(context_->GetNodeName(), "quant_group_size: %ld quantMode_: %ld roundScale_: %ld layout_: %ld blockStrideAttr_: %ld",
+-              quantGroupSize_, quantMode_, roundScale_, layout_, blockStrideAttr_);
+-
+-    return ge::GRAPH_SUCCESS;
+-}
+-
+-ge::graphStatus KvCompressEpilogTiling::GetDtypeInfo()
+-{
+-    auto xDesc = context_->GetInputDesc(X_INPUT_INDEX);
+-    OPS_ERR_IF(xDesc == nullptr,
+-              OPS_LOG_E(context_, "get x desc nullptr"),
+-              return ge::GRAPH_FAILED);
+-    xDtype_ = xDesc->GetDataType();
+-
+-    OPS_ERR_IF(xDtype_ != ge::DT_BF16,
+-              OPS_LOG_E(context_, "x dtype only support BF16, got %d",
+-                       static_cast<int>(xDtype_)),
+-              return ge::GRAPH_FAILED);
+-
+-    auto slotMappingDesc = context_->GetInputDesc(SLOT_MAPPING_INDEX);
+-    OPS_ERR_IF(slotMappingDesc == nullptr,
+-              OPS_LOG_E(context_, "get slot_mapping desc nullptr"),
+-              return ge::GRAPH_FAILED);
+-    slotMappingDtype_ = slotMappingDesc->GetDataType();
+-
+-    OPS_ERR_IF((slotMappingDtype_ != ge::DT_INT32 && slotMappingDtype_ != ge::DT_INT64),
+-              OPS_LOG_E(context_, "slot_mapping dtype only support INT32/INT64, got %d",
+-                       static_cast<int>(slotMappingDtype_)),
+-              return ge::GRAPH_FAILED);
+-
+-    return ge::GRAPH_SUCCESS;
+-}
+-
+-ge::graphStatus KvCompressEpilogTiling::ValidateShapes()
+-{
+-    OPS_ERR_IF(bs_ <= 0,
+-              OPS_LOG_E(context_, "input x first dimension must be positive, got %ld", bs_),
+-              return ge::GRAPH_FAILED);
+-
+-    OPS_ERR_IF(d_ <= 0,
+-              OPS_LOG_E(context_, "input x second dimension must be positive, got %ld",
+-                       d_),
+-              return ge::GRAPH_FAILED);
+-
+-    return ge::GRAPH_SUCCESS;
+-}
+-
+-ge::graphStatus KvCompressEpilogTiling::ValidateDtypes()
+-{
+-    // Output should have same dtype as input kv_compress_cache
+-    auto kvCacheOutputDesc = context_->GetOutputDesc(KV_COMPRESS_CACHE_OUTPUT_INDEX);
+-    OPS_ERR_IF(kvCacheOutputDesc == nullptr,
+-              OPS_LOG_E(context_, "get output desc nullptr"),
+-              return ge::GRAPH_FAILED);
+-
+-    ge::DataType outputDtype = kvCacheOutputDesc->GetDataType();
+-    OPS_ERR_IF((outputDtype != ge::DT_FLOAT8_E5M2 && outputDtype != ge::DT_FLOAT8_E4M3FN),
+-              OPS_LOG_E(context_, "kv_compress_cache dtype only support FLOAT8_E5M2/FLOAT8_E4M3FN, got %d",
+-                       static_cast<int>(kvCacheDtype_)),
+-              return ge::GRAPH_FAILED);
+-
+-    return ge::GRAPH_SUCCESS;
+-}
+-
+-ge::graphStatus KvCompressEpilogTiling::DoOpTiling()
+-{
+-    rowOfFormerBlock_ = CeilDiv(bs_, static_cast<int64_t>(coreNum_));
+-    usedCoreNums_ = std::min(CeilDiv(bs_, rowOfFormerBlock_), static_cast<int64_t>(coreNum_));
+-    rowOfTailBlock_ = bs_ - (usedCoreNums_ - 1) * rowOfFormerBlock_;
+-
+-    if (quantMode_ == QUANT_MDOE_GROUP_MXFP8) {
+-        OPS_ERR_IF(quantGroupSize_ != 64 && quantGroupSize_ != 128,
+-                  OPS_LOG_E(context_, "MXFP8 quant_group_size must be 64 or 128, got %ld", quantGroupSize_),
+-                  return ge::GRAPH_FAILED);
+-        scaleCol_ = CeilDiv(d_ - SLICE_SIZE, quantGroupSize_);
+-    } else {
+-        scaleCol_ = CeilDiv(d_ - SLICE_SIZE, static_cast<int64_t>(PER_BLOCK_FP16));
+-    }
+-
+-    int64_t scaleBytes = 4;
+-    if (quantMode_ == QUANT_MDOE_GROUP_MXFP8) {
+-       scaleBytes = 1;
+-    }
+-    int64_t concatCol = d_ - SLICE_SIZE + SLICE_SIZE * 2 + scaleCol_ * scaleBytes;
+-    kvCacheCol_ = RoundUp(concatCol, DEFAULT_QUANT_GROUP_SIZE);
+-
+-    int64_t padCol = kvCacheCol_ - concatCol;
+-
+-    // Layout-2 specific calculations
+-    int64_t valuePerToken = 0;
+-    int64_t scalePerToken = 0;
+-    int64_t blockStride = 0;
+-    if (layout_ == 2) {
+-        auto shapeKvCache = context_->GetInputShape(KV_COMPRESS_CACHE_INPUT_INDEX);
+-        OPS_ERR_IF(shapeKvCache == nullptr,
+-                  OPS_LOG_E(context_, "kv_compress_cache input shape is null"),
+-                  return ge::GRAPH_FAILED);
+-        const gert::Shape& kvCacheShape = shapeKvCache->GetStorageShape();
+-        blockSize_ = kvCacheShape.GetDim(1);
+-        OPS_ERR_IF(blockSize_ <= 0,
+-                  OPS_LOG_E(context_, "blockSize must be positive, got %ld", blockSize_),
+-                  return ge::GRAPH_FAILED);
+-
+-        int64_t quantCol = d_ - SLICE_SIZE;
+-        valuePerToken = quantCol + SLICE_SIZE * 2;  // FP8 quant bytes + BF16 rope bytes
+-        scalePerToken = RoundUp(scaleCol_, static_cast<int64_t>(8));
+-
+-        int64_t autoBlockStride = blockSize_ * (valuePerToken + scalePerToken);
+-        if (blockStrideAttr_ > 0) {
+-            blockStride = blockStrideAttr_;
+-            OPS_ERR_IF(blockStride < autoBlockStride,
+-                      OPS_LOG_E(context_, "block_stride (%ld) must be >= auto-computed stride (%ld)",
+-                               blockStride, autoBlockStride),
+-                      return ge::GRAPH_FAILED);
+-        } else {
+-            blockStride = autoBlockStride;
+-        }
+-
+-        OPS_LOG_I(context_->GetNodeName(),
+-                  "layout=2: blockSize=%ld valuePerToken=%ld scalePerToken=%ld blockStride=%ld (auto=%ld, attr=%ld)",
+-                  blockSize_, valuePerToken, scalePerToken, blockStride, autoBlockStride, blockStrideAttr_);
+-    } else {
+-        int64_t autoRowStride = kvCacheCol_;
+-        if (blockStrideAttr_ > 0) {
+-            blockStride = blockStrideAttr_;
+-            OPS_ERR_IF(blockStride < autoRowStride,
+-                      OPS_LOG_E(context_, "block_stride (%ld) must be >= layout=1 row width (%ld)",
+-                               blockStride, autoRowStride),
+-                      return ge::GRAPH_FAILED);
+-        } else {
+-            blockStride = autoRowStride;
+-        }
+-
+-        OPS_LOG_I(context_->GetNodeName(),
+-                  "layout=1: kvCacheCol=%ld rowStride=%ld (auto=%ld, attr=%ld)",
+-                  kvCacheCol_, blockStride, autoRowStride, blockStrideAttr_);
+-    }
+-
+-    // UB estimation: pre-compute per-row sizes
+-    int64_t xSizePerRow = RoundUp(d_, static_cast<int64_t>(16)) * 2 * DOUBLE_BUFFER;
+-    int64_t ySizePerRow, scaleSizePerRow;
+-    if (layout_ == 2) {
+-        ySizePerRow = RoundUp(valuePerToken, static_cast<int64_t>(32)) * 1 * DOUBLE_BUFFER;
+-        scaleSizePerRow = RoundUp(scalePerToken, static_cast<int64_t>(32)) * 1;
+-    } else {
+-        ySizePerRow = RoundUp(kvCacheCol_, static_cast<int64_t>(32)) * 1 * DOUBLE_BUFFER;
+-        scaleSizePerRow = 0;
+-    }
+-
+-    int64_t minRowPerCore = 1;
+-    int64_t rowOnceLoop = std::min(rowOfFormerBlock_, minRowPerCore);
+-    rowFactor_ = rowOnceLoop;
+-    // d全载,尝试搬入更多的bs
+-    while (rowFactor_ <= rowOfFormerBlock_) {
+-        int64_t xSize = rowFactor_ * xSizePerRow;
+-        int64_t ySize = rowFactor_ * ySizePerRow;
+-        int64_t scaleSize = rowFactor_ * scaleSizePerRow;
+-        int64_t tmpBufferSize = RoundUp(rowFactor_, static_cast<int64_t>(8)) * 4;
+-        int64_t totalSize = xSize + ySize + scaleSize + tmpBufferSize;
+-        if (totalSize > static_cast<int64_t>(ubSize_)) {
+-            rowFactor_ = rowFactor_ - 1;
+-            break;
+-        }
+-        rowFactor_ = rowFactor_ + 1;
+-    }
+-    rowFactor_ = rowFactor_ > rowOfFormerBlock_ ? rowFactor_ - 1 : rowFactor_;
+-
+-    rowLoopOfFormerBlock_ = CeilDiv(rowOfFormerBlock_, rowFactor_);
+-    rowLoopOfTailBlock_ = CeilDiv(rowOfTailBlock_, rowFactor_);
+-    tailRowFactorOfFormerBlock_ = rowOfFormerBlock_ % rowFactor_ == 0 ? rowFactor_ : rowOfFormerBlock_ % rowFactor_;
+-    tailRowFactorOfTailBlock_ = rowOfTailBlock_ % rowFactor_ == 0 ? rowFactor_ : rowOfTailBlock_ % rowFactor_;
+-
+-
+-    tilingData_.set_bs(bs_);
+-    tilingData_.set_d(d_);
+-    tilingData_.set_kvCacheCol(kvCacheCol_);
+-    tilingData_.set_scaleCol(scaleCol_);
+-    tilingData_.set_concatCol(concatCol);
+-    tilingData_.set_quantMode(quantMode_);
+-    tilingData_.set_roundScale(roundScale_);
+-    tilingData_.set_padCol(padCol);
+-    tilingData_.set_rowOfFormerBlock(rowOfFormerBlock_);
+-    tilingData_.set_rowOfTailBlock(rowOfTailBlock_);
+-    tilingData_.set_rowLoopOfFormerBlock(rowLoopOfFormerBlock_);
+-    tilingData_.set_rowLoopOfTailBlock(rowLoopOfTailBlock_);
+-    tilingData_.set_rowFactor(rowFactor_);
+-    tilingData_.set_tailRowFactorOfFormerBlock(tailRowFactorOfFormerBlock_);
+-    tilingData_.set_tailRowFactorOfTailBlock(tailRowFactorOfTailBlock_);
+-    tilingData_.set_layout(layout_);
+-    tilingData_.set_blockSize(blockSize_);
+-    tilingData_.set_valuePerToken(valuePerToken);
+-    tilingData_.set_scalePerToken(scalePerToken);
+-    tilingData_.set_blockStride(blockStride);
+-    tilingData_.set_perGroupSize(quantGroupSize_);
+-
+-    return ge::GRAPH_SUCCESS;
+-}
+-
+-ge::graphStatus KvCompressEpilogTiling::PostTiling()
+-{
+-    // Set block dimension (number of AI cores to use)
+-    context_->SetBlockDim(usedCoreNums_);
+-
+-    // Set tiling key for kernel dispatch
+-    context_->SetTilingKey(GetTilingKey());
+-
+-    // Set workspace size
+-    size_t* workspaces = context_->GetWorkspaceSizes(1);
+-    OPS_ERR_IF(workspaces == nullptr,
+-              OPS_LOG_E(context_, "get workspaces nullptr"),
+-              return ge::GRAPH_FAILED);
+-    workspaces[0] = static_cast<size_t>(DEFAULT_WORKSPACE_SIZE);
+-
+-    // Save tiling data to buffer
+-    OPS_ERR_IF(context_->GetRawTilingData() == nullptr,
+-              OPS_LOG_E(context_, "get tilingdata nullptr"),
+-              return ge::GRAPH_FAILED);
+-    tilingData_.SaveToBuffer(context_->GetRawTilingData()->GetData(),
+-                            context_->GetRawTilingData()->GetCapacity());
+-    context_->GetRawTilingData()->SetDataSize(tilingData_.GetDataSize());
+-
+-    // Log tiling information
+-    DumpTilingInfo();
+-
+-    return ge::GRAPH_SUCCESS;
+-}
+-
+-void KvCompressEpilogTiling::DumpTilingInfo()
+-{
+-    std::ostringstream info;
+-    info << "bs: " << tilingData_.get_bs();
+-    info << ", d: " << tilingData_.get_d();
+-    info << ", kvCacheCol: " << tilingData_.get_kvCacheCol();
+-    info << ", scaleCol: " << tilingData_.get_scaleCol();
+-    info << ", concatCol: " << tilingData_.get_concatCol();
+-    info << ", quantMode: " << tilingData_.get_quantMode();
+-    info << ", roundScale: " << tilingData_.get_roundScale();
+-    info << ", padCol: " << tilingData_.get_padCol();
+-    info << ", rowOfFormerBlock: " << tilingData_.get_rowOfFormerBlock();
+-    info << ", rowOfTailBlock: " << tilingData_.get_rowOfTailBlock();
+-    info << ", rowLoopOfFormerBlock: " << tilingData_.get_rowLoopOfFormerBlock();
+-    info << ", rowLoopOfTailBlock: " << tilingData_.get_rowLoopOfTailBlock();
+-    info << ", rowFactor: " << tilingData_.get_rowFactor();
+-    info << ", tailRowFactorOfFormerBlock: " << tilingData_.get_tailRowFactorOfFormerBlock();
+-    info << ", tailRowFactorOfTailBlock: " << tilingData_.get_tailRowFactorOfTailBlock();
+-    info << ", layout: " << tilingData_.get_layout();
+-    info << ", blockSize: " << tilingData_.get_blockSize();
+-    info << ", valuePerToken: " << tilingData_.get_valuePerToken();
+-    info << ", scalePerToken: " << tilingData_.get_scalePerToken();
+-    info << ", blockStride: " << tilingData_.get_blockStride();
+-
+-    OPS_LOG_I(context_, "%s", info.str().c_str());
+-}
+-
+-uint64_t KvCompressEpilogTiling::GetTilingKey() const
+-{
+-    return 0;
+-}
+-
+-ge::graphStatus KvCompressEpilogTiling::GetShapeAttrsInfo()
+-{
+-    OPS_ERR_IF(context_ == nullptr,
+-              OPS_LOG_E(context_, "context can not be nullptr"),
+-              return ge::GRAPH_FAILED);
+-
+-    OPS_ERR_IF(GetInputShapes() != ge::GRAPH_SUCCESS,
+-              OPS_LOG_E(context_, "GetInputShapes failed"),
+-              return ge::GRAPH_FAILED);
+-
+-    OPS_ERR_IF(GetAttributes() != ge::GRAPH_SUCCESS,
+-              OPS_LOG_E(context_, "GetAttributes failed"),
+-              return ge::GRAPH_FAILED);
+-
+-    OPS_ERR_IF(GetDtypeInfo() != ge::GRAPH_SUCCESS,
+-              OPS_LOG_E(context_, "GetDtypeInfo failed"),
+-              return ge::GRAPH_FAILED);
+-
+-    OPS_ERR_IF(ValidateShapes() != ge::GRAPH_SUCCESS,
+-              OPS_LOG_E(context_, "ValidateShapes failed"),
+-              return ge::GRAPH_FAILED);
+-
+-    OPS_ERR_IF(ValidateDtypes() != ge::GRAPH_SUCCESS,
+-              OPS_LOG_E(context_, "ValidateDtypes failed"),
+-              return ge::GRAPH_FAILED);
+-
+-    return ge::GRAPH_SUCCESS;
+-}
+-
+-ge::graphStatus KvCompressEpilogTiling::RunTiling()
+-{
+-    OPS_ERR_IF(GetPlatformInfo() != ge::GRAPH_SUCCESS,
+-              OPS_LOG_E(context_, "GetPlatformInfo failed"),
+-              return ge::GRAPH_FAILED);
+-
+-    OPS_ERR_IF(GetShapeAttrsInfo() != ge::GRAPH_SUCCESS,
+-              OPS_LOG_E(context_, "GetShapeAttrsInfo failed"),
+-              return ge::GRAPH_FAILED);
+-
+-    OPS_ERR_IF(DoOpTiling() != ge::GRAPH_SUCCESS,
+-              OPS_LOG_E(context_, "CalcOpTiling failed"),
+-              return ge::GRAPH_FAILED);
+-
+-    OPS_ERR_IF(PostTiling() != ge::GRAPH_SUCCESS,
+-              OPS_LOG_E(context_, "PostTiling failed"),
+-              return ge::GRAPH_FAILED);
+-
+-    return ge::GRAPH_SUCCESS;
+-}
+-
+-// ---------- Tiling Entry Points ----------
+-ge::graphStatus TilingForKvCompressEpilog(gert::TilingContext* context)
+-{
+-    OPS_ERR_IF(context == nullptr,
+-              OPS_REPORT_VECTOR_INNER_ERR("KvCompressEpilog", "Tiling context is null"),
+-              return ge::GRAPH_FAILED);
+-
+-    KvCompressEpilogTiling tiling(context);
+-    return tiling.RunTiling();
+-}
+-
+-ge::graphStatus TilingPrepareForKvCompressEpilog(gert::TilingParseContext* context)
+-{
+-    (void)context;
+-    return ge::GRAPH_SUCCESS;
+-}
+-
+-IMPL_OP_OPTILING(KvCompressEpilog)
+-    .Tiling(TilingForKvCompressEpilog)
+-    .TilingParse<KvCompressEpilogCompileInfo>(TilingPrepareForKvCompressEpilog);
+-
+-}  // namespace optiling
+diff --git a/csrc/attention/kv_compress_epilog/op_host/kv_compress_epilog_tiling_arch35.h b/csrc/attention/kv_compress_epilog/op_host/kv_compress_epilog_tiling_arch35.h
+deleted file mode 100644
+index b1abd32cf..000000000
+--- a/csrc/attention/kv_compress_epilog/op_host/kv_compress_epilog_tiling_arch35.h
++++ /dev/null
+@@ -1,163 +0,0 @@
+-/**
+- * Copyright (c) 2026 Huawei Technologies Co., Ltd.
+- * This program is free software, you can redistribute it and/or modify it under the terms and conditions of
+- * CANN Open Software License Agreement Version 2.0 (the "License").
+- * Please refer to the License for details. You may not use this file except in compliance with the License.
+- * THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
+- * INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
+- * See LICENSE in the root of the software repository for the full text of the License.
+- */
+-
+-/*!
+- * \file kv_compress_epilog_tiling_arch35.h
+- * \brief
+- */
+-
+-#ifndef KV_COMPRESS_EPILOG_TILING_ARCH35_H
+-#define KV_COMPRESS_EPILOG_TILING_ARCH35_H
+-
+-#include <vector>
+-#include <iostream>
+-#include "register/op_impl_registry.h"
+-#include "platform/platform_infos_def.h"
+-#include "exe_graph/runtime/tiling_context.h"
+-#include "tiling/platform/platform_ascendc.h"
+-#include "register/tilingdata_base.h"
+-#include "tiling/tiling_api.h"
+-#include "error/ops_error.h"
+-#include "platform/platform_info.h"
+-
+-namespace optiling {
+-
+-// ---------- Constants ----------
+-constexpr int64_t X_INPUT_INDEX = 1;
+-constexpr int64_t SLOT_MAPPING_INDEX = 2;
+-constexpr int64_t KV_COMPRESS_CACHE_OUTPUT_INDEX = 0;
+-
+-constexpr int64_t KV_COMPRESS_CACHE_INPUT_INDEX = 0;
+-
+-constexpr int64_t QUANT_GROUP_SIZE_ATTR_INDEX = 0;
+-constexpr int64_t QUANT_MODE_ATTR_INDEX = 1;
+-constexpr int64_t ROUND_SCALE_ATTR_INDEX = 2;
+-constexpr int64_t LAYOUT_ATTR_INDEX = 3;
+-constexpr int64_t BLOCK_STRIDE_ATTR_INDEX = 4;
+-
+-constexpr int64_t QUANT_MDOE_GROUP_FP8 = 1;
+-constexpr int64_t QUANT_MDOE_GROUP_MXFP8 = 2;
+-
+-constexpr int64_t DEFAULT_QUANT_GROUP_SIZE = 128;
+-constexpr int64_t DEFAULT_WORKSPACE_SIZE = 32;
+-
+-constexpr int64_t SLICE_SIZE = 64;
+-
+-constexpr int64_t BLOCK_SIZE = 32;
+-constexpr int64_t REPEAT_SIZE = 256;
+-constexpr int64_t DOUBLE_BUFFER = 2;
+-// per_block量化,每128个f16需要量化出一个scale, 因此切分尾轴时，以128为factor进行切分
+-constexpr int64_t PER_BLOCK_FP16 = 128;
+-
+-// ---------- TilingData Structure ----------
+-BEGIN_TILING_DATA_DEF(KvCompressEpilogTilingData)
+-TILING_DATA_FIELD_DEF(int64_t, bs);
+-TILING_DATA_FIELD_DEF(int64_t, d);
+-TILING_DATA_FIELD_DEF(int64_t, kvCacheCol);
+-TILING_DATA_FIELD_DEF(int64_t, scaleCol);
+-TILING_DATA_FIELD_DEF(int64_t, concatCol);
+-TILING_DATA_FIELD_DEF(int64_t, padCol);
+-TILING_DATA_FIELD_DEF(int64_t, quantMode);
+-TILING_DATA_FIELD_DEF(int64_t, roundScale);
+-TILING_DATA_FIELD_DEF(int64_t, perGroupSize);
+-TILING_DATA_FIELD_DEF(int64_t, rowOfFormerBlock);
+-TILING_DATA_FIELD_DEF(int64_t, rowOfTailBlock);
+-TILING_DATA_FIELD_DEF(int64_t, rowLoopOfFormerBlock);
+-TILING_DATA_FIELD_DEF(int64_t, rowLoopOfTailBlock);
+-TILING_DATA_FIELD_DEF(int64_t, rowFactor);
+-TILING_DATA_FIELD_DEF(int64_t, tailRowFactorOfFormerBlock);
+-TILING_DATA_FIELD_DEF(int64_t, tailRowFactorOfTailBlock);
+-TILING_DATA_FIELD_DEF(int64_t, layout);
+-TILING_DATA_FIELD_DEF(int64_t, blockSize);
+-TILING_DATA_FIELD_DEF(int64_t, valuePerToken);
+-TILING_DATA_FIELD_DEF(int64_t, scalePerToken);
+-TILING_DATA_FIELD_DEF(int64_t, blockStride);
+-END_TILING_DATA_DEF;
+-
+-REGISTER_TILING_DATA_CLASS(KvCompressEpilog, KvCompressEpilogTilingData)
+-
+-// ---------- CompileInfo Structure ----------
+-struct KvCompressEpilogCompileInfo {
+-    uint64_t coreNum = 0;
+-    uint64_t ubSize = 0;
+-};
+-
+-// ---------- Tiling Class ----------
+-class KvCompressEpilogTiling {
+-public:
+-    explicit KvCompressEpilogTiling(gert::TilingContext* context) : context_(context) {}
+-    ~KvCompressEpilogTiling() = default;
+-
+-    ge::graphStatus RunTiling();
+-
+-protected:
+-    // Main tiling workflow methods
+-    ge::graphStatus GetPlatformInfo();
+-    ge::graphStatus GetShapeAttrsInfo();
+-    ge::graphStatus DoOpTiling();
+-    ge::graphStatus PostTiling();
+-
+-    // Helper methods
+-    ge::graphStatus GetInputShapes();
+-    ge::graphStatus GetAttributes();
+-    ge::graphStatus GetDtypeInfo();
+-    void CountTilingKey();
+-
+-    // Validation
+-    ge::graphStatus ValidateShapes();
+-    ge::graphStatus ValidateDtypes();
+-
+-    // Utilities
+-    uint64_t GetTilingKey() const;
+-    void DumpTilingInfo();
+-
+-private:
+-    // Context
+-    gert::TilingContext* context_ = nullptr;
+-    KvCompressEpilogTilingData tilingData_;
+-    uint64_t tilingKey_ = 0;
+-
+-    // Platform info
+-    uint64_t coreNum_ = 0;
+-    uint64_t workspaceSize_ = 0;
+-    uint64_t usedCoreNums_ = 0;
+-    uint64_t ubSize_ = 0;
+-
+-    // Shape info from inputs
+-    int64_t bs_ = 0;  // First dimension of x (to be partitioned)
+-    int64_t d_ = 0;  // Second dimension of x
+-    int64_t kvCacheCol_ = 0;  // kvCache cols
+-    int64_t scaleCol_ = 0;  // scale cols
+-
+-    int64_t rowOfFormerBlock_ = 0;
+-    int64_t rowOfTailBlock_ = 0;
+-    int64_t rowLoopOfFormerBlock_ = 0;
+-    int64_t rowLoopOfTailBlock_ = 0;
+-    int64_t rowFactor_ = 0;
+-    int64_t tailRowFactorOfFormerBlock_ = 0;
+-    int64_t tailRowFactorOfTailBlock_= 0;
+-
+-    // Attributes
+-    int64_t quantGroupSize_ = DEFAULT_QUANT_GROUP_SIZE;
+-    int64_t quantMode_ = 1;
+-    int64_t roundScale_ = 1;
+-    int64_t layout_ = 1;
+-    int64_t blockSize_ = 0;
+-    int64_t blockStrideAttr_ = 0;  // 0 = auto-compute, >0 = user-specified
+-
+-    // Data types
+-    ge::DataType xDtype_ = ge::DT_BF16;
+-    ge::DataType slotMappingDtype_ = ge::DT_INT32;
+-    ge::DataType kvCacheDtype_ = ge::DT_FLOAT8_E5M2;
+-};
+-
+-}  // namespace optiling
+-
+-#endif  // KV_COMPRESS_EPILOG_TILING_ARCH35_H
+diff --git a/csrc/attention/kv_compress_epilog/op_kernel/kv_compress_epilog.cpp b/csrc/attention/kv_compress_epilog/op_kernel/kv_compress_epilog.cpp
+deleted file mode 100644
+index 347d017bd..000000000
+--- a/csrc/attention/kv_compress_epilog/op_kernel/kv_compress_epilog.cpp
++++ /dev/null
+@@ -1,56 +0,0 @@
+-/**
+- * Copyright (c) 2026 Huawei Technologies Co., Ltd.
+- * This program is free software, you can redistribute it and/or modify it under the terms and conditions of
+- * CANN Open Software License Agreement Version 2.0 (the "License").
+- * Please refer to the License for details. You may not use this file except in compliance with the License.
+- * THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
+- * INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
+- * See LICENSE in the root of the software repository for the full text of the License.
+- */
+-
+-/*!
+- * \file kv_compress_epilog.cpp
+- * \brief KV compress epilog kernel implementation
+- */
+-
+-#include "kv_compress_epilog.h"
+-
+-using namespace AscendC;
+-
+-extern "C" __global__ __aicore__ void kv_compress_epilog(
+-    GM_ADDR kv_compress_cache,
+-    GM_ADDR x,
+-    GM_ADDR slot_mapping,
+-    GM_ADDR kv_compress_cache_out,
+-    GM_ADDR workspace,
+-    GM_ADDR tiling)
+-{
+-    if (workspace == nullptr) {
+-        return;
+-    }
+-
+-    GM_ADDR userspace = GetUserWorkspace(workspace);
+-    if (userspace == nullptr) {
+-        return;
+-    }
+-
+-    TPipe pipe;
+-
+-    // Get tiling data
+-    GET_TILING_DATA_WITH_STRUCT(KvCompressEpilogTilingData, tilingDataIn, tiling);
+-    const KvCompressEpilogTilingData* __restrict__ tilingData = &tilingDataIn;
+-
+-    // Save and set overflow mode to saturation (0) for FP8 quantization
+-    int64_t oriOverflowMode = AscendC::GetCtrlSpr<FLOAT_OVERFLOW_MODE_CTRL, FLOAT_OVERFLOW_MODE_CTRL>();
+-    AscendC::SetCtrlSpr<FLOAT_OVERFLOW_MODE_CTRL, FLOAT_OVERFLOW_MODE_CTRL>(0);
+-
+-    // Dispatch based on tiling key
+-    if (TILING_KEY_IS(0)) {
+-        KvCompressEpilogOps::KvCompressEpilogRegBase<DTYPE_X, DTYPE_SLOT_MAPPING, DTYPE_KV_COMPRESS_CACHE> op(&pipe);
+-        op.Init(x, slot_mapping, kv_compress_cache, tilingData);
+-        op.Process();
+-    }
+-
+-    // Restore overflow mode
+-    AscendC::SetCtrlSpr<FLOAT_OVERFLOW_MODE_CTRL, FLOAT_OVERFLOW_MODE_CTRL>(oriOverflowMode);
+-}
+diff --git a/csrc/attention/kv_compress_epilog/op_kernel/kv_compress_epilog.h b/csrc/attention/kv_compress_epilog/op_kernel/kv_compress_epilog.h
+deleted file mode 100644
+index db9c9f665..000000000
+--- a/csrc/attention/kv_compress_epilog/op_kernel/kv_compress_epilog.h
++++ /dev/null
+@@ -1,216 +0,0 @@
+-/**
+- * Copyright (c) 2026 Huawei Technologies Co., Ltd.
+- * This program is free software, you can redistribute it and/or modify it under the terms and conditions of
+- * CANN Open Software License Agreement Version 2.0 (the "License").
+- * Please refer to the License for details. You may not use this file except in compliance with the License.
+- * THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
+- * INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
+- * See LICENSE in the root of the software repository for the full text of the License.
+- */
+-
+-/*!
+- * \file kv_compress_epilog.h
+- * \brief KV compress epilog kernel implementation
+- */
+-
+-#ifndef KV_COMPRESS_EPILOG_H
+-#define KV_COMPRESS_EPILOG_H
+-
+-#include "kernel_operator.h"
+-#include "kernel_tiling/kernel_tiling.h"
+-#include "kv_compress_epilog_common.h"
+-
+-using namespace AscendC;
+-
+-namespace KvCompressEpilogOps {
+-
+-template <typename T0, typename U, typename T1>
+-class KvCompressEpilogRegBase {
+-public:
+-    __aicore__ inline KvCompressEpilogRegBase(TPipe* pipe) : pipe_(pipe) {}
+-
+-    __aicore__ inline void Init(
+-        GM_ADDR x,
+-        GM_ADDR slotMapping,
+-        GM_ADDR kvCache,
+-        const KvCompressEpilogTilingData* tilingData);
+-
+-    __aicore__ inline void Process();
+-
+-    __aicore__ inline void SetMaxValue();
+-
+-private:
+-    TPipe* pipe_ = nullptr;
+-
+-    GlobalTensor<T0> xGm;
+-    GlobalTensor<U> slotMappingGm;
+-    GlobalTensor<T1> kvCacheGm;
+-
+-    TQue<QuePosition::VECIN, 1> xQue;
+-    TQue<QuePosition::VECOUT, 1> kvCacheQue;
+-    TBuf<QuePosition::VECCALC> kvCacheScaleBuf;
+-    TBuf<QuePosition::VECCALC> indexBuf;
+-
+-    LocalTensor<T0> xLocal;
+-    LocalTensor<T1> kvCacheLocal;
+-    LocalTensor<T1> kvCacheScaleLocal;
+-    LocalTensor<U> indexLocal;
+-    int64_t validIdx = 0;
+-    float maxValue = 0.0f;
+-    float fp8Min = 0.0f;
+-    float fp8Max = 0.0f;
+-
+-    // Tiling data
+-    const KvCompressEpilogTilingData* tilingData = nullptr;
+-};
+-
+-// Template implementations
+-
+-template <typename T0, typename U, typename T1>
+-__aicore__ inline void KvCompressEpilogRegBase<T0, U, T1>::Init(
+-    GM_ADDR x,
+-    GM_ADDR slotMapping,
+-    GM_ADDR kvCache,
+-    const KvCompressEpilogTilingData* tilingDataPtr)
+-{
+-        tilingData = tilingDataPtr;
+-
+-        int64_t xGmBaseOffset = GetBlockIdx() * tilingData->rowOfFormerBlock * tilingData->d;
+-
+-        xGm.SetGlobalBuffer((__gm__ T0*)x + xGmBaseOffset);
+-        kvCacheGm.SetGlobalBuffer((__gm__ T1*)kvCache);
+-        slotMappingGm.SetGlobalBuffer((__gm__ U*)slotMapping);
+-
+-        pipe_->InitBuffer(xQue, 2, tilingData->rowFactor * RoundUp<T0>(tilingData->d) * sizeof(T0));
+-        if (tilingData->layout == 2) {
+-            pipe_->InitBuffer(kvCacheQue, 2, tilingData->rowFactor * RoundUp<T1>(tilingData->valuePerToken) * sizeof(T1));
+-            pipe_->InitBuffer(kvCacheScaleBuf, tilingData->rowFactor * RoundUp<T1>(tilingData->scalePerToken) * sizeof(T1));
+-        } else {
+-            pipe_->InitBuffer(kvCacheQue, 2, tilingData->rowFactor * RoundUp<T1>(tilingData->kvCacheCol) * sizeof(T1));
+-        }
+-
+-        pipe_->InitBuffer(indexBuf, RoundUp<U>(tilingData->rowFactor) * sizeof(U));
+-        indexLocal = indexBuf.Get<U>();
+-}
+-
+-template <typename T0, typename U, typename T1>
+- __aicore__ inline void KvCompressEpilogRegBase<T0, U, T1>::Process()
+-    {
+-        SetMaxValue();
+-        int64_t rowOuterLoop =
+-            (GetBlockIdx() == GetBlockNum() - 1) ? tilingData->rowLoopOfTailBlock : tilingData->rowLoopOfFormerBlock;
+-        int64_t tailRowFactor = (GetBlockIdx() == GetBlockNum() - 1) ? tilingData->tailRowFactorOfTailBlock :
+-                                                                     tilingData->tailRowFactorOfFormerBlock;
+-        for (int64_t rowOuterIdx = 0; rowOuterIdx < rowOuterLoop; rowOuterIdx++) {
+-            int64_t curRowFactor = (rowOuterIdx == rowOuterLoop - 1) ? tailRowFactor : tilingData->rowFactor;
+-            xLocal = xQue.template AllocTensor<T0>();
+-            validIdx = 0;
+-            for (int64_t rowInnerIdx = 0; rowInnerIdx < curRowFactor; rowInnerIdx++) {
+-                int32_t curSlotIdx = GetBlockIdx() * tilingData->rowOfFormerBlock + rowOuterIdx * tilingData->rowFactor + rowInnerIdx;
+-                int32_t slot = static_cast<int32_t>(slotMappingGm.GetValue(curSlotIdx));
+-                if (slot == -1) {
+-                    continue;
+-                }
+-                CopyIn(
+-                    xGm[rowOuterIdx * tilingData->rowFactor * tilingData->d +
+-                        rowInnerIdx * tilingData->d],
+-                    xLocal[validIdx * RoundUp<T0>(tilingData->d)], 1, tilingData->d);
+-                indexLocal.SetValue(validIdx, slot);
+-                validIdx++;
+-
+-                event_t eventId = static_cast<event_t>(GetTPipePtr()->FetchEventID(HardEvent::S_MTE3));
+-                SetFlag<HardEvent::S_MTE3>(eventId);
+-                WaitFlag<HardEvent::S_MTE3>(eventId);
+-            }
+-            xQue.template EnQue(xLocal);
+-            xLocal = xQue.template DeQue<T0>();
+-
+-            kvCacheLocal = kvCacheQue.template AllocTensor<T1>();
+-
+-            if (tilingData->quantMode == QUANT_MDOE_GROUP_FP8) {
+-                VFProcessDynamicBlockQuant(
+-                    kvCacheLocal, xLocal, maxValue, validIdx, tilingData->d, tilingData->concatCol, tilingData->padCol);
+-            } else if (tilingData->layout == 2) {
+-                kvCacheScaleLocal = kvCacheScaleBuf.template Get<T1>();
+-                if (tilingData->roundScale == 1) {
+-                    VFProcessDynamicMxFP8QuantLayout2<T0, T1, true>(
+-                        kvCacheLocal, kvCacheScaleLocal, xLocal, maxValue, fp8Min, fp8Max,
+-                        validIdx, tilingData->d, tilingData->valuePerToken, tilingData->scalePerToken,
+-                        tilingData->perGroupSize);
+-                } else {
+-                    VFProcessDynamicMxFP8QuantLayout2<T0, T1, false>(
+-                        kvCacheLocal, kvCacheScaleLocal, xLocal, maxValue, fp8Min, fp8Max,
+-                        validIdx, tilingData->d, tilingData->valuePerToken, tilingData->scalePerToken,
+-                        tilingData->perGroupSize);
+-                }
+-            } else {
+-                if (tilingData->roundScale == 1) {
+-                    VFProcessDynamicMxFP8Quant<T0, T1, true>(
+-                        kvCacheLocal, xLocal, maxValue, fp8Min, fp8Max, validIdx, tilingData->d, tilingData->concatCol, tilingData->padCol,
+-                        tilingData->perGroupSize);
+-                } else {
+-                    VFProcessDynamicMxFP8Quant<T0, T1, false>(
+-                        kvCacheLocal, xLocal, maxValue, fp8Min, fp8Max, validIdx, tilingData->d, tilingData->concatCol, tilingData->padCol,
+-                        tilingData->perGroupSize);
+-                }
+-            }
+-
+-            xQue.template FreeTensor(xLocal);
+-
+-            kvCacheQue.template EnQue(kvCacheLocal);
+-            kvCacheLocal = kvCacheQue.template DeQue<T1>();
+-
+-            if (tilingData->layout == 2 && tilingData->quantMode == QUANT_MDOE_GROUP_MXFP8) {
+-                for (int32_t curValidIdx = 0; curValidIdx < validIdx; curValidIdx++) {
+-                    int32_t slot = indexLocal.GetValue(curValidIdx);
+-                    int64_t blockIdx = static_cast<int64_t>(slot) / tilingData->blockSize;
+-                    int64_t slotInBlock = static_cast<int64_t>(slot) % tilingData->blockSize;
+-
+-                    // CopyOut value (FP8 quant + BF16 rope)
+-                    int64_t valueGmOff = blockIdx * tilingData->blockStride
+-                                       + slotInBlock * tilingData->valuePerToken;
+-                    CopyOut(
+-                        kvCacheLocal[curValidIdx * RoundUp<T1>(tilingData->valuePerToken)],
+-                        kvCacheGm[valueGmOff], 1, tilingData->valuePerToken);
+-
+-                    // CopyOut scale (uint8)
+-                    int64_t scaleGmOff = blockIdx * tilingData->blockStride
+-                                       + tilingData->blockSize * tilingData->valuePerToken
+-                                       + slotInBlock * tilingData->scalePerToken;
+-                    CopyOut(
+-                        kvCacheScaleLocal[curValidIdx * RoundUp<T1>(tilingData->scalePerToken)],
+-                        kvCacheGm[scaleGmOff], 1, tilingData->scalePerToken);
+-                }
+-            } else {
+-                for (int32_t curValidIdx = 0; curValidIdx < validIdx; curValidIdx++) {
+-                    int32_t slot = indexLocal.GetValue(curValidIdx);
+-                    int64_t gmOffset = static_cast<int64_t>(slot) * tilingData->kvCacheCol;
+-                    if (tilingData->layout == 1) {
+-                        int64_t rowStride = tilingData->blockStride > 0 ? tilingData->blockStride : tilingData->kvCacheCol;
+-                        gmOffset = static_cast<int64_t>(slot) * rowStride;
+-                    }
+-                    CopyOut(
+-                        kvCacheLocal[curValidIdx * RoundUp<T1>(tilingData->kvCacheCol)],
+-                        kvCacheGm[gmOffset], 1, tilingData->kvCacheCol);
+-                }
+-            }
+-            kvCacheQue.template FreeTensor(kvCacheLocal);
+-        }
+-    }
+-
+-    template <typename T0, typename U, typename T1>
+-    __aicore__ inline void KvCompressEpilogRegBase<T0, U, T1>::SetMaxValue()
+-    {
+-        if constexpr (IsSameType<T1, fp8_e5m2_t>::value) {
+-            maxValue = static_cast<float>(1.0) / FP8_E5M2_MAX_VALUE;
+-            fp8Max = FP8_E5M2_MAX_VALUE;
+-            fp8Min = FP8_E5M2_MIN_VALUE;
+-        } else if constexpr (IsSameType<T1, fp8_e4m3fn_t>::value) {
+-            maxValue = static_cast<float>(1.0) / FP8_E4M3FN_MAX_VALUE;
+-            fp8Max = FP8_E4M3FN_MAX_VALUE;
+-            fp8Min = FP8_E4M3FN_MIN_VALUE;
+-        }
+-    }
+-
+-}
+-#endif  // KV_COMPRESS_EPILOG_H
+diff --git a/csrc/attention/kv_compress_epilog/op_kernel/kv_compress_epilog_common.h b/csrc/attention/kv_compress_epilog/op_kernel/kv_compress_epilog_common.h
+deleted file mode 100644
+index d088a6f73..000000000
+--- a/csrc/attention/kv_compress_epilog/op_kernel/kv_compress_epilog_common.h
++++ /dev/null
+@@ -1,724 +0,0 @@
+-/**
+- * Copyright (c) 2026 Huawei Technologies Co., Ltd.
+- * This program is free software, you can redistribute it and/or modify it under the terms and conditions of
+- * CANN Open Software License Agreement Version 2.0 (the "License").
+- * Please refer to the License for details. You may not use this file except in compliance with the License.
+- * THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
+- * INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
+- * See LICENSE in the root of the software repository for the full text of the License.
+- */
+-
+-/*!
+- * \file swiglu_block_quant_base.h
+- * \brief
+- */
+-
+-#ifndef KV_COMPRESS_EPILOG_COMMON_H
+-#define KV_COMPRESS_EPILOG_COMMON_H
+-
+-#include "kernel_operator.h"
+-
+-namespace KvCompressEpilogOps {
+-using namespace AscendC;
+-using namespace AscendC::MicroAPI;
+-using AscendC::MicroAPI::MaskReg;
+-using AscendC::MicroAPI::RegTensor;
+-using AscendC::MicroAPI::UnalignReg;
+-constexpr int32_t BLOCK_SIZE = 32;
+-constexpr int32_t VL_FP32 = 64;
+-constexpr int32_t PER_BLOCK_FP16 = 128;
+-constexpr float FP8_E5M2_MAX_VALUE = 57344.0f;
+-constexpr float FP8_E4M3FN_MAX_VALUE = 448.0f;
+-constexpr int64_t QUANT_MDOE_GROUP_FP8 = 1;
+-constexpr int64_t QUANT_MDOE_GROUP_MXFP8 = 2;
+-constexpr float FP8_E5M2_MIN_VALUE = -57344.0f;
+-constexpr float FP8_E4M3FN_MIN_VALUE = -448.0f;
+-constexpr uint32_t FAST_LOG_SHIFT_BITS = 23U;
+-constexpr uint32_t FAST_LOG_AND_VALUE1 = 0xFF;
+-constexpr uint32_t FAST_LOG_AND_VALUE2 = (((uint32_t)1 << (uint32_t)23) - (uint32_t)1);
+-constexpr uint32_t INV_FP8_E5M2_MAX_VALUE = 0x37924925;
+-constexpr uint32_t INV_FP8_E4M3_MAX_VALUE = 0x3b124925;
+-
+-#define FLOAT_OVERFLOW_MODE_CTRL 60
+-#ifndef INFINITY
+-#define INFINITY (__builtin_inff())
+-#endif
+-constexpr float POS_INFINITY = INFINITY;
+-constexpr float NEG_INFINITY = -INFINITY;
+-
+-__aicore__ inline int32_t CeilDiv(int32_t a, int b)
+-{
+-    if (b == 0) {
+-        return a;
+-    }
+-    return (a + b - 1) / b;
+-}
+-
+-__aicore__ inline int32_t CeilAlign(int32_t a, int b)
+-{
+-    return CeilDiv(a, b) * b;
+-}
+-
+-template <typename T>
+-__aicore__ inline int32_t RoundUp(int32_t num)
+-{
+-    int32_t elemNum = BLOCK_SIZE / sizeof(T);
+-    return CeilAlign(num, elemNum);
+-}
+-
+-constexpr AscendC::MicroAPI::CastTrait castTraitB162B32Even = {
+-    AscendC::MicroAPI::RegLayout::ZERO,
+-    AscendC::MicroAPI::SatMode::UNKNOWN,
+-    AscendC::MicroAPI::MaskMergeMode::ZEROING,
+-    AscendC::RoundMode::UNKNOWN,
+-};
+-
+-constexpr AscendC::MicroAPI::CastTrait castTraitB322B16Even = {
+-    AscendC::MicroAPI::RegLayout::ZERO,
+-    AscendC::MicroAPI::SatMode::NO_SAT,
+-    AscendC::MicroAPI::MaskMergeMode::ZEROING,
+-    AscendC::RoundMode::CAST_RINT,
+-};
+-
+-constexpr static AscendC::MicroAPI::CastTrait castTraitF32toFp8Even = {
+-    AscendC::MicroAPI::RegLayout::ZERO,
+-    AscendC::MicroAPI::SatMode::NO_SAT,
+-    AscendC::MicroAPI::MaskMergeMode::ZEROING,
+-    AscendC::RoundMode::CAST_RINT,
+-};
+-
+-constexpr static AscendC::MicroAPI::CastTrait castTraitU32toU8Even = {
+-    AscendC::MicroAPI::RegLayout::ZERO,
+-    AscendC::MicroAPI::SatMode::NO_SAT,
+-    AscendC::MicroAPI::MaskMergeMode::ZEROING,
+-    AscendC::RoundMode::CAST_NONE,
+-};
+-
+-template <typename T>
+-__aicore__ inline void LoadInputData(RegTensor<float>& dst, __local_mem__ T* src, MaskReg pregLoop, uint32_t srcOffset)
+-{
+-    if constexpr (IsSameType<T, float>::value) {
+-        DataCopy(dst, src + srcOffset);
+-    } else if constexpr (IsSameType<T, half>::value || IsSameType<T, bfloat16_t>::value) {
+-        RegTensor<T> tmp;
+-        DataCopy<T, AscendC::MicroAPI::LoadDist::DIST_UNPACK_B16>(tmp, src + srcOffset);
+-        Cast<float, T, castTraitB162B32Even>(dst, tmp, pregLoop);
+-    }
+-}
+-
+-template <typename T>
+-__aicore__ inline void StoreOutputData(
+-    __local_mem__ T* dst, RegTensor<float>& src, MaskReg pregLoop, uint32_t dstOffset)
+-{
+-    if constexpr (IsSameType<T, float>::value) {
+-        DataCopy(dst + dstOffset, src, pregLoop);
+-    } else if constexpr (IsSameType<T, half>::value || IsSameType<T, bfloat16_t>::value) {
+-        RegTensor<T> tmp;
+-        Cast<T, float, castTraitB322B16Even>(tmp, src, pregLoop);
+-        DataCopy<T, AscendC::MicroAPI::StoreDist::DIST_PACK_B32>(dst + dstOffset, tmp, pregLoop);
+-    } else if constexpr (IsSameType<T, fp8_e4m3fn_t>::value || IsSameType<T, fp8_e5m2_t>::value) {
+-        RegTensor<T> tmp;
+-        Cast<T, float, castTraitF32toFp8Even>(tmp, src, pregLoop);
+-        DataCopy<T, AscendC::MicroAPI::StoreDist::DIST_PACK4_B32>(dst + dstOffset, tmp, pregLoop);
+-    }
+-}
+-
+-template <typename T0, typename T1>
+-__aicore__ inline void VFProcessDynamicBlockQuant(
+-    const LocalTensor<T1>& yLocal, const LocalTensor<T0>& xLocal,
+-    float coeff, const uint16_t curRowNum, const uint32_t curColNum, const uint32_t concatColNum, const uint32_t padColNum)
+-{
+-    __local_mem__ T1* yLocalAddr = (__local_mem__ T1*)yLocal.GetPhyAddr();
+-    __local_mem__ T1* scaleLocalAddr = (__local_mem__ T1*)yLocal.GetPhyAddr();
+-    __local_mem__ T0* xLocalAddr = (__local_mem__ T0*)xLocal.GetPhyAddr();
+-    __local_mem__ T0* ropeXLocalAddr = (__local_mem__ T0*)xLocal.GetPhyAddr();
+-    __local_mem__ T0* ropeYLocalAddr = (__local_mem__ T0*)yLocal.GetPhyAddr();
+-    __local_mem__ T1* padLocalAddr = (__local_mem__ T1*)yLocal.GetPhyAddr();
+-    static constexpr AscendC::MicroAPI::DivSpecificMode mode = {AscendC::MicroAPI::MaskMergeMode::ZEROING, false};
+-    uint32_t maxValueInt = 0;
+-    if constexpr (IsSameType<T1, fp8_e5m2_t>::value) {
+-        maxValueInt = INV_FP8_E5M2_MAX_VALUE;
+-    } else if constexpr (IsSameType<T1, fp8_e4m3fn_t>::value) {
+-        maxValueInt = INV_FP8_E4M3_MAX_VALUE;
+-    }
+-
+-    uint32_t quantColNum = curColNum - 64;
+-    uint16_t scaleColNum = CeilDiv(quantColNum, 128);
+-    uint16_t loopCount = CeilDiv(curColNum, VL_FP32);
+-    uint32_t curColNumAlign = RoundUp<T0>(curColNum);
+-    uint32_t dstCurColNumAlign = RoundUp<T1>(concatColNum+padColNum);
+-    uint16_t loopCountFoldTwo = loopCount / 2;
+-    uint16_t loopCountReminder = loopCount % 2;
+-    uint32_t tailReminder = curColNum - (loopCount - 1) * VL_FP32;
+-    uint32_t scaleColNumAlign = RoundUp<T0>(scaleColNum);
+-    uint32_t sregNum = loopCountReminder == 0 ? quantColNum - loopCountFoldTwo * VL_FP32 : loopCountFoldTwo * VL_FP32;
+-    __VEC_SCOPE__
+-    {
+-        RegTensor<float> xLeft;
+-        RegTensor<float> xRight;
+-        RegTensor<float> x1Left;
+-        RegTensor<float> x1Right;
+-        RegTensor<float> xAbsLeft;
+-        RegTensor<float> xAbsRight;
+-        RegTensor<float> xMax;
+-        RegTensor<float> tmp;
+-        RegTensor<float> dupScale;
+-        RegTensor<float> scale;
+-        RegTensor<float> scale0;
+-        RegTensor<float> scale1;
+-        RegTensor<float> inf;
+-        RegTensor<float> one;
+-        RegTensor<float> zeros;
+-        RegTensor<uint32_t> coeffReg;
+-        RegTensor<T0> ropeReg;
+-        UnalignRegForStore ureg0;
+-        UnalignRegForLoad ureg1;
+-        UnalignRegForStore ureg2;
+-        MaskReg pregLoop = CreateMask<float>();
+-        Duplicate(coeffReg, maxValueInt, pregLoop);
+-        Duplicate(one, static_cast<float>(1.0f), pregLoop);
+-        Duplicate(zeros, static_cast<float>(0.0f), pregLoop);
+-        Div<float, &mode>(inf, one, zeros, pregLoop);
+-        MaskReg pregMain = CreateMask<float>();
+-        MaskReg preg1 = CreateMask<float, AscendC::MicroAPI::MaskPattern::VL1>();
+-        MaskReg compareLeft;
+-         MaskReg compareRight;
+-        MaskReg compareScalar;
+-        for (uint16_t i = 0; i < curRowNum; i++) {
+-            // cat scale
+-            scaleLocalAddr = scaleLocalAddr + quantColNum + 128; // quantColNum个B8 + 64个B16元素
+-            uint32_t sreg = sregNum;
+-            for (uint16_t j = 0; j < loopCountFoldTwo; j++) {
+-                pregLoop = UpdateMask<float>(sreg);
+-                LoadInputData<T0>(xLeft, xLocalAddr, pregMain, 2 * j * VL_FP32 + i * curColNum);
+-                LoadInputData<T0>(xRight, xLocalAddr, pregLoop, (2 * j + 1) * VL_FP32 + i * curColNum);
+-                Muls(xAbsLeft, xLeft, 0.0f, pregMain);
+-                 Compare<float, CMPMODE::NE>(compareLeft, xAbsLeft, xAbsLeft, pregMain);
+-                 MaskNot(compareLeft, compareLeft, pregMain);
+-                 Abs(xAbsLeft, xLeft, compareLeft);
+-                ReduceMax(scale0, xAbsLeft, pregMain);
+-                Muls(xAbsRight, xRight, 0.0f, pregLoop);
+-                 Compare<float, CMPMODE::NE>(compareRight, xAbsRight, xAbsRight, pregLoop);
+-                 MaskNot(compareRight, compareRight, pregLoop);
+-                 Abs(xAbsRight, xRight, compareRight);
+-                ReduceMax(scale1, xAbsRight, pregLoop);
+-                Max(scale, scale0, scale1, preg1);
+-                CompareScalar<float, CMPMODE::NE>(compareScalar, scale, (float)0.0, preg1);
+-                Mul(scale, scale, (RegTensor<float>&)coeffReg, compareScalar);
+-                Min(scale, scale, inf, preg1);
+-                Duplicate(dupScale, scale, pregMain);
+-                // cat scale
+-                StoreUnAlign(scaleLocalAddr, (RegTensor<T1>&)scale, ureg2, 4);
+-                StoreUnAlignPost(scaleLocalAddr, ureg2, 0);
+-                Div<float, &mode>(xAbsLeft, xLeft, dupScale, pregMain);
+-                Muls(x1Left, xAbsLeft, 0.0f, pregMain);
+-                Compare<float, CMPMODE::NE>(compareLeft, x1Left, x1Left, pregMain);
+-                Select(xLeft, xLeft, xAbsLeft, compareLeft);
+-                Div<float, &mode>(xAbsRight, xRight, dupScale, pregLoop);
+-                Muls(x1Right, xAbsRight, 0.0f, pregLoop);
+-                Compare<float, CMPMODE::NE>(compareRight, x1Right, x1Right, pregLoop);
+-                Select(xRight, xRight, xAbsRight, compareRight);
+-                StoreOutputData<T1>(yLocalAddr, xLeft, pregMain, 2 * j * VL_FP32 + i * dstCurColNumAlign);
+-                StoreOutputData<T1>(yLocalAddr, xRight, pregLoop, (2 * j + 1) * VL_FP32 + i * dstCurColNumAlign);
+-            }
+-            // 处理尾块, 这里只有一个for循环
+-            uint32_t sregTail = tailReminder;
+-            pregLoop = UpdateMask<float>(sregTail);
+-            for (uint16_t j = 0; j < loopCountReminder; j++) {
+-                LoadInputData<T0>(xLeft, xLocalAddr, pregLoop, loopCountFoldTwo * 2 * VL_FP32 + i * curColNum);
+-                Muls(xAbsLeft, xLeft, 0.0f, pregLoop);
+-                 Compare<float, CMPMODE::NE>(compareLeft, xAbsLeft, xAbsLeft, pregLoop);
+-                 MaskNot(compareLeft, compareLeft, pregLoop);
+-                Abs(xAbsLeft, xLeft, compareLeft);
+-                ReduceMax(scale, xAbsLeft, pregLoop);
+-                CompareScalar<float, CMPMODE::NE>(compareScalar, scale, (float)0.0, preg1);
+-                Mul(scale, scale, (RegTensor<float>&)coeffReg, compareScalar);
+-                Min(scale, scale, inf, preg1);
+-                Duplicate(dupScale, scale, pregLoop);
+-                // cat scale
+-                StoreUnAlign(scaleLocalAddr, (RegTensor<T1>&)scale, ureg2, 4);
+-                StoreUnAlignPost(scaleLocalAddr, ureg2, 0);
+-                Div<float, &mode>(xAbsLeft, xLeft, dupScale, pregLoop);
+-                Muls(x1Left, xAbsLeft, 0.0f, pregLoop);
+-                Compare<float, CMPMODE::NE>(compareLeft, x1Left, x1Left, pregLoop);
+-                Select(xLeft, xLeft, xAbsLeft, compareLeft);
+-                StoreOutputData(yLocalAddr, xLeft, pregLoop, loopCountFoldTwo * 2 * VL_FP32 + i * dstCurColNumAlign);
+-            }
+-            LocalMemBar<MemType::VEC_STORE, MemType::VEC_STORE>();
+-            // cat rope
+-            ropeXLocalAddr = ropeXLocalAddr + quantColNum;
+-            ropeYLocalAddr = ropeYLocalAddr + quantColNum / 2;
+-
+-            LoadUnAlignPre(ureg0, ropeXLocalAddr);
+-            LoadUnAlign(ropeReg, ureg0, ropeXLocalAddr, 64);
+-            StoreUnAlign(ropeYLocalAddr, ropeReg, ureg1, 64);
+-            StoreUnAlignPost(ropeYLocalAddr, ureg1, 0);
+-
+-            // pad zero
+-            padLocalAddr = padLocalAddr + concatColNum;
+-            StoreUnAlign(padLocalAddr, (RegTensor<T1>&)zeros, ureg1, padColNum);
+-            StoreUnAlignPost(padLocalAddr, ureg1, 0);
+-
+-            ropeYLocalAddr = ropeYLocalAddr + scaleColNum * 2 + padColNum / 2;
+-            scaleLocalAddr = scaleLocalAddr + padColNum;
+-        }
+-    }
+-}
+-
+-template <typename T0, typename T1, bool roundScale = true>
+-__aicore__ inline void VFProcessDynamicMxFP8Quant(
+-    const LocalTensor<T1>& yLocal, const LocalTensor<T0>& xLocal,
+-    float coeff, float fp8Min, float fp8Max, const uint16_t curRowNum, const uint32_t curColNum, const uint32_t concatColNum, const uint32_t padColNum,
+-    const int64_t perGroupSize)
+-{
+-    __local_mem__ T1* yLocalAddr = (__local_mem__ T1*)yLocal.GetPhyAddr();
+-    __local_mem__ T0* xLocalAddr = (__local_mem__ T0*)xLocal.GetPhyAddr();
+-    __local_mem__ T1* scaleLocalAddr = (__local_mem__ T1*)yLocal.GetPhyAddr();
+-    __local_mem__ T0* ropeXLocalAddr = (__local_mem__ T0*)xLocal.GetPhyAddr();
+-    __local_mem__ T0* ropeYLocalAddr = (__local_mem__ T0*)yLocal.GetPhyAddr();
+-    __local_mem__ T1* padLocalAddr = (__local_mem__ T1*)yLocal.GetPhyAddr();
+-
+-    uint32_t quantColNum = curColNum - 64;
+-    uint16_t scaleColNum = CeilDiv(quantColNum, static_cast<int32_t>(perGroupSize));
+-    uint16_t ropeNum = 128;
+-    uint16_t loopCount = CeilDiv(quantColNum, VL_FP32);
+-    uint32_t curColNumAlign = RoundUp<T0>(curColNum);
+-    uint32_t dstCurColNumAlign = RoundUp<T1>(concatColNum+padColNum);
+-    uint16_t loopCountFoldTwo = loopCount / 2;
+-    uint16_t loopCountReminder = loopCount % 2;
+-    uint32_t tailReminder = quantColNum - (loopCount - 1) * VL_FP32;
+-    uint32_t scaleColNumAlign = RoundUp<T0>(scaleColNum);
+-    uint32_t sregNum = quantColNum;
+-    __VEC_SCOPE__
+-    {
+-        RegTensor<float> x0;
+-        RegTensor<float> x0Abs;
+-        RegTensor<float> x1;
+-        RegTensor<float> x1Abs;
+-        RegTensor<float> max0;
+-        RegTensor<float> max1;
+-        RegTensor<float> max2;
+-        RegTensor<uint32_t> tmp0;
+-        RegTensor<uint32_t> tmp1;
+-        RegTensor<uint32_t> vreg0;
+-        RegTensor<uint32_t> vreg1;
+-        RegTensor<uint32_t> vreg2;
+-        RegTensor<uint32_t> vreg3;
+-        RegTensor<uint32_t> vreg4;
+-        RegTensor<int32_t> vreg5;
+-        RegTensor<uint32_t> zero;
+-        RegTensor<uint32_t> one;
+-        RegTensor<uint32_t> tmp3;
+-        RegTensor<float> dupScale;
+-        RegTensor<T0> ropeReg;
+-        RegTensor<uint32_t> scaleTmp0;
+-        RegTensor<uint8_t> scaleTmp1;
+-        UnalignRegForStore ureg0;
+-        UnalignRegForLoad ureg1;
+-        UnalignRegForStore ureg2;
+-        MaskReg pregLoop;
+-        MaskReg preg1 = CreateMask<T0, AscendC::MicroAPI::MaskPattern::VL1>();
+-        MaskReg pregMerge = CreateMask<float, AscendC::MicroAPI::MaskPattern::VL1>();
+-        MaskReg pregMain = CreateMask<float>();
+-        MaskReg pregRope = CreateMask<T0, AscendC::MicroAPI::MaskPattern::VL64>();
+-        MaskReg cmpMask;
+-        Duplicate(tmp0, FAST_LOG_AND_VALUE1, pregMerge);
+-        Duplicate(tmp1, FAST_LOG_AND_VALUE2, pregMerge);
+-        Duplicate(zero, static_cast<uint32_t>(0), pregMerge);
+-        Duplicate(one, static_cast<uint32_t>(1), pregMerge);
+-        Duplicate(tmp3, static_cast<uint32_t>(127), pregMerge);
+-        if (perGroupSize >= 128) {
+-            // ── fold-two path: group_size=128, pair two 64-element groups per scale ──
+-            uint32_t sregNumFold = quantColNum - loopCountFoldTwo * VL_FP32;
+-            for (uint16_t i = 0; i < curRowNum; i++) {
+-                // cat rope
+-                ropeXLocalAddr = ropeXLocalAddr + quantColNum;
+-                LoadUnAlignPre(ureg0, ropeXLocalAddr);
+-                LoadUnAlign(ropeReg, ureg0, ropeXLocalAddr, 64);
+-                DataCopy(ropeYLocalAddr + i * dstCurColNumAlign / 2, ropeReg, pregRope);
+-                LocalMemBar<MemType::VEC_STORE, MemType::VEC_STORE>();
+-
+-                uint32_t sreg = sregNumFold;
+-                uint16_t scaleIdx = 0;
+-
+-                for (uint16_t g = 0; g < loopCountFoldTwo; g++) {
+-                    uint16_t jL = g * 2;
+-                    uint16_t jR = g * 2 + 1;
+-                    pregLoop = UpdateMask<float>(sreg);
+-
+-                    // Load two 64-element groups
+-                    LoadInputData<T0>(x0, xLocalAddr, pregMain, jL * VL_FP32 + i * curColNumAlign);
+-                    LoadInputData<T0>(x1, xLocalAddr, pregLoop, jR * VL_FP32 + i * curColNumAlign);
+-
+-                    // Abs + ReduceMax for each half
+-                    Abs(x0Abs, x0, pregMain);
+-                    ReduceMax(max0, x0Abs, pregMain);
+-                    Abs(x1Abs, x1, pregLoop);
+-                    ReduceMax(max1, x1Abs, pregLoop);
+-
+-                    // Merge max
+-                    Max(max2, max0, max1, pregMerge);
+-                    Maxs(max2, max2, static_cast<float>(1e-4), pregMerge);
+-                    Muls(max2, max2, coeff, pregMerge);
+-                    if constexpr (roundScale) {
+-                        ShiftRights(vreg0, (RegTensor<uint32_t> &)max2, static_cast<int16_t>(FAST_LOG_SHIFT_BITS), pregMerge);
+-                        And(vreg1, vreg0, tmp0, pregMerge);
+-                        And(vreg2, vreg1, tmp1, pregMerge);
+-                        Compare<uint32_t, AscendC::CMPMODE::NE>(cmpMask, vreg2, zero, pregMerge);
+-                        Select(vreg4, one, zero, cmpMask);
+-                        Sub(vreg1, vreg1, tmp3, pregMerge);
+-                        Add(vreg1, vreg1, vreg4, pregMerge);
+-                        Adds(vreg5, (RegTensor<int32_t> &)vreg1, static_cast<int32_t>(127), pregMerge);
+-                        ShiftLefts((RegTensor<int32_t> &)max2, vreg5, static_cast<int16_t>(23), pregMerge);
+-                    }
+-
+-                    // Quantize left half
+-                    Duplicate(dupScale, max2, pregMain);
+-                    Div(x0, x0, dupScale, pregMain);
+-                    Maxs(x0, x0, fp8Min, pregMain);
+-                    Mins(x0, x0, fp8Max, pregMain);
+-                    StoreOutputData<T1>(yLocalAddr, x0, pregMain, jL * VL_FP32 + i * dstCurColNumAlign + ropeNum);
+-
+-                    // Quantize right half
+-                    Div(x1, x1, dupScale, pregLoop);
+-                    Maxs(x1, x1, fp8Min, pregLoop);
+-                    Mins(x1, x1, fp8Max, pregLoop);
+-                    StoreOutputData<T1>(yLocalAddr, x1, pregLoop, jR * VL_FP32 + i * dstCurColNumAlign + ropeNum);
+-
+-                    // Store 1 uint8 scale
+-                    ShiftRights(scaleTmp0, (RegTensor<uint32_t> &)max2, static_cast<int16_t>(FAST_LOG_SHIFT_BITS), preg1);
+-                    Cast<uint8_t, uint32_t, castTraitU32toU8Even>(scaleTmp1, scaleTmp0, preg1);
+-                    DataCopy<T1, AscendC::MicroAPI::StoreDist::DIST_FIRST_ELEMENT_B8>(scaleLocalAddr + quantColNum + ropeNum + scaleIdx + i * dstCurColNumAlign, (RegTensor<T1>&)scaleTmp1, preg1);
+-                    scaleIdx++;
+-                }
+-
+-                // Tail block: odd loopCount leaves 1 group <= 64 elements
+-                for (uint16_t t = 0; t < loopCountReminder; t++) {
+-                    uint16_t jT = loopCountFoldTwo * 2;
+-                    uint32_t tailRem = quantColNum - jT * VL_FP32;
+-                    pregLoop = UpdateMask<float>(tailRem);
+-                    LoadInputData<T0>(x0, xLocalAddr, pregLoop, jT * VL_FP32 + i * curColNumAlign);
+-                    Abs(x0Abs, x0, pregLoop);
+-                    ReduceMax(max0, x0Abs, pregLoop);
+-                    Maxs(max2, max0, static_cast<float>(1e-4), pregMerge);
+-                    Muls(max2, max2, coeff, pregMerge);
+-                    if constexpr (roundScale) {
+-                        ShiftRights(vreg0, (RegTensor<uint32_t> &)max2, static_cast<int16_t>(FAST_LOG_SHIFT_BITS), pregMerge);
+-                        And(vreg1, vreg0, tmp0, pregMerge);
+-                        And(vreg2, vreg1, tmp1, pregMerge);
+-                        Compare<uint32_t, AscendC::CMPMODE::NE>(cmpMask, vreg2, zero, pregMerge);
+-                        Select(vreg4, one, zero, cmpMask);
+-                        Sub(vreg1, vreg1, tmp3, pregMerge);
+-                        Add(vreg1, vreg1, vreg4, pregMerge);
+-                        Adds(vreg5, (RegTensor<int32_t> &)vreg1, static_cast<int32_t>(127), pregMerge);
+-                        ShiftLefts((RegTensor<int32_t> &)max2, vreg5, static_cast<int16_t>(23), pregMerge);
+-                    }
+-                    Duplicate(dupScale, max2, pregLoop);
+-                    Div(x0, x0, dupScale, pregLoop);
+-                    Maxs(x0, x0, fp8Min, pregLoop);
+-                    Mins(x0, x0, fp8Max, pregLoop);
+-                    StoreOutputData<T1>(yLocalAddr, x0, pregLoop, jT * VL_FP32 + i * dstCurColNumAlign + ropeNum);
+-
+-                    ShiftRights(scaleTmp0, (RegTensor<uint32_t> &)max2, static_cast<int16_t>(FAST_LOG_SHIFT_BITS), preg1);
+-                    Cast<uint8_t, uint32_t, castTraitU32toU8Even>(scaleTmp1, scaleTmp0, preg1);
+-                    DataCopy<T1, AscendC::MicroAPI::StoreDist::DIST_FIRST_ELEMENT_B8>(scaleLocalAddr + quantColNum + ropeNum + scaleIdx + i * dstCurColNumAlign, (RegTensor<T1>&)scaleTmp1, preg1);
+-                    scaleIdx++;
+-                }
+-                LocalMemBar<MemType::VEC_STORE, MemType::VEC_STORE>();
+-
+-                // pad zero
+-                padLocalAddr = padLocalAddr + concatColNum;
+-                StoreUnAlign(padLocalAddr, (RegTensor<T1>&)zero, ureg1, padColNum);
+-                StoreUnAlignPost(padLocalAddr, ureg1, 0);
+-            }
+-        } else {
+-            // ── original group=64 path ──
+-            for (uint16_t i = 0; i < curRowNum; i++) {
+-                // cat rope
+-                ropeXLocalAddr = ropeXLocalAddr + quantColNum;
+-
+-                LoadUnAlignPre(ureg0, ropeXLocalAddr);
+-                LoadUnAlign(ropeReg, ureg0, ropeXLocalAddr, 64);
+-                DataCopy(ropeYLocalAddr + i * dstCurColNumAlign / 2, ropeReg, pregRope);
+-                LocalMemBar<MemType::VEC_STORE, MemType::VEC_STORE>();
+-                uint32_t sreg = sregNum;
+-                for (uint16_t j = 0; j < loopCount; j++) {
+-                    pregLoop = UpdateMask<float>(sreg);
+-                    LoadInputData<T0>(x0, xLocalAddr, pregLoop, j * VL_FP32 + i * curColNumAlign);
+-                    Abs(x0Abs, x0, pregLoop);
+-                    ReduceMax(max0, x0Abs, pregLoop);
+-                    Maxs(max2, max0, static_cast<float>(1e-4), pregMerge);
+-                    Muls(max2, max2, coeff, pregMerge);
+-                    if constexpr (roundScale) {
+-                        ShiftRights(vreg0, (RegTensor<uint32_t> &)max2, static_cast<int16_t>(FAST_LOG_SHIFT_BITS), pregMerge);
+-                        And(vreg1, vreg0, tmp0, pregMerge);
+-                        And(vreg2, vreg1, tmp1, pregMerge);
+-                        Compare<uint32_t, AscendC::CMPMODE::NE>(cmpMask, vreg2, zero, pregMerge);
+-                        Select(vreg4, one, zero, cmpMask);
+-                        Sub(vreg1, vreg1, tmp3, pregMerge);
+-                        Add(vreg1, vreg1, vreg4, pregMerge);
+-                        Adds(vreg5, (RegTensor<int32_t> &)vreg1, static_cast<int32_t>(127), pregMerge);
+-                        ShiftLefts((RegTensor<int32_t> &)max2, vreg5, static_cast<int16_t>(23), pregMerge);
+-                    }
+-                    Duplicate(dupScale, max2, pregMain);
+-                    Div(x0, x0, dupScale, pregLoop);
+-                    Maxs(x0, x0, fp8Min, pregLoop);
+-                    Mins(x0, x0, fp8Max, pregLoop);
+-                    StoreOutputData<T1>(yLocalAddr, x0, pregLoop, j * VL_FP32 + i * dstCurColNumAlign + ropeNum);
+-
+-                    // cat scale
+-                    ShiftRights(scaleTmp0, (RegTensor<uint32_t> &)max2, static_cast<int16_t>(FAST_LOG_SHIFT_BITS), preg1);
+-                    Cast<uint8_t, uint32_t, castTraitU32toU8Even>(scaleTmp1, scaleTmp0, preg1);
+-                    DataCopy<T1, AscendC::MicroAPI::StoreDist::DIST_FIRST_ELEMENT_B8>(scaleLocalAddr + quantColNum + ropeNum + j + i * dstCurColNumAlign, (RegTensor<T1>&)scaleTmp1, preg1);
+-                }
+-                LocalMemBar<MemType::VEC_STORE, MemType::VEC_STORE>();
+-
+-                // pad zero
+-                padLocalAddr = padLocalAddr + concatColNum;
+-                StoreUnAlign(padLocalAddr, (RegTensor<T1>&)zero, ureg1, padColNum);
+-                StoreUnAlignPost(padLocalAddr, ureg1, 0);
+-            }
+-        }
+-    }
+-}
+-
+-template <typename T0, typename T1, bool roundScale = true>
+-__aicore__ inline void VFProcessDynamicMxFP8QuantLayout2(
+-    const LocalTensor<T1>& yLocal, const LocalTensor<T1>& scaleLocal,
+-    const LocalTensor<T0>& xLocal,
+-    float coeff, float fp8Min, float fp8Max,
+-    const uint16_t curRowNum, const uint32_t curColNum,
+-    const uint32_t valuePerToken, const uint32_t scalePerToken,
+-    const int64_t perGroupSize)
+-{
+-    __local_mem__ T1* yLocalAddr = (__local_mem__ T1*)yLocal.GetPhyAddr();
+-    __local_mem__ T0* xLocalAddr = (__local_mem__ T0*)xLocal.GetPhyAddr();
+-    __local_mem__ T1* scaleAddr = (__local_mem__ T1*)scaleLocal.GetPhyAddr();
+-    __local_mem__ T0* ropeXLocalAddr = (__local_mem__ T0*)xLocal.GetPhyAddr();
+-    __local_mem__ T0* ropeYLocalAddr = (__local_mem__ T0*)yLocal.GetPhyAddr();
+-
+-    uint32_t quantColNum = curColNum - 64;
+-    uint16_t scaleColNum = CeilDiv(quantColNum, static_cast<int32_t>(perGroupSize));
+-    uint16_t loopCount = CeilDiv(quantColNum, VL_FP32);
+-    uint32_t curColNumAlign = RoundUp<T0>(curColNum);
+-    uint32_t dstCurColNumAlign = RoundUp<T1>(valuePerToken);
+-    uint16_t loopCountFoldTwo = loopCount / 2;
+-    uint16_t loopCountReminder = loopCount % 2;
+-    uint32_t tailReminder = quantColNum - (loopCount - 1) * VL_FP32;
+-    uint32_t scaleColNumAlign = RoundUp<T0>(scaleColNum);
+-    uint32_t sregNum = quantColNum;
+-    uint32_t scaleStride = RoundUp<T1>(scalePerToken);
+-    __VEC_SCOPE__
+-    {
+-        RegTensor<float> x0;
+-        RegTensor<float> x0Abs;
+-        RegTensor<float> x1;
+-        RegTensor<float> x1Abs;
+-        RegTensor<float> max0;
+-        RegTensor<float> max1;
+-        RegTensor<float> max2;
+-        RegTensor<uint32_t> tmp0;
+-        RegTensor<uint32_t> tmp1;
+-        RegTensor<uint32_t> vreg0;
+-        RegTensor<uint32_t> vreg1;
+-        RegTensor<uint32_t> vreg2;
+-        RegTensor<uint32_t> vreg3;
+-        RegTensor<uint32_t> vreg4;
+-        RegTensor<int32_t> vreg5;
+-        RegTensor<uint32_t> zero;
+-        RegTensor<uint32_t> one;
+-        RegTensor<uint32_t> tmp3;
+-        RegTensor<float> dupScale;
+-        RegTensor<T0> ropeReg;
+-        RegTensor<uint32_t> scaleTmp0;
+-        RegTensor<uint8_t> scaleTmp1;
+-        UnalignRegForLoad ureg0;
+-        UnalignRegForStore ureg1;
+-        UnalignRegForStore uregRopeStore;
+-        MaskReg pregLoop;
+-        MaskReg preg1 = CreateMask<T0, AscendC::MicroAPI::MaskPattern::VL1>();
+-        MaskReg pregMerge = CreateMask<float, AscendC::MicroAPI::MaskPattern::VL1>();
+-        MaskReg pregMain = CreateMask<float>();
+-        MaskReg pregRope = CreateMask<T0, AscendC::MicroAPI::MaskPattern::VL64>();
+-        MaskReg cmpMask;
+-        Duplicate(tmp0, FAST_LOG_AND_VALUE1, pregMerge);
+-        Duplicate(tmp1, FAST_LOG_AND_VALUE2, pregMerge);
+-        Duplicate(zero, static_cast<uint32_t>(0), pregMerge);
+-        Duplicate(one, static_cast<uint32_t>(1), pregMerge);
+-        Duplicate(tmp3, static_cast<uint32_t>(127), pregMerge);
+-        if (perGroupSize >= 128) {
+-            // ── fold-two path: group_size=128, pair two 64-element groups per scale ──
+-            uint32_t sregNumFold = quantColNum - loopCountFoldTwo * VL_FP32;
+-            for (uint16_t i = 0; i < curRowNum; i++) {
+-                // cat rope (use StoreUnAlign for non-32B-aligned dest when quantColNum % 32 != 0)
+-                ropeXLocalAddr = ropeXLocalAddr + quantColNum;
+-                LoadUnAlignPre(ureg0, ropeXLocalAddr);
+-                LoadUnAlign(ropeReg, ureg0, ropeXLocalAddr, 64);
+-                __local_mem__ T1* ropeDstAddr = (__local_mem__ T1*)yLocalAddr + i * dstCurColNumAlign + quantColNum;
+-                StoreUnAlign(ropeDstAddr, (RegTensor<T1>&)ropeReg, uregRopeStore, 128);
+-                StoreUnAlignPost(ropeDstAddr, uregRopeStore, 0);
+-                LocalMemBar<MemType::VEC_STORE, MemType::VEC_STORE>();
+-
+-                uint32_t sreg = sregNumFold;
+-                uint16_t scaleIdx = 0;
+-
+-                for (uint16_t g = 0; g < loopCountFoldTwo; g++) {
+-                    uint16_t jL = g * 2;
+-                    uint16_t jR = g * 2 + 1;
+-                    pregLoop = UpdateMask<float>(sreg);
+-
+-                    LoadInputData<T0>(x0, xLocalAddr, pregMain, jL * VL_FP32 + i * curColNumAlign);
+-                    LoadInputData<T0>(x1, xLocalAddr, pregLoop, jR * VL_FP32 + i * curColNumAlign);
+-
+-                    Abs(x0Abs, x0, pregMain);
+-                    ReduceMax(max0, x0Abs, pregMain);
+-                    Abs(x1Abs, x1, pregLoop);
+-                    ReduceMax(max1, x1Abs, pregLoop);
+-
+-                    Max(max2, max0, max1, pregMerge);
+-                    Maxs(max2, max2, static_cast<float>(1e-4), pregMerge);
+-                    Muls(max2, max2, coeff, pregMerge);
+-                    if constexpr (roundScale) {
+-                        ShiftRights(vreg0, (RegTensor<uint32_t> &)max2, static_cast<int16_t>(FAST_LOG_SHIFT_BITS), pregMerge);
+-                        And(vreg1, vreg0, tmp0, pregMerge);
+-                        And(vreg2, vreg1, tmp1, pregMerge);
+-                        Compare<uint32_t, AscendC::CMPMODE::NE>(cmpMask, vreg2, zero, pregMerge);
+-                        Select(vreg4, one, zero, cmpMask);
+-                        Sub(vreg1, vreg1, tmp3, pregMerge);
+-                        Add(vreg1, vreg1, vreg4, pregMerge);
+-                        Adds(vreg5, (RegTensor<int32_t> &)vreg1, static_cast<int32_t>(127), pregMerge);
+-                        ShiftLefts((RegTensor<int32_t> &)max2, vreg5, static_cast<int16_t>(23), pregMerge);
+-                    }
+-
+-                    Duplicate(dupScale, max2, pregMain);
+-                    Div(x0, x0, dupScale, pregMain);
+-                    Maxs(x0, x0, fp8Min, pregMain);
+-                    Mins(x0, x0, fp8Max, pregMain);
+-                    StoreOutputData<T1>(yLocalAddr, x0, pregMain, jL * VL_FP32 + i * dstCurColNumAlign);
+-
+-                    Div(x1, x1, dupScale, pregLoop);
+-                    Maxs(x1, x1, fp8Min, pregLoop);
+-                    Mins(x1, x1, fp8Max, pregLoop);
+-                    StoreOutputData<T1>(yLocalAddr, x1, pregLoop, jR * VL_FP32 + i * dstCurColNumAlign);
+-
+-                    ShiftRights(scaleTmp0, (RegTensor<uint32_t> &)max2, static_cast<int16_t>(FAST_LOG_SHIFT_BITS), preg1);
+-                    Cast<uint8_t, uint32_t, castTraitU32toU8Even>(scaleTmp1, scaleTmp0, preg1);
+-                    DataCopy<T1, AscendC::MicroAPI::StoreDist::DIST_FIRST_ELEMENT_B8>(scaleAddr + i * scaleStride + scaleIdx, (RegTensor<T1>&)scaleTmp1, preg1);
+-                    scaleIdx++;
+-                }
+-
+-                // Tail block
+-                for (uint16_t t = 0; t < loopCountReminder; t++) {
+-                    uint16_t jT = loopCountFoldTwo * 2;
+-                    uint32_t tailRem = quantColNum - jT * VL_FP32;
+-                    pregLoop = UpdateMask<float>(tailRem);
+-                    LoadInputData<T0>(x0, xLocalAddr, pregLoop, jT * VL_FP32 + i * curColNumAlign);
+-                    Abs(x0Abs, x0, pregLoop);
+-                    ReduceMax(max0, x0Abs, pregLoop);
+-                    Maxs(max2, max0, static_cast<float>(1e-4), pregMerge);
+-                    Muls(max2, max2, coeff, pregMerge);
+-                    if constexpr (roundScale) {
+-                        ShiftRights(vreg0, (RegTensor<uint32_t> &)max2, static_cast<int16_t>(FAST_LOG_SHIFT_BITS), pregMerge);
+-                        And(vreg1, vreg0, tmp0, pregMerge);
+-                        And(vreg2, vreg1, tmp1, pregMerge);
+-                        Compare<uint32_t, AscendC::CMPMODE::NE>(cmpMask, vreg2, zero, pregMerge);
+-                        Select(vreg4, one, zero, cmpMask);
+-                        Sub(vreg1, vreg1, tmp3, pregMerge);
+-                        Add(vreg1, vreg1, vreg4, pregMerge);
+-                        Adds(vreg5, (RegTensor<int32_t> &)vreg1, static_cast<int32_t>(127), pregMerge);
+-                        ShiftLefts((RegTensor<int32_t> &)max2, vreg5, static_cast<int16_t>(23), pregMerge);
+-                    }
+-                    Duplicate(dupScale, max2, pregLoop);
+-                    Div(x0, x0, dupScale, pregLoop);
+-                    Maxs(x0, x0, fp8Min, pregLoop);
+-                    Mins(x0, x0, fp8Max, pregLoop);
+-                    StoreOutputData<T1>(yLocalAddr, x0, pregLoop, jT * VL_FP32 + i * dstCurColNumAlign);
+-
+-                    ShiftRights(scaleTmp0, (RegTensor<uint32_t> &)max2, static_cast<int16_t>(FAST_LOG_SHIFT_BITS), preg1);
+-                    Cast<uint8_t, uint32_t, castTraitU32toU8Even>(scaleTmp1, scaleTmp0, preg1);
+-                    DataCopy<T1, AscendC::MicroAPI::StoreDist::DIST_FIRST_ELEMENT_B8>(scaleAddr + i * scaleStride + scaleIdx, (RegTensor<T1>&)scaleTmp1, preg1);
+-                    scaleIdx++;
+-                }
+-                LocalMemBar<MemType::VEC_STORE, MemType::VEC_STORE>();
+-            }
+-        } else {
+-            // ── original group=64 path ──
+-            for (uint16_t i = 0; i < curRowNum; i++) {
+-                // cat rope (use StoreUnAlign for non-32B-aligned dest when quantColNum % 32 != 0)
+-                ropeXLocalAddr = ropeXLocalAddr + quantColNum;
+-                LoadUnAlignPre(ureg0, ropeXLocalAddr);
+-                LoadUnAlign(ropeReg, ureg0, ropeXLocalAddr, 64);
+-                __local_mem__ T1* ropeDstAddr2 = (__local_mem__ T1*)yLocalAddr + i * dstCurColNumAlign + quantColNum;
+-                StoreUnAlign(ropeDstAddr2, (RegTensor<T1>&)ropeReg, uregRopeStore, 128);
+-                StoreUnAlignPost(ropeDstAddr2, uregRopeStore, 0);
+-                LocalMemBar<MemType::VEC_STORE, MemType::VEC_STORE>();
+-                uint32_t sreg = sregNum;
+-                for (uint16_t j = 0; j < loopCount; j++) {
+-                    pregLoop = UpdateMask<float>(sreg);
+-                    LoadInputData<T0>(x0, xLocalAddr, pregLoop, j * VL_FP32 + i * curColNumAlign);
+-                    Abs(x0Abs, x0, pregLoop);
+-                    ReduceMax(max0, x0Abs, pregLoop);
+-                    Maxs(max2, max0, static_cast<float>(1e-4), pregMerge);
+-                    Muls(max2, max2, coeff, pregMerge);
+-                    if constexpr (roundScale) {
+-                        ShiftRights(vreg0, (RegTensor<uint32_t> &)max2, static_cast<int16_t>(FAST_LOG_SHIFT_BITS), pregMerge);
+-                        And(vreg1, vreg0, tmp0, pregMerge);
+-                        And(vreg2, vreg1, tmp1, pregMerge);
+-                        Compare<uint32_t, AscendC::CMPMODE::NE>(cmpMask, vreg2, zero, pregMerge);
+-                        Select(vreg4, one, zero, cmpMask);
+-                        Sub(vreg1, vreg1, tmp3, pregMerge);
+-                        Add(vreg1, vreg1, vreg4, pregMerge);
+-                        Adds(vreg5, (RegTensor<int32_t> &)vreg1, static_cast<int32_t>(127), pregMerge);
+-                        ShiftLefts((RegTensor<int32_t> &)max2, vreg5, static_cast<int16_t>(23), pregMerge);
+-                    }
+-                    Duplicate(dupScale, max2, pregMain);
+-                    Div(x0, x0, dupScale, pregLoop);
+-                    Maxs(x0, x0, fp8Min, pregLoop);
+-                    Mins(x0, x0, fp8Max, pregLoop);
+-                    StoreOutputData<T1>(yLocalAddr, x0, pregLoop, j * VL_FP32 + i * dstCurColNumAlign);
+-
+-                    ShiftRights(scaleTmp0, (RegTensor<uint32_t> &)max2, static_cast<int16_t>(FAST_LOG_SHIFT_BITS), preg1);
+-                    Cast<uint8_t, uint32_t, castTraitU32toU8Even>(scaleTmp1, scaleTmp0, preg1);
+-                    DataCopy<T1, AscendC::MicroAPI::StoreDist::DIST_FIRST_ELEMENT_B8>(scaleAddr + i * scaleStride + j, (RegTensor<T1>&)scaleTmp1, preg1);
+-                }
+-                LocalMemBar<MemType::VEC_STORE, MemType::VEC_STORE>();
+-            }
+-        }
+-    }
+-}
+-
+-template <typename T>
+-__aicore__ inline void CopyIn(
+-    const GlobalTensor<T>& inputGm, const LocalTensor<T>& inputTensor, const uint16_t nBurst, const uint32_t copyLen,
+-    uint32_t srcStride = 0)
+-{
+-    DataCopyPadExtParams<T> dataCopyPadExtParams;
+-    dataCopyPadExtParams.isPad = false;
+-    dataCopyPadExtParams.leftPadding = 0;
+-    dataCopyPadExtParams.rightPadding = 0;
+-    dataCopyPadExtParams.paddingValue = 0;
+-
+-    DataCopyExtParams dataCoptExtParams;
+-    dataCoptExtParams.blockCount = nBurst;
+-    dataCoptExtParams.blockLen = copyLen * sizeof(T);
+-    dataCoptExtParams.srcStride = srcStride * sizeof(T);
+-    dataCoptExtParams.dstStride = 0;
+-    DataCopyPad(inputTensor, inputGm, dataCoptExtParams, dataCopyPadExtParams);
+-}
+-
+-template <typename T, AscendC::PaddingMode mode = AscendC::PaddingMode::Normal>
+-__aicore__ inline void CopyOut(
+-    const LocalTensor<T>& outputTensor, const GlobalTensor<T>& outputGm, const uint16_t nBurst, const uint32_t copyLen,
+-    uint32_t dstStride = 0)
+-{
+-    DataCopyExtParams dataCopyParams;
+-    dataCopyParams.blockCount = nBurst;
+-    dataCopyParams.blockLen = copyLen * sizeof(T);
+-    dataCopyParams.srcStride = 0;
+-    dataCopyParams.dstStride = dstStride * sizeof(T);
+-    DataCopyPad<T, mode>(outputGm, outputTensor, dataCopyParams);
+-}
+-
+-} // namespace KvCompressEpilogOps
+-
+-#endif
+\ No newline at end of file
+diff --git a/csrc/attention/kv_compress_epilog_v2/README.md b/csrc/attention/kv_compress_epilog_v2/README.md
+index 3a574ae61..5f57e8dff 100644
+--- a/csrc/attention/kv_compress_epilog_v2/README.md
++++ b/csrc/attention/kv_compress_epilog_v2/README.md
+@@ -6,8 +6,7 @@ The original CANN Open Software License notices are preserved in the source file
+ 
+ `torch.ops._C_ascend.kv_compress_epilog_v2` quantizes BF16 rows and writes
+ specified slots in a flat or paged cache in place. Negative and out-of-range
+-slots leave the cache unchanged. This entry point has its own cache ABI and
+-does not replace the existing `kv_compress_epilog` operator.
++slots leave the cache unchanged.
+ 
+ Supported modes are `mxfp8_bf16` with groups of 32 and `mxfp4_bf16` with
+ groups of 16 or 32. Each token stores its packed data followed by BF16 scales.
+diff --git a/csrc/build_aclnn.sh b/csrc/build_aclnn.sh
+index fb71ee50c..e4d9da203 100755
+--- a/csrc/build_aclnn.sh
++++ b/csrc/build_aclnn.sh
+@@ -204,7 +204,6 @@ elif [[ "$SOC_VERSION" =~ ^ascend950 ]]; then
+         "add_rms_norm_bias"
+         "moe_gating_top_k_hash"
+         "inplace_partial_rotary_mul"
+-        "kv_compress_epilog"
+         "kv_compress_epilog_v2"
+         "compressor"
+         "compressor_metadata"
+diff --git a/csrc/torch_binding.cpp b/csrc/torch_binding.cpp
+index c86ec94e5..b7cd4924b 100644
+--- a/csrc/torch_binding.cpp
++++ b/csrc/torch_binding.cpp
+@@ -1026,7 +1026,6 @@ std::vector<bool> is_contiguous_axes(const at::Tensor &tensor)
+         contiguous_stride[i] = contiguous_stride[i + 1] * sizes[i + 1];
+     }
+ 
+-
+     for (int64_t i = 0; i < ndim; i++) {
+         result[i] = (strides[i] == contiguous_stride[i]);
+     }
+@@ -1054,7 +1053,6 @@ std::tuple<at::Tensor> construct_compressor_output_tensor(const at::Tensor &x, c
+     return std::tuple<at::Tensor>(cmp_kv);
+ }
+ 
+-
+ std::tuple<at::Tensor> compressor(const at::Tensor &x, const at::Tensor &wkv, const at::Tensor &wgate,
+                                   at::Tensor &state_cache, const at::Tensor &ape, const at::Tensor &norm_weight,
+                                   const at::Tensor &rope_sin, const at::Tensor &rope_cos,
+@@ -1719,54 +1717,6 @@ std::tuple<at::Tensor, at::Tensor> npu_rms_norm_dynamic_quant_npu(
+     return std::make_tuple(y_out, scale_out);
+ }
+ 
+-void validate_kv_compress_epilog_inputs(
+-    const at::Tensor& x,
+-    const at::Tensor& slot_mapping,
+-    at::Tensor& kv_compress_cache)
+-{
+-    TORCH_CHECK(x.dim() == 2, "x must be 2D tensor, but got dimensions: ", x.dim());
+-    TORCH_CHECK(x.size(0) > 0 && x.size(1) > 0,
+-                "x dimensions must be positive, but got: [", x.size(0), ", ", x.size(1), "]");
+-    TORCH_CHECK(slot_mapping.dim() == 1,
+-                "slot_mapping must be 1D tensor, but got dimensions: ", slot_mapping.dim());
+-    TORCH_CHECK(slot_mapping.size(0) == x.size(0),
+-                "slot_mapping size must equal x's first dimension, but got slot_mapping_size=",
+-                slot_mapping.size(0), ", x.dim(0)=", x.size(0));
+-    if (kv_compress_cache.dim() == 4) {
+-        TORCH_CHECK(kv_compress_cache.size(2) == 1,
+-                    "kv_compress_cache 4D tensor requires headnum (dim 2) == 1, but got ",
+-                    kv_compress_cache.size(2));
+-    }
+-    TORCH_CHECK(x.dtype() == at::kBFloat16, "x must be BF16, but got ", x.dtype());
+-    TORCH_CHECK(slot_mapping.dtype() == at::kInt || slot_mapping.dtype() == at::kLong,
+-                "slot_mapping must be INT32 or INT64, but got ", slot_mapping.dtype());
+-    TORCH_CHECK(kv_compress_cache.dtype() == at::ScalarType::Float8_e5m2 ||
+-                kv_compress_cache.dtype() == at::ScalarType::Float8_e4m3fn,
+-                "kv_compress_cache must be FP8_E5M2 or FP8_E4M3, but got ", kv_compress_cache.dtype());
+-}
+-
+-void kv_compress_epilog_npu(
+-    at::Tensor& kv_compress_cache,
+-    const at::Tensor& x,
+-    const at::Tensor& slot_mapping,
+-    int64_t quant_group_size,
+-    int64_t quant_mode,
+-    bool round_scale_flag,
+-    int64_t layout)
+-{
+-    validate_kv_compress_epilog_inputs(x, slot_mapping, kv_compress_cache);
+-
+-    at::Tensor cache = kv_compress_cache;
+-    if (cache.dim() == 4) {
+-        cache = cache.squeeze(2);
+-    }
+-
+-    int64_t round_scale = round_scale_flag ? 1 : 0;
+-    int64_t cache_stride = cache.stride(0);
+-    EXEC_NPU_CMD(aclnnKvCompressEpilog, cache, x, slot_mapping, quant_group_size, quant_mode, round_scale,
+-                 layout, cache_stride);
+-}
+-
+ std::tuple<at::Tensor, at::Tensor> npu_kv_quant_sparse_attn_sharedkv_npu(
+     const at::Tensor& q,
+     int64_t kv_quant_mode,
+@@ -3447,19 +3397,6 @@ TORCH_LIBRARY_EXPAND(CONCAT(_C, _ascend), ops)
+         );
+     ops.impl("npu_rms_norm_dynamic_quant", torch::kPrivateUse1, &vllm_ascend::npu_rms_norm_dynamic_quant_npu);
+ 
+-    ops.def(
+-        "kv_compress_epilog("
+-            "Tensor(a!) kv_compress_cache, "
+-            "Tensor x, "
+-            "Tensor slot_mapping, "
+-            "int quant_group_size, "
+-            "int quant_mode, "
+-            "bool round_scale_flag, "
+-            "int layout"
+-        ") -> ()"
+-    );
+-    ops.impl("kv_compress_epilog", torch::kPrivateUse1, &vllm_ascend::kv_compress_epilog_npu);
+-
+     ops.def(
+         "kv_compress_epilog_v2(Tensor(a!) cache, Tensor x, Tensor slot_mapping, *, "
+         "int quant_group_size=32, str quant_mode='mxfp8_bf16', "
+diff --git a/csrc/torch_binding_meta.cpp b/csrc/torch_binding_meta.cpp
+index 33ed44abe..b13e51bcf 100644
+--- a/csrc/torch_binding_meta.cpp
++++ b/csrc/torch_binding_meta.cpp
+@@ -1175,18 +1175,6 @@ std::tuple<at::Tensor, at::Tensor> npu_rms_norm_dynamic_quant_meta(
+     return std::make_tuple(y_out, scale_out);
+ }
+ 
+-void kv_compress_epilog_meta(
+-    at::Tensor& kv_compress_cache,
+-    const at::Tensor& x,
+-    const at::Tensor& slot_mapping,
+-    int64_t quant_group_size,
+-    int64_t quant_mode,
+-    bool round_scale_flag,
+-    int64_t layout)
+-{
+-    return;
+-}
+-
+ void kv_compress_epilog_v2_meta(at::Tensor &cache, const at::Tensor &x,
+                             const at::Tensor &slotMapping,
+                             int64_t quantGroupSize, std::string quantMode,
+@@ -1890,7 +1878,6 @@ TORCH_LIBRARY_IMPL_EXPAND(CONCAT(_C, _ascend), Meta, ops) {
+     ops.impl("npu_hc_pre_v3", &vllm_ascend::meta::npu_hc_pre_v3_meta);
+     ops.impl("inplace_partial_rotary_mul", &vllm_ascend::meta::inplace_partial_rotary_mul_meta);
+     ops.impl("npu_rms_norm_dynamic_quant", &vllm_ascend::meta::npu_rms_norm_dynamic_quant_meta);
+-    ops.impl("kv_compress_epilog", &vllm_ascend::meta::kv_compress_epilog_meta);
+     ops.impl("kv_compress_epilog_v2", &vllm_ascend::meta::kv_compress_epilog_v2_meta);
+     ops.impl("npu_kv_quant_sparse_attn_sharedkv", &vllm_ascend::meta::npu_kv_quant_sparse_attn_sharedkv_meta);
+     ops.impl("npu_kv_quant_sparse_attn_sharedkv_metadata",
+diff --git a/tests/ut/attention/test_dsa_attn_kv_plan.py b/tests/ut/attention/test_dsa_attn_kv_plan.py
+index c399f54a1..798dae689 100644
+--- a/tests/ut/attention/test_dsa_attn_kv_plan.py
++++ b/tests/ut/attention/test_dsa_attn_kv_plan.py
+@@ -24,7 +24,6 @@ _DSA_C_ASCEND_OPS = (
+     "npu_sparse_attn_sharedkv_metadata",
+     "npu_kv_quant_sparse_attn_sharedkv",
+     "npu_kv_quant_sparse_attn_sharedkv_metadata",
+-    "kv_compress_epilog",
+     "npu_scatter_nd_update_sk",
+ )
+ 
+@@ -72,7 +71,7 @@ def test_a5_fp8_plan_uses_flat_shared_kv():
+         plan = get_dsa_attn_kv_plan(_config(False))
+         assert plan.get_dsa_compressor_slot_mapping_format() == DSA_COMPRESSOR_SLOT_MAPPING_FLAT
+         assert not plan.requires_block_offset_slots
+-        assert plan.get_dsa_sparse_attn_metadata_kwargs("npu:0") == {"kv_quant_mode": 1}
++        assert plan.get_dsa_sparse_attn_metadata_kwargs("npu:0") == {}
+ 
+ 
+ def test_a5_bf16_plan_uses_sparse_flash_mla():
+@@ -118,7 +117,7 @@ def test_scatter_skips_none_updates():
+     with _on(AscendDeviceType.A5):
+         plan = get_dsa_attn_kv_plan(_config(False))
+         cache = torch.zeros(2, 1, 4)
+-        with mock.patch.object(torch.ops._C_ascend, "kv_compress_epilog") as epilog:
++        with mock.patch.object(torch.ops, "cann_ops_transformer.kv_compress_epilog") as epilog:
+             plan.dsa_kv_compress_scatter(cache, None, torch.tensor([0], dtype=torch.int32))
+             epilog.assert_not_called()
+ 
+diff --git a/tests/ut/attention/test_dsa_v1.py b/tests/ut/attention/test_dsa_v1.py
+index b79e9f4fe..3984c4306 100644
+--- a/tests/ut/attention/test_dsa_v1.py
++++ b/tests/ut/attention/test_dsa_v1.py
+@@ -71,7 +71,6 @@ _DSA_C_ASCEND_OPS = (
+     "npu_sparse_attn_sharedkv_metadata",
+     "npu_kv_quant_sparse_attn_sharedkv",
+     "npu_kv_quant_sparse_attn_sharedkv_metadata",
+-    "kv_compress_epilog",
+     "npu_scatter_nd_update_sk",
+ )
+ 
+diff --git a/tests/ut/quantization/methods/kv_cache/turboquant/test_operators.py b/tests/ut/quantization/methods/kv_cache/turboquant/test_operators.py
+index aed692a95..5b4f79a2f 100644
+--- a/tests/ut/quantization/methods/kv_cache/turboquant/test_operators.py
++++ b/tests/ut/quantization/methods/kv_cache/turboquant/test_operators.py
+@@ -6,8 +6,8 @@ import torch
+ 
+ import vllm_ascend.attention.mixed_quant_sparse_flash_mla as adapter
+ from vllm_ascend.attention.mixed_quant_sparse_flash_mla import (
+-    mixed_quant_sparse_flash_mla,
+-    mixed_quant_sparse_flash_mla_metadata,
++    mixed_quant_sparse_flash_mla_metadata_turboquant,
++    mixed_quant_sparse_flash_mla_turboquant,
+ )
+ 
+ 
+@@ -15,7 +15,7 @@ def test_metadata_maps_paged_lengths_and_quant_mode():
+     lengths = torch.tensor([7, 128, 513], dtype=torch.int32)
+     op = Mock()
+     with patch.object(adapter, "_get_mixed_quant_sparse_flash_mla_ops", return_value=(None, op)):
+-        mixed_quant_sparse_flash_mla_metadata(
++        mixed_quant_sparse_flash_mla_metadata_turboquant(
+             seqused_kv=lengths,
+             max_seqlen_kv=513,
+             cmp_ratio=4,
+@@ -40,7 +40,7 @@ def test_attention_retains_caller_owned_cache_and_sinks():
+     sinks = torch.zeros(4)
+     op = Mock()
+     with patch.object(adapter, "_get_mixed_quant_sparse_flash_mla_ops", return_value=(op, None)):
+-        mixed_quant_sparse_flash_mla(
++        mixed_quant_sparse_flash_mla_turboquant(
+             q, cmp_kv=cache, sinks=sinks, cmp_ratio=4, seqused_kv=torch.tensor([132], dtype=torch.int32)
+         )
+     assert "seqused_cmp_kv" not in op.call_args.kwargs
+@@ -49,12 +49,14 @@ def test_attention_retains_caller_owned_cache_and_sinks():
+     assert op.call_args.kwargs["cmp_kv"] is cache
+     assert op.call_args.kwargs["sinks"] is sinks
+     with pytest.raises(ValueError, match="caller-owned"):
+-        mixed_quant_sparse_flash_mla(q, sinks=None)
++        mixed_quant_sparse_flash_mla_turboquant(q, sinks=None)
+ 
+ 
+ def test_attention_defaults_to_c4_compression_ratio():
+     q = torch.zeros(1, 4, 512, dtype=torch.bfloat16)
+     op = Mock()
+     with patch.object(adapter, "_get_mixed_quant_sparse_flash_mla_ops", return_value=(op, None)):
+-        mixed_quant_sparse_flash_mla(q, cmp_kv=torch.zeros(1, 1, 1, 258, dtype=torch.uint8), sinks=torch.zeros(4))
++        mixed_quant_sparse_flash_mla_turboquant(
++            q, cmp_kv=torch.zeros(1, 1, 1, 258, dtype=torch.uint8), sinks=torch.zeros(4)
++        )
+     assert op.call_args.kwargs["cmp_ratio"] == 4
+diff --git a/vllm_ascend/attention/dsa_attn_kv_plan.py b/vllm_ascend/attention/dsa_attn_kv_plan.py
+index 27df5b256..e59127dee 100644
+--- a/vllm_ascend/attention/dsa_attn_kv_plan.py
++++ b/vllm_ascend/attention/dsa_attn_kv_plan.py
+@@ -11,8 +11,10 @@ import torch_npu
+ from vllm.triton_utils import tl, triton
+ 
+ from vllm_ascend.attention.mixed_quant_sparse_flash_mla import (
+-    mixed_quant_sparse_flash_mla,
+-    mixed_quant_sparse_flash_mla_metadata,
++    mixed_quant_sparse_flash_mla_fp8,
++    mixed_quant_sparse_flash_mla_metadata_fp8,
++    mixed_quant_sparse_flash_mla_metadata_turboquant,
++    mixed_quant_sparse_flash_mla_turboquant,
+ )
+ from vllm_ascend.attention.sparse_flash_mla import sparse_flash_mla, sparse_flash_mla_metadata
+ from vllm_ascend.device.hardware_profile import HardwareCapability, get_current_hardware_profile
+@@ -192,14 +194,21 @@ class DsaAttnKvPlan:
+         if not self.uses_kv_compress_epilog:
+             torch.ops._C_ascend.npu_scatter_nd_update_sk(cache, slot_mapping, x)
+             return
+-        torch.ops._C_ascend.kv_compress_epilog(
+-            kv_compress_cache=cache.view(-1, 1, cache.shape[-1]),
++        # cann_ops_transformer.kv_compress_epilog writes the PA_BBND
++        # quantMode=1 (608 B/token) layout directly:
++        #   [rope(64 bf16=128B) | nope(448 fp8) | scale(7 bf16=14B) | pad(18B)]
++        # The op only accepts UINT8 caches, so reinterpret the FP8 cache view
++        # (same 8-bit storage; the in-place update lands in the original
++        # tensor). quant_mode="fp8_bf16" (int 0): group(64) FP8(e4m3) with
++        # bf16 scale, rope kept bf16.
++        torch.ops.cann_ops_transformer.kv_compress_epilog(
++            cache=cache.view(torch.uint8),
+             x=x.view(-1, x.shape[-1]),
+             slot_mapping=slot_mapping,
+             quant_group_size=64,
+-            quant_mode=2,
+-            round_scale_flag=True,
+-            layout=1,
++            quant_mode="fp8_bf16",
++            round_scale=True,
++            x_scale=1.0,
+         )
+ 
+ 
+@@ -212,8 +221,8 @@ def get_dsa_attn_kv_plan(vllm_config, compress_ratio: int = 1) -> DsaAttnKvPlan:
+             layout_kv="PA_BBND",
+             compressor_slot_mapping_format=DSA_COMPRESSOR_SLOT_MAPPING_BLOCK_OFFSET,
+             requires_block_offset_slots=True,
+-            sparse_attn_op=mixed_quant_sparse_flash_mla,
+-            sparse_attn_metadata_op=mixed_quant_sparse_flash_mla_metadata,
++            sparse_attn_op=mixed_quant_sparse_flash_mla_turboquant,
++            sparse_attn_metadata_op=mixed_quant_sparse_flash_mla_metadata_turboquant,
+             sparse_attn_base_kwargs={},
+             sparse_attn_metadata_kwargs={},
+             include_metadata_device=False,
+@@ -255,10 +264,10 @@ def get_dsa_attn_kv_plan(vllm_config, compress_ratio: int = 1) -> DsaAttnKvPlan:
+         layout_kv="PA_ND",
+         compressor_slot_mapping_format=DSA_COMPRESSOR_SLOT_MAPPING_FLAT,
+         requires_block_offset_slots=False,
+-        sparse_attn_op=torch.ops._C_ascend.npu_kv_quant_sparse_attn_sharedkv,
+-        sparse_attn_metadata_op=torch.ops._C_ascend.npu_kv_quant_sparse_attn_sharedkv_metadata,
+-        sparse_attn_base_kwargs={"kv_quant_mode": 1, "tile_size": 64, "rope_head_dim": 64},
+-        sparse_attn_metadata_kwargs={"kv_quant_mode": 1},
++        sparse_attn_op=mixed_quant_sparse_flash_mla_fp8,
++        sparse_attn_metadata_op=mixed_quant_sparse_flash_mla_metadata_fp8,
++        sparse_attn_base_kwargs={},
++        sparse_attn_metadata_kwargs={},
+         include_metadata_device=False,
+         applies_sparse_attn_runtime_kwargs=False,
+     )
+diff --git a/vllm_ascend/attention/mixed_quant_sparse_flash_mla.py b/vllm_ascend/attention/mixed_quant_sparse_flash_mla.py
+index 33ef7d651..e401889e6 100644
+--- a/vllm_ascend/attention/mixed_quant_sparse_flash_mla.py
++++ b/vllm_ascend/attention/mixed_quant_sparse_flash_mla.py
+@@ -1,6 +1,16 @@
+ # SPDX-License-Identifier: Apache-2.0
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+-"""Adapt DSA arguments to the installed MixedQuantSparseFlashMla operators."""
++"""Adapt DSA arguments to the installed MixedQuantSparseFlashMla operators.
++
++Two paths share the MixedQuantSparseFlashMla (cann_ops_transformer) operator:
++
++* TurboQuant (quant_mode=3): ``mixed_quant_sparse_flash_mla_turboquant`` /
++  ``mixed_quant_sparse_flash_mla_metadata_turboquant`` (see
++  vllm_ascend/quantization/methods/kv_cache/turboquant.py).
++* DSV4 FP8 (quant_mode=1): ``mixed_quant_sparse_flash_mla_fp8`` /
++  ``mixed_quant_sparse_flash_mla_metadata_fp8``, adapted from
++  the former ``npu_kv_quant_sparse_attn_sharedkv`` path.
++"""
+ 
+ from collections.abc import Callable
+ from functools import lru_cache
+@@ -43,7 +53,7 @@ def _adapt(kwargs):
+     _drop_paged_kv_cu_seqlens(kwargs)
+ 
+ 
+-def mixed_quant_sparse_flash_mla_metadata(**kwargs):
++def mixed_quant_sparse_flash_mla_metadata_turboquant(**kwargs):
+     _adapt(kwargs)
+     # Metadata requires explicit compressed lengths; fused TQ attention derives them.
+     _add_compressed_kv_lengths(kwargs)
+@@ -51,8 +61,179 @@ def mixed_quant_sparse_flash_mla_metadata(**kwargs):
+     return metadata_op(**kwargs)
+ 
+ 
+-def mixed_quant_sparse_flash_mla(q, **kwargs):
++def mixed_quant_sparse_flash_mla_turboquant(q, **kwargs):
+     _adapt(kwargs)
+     _ensure_sinks(kwargs)
+     attention_op, _ = _get_mixed_quant_sparse_flash_mla_ops()
+     return attention_op(q, **kwargs)
++
++
++# ---------------------------------------------------------------------------
++# DSV4 FP8 quantMode=1 adapter
++# ---------------------------------------------------------------------------
++
++
++def _has_cmp(kw):
++    return bool(kw.get("has_cmp_kv", int(kw.get("cmp_ratio", 1)) > 1))
++
++
++def _split_seqused(seqused, ratio, has_cmp):
++    if not has_cmp:
++        return None, None
++    return seqused // ratio, seqused % ratio
++
++
++def _fullcov_sparse_indices(si, max_used):
++    """True when the sparse indices cover the whole KV range.
++
++    ``max_used`` is the per-sequence KV length limit as a host int
++    (``max(seqused_kv)``). Callers already hold it as ``max_seqlen_kv``
++    derived from the CPU sequence lengths, so no NPU-to-CPU tensor
++    migration is needed for the coverage decision.
++    """
++    if si is None:
++        return False
++    valid = si[si >= 0]
++    if valid.numel() == 0:
++        return False
++    return valid.numel() >= max_used and int(valid.max().item()) >= max_used - 1
++
++
++# ---------------------------------------------------------------------------
++# metadata op
++# ---------------------------------------------------------------------------
++
++
++def mq_meta_adapter(kw):
++    # quantMode=1 (FP8): keep the operator's per-mode layout; the generic DSA
++    # ``layout_kv`` argument is rewritten to the paged PA_BBND contract.
++    kw.pop("device", None)
++    kw.pop("kv_quant_mode", None)
++    kw.pop("tile_size", None)
++    kw.update(quant_mode=1, layout_kv="PA_BBND")
++    # ``has_ori_kv``/``has_cmp_kv`` are host booleans, not tensors; the op
++    # rejects tensors for them.
++    kw["has_ori_kv"] = bool(kw.get("has_ori_kv", True))
++    kw["has_cmp_kv"] = _has_cmp(kw)
++    ratio = max(int(kw.get("cmp_ratio", 1)), 1)
++    cmp_len, residual = _split_seqused(kw["seqused_kv"], ratio, kw["has_cmp_kv"])
++    # max(cmp_len) == max(seqused) // ratio for floor division, and
++    # max_seqlen_kv is the host int max(seqused_kv) supplied by the caller
++    # (derived from the CPU sequence lengths), so no NPU-to-CPU sync is
++    # needed here. Graph-capture warmup may omit the key; fall back to the
++    # old device-free 0, keeping the previous .item() path's behavior.
++    max_cmp = max(int(kw.get("max_seqlen_kv", 0)) // ratio, 1) if kw["has_cmp_kv"] else 0
++    kw.update(
++        num_heads_kv=int(kw.get("num_heads_kv", 1)),
++        seqused_ori_kv=kw["seqused_kv"],
++        seqused_cmp_kv=cmp_len,
++        cmp_residual_kv=residual,
++        max_seqlen_ori_kv=int(kw["max_seqlen_kv"]),
++        max_seqlen_cmp_kv=max_cmp,
++        ori_topk=0,
++        cmp_topk=int(kw.get("cmp_topk", 0)),
++        rope_head_dim=int(kw.get("rope_head_dim", 64)),
++        cmp_ratio=ratio,
++        ori_mask_mode=int(kw.get("ori_mask_mode", 4)),
++        cmp_mask_mode=3 if kw["has_cmp_kv"] else 0,
++        ori_win_left=int(kw.get("ori_win_left", 0)),
++        ori_win_right=int(kw.get("ori_win_right", 0)),
++        layout_q=kw.get("layout_q", "TND"),
++    )
++    # ``seqused_kv`` is the caller-facing DSA name; the op reads the split
++    # ``*_ori_kv``/``*_cmp_kv`` names instead.
++    kw.pop("seqused_kv", None)
++    kw.pop("max_seqlen_kv", None)
++    # Explicit per-branch topk lengths are unused in this mode.
++    kw.update(ori_topk_length=None, cmp_topk_length=None)
++    # Keep the op-facing optionals explicit (None), matching the operator's
++    # schema defaults and the prior full-dict contract.
++    kw.update(seqused_q=None, cu_seqlens_ori_kv=None, cu_seqlens_cmp_kv=None)
++    # cu_seqlens_q stays for the fused attention kernel.
++    kw["cu_seqlens_q"] = kw.get("cu_seqlens_q")
++
++
++def mixed_quant_sparse_flash_mla_metadata_fp8(**kw):
++    mq_meta_adapter(kw)
++    _, meta_op = _get_mixed_quant_sparse_flash_mla_ops()
++    return meta_op(**kw)
++
++
++# ---------------------------------------------------------------------------
++# attention op
++# ---------------------------------------------------------------------------
++
++
++def mq_attn_adapter(q, kw):
++    kw.pop("device", None)
++    kw.pop("kv_quant_mode", None)
++    kw.pop("tile_size", None)
++    kw.update(quant_mode=1, layout_kv="PA_BBND")
++    ratio = max(int(kw.get("cmp_ratio", 1)), 1)
++    has_cmp = ratio > 1 and kw.get("cmp_kv") is not None
++    cmp_len, residual = _split_seqused(kw["seqused_kv"], ratio, has_cmp)
++    if not has_cmp:
++        kw.pop("cmp_block_table", None)
++        kw.pop("cmp_kv", None)
++        kw.pop("cmp_sparse_indices", None)
++        kw.pop("cmp_mask_mode", None)
++    win_r = int(kw.get("ori_win_right", 0))
++    osi = kw.get("ori_sparse_indices")
++    if osi is not None:
++        # Full coverage: the new op derives attention from the window instead.
++        # The coverage check needs the batch total on the host, so it only
++        # runs outside graph capture (vision prefill, executed eagerly).
++        # Inside CUDA-graph capture the DSpark draft window from kwargs is
++        # equivalent: the sliding window clips at the sequence start, so a
++        # short sequence gets full coverage either way.
++        # max_seqlen_kv is the host int max(seqused_kv); the window right
++        # edge at max_seqlen_kv - 1 covers every sequence's KV (per-sequence
++        # KV is independently addressed), so no NPU-to-CPU sync is needed
++        # here either. Graph-capture warmup may not supply max_seqlen_kv, so
++        # keep the lookup inside the non-capturing branch.
++        if not torch.npu.is_current_stream_capturing():
++            max_kv = kw.get("max_seqlen_kv")
++            if max_kv is not None and _fullcov_sparse_indices(osi, int(max_kv)):
++                win_r = int(q.shape[0]) - 1
++        # Original indices are never passed: the new op derives attention
++        # from the window (ori_mask_mode) instead.
++        kw.pop("ori_sparse_indices", None)
++    kw.update(
++        seqused_ori_kv=kw["seqused_kv"],
++        seqused_cmp_kv=cmp_len,
++        cmp_residual_kv=residual,
++        ori_topk_length=None,
++        cmp_topk_length=None,
++        quant_mode=1,
++        rope_head_dim=int(kw.get("rope_head_dim", 64)),
++        cmp_ratio=ratio,
++        ori_mask_mode=int(kw.get("ori_mask_mode", 4)),
++        cmp_mask_mode=3 if has_cmp else 0,
++        ori_win_left=int(kw.get("ori_win_left", 0)),
++        ori_win_right=win_r,
++        layout_q=kw.get("layout_q", "TND"),
++        topk_value_mode=1,
++        return_softmax_lse=False,
++    )
++    # ``seqused_kv`` is the caller-facing DSA name; the op reads the split
++    # ``*_ori_kv``/``*_cmp_kv`` names instead.
++    kw.pop("seqused_kv", None)
++    kw.pop("max_seqlen_kv", None)
++    # Keep the op-facing optionals explicit (None), matching the operator's
++    # schema defaults and the prior full-dict contract.
++    kw.update(
++        seqused_q=None,
++        cu_seqlens_ori_kv=None,
++        cu_seqlens_cmp_kv=None,
++        ori_sparse_indices=None,
++        metadata=kw.get("metadata"),
++    )
++    # cu_seqlens_q stays for the fused attention kernel.
++    kw["cu_seqlens_q"] = kw.get("cu_seqlens_q")
++
++
++def mixed_quant_sparse_flash_mla_fp8(q, **kw):
++    mq_attn_adapter(q, kw)
++    attention_op, _ = _get_mixed_quant_sparse_flash_mla_ops()
++    out, lse = attention_op(q, **kw)
++    return out, lse
+diff --git a/vllm_ascend/models/deepseek_v4/model.py b/vllm_ascend/models/deepseek_v4/model.py
+index 4178dd0d4..f65af8f3c 100644
+--- a/vllm_ascend/models/deepseek_v4/model.py
++++ b/vllm_ascend/models/deepseek_v4/model.py
+@@ -127,7 +127,9 @@ class AscendDeepseekV4SWACache(VllmDeepseekV4SWACache):
+         self.block_size = DSV4_BLOCK_SIZES[cache_config.block_size][0][1]
+ 
+     def get_kv_cache_spec(self, vllm_config: VllmConfig) -> KVCacheSpec:
+-        cached_head_size = self.head_dim + 128 if self.dtype == torch.float8_e4m3fn else self.head_dim
++        # FP8 SWA cache row: quantMode=1 layout = 608 B/token (rope 128 +
++        # nope 448 + bf16 scale 14 + pad 18), i.e. head_dim + 96.
++        cached_head_size = self.head_dim + 96 if self.dtype == torch.float8_e4m3fn else self.head_dim
+         return AscendSlidingWindowMLASpec(
+             block_size=self.block_size,
+             num_kv_heads=1,
+diff --git a/vllm_ascend/models/layer/attention/layer.py b/vllm_ascend/models/layer/attention/layer.py
+index 86c0f70ca..50e6e7980 100644
+--- a/vllm_ascend/models/layer/attention/layer.py
++++ b/vllm_ascend/models/layer/attention/layer.py
+@@ -38,9 +38,9 @@ def get_dsv4_block_sizes(use_a5_bf16_kv: bool = False):
+         32: [[32, 32, 2, 8], [4160, 32768]],
+     }
+     _DSV4_COMPRESSED_BLOCK_SIZES = {
+-        128: [[128, 128, 8, 16], [16896, 81920]],
+-        64: [[64, 64, 4, 8], [8448, 40960]],
+-        32: [[32, 32, 2, 4], [4224, 20480]],
++        128: [[128, 128, 8, 16], [16896, 77824]],
++        64: [[64, 64, 4, 8], [8448, 38912]],
++        32: [[32, 32, 2, 4], [4224, 19456]],
+     }
+     _DSV4_BLOCK_SIZES_A5_BF16 = {
+         128: [[128, 128, 8, 16], [16896, 131072]],
+@@ -197,7 +197,7 @@ class DSAAttention(nn.Module, AttentionLayerBase):
+         use_bf16_kv = is_a5_bf16_kv_enabled(vllm_config)
+         has_compressed_cache = get_current_hardware_profile().supports(HardwareCapability.DSV4_COMPRESSED_CACHE)
+ 
+-        cached_head_size = self.head_size + 128 if has_compressed_cache and not use_bf16_kv else self.head_size
++        cached_head_size = self.head_size + 96 if has_compressed_cache and not use_bf16_kv else self.head_size
+         if is_turboquant(vllm_config) and self.compress_ratio == 4:
+             cached_head_size = SLOT_BYTES
+         storage_block_size = dsv4_block_sizes(vllm_config)[vllm_config.cache_config.block_size][0][0]

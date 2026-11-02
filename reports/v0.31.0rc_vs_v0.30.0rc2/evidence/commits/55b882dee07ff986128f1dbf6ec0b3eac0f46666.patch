@@ -1,0 +1,472 @@
+commit 55b882dee07ff986128f1dbf6ec0b3eac0f46666
+Author:     zxr2333 <64738772+nwpu-zxr@users.noreply.github.com>
+AuthorDate: Sat Oct 10 18:37:17 2026 +0800
+Commit:     GitHub <noreply@github.com>
+CommitDate: Sat Oct 10 18:37:17 2026 +0800
+
+    [Feature][P/D][v0.30.0] Support Mooncake V2 KV receive failure handling (#18147)
+    
+    ### What this PR does / why we need it?
+    
+    Backport of #18146 to `releases/v0.30.0` (cherry-picked without
+    conflicts).
+    
+    Support request-level KV receive failure reporting in
+    `MooncakeConnectorV2` through vLLM's `KVConnectorTransferResults`,
+    including hybrid caches with multiple KV groups. Drain receive
+    completion and failure together, attribute transfer errors to the
+    affected requests, and retain producer release notifications after
+    worker completion is aggregated. Log failed request IDs and the
+    configured failure policy on D.
+    
+    Preserve externally supplied request IDs in the PD proxy, with
+    `X-Request-Id` taking precedence over the JSON body. Update existing
+    connector tests for the new completion results.
+    
+    ### Does this PR introduce _any_ user-facing change?
+    
+    Yes. Multi-group KV transfer failures follow `kv_load_failure_policy`
+    instead of being ignored. When this option is omitted, vLLM defaults to
+    `fail`, so failed KV transfers are handled as request failures without
+    any additional configuration. Clients can supply a request ID through
+    the proxy and correlate it with failure logs.
+    
+    ### How was this patch tested?
+    
+    The functional experiment results below are from the original
+    main-branch validation; the experiment was not rerun on the release
+    branch.
+    
+    Ascend A5 with DeepSeek-V4-Flash, `MooncakeConnectorV2`, P/D DP4 TP1,
+    six KV groups, and `kv_load_failure_policy=fail`. Injected receive
+    failures based on externally supplied request IDs, using both header and
+    body IDs; the randomized phase used concurrency 4.
+    
+    | Requests | HTTP 200 | HTTP 500 |
+    | --- | --- | --- |
+    | Deterministic and recovery checks | 8 | 3 |
+    | Randomized injection | 53 | 47 |
+    | Total | 61 | 50 |
+    
+    All 111 requests matched the expected outcome. All 50 failed requests
+    reached `FINISHED_ERROR`; P-side release and D-side cleanup were
+    verified. Running/waiting requests and KV-cache usage returned to zero
+    on all P/D ranks. Temporary fault-injection code is excluded from this
+    PR.
+    
+    These runs cover simulated receive failures, not actual network faults
+    or same-request cross-TP failure aggregation.
+    
+    - vLLM:
+    https://github.com/vllm-project/vllm/commit/ced6857afa0ea7b2e3f0846a62e1394e90f15607
+    
+    - vLLM main:
+    https://github.com/vllm-project/vllm/commit/ced6857afa0ea7b2e3f0846a62e1394e90f15607
+    
+    Signed-off-by: nwpu-zxr <zhouxuerong2@huawei.com>
+
+diff --git a/examples/disaggregated_prefill_v1/load_balance_proxy_server_example.py b/examples/disaggregated_prefill_v1/load_balance_proxy_server_example.py
+index 383068b5f..0462e9e61 100644
+--- a/examples/disaggregated_prefill_v1/load_balance_proxy_server_example.py
++++ b/examples/disaggregated_prefill_v1/load_balance_proxy_server_example.py
+@@ -951,7 +951,7 @@ async def assign_instances(
+     args = get_global_args()
+     prefiller_score = calculate_prefill_score(request_length)
+     decoder_score = calculate_decode_score(request_length)
+-    request_id = next_req_id()
++    request_id = req_data.get("request_id") or next_req_id()
+     pick_prefill = "begin_request" if is_initial_request else "reserve_prefill_kv"
+     prefiller = await runtime.schedule(pick_prefill, prefiller_score)
+     prefiller_key = prefiller["key"]
+@@ -1035,6 +1035,8 @@ async def handle_completions_impl(api: str, request: Request):
+     request_released = False
+     try:
+         req_data = await request.json()
++        if request_id := request.headers.get("X-Request-Id"):
++            req_data["request_id"] = request_id
+         req_body = await request.body()
+         request_length = len(req_body)
+         instance_info = await assign_instances(api, req_data, request_length, is_initial_request=True)
+diff --git a/tests/ut/kv_offload/mooncake_v2/test_connector.py b/tests/ut/kv_offload/mooncake_v2/test_connector.py
+index de446ec94..10c1e6c87 100644
+--- a/tests/ut/kv_offload/mooncake_v2/test_connector.py
++++ b/tests/ut/kv_offload/mooncake_v2/test_connector.py
+@@ -4,7 +4,7 @@ from types import SimpleNamespace
+ from unittest.mock import MagicMock, patch
+ 
+ import pytest
+-from vllm.distributed.kv_transfer.kv_connector.v1.base import KVConnectorRole
++from vllm.distributed.kv_transfer.kv_connector.v1.base import KVConnectorRole, KVConnectorTransferResults
+ 
+ from vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake import connector as connector_module
+ from vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake.connector import (
+@@ -59,6 +59,10 @@ def test_facade_delegates_scheduler_methods() -> None:
+ def test_facade_delegates_worker_methods_and_metadata() -> None:
+     connector = make_facade()
+     connector.connector_worker.get_finished.return_value = ({"sent"}, {"received"})
++    results = KVConnectorTransferResults(
++        finished_sending={"sent"}, finished_recving={"received", "failed"}, failed_recving={"failed"}
++    )
++    connector.connector_worker.get_transfer_results.return_value = results
+     connector.connector_worker.get_block_ids_with_load_errors.return_value = {10}
+     connector.connector_worker.xfer_handshake_metadata = MagicMock()
+     connector._connector_metadata.requests["request"] = MagicMock()
+@@ -67,6 +71,8 @@ def test_facade_delegates_worker_methods_and_metadata() -> None:
+     connector.start_load_kv(MagicMock())
+ 
+     assert connector.get_finished(set()) == ({"sent"}, {"received"})
++    assert connector.get_transfer_results(set()) is results
++    connector.connector_worker.get_transfer_results.assert_called_once_with()
+     assert connector.get_block_ids_with_load_errors() == {10}
+     assert connector.get_handshake_metadata() is connector.connector_worker.xfer_handshake_metadata
+     connector.connector_worker.start_load_kv.assert_called_once_with(connector._connector_metadata)
+diff --git a/tests/ut/kv_offload/mooncake_v2/test_pull_scheduler.py b/tests/ut/kv_offload/mooncake_v2/test_pull_scheduler.py
+index 586b8fe60..37068a26b 100644
+--- a/tests/ut/kv_offload/mooncake_v2/test_pull_scheduler.py
++++ b/tests/ut/kv_offload/mooncake_v2/test_pull_scheduler.py
+@@ -451,14 +451,20 @@ def test_request_finished_delays_blocks_and_builds_remote_params() -> None:
+     scheduler._sending_thread.add_delayed_request.assert_called_once()
+ 
+ 
+-def test_update_connector_output_routes_worker_completion_and_scheduler_ack() -> None:
++@pytest.mark.parametrize("failed", [False, True])
++def test_update_connector_output_routes_worker_completion_and_scheduler_ack(failed: bool) -> None:
+     scheduler = make_pull_scheduler()
++    scheduler.kv_transfer_config = SimpleNamespace(kv_load_failure_policy="fail")
+     scheduler._recving_thread = MagicMock()
+     scheduler._sending_thread = MagicMock()
+     scheduler._sending_thread.get_and_clear_finished_requests.return_value = {"request-p"}
+     scheduler._reqs_recv_info["request-d"] = ("10.0.0.1", 6000, "request-p")
+     scheduler._reqs_need_send["request-p"] = time.time()
+-    output = SimpleNamespace(finished_recving={"request-d"}, finished_sending=None)
++    output = SimpleNamespace(
++        finished_recving={"request-d"},
++        finished_sending=None,
++        failed_recving={"request-d"} if failed else set(),
++    )
+ 
+     scheduler.update_connector_output(output)  # type: ignore[arg-type]
+ 
+diff --git a/tests/ut/kv_offload/mooncake_v2/test_pull_worker.py b/tests/ut/kv_offload/mooncake_v2/test_pull_worker.py
+index 1a3bb334d..803e77a76 100644
+--- a/tests/ut/kv_offload/mooncake_v2/test_pull_worker.py
++++ b/tests/ut/kv_offload/mooncake_v2/test_pull_worker.py
+@@ -10,6 +10,7 @@ from unittest.mock import MagicMock, patch
+ import msgspec
+ import pytest
+ import torch
++from vllm.distributed.kv_transfer.kv_connector.v1.base import KVConnectorTransferResults
+ from vllm.v1.attention.backends.registry import MambaAttentionBackendEnum
+ from vllm.v1.kv_cache_interface import KVCacheSpec, MLAAttentionSpec
+ 
+@@ -102,12 +103,14 @@ def test_remote_endpoint_requires_one_endpoint() -> None:
+ 
+ def test_result_queues_are_drained_atomically() -> None:
+     thread = make_thread()
+-    thread.finished_requests.put("request-a")
+-    thread.finished_requests.put("request-b")
++    thread.finished_requests.put(("request-a", False))
++    thread.finished_requests.put(("request-b", True))
+     thread.invalid_block_ids = {10, 11}
+ 
+-    assert thread.get_and_clear_finished_requests() == {"request-a", "request-b"}
+-    assert thread.get_and_clear_finished_requests() == set()
++    assert thread.get_and_clear_finished_requests() == KVConnectorTransferResults(
++        finished_recving={"request-a", "request-b"}, failed_recving={"request-b"}
++    )
++    assert thread.get_and_clear_finished_requests() == KVConnectorTransferResults()
+     assert thread.get_and_clear_invalid_block_ids() == {10, 11}
+     assert thread.get_and_clear_invalid_block_ids() == set()
+ 
+@@ -967,10 +970,11 @@ def test_execute_bucket_uses_selected_pcp_endpoint_and_addresses() -> None:
+     )
+ 
+ 
+-@pytest.mark.parametrize(("can_report", "expected_failed"), [(True, {"request-b"}), (False, set())])
++@pytest.mark.parametrize("can_report", [True, False])
++@pytest.mark.parametrize("submission_error", [False, True])
+ def test_handle_requests_attributes_failed_tp_to_affected_requests(
+     can_report: bool,
+-    expected_failed: set[str],
++    submission_error: bool,
+ ) -> None:
+     thread = make_thread(can_report_invalid_block_ids=can_report)
+     remote_pp = make_pp_metadata(tp_base_addrs={0: [[5000]], 1: [[6000]]})
+@@ -988,7 +992,16 @@ def test_handle_requests_attributes_failed_tp_to_affected_requests(
+         )
+     )
+ 
++    completed_future: Future[None] = Future()
++    completed_future.set_result(None)
++    completed_result = MagicMock(wraps=completed_future.result)
++    completed_future.result = completed_result  # type: ignore[method-assign]
++
+     def submit(_func: object, _pp: int, _pcp: int, tp_rank: int, *_args: object) -> Future[None]:
++        if tp_rank == 0:
++            return completed_future
++        if submission_error:
++            raise RuntimeError("submit failed")
+         future: Future[None] = Future()
+         if tp_rank == 1:
+             future.set_exception(RuntimeError("remote TP failed"))
+@@ -1000,7 +1013,12 @@ def test_handle_requests_attributes_failed_tp_to_affected_requests(
+     thread.executor.submit.side_effect = submit
+     requests = {"request-a": make_req_meta(), "request-b": make_req_meta()}
+ 
+-    assert thread._handle_requests("engine-p", "10.0.0.1", 6000, requests) == expected_failed
++    if submission_error:
++        with pytest.raises(RuntimeError, match="submit failed"):
++            thread._handle_requests("engine-p", "10.0.0.1", 6000, requests)
++    else:
++        assert thread._handle_requests("engine-p", "10.0.0.1", 6000, requests) == {"request-b"}
++    completed_result.assert_called_once_with()
+ 
+ 
+ def test_connector_worker_groups_start_load_by_remote_engine() -> None:
+@@ -1024,12 +1042,19 @@ def test_connector_worker_groups_start_load_by_remote_engine() -> None:
+ 
+ def test_connector_worker_exposes_finished_and_invalid_blocks() -> None:
+     worker = MooncakePullConnectorWorker.__new__(MooncakePullConnectorWorker)
+-    worker._recving_thread = MagicMock()
+-    worker._recving_thread.get_and_clear_finished_requests.return_value = {"request"}
+-    worker._recving_thread.get_and_clear_invalid_block_ids.return_value = {10, 11}
++    worker._recving_thread = make_thread()
++    worker._recving_thread.finished_requests.put(("request", True))
++    worker._recving_thread.invalid_block_ids = {10, 11}
+ 
+-    assert worker.get_finished() == (set(), {"request"})
++    assert worker.get_transfer_results() == KVConnectorTransferResults(
++        finished_recving={"request"}, failed_recving={"request"}
++    )
++    assert worker.get_transfer_results() == KVConnectorTransferResults()
+     assert worker.get_block_ids_with_load_errors() == {10, 11}
++    worker._recving_thread.finished_requests.put(("legacy", False))
++    assert worker.get_finished() == (set(), {"legacy"})
++    worker._recving_thread = None
++    assert worker.get_transfer_results() == KVConnectorTransferResults()
+ 
+ 
+ class _StopWorkerLoop(BaseException):
+@@ -1148,10 +1173,14 @@ def test_validate_remote_metadata_rejects_invalid_topology(
+         MooncakePullRecvingThread._validate_remote_metadata(metadata, "engine-p")
+ 
+ 
++@pytest.mark.parametrize("can_report", [True, False])
++@pytest.mark.parametrize("batch_error", [False, True])
+ def test_worker_run_marks_only_failed_requests_and_finishes_the_batch(
+     monkeypatch: pytest.MonkeyPatch,
++    can_report: bool,
++    batch_error: bool,
+ ) -> None:
+-    thread = make_thread(device=0, ready_event=threading.Event())
++    thread = make_thread(device=0, ready_event=threading.Event(), can_report_invalid_block_ids=can_report)
+     requests = {
+         "request-a": make_req_meta(local=([10],)),
+         "request-b": make_req_meta(local=([20],)),
+@@ -1159,7 +1188,10 @@ def test_worker_run_marks_only_failed_requests_and_finishes_the_batch(
+     request_queue = MagicMock()
+     request_queue.get.side_effect = [("engine-p", requests), _StopWorkerLoop()]
+     thread.request_queue = request_queue
+-    thread._handle_requests = MagicMock(return_value={"request-b"})  # type: ignore[method-assign]
++    thread._handle_requests = MagicMock(  # type: ignore[method-assign]
++        side_effect=RuntimeError("metadata unavailable") if batch_error else None,
++        return_value={"request-b"},
++    )
+     set_device = MagicMock()
+     monkeypatch.setattr(torch.npu, "set_device", set_device)
+ 
+@@ -1168,8 +1200,12 @@ def test_worker_run_marks_only_failed_requests_and_finishes_the_batch(
+ 
+     set_device.assert_called_once_with(0)
+     assert thread.ready_event.is_set()
+-    assert thread.invalid_block_ids == {20}
+-    assert thread.get_and_clear_finished_requests() == {"request-a", "request-b"}
++    expected_failed = set(requests) if batch_error else {"request-b"}
++    assert thread.invalid_block_ids == (({10, 20} if batch_error else {20}) if can_report else set())
++    assert thread.get_and_clear_finished_requests() == KVConnectorTransferResults(
++        finished_recving=set(requests), failed_recving=expected_failed
++    )
++    assert thread.get_and_clear_finished_requests() == KVConnectorTransferResults()
+     request_queue.task_done.assert_called_once_with()
+ 
+ 
+diff --git a/vllm_ascend/distributed/kv_transfer/kv_p2p/mooncake/base_worker.py b/vllm_ascend/distributed/kv_transfer/kv_p2p/mooncake/base_worker.py
+index 26e203523..181c6b29d 100644
+--- a/vllm_ascend/distributed/kv_transfer/kv_p2p/mooncake/base_worker.py
++++ b/vllm_ascend/distributed/kv_transfer/kv_p2p/mooncake/base_worker.py
+@@ -12,6 +12,7 @@ from vllm.config import VllmConfig
+ from vllm.distributed import get_pcp_group
+ from vllm.distributed.kv_transfer.kv_connector.v1.base import (
+     KVConnectorHandshakeMetadata,
++    KVConnectorTransferResults,
+ )
+ from vllm.distributed.kv_transfer.kv_connector.v1.metrics import KVConnectorStats
+ from vllm.distributed.parallel_state import (
+@@ -338,7 +339,12 @@ class MooncakeBaseConnectorWorker:
+         )
+ 
+     def get_finished(self) -> tuple[set[str], set[str]]:
+-        """Return requests with completed receive and send operations."""
++        """Compatibility wrapper for the legacy completion API."""
++        results = self.get_transfer_results()
++        return results.finished_sending, results.finished_recving
++
++    def get_transfer_results(self) -> KVConnectorTransferResults:
++        """Return completed transfers and receive failures together."""
+         raise NotImplementedError
+ 
+     def get_block_ids_with_load_errors(self) -> set[int]:
+diff --git a/vllm_ascend/distributed/kv_transfer/kv_p2p/mooncake/connector.py b/vllm_ascend/distributed/kv_transfer/kv_p2p/mooncake/connector.py
+index 4f5cede9e..5486bb737 100644
+--- a/vllm_ascend/distributed/kv_transfer/kv_p2p/mooncake/connector.py
++++ b/vllm_ascend/distributed/kv_transfer/kv_p2p/mooncake/connector.py
+@@ -21,6 +21,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.base import (
+     KVConnectorHandshakeMetadata,
+     KVConnectorMetadata,
+     KVConnectorRole,
++    KVConnectorTransferResults,
+     SupportsHMA,
+ )
+ from vllm.distributed.kv_transfer.kv_connector.v1.metrics import (
+@@ -175,6 +176,10 @@ class MooncakeBaseConnector(KVConnectorBase_V1, SupportsHMA):
+         assert self.connector_worker is not None
+         return self.connector_worker.get_finished()
+ 
++    def get_transfer_results(self, finished_req_ids: set[str]) -> KVConnectorTransferResults:
++        assert self.connector_worker is not None
++        return self.connector_worker.get_transfer_results()
++
+     def get_block_ids_with_load_errors(self) -> set[int]:
+         """Return block IDs whose Mooncake KV load failed."""
+         assert self.connector_worker is not None
+diff --git a/vllm_ascend/distributed/kv_transfer/kv_p2p/mooncake/pull_scheduler.py b/vllm_ascend/distributed/kv_transfer/kv_p2p/mooncake/pull_scheduler.py
+index 3a584d045..83bd97d54 100644
+--- a/vllm_ascend/distributed/kv_transfer/kv_p2p/mooncake/pull_scheduler.py
++++ b/vllm_ascend/distributed/kv_transfer/kv_p2p/mooncake/pull_scheduler.py
+@@ -681,6 +681,16 @@ class MooncakePullConnectorScheduler(MooncakeBaseConnectorScheduler):
+                 if self._recving_thread is None:
+                     raise RuntimeError("Producer Mooncake scheduler received a receive-completion event")
+                 self._recving_thread.add_request(*remote)
++                if req_id in connector_output.failed_recving:
++                    logger.error(
++                        "Mooncake D receive failed after worker aggregation: request_id=%s, "
++                        "remote_request_id=%s, producer=%s:%s, failure_policy=%s; producer release notification queued",
++                        req_id,
++                        remote[2],
++                        remote[0],
++                        remote[1],
++                        self.kv_transfer_config.kv_load_failure_policy,
++                    )
+ 
+         # P side: feed scheduler-received ACKs into vLLM's standard delayed
+         # free path. Scheduler._update_from_kv_xfer_finished reads this same
+diff --git a/vllm_ascend/distributed/kv_transfer/kv_p2p/mooncake/pull_worker.py b/vllm_ascend/distributed/kv_transfer/kv_p2p/mooncake/pull_worker.py
+index df64d4e52..9693200da 100644
+--- a/vllm_ascend/distributed/kv_transfer/kv_p2p/mooncake/pull_worker.py
++++ b/vllm_ascend/distributed/kv_transfer/kv_p2p/mooncake/pull_worker.py
+@@ -12,6 +12,7 @@ import msgspec
+ import torch
+ import zmq
+ from vllm.config import VllmConfig
++from vllm.distributed.kv_transfer.kv_connector.v1.base import KVConnectorTransferResults
+ from vllm.logger import logger
+ from vllm.utils.network_utils import make_zmq_path
+ from vllm.v1.attention.backends.registry import MambaAttentionBackendEnum
+@@ -137,7 +138,7 @@ class MooncakePullRecvingThread(threading.Thread):
+         # -> [(local_layer_index, remote_layer_index), ...]
+         self.remote_layer_index_pairs: SizedDict[str, dict[int, list[tuple[int, int]]]] = SizedDict()
+         self.request_queue: queue.Queue[tuple[str, dict[str, ReqMeta]]] = queue.Queue()
+-        self.finished_requests: queue.SimpleQueue[str] = queue.SimpleQueue()
++        self.finished_requests: queue.SimpleQueue[tuple[str, bool]] = queue.SimpleQueue()
+         self.invalid_block_ids: set[int] = set()
+         self.invalid_block_ids_lock = threading.Lock()
+         assert self.local_metadata is not None
+@@ -151,14 +152,17 @@ class MooncakePullRecvingThread(threading.Thread):
+         if requests:
+             self.request_queue.put((remote_engine_id, requests))
+ 
+-    def get_and_clear_finished_requests(self) -> set[str]:
+-        """Drain requests whose transfer attempt has completed."""
+-        finished: set[str] = set()
++    def get_and_clear_finished_requests(self) -> KVConnectorTransferResults:
++        """Drain completion and failure together for each finished request."""
++        results = KVConnectorTransferResults()
+         while True:
+             try:
+-                finished.add(self.finished_requests.get_nowait())
++                request_id, failed = self.finished_requests.get_nowait()
+             except queue.Empty:
+-                return finished
++                return results
++            results.finished_recving.add(request_id)
++            if failed:
++                results.failed_recving.add(request_id)
+ 
+     def get_and_clear_invalid_block_ids(self) -> set[int]:
+         """Drain local block IDs affected by failed pull attempts."""
+@@ -173,6 +177,7 @@ class MooncakePullRecvingThread(threading.Thread):
+         self.ready_event.set()
+         while True:
+             remote_engine_id, requests = self.request_queue.get()
++            failed_request_ids: set[str] = set()
+             request_endpoints = {(request.remote_host, request.remote_port) for request in requests.values()}
+             try:
+                 remote_host, remote_port = self._get_remote_endpoint(request_endpoints)
+@@ -185,18 +190,20 @@ class MooncakePullRecvingThread(threading.Thread):
+                 for request_id in failed_request_ids:
+                     self._mark_request_failed(requests[request_id])
+             except Exception as exc:
++                failed_request_ids = set(requests)
+                 if self.can_report_invalid_block_ids:
+                     for request_metadata in requests.values():
+                         self._mark_request_failed(request_metadata)
+                 logger.exception(
+-                    "Mooncake pull failed for remote engine %s at %s: %s",
++                    "Mooncake pull failed for remote engine %s at %s, marking batch requests failed: %s; error=%s",
+                     remote_engine_id,
+                     sorted(request_endpoints),
++                    sorted(failed_request_ids),
+                     exc,
+                 )
+             finally:
+                 for request_id in requests:
+-                    self.finished_requests.put(request_id)
++                    self.finished_requests.put((request_id, request_id in failed_request_ids))
+                 self.request_queue.task_done()
+ 
+     def _mark_request_failed(self, request_metadata: ReqMeta) -> None:
+@@ -592,14 +599,7 @@ class MooncakePullRecvingThread(threading.Thread):
+                     remote_tp_rank,
+                     sorted(request_ids),
+                 )
+-                if self.can_report_invalid_block_ids:
+-                    failed_request_ids.update(request_ids)
+-                else:
+-                    logger.warning(
+-                        "Ignoring Mooncake transfer failure for hybrid KV cache requests %s because "
+-                        "vLLM invalid block reporting currently supports only one KV cache group",
+-                        sorted(request_ids),
+-                    )
++                failed_request_ids.update(request_ids)
+ 
+         if submission_error is not None:
+             raise submission_error
+@@ -1590,12 +1590,13 @@ class MooncakePullConnectorWorker(MooncakeBaseConnectorWorker):
+             for remote_engine_id, requests in request_groups.items():
+                 self._recving_thread.add_requests(remote_engine_id, requests)
+ 
+-    def get_finished(self) -> tuple[set[str], set[str]]:
+-        """Return requests with completed receive and send operations."""
+-        finished_recving = (
+-            self._recving_thread.get_and_clear_finished_requests() if self._recving_thread is not None else set()
++    def get_transfer_results(self) -> KVConnectorTransferResults:
++        """Return completed receives, including their failure status."""
++        return (
++            self._recving_thread.get_and_clear_finished_requests()
++            if self._recving_thread is not None
++            else KVConnectorTransferResults()
+         )
+-        return set(), finished_recving
+ 
+     def get_block_ids_with_load_errors(self) -> set[int]:
+         """Return local block IDs whose pull operations failed."""

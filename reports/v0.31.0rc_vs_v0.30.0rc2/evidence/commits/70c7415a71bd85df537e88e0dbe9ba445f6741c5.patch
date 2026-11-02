@@ -1,0 +1,125 @@
+commit 70c7415a71bd85df537e88e0dbe9ba445f6741c5
+Author:     wzx0726 <zhexuanwu12@gmail.com>
+AuthorDate: Sat Oct 10 20:57:57 2026 +0800
+Commit:     GitHub <noreply@github.com>
+CommitDate: Sat Oct 10 20:57:57 2026 +0800
+
+    [releases/v0.30.0][Attention][BugFix] Handle empty MLA PCP prefill ranks (#18195)
+    
+    ### What this PR does / why we need it?
+    
+    Backport #17972 to `releases/v0.30.0`. This author-submitted PR replaces
+    the bot-created backport #18189 with the same code patch.
+    
+    PCP can assign zero real prefill tokens to a rank while retaining padded
+    KV inputs for collective processing. MLA preprocessing then attempts
+    `prefill_k_pe.view(0, num_kv_heads, -1)` and raises an ambiguous
+    zero-element reshape error. Use the existing `self.qk_rope_head_dim`
+    instead of inferring the final dimension, preserving padded KV
+    processing, collectives and the existing attention path.
+    
+    ### Does this PR introduce _any_ user-facing change?
+    
+    Yes. MLA PCP requests with a locally empty prefill rank can proceed
+    through preprocessing instead of failing on the reshape. No API or
+    configuration changes are introduced.
+    
+    ### How was this patch tested?
+    
+    - Verified that the backport patch matches merged #17972 and bot-created
+    #18189. Both changed files are identical to #18189, and `git diff
+    --check` passed.
+    - Existing #18189 CI passed the full CPU unit tests with both the
+    [verified vLLM main
+    commit](https://github.com/vllm-project/vllm-ascend/actions/runs/38030570140/job/114151340151)
+    and [vLLM
+    v0.30.0](https://github.com/vllm-project/vllm-ascend/actions/runs/38030570140/job/114151340147).
+    [Pre-commit](https://github.com/vllm-project/vllm-ascend/actions/runs/38030570140/job/114150451875)
+    also passed.
+    - The regression test in `tests/ut/attention/test_mla_v1.py` covers 0, 1
+    and 3 real local tokens, retained padded KV input and returned Q/K/V
+    shapes.
+    - Original validation in #17972 used BF16 DeepSeek-V2-Lite on
+    Ascend950DT with MRV2, TP1/DCP1, PCP1/PCP2 and `enable_mlapo=false`.
+    Empty-rank inference and the length boundary matrix matched output
+    tokens across PCP1/PCP2 eager and PCP2 `FULL_DECODE_ONLY`; restoring the
+    original line reproduced the reshape failure. The 35 selected
+    prefill/preprocess unit tests passed.
+    - The earlier NPU-backed whole-file unit-test run retained eight
+    pre-existing failures and timed out during shutdown; that run is not
+    claimed passing. Fused MLA prolog, prefill graph, MTP, prefix caching,
+    async scheduling, quantized MLA, other PCP/DCP topologies and
+    performance were outside that runtime validation.
+    - CI for this resubmission is pending. No new NPU runtime validation was
+    performed on this release backport.
+    
+    - vLLM main:
+    https://github.com/vllm-project/vllm/commit/ced6857afa0ea7b2e3f0846a62e1394e90f15607
+    
+    Signed-off-by: wzx0726 <278573478+wzx0726@users.noreply.github.com>
+    Co-authored-by: wzx0726 <278573478+wzx0726@users.noreply.github.com>
+
+diff --git a/tests/ut/attention/test_mla_v1.py b/tests/ut/attention/test_mla_v1.py
+index 21cfd1771..5dedb54a2 100644
+--- a/tests/ut/attention/test_mla_v1.py
++++ b/tests/ut/attention/test_mla_v1.py
+@@ -2894,6 +2894,46 @@ class TestAscendMLAImpl(TestBase):
+         self.assertIsNotNone(decode_res)
+         self.assertIsNotNone(prefill_res)
+ 
++    def test_mla_preprocess_prefill_pcp_empty_rank(self):
++        self.impl.pcp_enabled = True
++        self.impl.num_heads = 2
++        self.impl.num_kv_heads = 1
++        self.impl.rope_single = MagicMock(side_effect=lambda x, cos, sin: x)
++        self.impl.exec_kv_prefill = MagicMock()
++
++        for num_tokens in (0, 1, 3):
++            with self.subTest(num_tokens=num_tokens):
++                padded_tokens = max(1, num_tokens)
++                q_c = torch.zeros(padded_tokens, self.impl.q_lora_rank)
++                kv = torch.zeros(padded_tokens, self.impl.kv_lora_rank + self.impl.qk_rope_head_dim)
++                metadata = SimpleNamespace(
++                    num_decode_tokens=0,
++                    num_actual_tokens=num_tokens,
++                    slot_mapping=torch.arange(2 * padded_tokens),
++                    prefill=SimpleNamespace(
++                        cos=torch.zeros(padded_tokens, self.impl.qk_rope_head_dim),
++                        sin=torch.zeros(padded_tokens, self.impl.qk_rope_head_dim),
++                        pcp_local_num_input_tokens=padded_tokens,
++                    ),
++                )
++                self.impl.q_proj.return_value = (torch.zeros(num_tokens, 2 * self.impl.qk_head_dim),)
++                self.impl.kv_b_proj.return_value = (
++                    torch.zeros(num_tokens, 2 * (self.impl.qk_nope_head_dim + self.impl.v_head_dim)),
++                )
++                self.impl.exec_kv_prefill.return_value = (
++                    torch.ones(num_tokens, 1, 1, self.impl.qk_rope_head_dim),
++                    torch.zeros(num_tokens, 1, 1, self.impl.kv_lora_rank),
++                )
++
++                result = self.impl.mla_preprocess_prefill(q_c, kv, (), metadata)
++
++                self.assertEqual(self.impl.exec_kv_prefill.call_args.args[0].shape[0], padded_tokens)
++                self.assertEqual(result.q_nope.shape, (num_tokens, 2, self.impl.qk_nope_head_dim))
++                self.assertEqual(result.q_pe.shape, (num_tokens, 2, self.impl.qk_rope_head_dim))
++                self.assertEqual(result.k_nope.shape, (num_tokens, 2, self.impl.qk_nope_head_dim))
++                self.assertEqual(result.value.shape, (num_tokens, 2, self.impl.v_head_dim))
++                torch.testing.assert_close(result.k_pe, torch.ones(num_tokens, 2, self.impl.qk_rope_head_dim))
++
+     @patch("vllm_ascend.attention.mla_v1.DeviceOperator.reshape_and_cache")
+     @patch("torch_npu.npu_interleave_rope")
+     @patch("torch_npu.npu_kv_rmsnorm_rope_cache")
+diff --git a/vllm_ascend/attention/mla_v1.py b/vllm_ascend/attention/mla_v1.py
+index 7eb0baca7..59dc062f4 100644
+--- a/vllm_ascend/attention/mla_v1.py
++++ b/vllm_ascend/attention/mla_v1.py
+@@ -2120,7 +2120,7 @@ class AscendMLAImpl(MLAAttentionImpl):
+             .view(-1, self.num_heads, self.qk_nope_head_dim + self.v_head_dim)
+             .split([self.qk_nope_head_dim, self.v_head_dim], dim=-1)
+         )
+-        prefill_k_pe = prefill_k_pe.view(prefill_q_c.shape[0], self.num_kv_heads, -1)
++        prefill_k_pe = prefill_k_pe.view(prefill_q_c.shape[0], self.num_kv_heads, self.qk_rope_head_dim)
+         prefill_k_pe = prefill_k_pe.expand((*prefill_k_nope.shape[:-1], -1))
+         return PrefillMLAPreprocessResult(prefill_q_nope, prefill_q_pe, prefill_k_nope, prefill_k_pe, prefill_value)
+ 

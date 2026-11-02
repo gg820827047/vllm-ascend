@@ -1,0 +1,1257 @@
+commit 530ac6b7d05b2063275a5b3b75e0443e4b931a09
+Author:     CXY-Katrina <katrina.cxy@gmail.com>
+AuthorDate: Mon Oct 12 10:38:55 2026 +0800
+Commit:     GitHub <noreply@github.com>
+CommitDate: Mon Oct 12 10:38:55 2026 +0800
+
+    [Performance][Model] Fuse MiniMax-M3 QK norm, RoPE and KV cache insertion (#18235)
+    
+    ### What this PR does / why we need it?
+    
+    MiniMax-M3's attention preparation launches separate normalization,
+    RoPE, and two cache-insertion operators. This change performs four Gemma
+    RMSNorms, partial NeoX RoPE, and main K/V plus index K cache writes in
+    one Triton kernel. Only Q and index Q are materialized. RoPE rows are
+    read directly inside the kernel, eliminating the external gather as
+    well.
+    
+    Support both packed projections and separate QKV/index projections used
+    by W8A8 models, without adding a concat/copy. Vectorize Q/K and index
+    Q/K over contiguous head rows within one program per token.
+    
+    Based on main `05fa3be5f`; independent of #15772. References: #15772 and
+    vLLM's
+    [`fusedMiniMaxQNormRopeKVInsertKernel`](https://github.com/vllm-project/vllm/blob/7566d83bd35cdfd7cd3f9e521a005d2fc1ed1c33/csrc/libtorch_stable/fused_minimax_m3_qknorm_rope_kv_insert_kernel.cu).
+    
+    Preserve independent main/index slot mappings, negative slots, graph
+    padding, cache strides, and BF16 normalization rounding. Cache capacity
+    (`num_blocks`) is dynamic and is not a kernel compilation parameter.
+    Cache writes, indexer and sparse attention remain inside an opaque
+    attention boundary, with no duplicate insertion calls.
+    
+    ### Does this PR introduce _any_ user-facing change?
+    
+    Automatically enable for BF16 NPU input, matching 128-wide main/index
+    heads, NeoX RoPE, matching norm epsilon and at most 512 tokens including
+    padding. Both packed and separate index projections are supported. Other
+    configurations retain the existing path. No new flags or environment
+    variables.
+    
+    ### How was this patch tested?
+    
+    A3 operator tests on host 197: CANN 9.2.0, torch 2.10.0, torch_npu
+    2.10.0.post4, triton 3.5.0 / triton_ascend 3.2.2. BF16, Q/KV/index heads
+    8/1/1, head dimension 128, rotary dimension 64, block size 128, 5392
+    blocks, separate index projection.
+    
+    The baseline matches the model's separate-index operator chain
+    (including runtime Q/K `1 + weight`, two index contiguous operations,
+    two index Gemma RMSNorms, RoPE, and both cache-insertion calls). Timings
+    cover the complete prepare/cache region; no gather or copy is moved
+    outside measurement. Projection GEMMs and allocation are outside both
+    paths.
+    
+    | Tokens | Baseline (us) | Fused (us) | Speedup |
+    | --- | --- | --- | --- |
+    | 1 | 32.73 | 3.07 | 10.67x |
+    | 4 | 37.40 | 3.45 | 10.85x |
+    | 8 | 41.71 | 3.66 | 11.41x |
+    | 16 | 50.96 | 4.55 | 11.20x |
+    | 32 | 59.96 | 6.66 | 9.01x |
+    | 64 | 64.47 | 8.48 | 7.60x |
+    | 128 | 67.47 | 11.34 | 5.95x |
+    | 192 | 76.05 | 14.40 | 5.28x |
+    | 256 | 86.53 | 17.50 | 4.95x |
+    
+    ```bash
+    pytest -q tests/ut/models/minimax_m3 \
+      tests/e2e/pull_request/one_card/test_minimax_qknorm_rope_cache.py
+    # 188 passed, 2 skipped (FP8 requires A5)
+    pytest -sv tests/e2e/nightly/single_node/ops/test_minimax_qknorm_rope_cache_performance.py \
+      -o junit_family=legacy --junitxml=/tmp/minimax-qk-performance.xml
+    # 20 passed
+    ```
+    
+    The real compilation tests use an isolated real Triton JIT function and
+    count both dispatch-cache variants and calls into the real compilation
+    entry point:
+    
+    - In one process, fixed BF16/layout: warm once, independently sweep
+    launch tokens (1/4/8/16/32/64/128/192/256/512), actual tokens
+    (`NUM_SLOTS`, including 0/1 and aligned/unaligned values), and cache
+    blocks (3/64/5392/8192). All **25 cases retain exactly one variant and
+    one compilation entry**. Cache writes also check that the runtime bound
+    actually changes.
+    - Nine distinct layouts each compile once (dense, main/index row
+    padding, strided positions, RoPE row padding, independent K/V/index
+    block padding, packed projections). Revisiting all nine with different
+    request sizes adds **zero variants or compilation entries**.
+    - Negative controls: restoring `tl.constexpr`, or removing
+    `do_not_specialize` alone, each makes the reuse test fail on a second
+    compiled variant. These controls ran in separate processes without
+    changing the production file.
+    
+    Correctness coverage includes guards/fallback, fake/dummy handling,
+    separate projections without concat, insertion ordering, CPU-reference
+    numerical comparisons, multiple head layouts, partial/full RoPE,
+    independent shuffled/negative slots, untouched cache regions,
+    non-contiguous strides, empty inputs, graph replay after positions/slots
+    changes, and dynamic cache capacity. Runtime JIT reuse does not imply
+    that ACLGraph buckets or captured scalar arguments update automatically.
+    
+    
+    - vLLM main:
+    https://github.com/vllm-project/vllm/commit/ced6857afa0ea7b2e3f0846a62e1394e90f15607
+    
+    ---------
+    
+    Signed-off-by: CXY-Katrina <katrina.cxy@gmail.com>
+    Signed-off-by: y30084614 <yuanjie68@h-partners.com>
+    Co-authored-by: y30084614 <yuanjie68@h-partners.com>
+    Co-authored-by: Cursor <cursoragent@cursor.com>
+
+diff --git a/.github/workflows/scripts/estimated_times.yaml b/.github/workflows/scripts/estimated_times.yaml
+index f7e269727..f24f73086 100644
+--- a/.github/workflows/scripts/estimated_times.yaml
++++ b/.github/workflows/scripts/estimated_times.yaml
+@@ -64,6 +64,7 @@ estimated_times:
+   tests/e2e/pull_request/one_card/test_guided_decoding.py: 690
+   tests/e2e/pull_request/one_card/test_minicpm.py: 330
+   tests/e2e/pull_request/one_card/test_minimax_m3_sparse_attn.py: 440
++  tests/e2e/pull_request/one_card/test_minimax_qknorm_rope_cache.py: 600
+   tests/e2e/pull_request/one_card/test_multi_instance.py: 160
+   tests/e2e/pull_request/one_card/test_multistream_overlap_shared_expert.py: 360
+   tests/e2e/pull_request/one_card/rlhf/state_transitions/test_npu_ipc_weight_transfer.py: 1050
+diff --git a/tests/e2e/nightly/single_node/ops/test_minimax_qknorm_rope_cache_performance.py b/tests/e2e/nightly/single_node/ops/test_minimax_qknorm_rope_cache_performance.py
+new file mode 100644
+index 000000000..f80f62bd5
+--- /dev/null
++++ b/tests/e2e/nightly/single_node/ops/test_minimax_qknorm_rope_cache_performance.py
+@@ -0,0 +1,108 @@
++# SPDX-License-Identifier: Apache-2.0
++# Copyright (c) 2026 Huawei Technologies Co., Ltd. All Rights Reserved.
++"""Compare runtime NUM_SLOTS against the previous constexpr specialization.
++
++Run with pytest -s to retain the JSON timing records, or --junitxml to collect
++properties. No absolute latency threshold is imposed across different NPUs.
++"""
++
++import ast
++import importlib.util
++import inspect
++import json
++import statistics
++
++import pytest
++import torch
++
++from tests.e2e.pull_request.one_card.test_minimax_qknorm_rope_cache import make_compile_case
++from vllm_ascend.ops.triton.msa import minimax_qknorm_rope_cache as fused_module
++
++WARMUP_ITERATIONS = 5
++CAPTURE_ITERATIONS = 20
++REPLAY_ITERATIONS = 10
++TIMING_SAMPLES = 5
++
++
++@pytest.fixture(scope="module")
++def constexpr_reference(tmp_path_factory):
++    # Generate the previous specialization from exactly the current kernel body,
++    # avoiding a second hand-maintained copy of the production implementation.
++    tree = ast.parse(inspect.getsource(fused_module._minimax_qknorm_rope_cache_kernel.fn))
++    fn = tree.body[0]
++    assert isinstance(fn, ast.FunctionDef)
++    fn.decorator_list = [ast.parse("triton.jit", mode="eval").body]
++    argument = next(arg for arg in fn.args.args if arg.arg == "NUM_SLOTS")
++    argument.annotation = ast.parse("tl.constexpr", mode="eval").body
++    path = tmp_path_factory.mktemp("minimax_constexpr") / "reference.py"
++    path.write_text(
++        "from vllm.triton_utils import tl, triton\n"
++        "from vllm_ascend.ops.triton.triton_utils import extract_slice, insert_slice\n"
++        "from vllm_ascend.ops.triton.msa.minimax_qknorm_rope_cache import _norm_rope, FP8_E4M3_MAX\n"
++        + ast.unparse(tree),
++        encoding="utf-8",
++    )
++    spec = importlib.util.spec_from_file_location("minimax_constexpr_reference", path)
++    assert spec is not None and spec.loader is not None
++    module = importlib.util.module_from_spec(spec)
++    spec.loader.exec_module(module)
++    return module._minimax_qknorm_rope_cache_kernel
++
++
++def captured_call(fn):
++    for _ in range(WARMUP_ITERATIONS):
++        fn()
++    torch.npu.synchronize()
++    graph = torch.npu.NPUGraph()
++    with torch.npu.graph(graph):
++        for _ in range(CAPTURE_ITERATIONS):
++            fn()
++    graph.replay()
++    torch.npu.synchronize()
++    return graph
++
++
++def replay_latency_us(graph):
++    start, end = torch.npu.Event(enable_timing=True), torch.npu.Event(enable_timing=True)
++    start.record()
++    for _ in range(REPLAY_ITERATIONS):
++        graph.replay()
++    end.record()
++    torch.npu.synchronize()
++    return start.elapsed_time(end) * 1000 / (CAPTURE_ITERATIONS * REPLAY_ITERATIONS)
++
++
++@pytest.mark.parametrize("tokens", [1, 4, 8, 16, 32, 64, 128, 192, 256, 512])
++@pytest.mark.parametrize("q_heads", [8, 16])
++@torch.inference_mode()
++def test_num_slots_specialization_performance(tokens, q_heads, constexpr_reference, monkeypatch, record_property):
++    # Same tensors, strides and kernel body for both variants; only the bound's
++    # specialization differs. Compilation is excluded from steady-state timing.
++    args, kwargs = make_compile_case(tokens=tokens, actual=tokens, blocks=5392, q_heads=q_heads)
++    runtime_kernel = fused_module._minimax_qknorm_rope_cache_kernel
++    assert "NUM_SLOTS" in runtime_kernel.do_not_specialize
++    assert next(p for p in runtime_kernel.params if p.name == "NUM_SLOTS").is_constexpr is False
++    assert next(p for p in constexpr_reference.params if p.name == "NUM_SLOTS").is_constexpr is True
++    graphs, outputs = {}, {}
++    for name, kernel in (("constexpr", constexpr_reference), ("runtime", runtime_kernel)):
++        with monkeypatch.context() as context:
++            context.setattr(fused_module, "_minimax_qknorm_rope_cache_kernel", kernel)
++            fn = lambda: fused_module.minimax_qknorm_rope_cache(*args, **kwargs)
++            q, iq = fn()
++            outputs[name] = (q.clone(), iq.clone(), args[7].clone(), args[8].clone(), args[9].clone())
++            graphs[name] = captured_call(fn)
++    for actual, expected in zip(outputs["runtime"], outputs["constexpr"]):
++        torch.testing.assert_close(actual, expected, atol=0, rtol=0)
++    samples: dict[str, list[float]] = {name: [] for name in graphs}
++    # Alternate order to reduce systematic clock/thermal drift between variants.
++    for sample in range(TIMING_SAMPLES):
++        order = ("constexpr", "runtime") if sample % 2 == 0 else ("runtime", "constexpr")
++        for name in order:
++            samples[name].append(replay_latency_us(graphs[name]))
++    result = {"tokens": tokens, "q_heads": q_heads, "cache_blocks": 5392}
++    result.update({f"{name}_us": statistics.median(values) for name, values in samples.items()})
++    result["change_percent"] = (result["runtime_us"] / result["constexpr_us"] - 1) * 100
++    result["samples_us"] = samples
++    for name, value in result.items():
++        record_property(name, json.dumps(value))
++    print(json.dumps(result), flush=True)
+diff --git a/tests/e2e/pull_request/one_card/test_minimax_qknorm_rope_cache.py b/tests/e2e/pull_request/one_card/test_minimax_qknorm_rope_cache.py
+new file mode 100644
+index 000000000..7edf216cf
+--- /dev/null
++++ b/tests/e2e/pull_request/one_card/test_minimax_qknorm_rope_cache.py
+@@ -0,0 +1,361 @@
++# SPDX-License-Identifier: Apache-2.0
++# Copyright (c) 2026 Huawei Technologies Co., Ltd. All Rights Reserved.
++
++from unittest.mock import Mock
++
++import pytest
++import torch
++from vllm.triton_utils import triton
++
++from vllm_ascend.ops.triton.msa import minimax_qknorm_rope_cache as fused_module
++from vllm_ascend.ops.triton.msa.minimax_qknorm_rope_cache import minimax_qknorm_rope_cache
++
++
++def reference(packed, cos_sin, positions, weights, q_heads, kv_heads, index_heads, eps):
++    head_dim = weights[0].numel()
++    sizes = [q_heads * head_dim, kv_heads * head_dim, kv_heads * head_dim, index_heads * head_dim, head_dim]
++    parts = list(packed.split(sizes, -1))
++    half = cos_sin.shape[-1] // 2
++    cs = cos_sin[positions].float().unsqueeze(1)
++    for part, weight in zip((0, 1, 3, 4), weights):
++        x = parts[part].reshape(packed.shape[0], -1, head_dim).float()
++        x = x * torch.rsqrt(x.square().mean(-1, keepdim=True) + eps) * (1 + weight.float())
++        x = x.to(packed.dtype).float()
++        a, b = x[..., :half].clone(), x[..., half : 2 * half].clone()
++        x[..., :half] = a * cs[..., :half] - b * cs[..., half:]
++        x[..., half : 2 * half] = b * cs[..., :half] + a * cs[..., half:]
++        parts[part] = x.reshape(packed.shape[0], -1)
++    return parts
++
++
++@pytest.mark.parametrize("tokens", [1, 4, 8, 16, 32, 64, 128, 192, 256, 513])
++@pytest.mark.parametrize("heads", [(8, 1, 1), (16, 2, 2), (5, 1, 3)])
++@pytest.mark.parametrize("rotary_dim", [64, 128])
++@torch.inference_mode()
++def test_minimax_qknorm_rope_cache(tokens, heads, rotary_dim):
++    torch.manual_seed(17)
++    q_heads, kv_heads, index_heads = heads
++    head_dim, eps, block_size = 128, 1e-6, 16
++    total_heads = q_heads + 2 * kv_heads + index_heads + 1
++    # A non-contiguous token stride exercises fused projections with padding.
++    packed = torch.randn((tokens, total_heads * head_dim + 32), dtype=torch.bfloat16)[:, : total_heads * head_dim]
++    weights = [torch.randn(head_dim, dtype=torch.bfloat16) * 0.1 for _ in range(4)]
++    angles = torch.randn((257, rotary_dim // 2))
++    cos_sin = torch.cat((angles.cos(), angles.sin()), -1).to(torch.bfloat16)
++    positions = torch.randint(257, (tokens,))
++    actual = max(1, tokens - 3)
++    blocks = (2 * tokens + block_size - 1) // block_size
++    slots = torch.randperm(blocks * block_size)[:actual].long()
++    index_slots = torch.randperm(blocks * block_size)[:actual].long()
++    slots[::5] = -1
++    index_slots[::7] = -1
++    cache_shape = (blocks, block_size, kv_heads, head_dim)
++    key_cache = torch.full(cache_shape, -3.0, dtype=torch.bfloat16, device="npu")
++    value_cache = torch.full_like(key_cache, -4.0)
++    index_cache = torch.full((blocks, block_size, head_dim), -5.0, dtype=torch.bfloat16, device="npu")
++    packed_npu = torch.empty((tokens, total_heads * head_dim + 32), dtype=packed.dtype, device="npu")
++    packed_npu = packed_npu[:, : total_heads * head_dim]
++    packed_npu.copy_(packed)
++    # Exercise independent main/index projections without concatenating them.
++    main_width = (q_heads + 2 * kv_heads) * head_dim
++    separate_index = tokens % 2 == 0
++    q, iq = minimax_qknorm_rope_cache(
++        packed_npu[:, :main_width] if separate_index else packed_npu,
++        cos_sin.npu(),
++        positions.npu(),
++        *[w.npu() for w in weights],
++        key_cache,
++        value_cache,
++        index_cache,
++        slots.npu(),
++        index_slots.npu(),
++        actual,
++        q_heads,
++        kv_heads,
++        index_heads,
++        eps,
++        index_packed=packed_npu[:, main_width:] if separate_index else None,
++    )
++    expected = reference(packed, cos_sin, positions, weights, q_heads, kv_heads, index_heads, eps)
++    torch.testing.assert_close(q.cpu().float(), expected[0].to(q.dtype).float(), atol=0.032, rtol=0.01)
++    torch.testing.assert_close(iq.cpu().float(), expected[3].to(iq.dtype).float(), atol=0.032, rtol=0.01)
++    for cache, part, mapping, sentinel in (
++        (key_cache, expected[1], slots, -3.0),
++        (value_cache, expected[2], slots, -4.0),
++        (index_cache, expected[4], index_slots, -5.0),
++    ):
++        gold = torch.full(cache.shape, sentinel, dtype=cache.dtype).view(blocks * block_size, -1)
++        valid = mapping >= 0
++        gold[mapping[valid]] = part[:actual][valid].to(cache.dtype)
++        torch.testing.assert_close(cache.cpu().float().reshape_as(gold), gold.float(), atol=0.032, rtol=0.01)
++        # Untouched rows must remain bit-exact, including padding and negative slots.
++        untouched = torch.ones(blocks * block_size, dtype=torch.bool)
++        untouched[mapping[valid]] = False
++        assert torch.equal(cache.cpu().view(blocks * block_size, -1)[untouched], gold[untouched])
++
++
++@torch.inference_mode()
++def test_empty_minimax_qknorm_rope_cache():
++    device = "npu"
++    weight = torch.zeros(128, dtype=torch.bfloat16, device=device)
++    cache = torch.zeros((1, 16, 1, 128), dtype=torch.bfloat16, device=device)
++    index_cache = torch.zeros((1, 16, 128), dtype=torch.bfloat16, device=device)
++    slots = torch.empty(0, dtype=torch.int64, device=device)
++    q, iq = minimax_qknorm_rope_cache(
++        torch.empty((0, 12 * 128), dtype=torch.bfloat16, device=device),
++        torch.empty((16, 64), dtype=torch.bfloat16, device=device),
++        slots,
++        weight,
++        weight,
++        weight,
++        weight,
++        cache,
++        cache.clone(),
++        index_cache,
++        slots,
++        slots,
++        0,
++        8,
++        1,
++        1,
++        1e-6,
++    )
++    assert q.shape == (0, 1024) and iq.shape == (0, 128)
++    assert torch.count_nonzero(cache).item() == 0
++
++
++@pytest.mark.parametrize("blocks,tokens", [(3, 8), (64, 192), (5392, 192), (8192, 256)])
++@torch.inference_mode()
++def test_dynamic_cache_capacity_and_strided_positions(blocks, tokens):
++    torch.manual_seed(71)
++    hd, block_size, max_position = 128, 128, 263000
++    packed = torch.randn(tokens, 12 * hd, dtype=torch.bfloat16)
++    weights = [torch.randn(hd, dtype=packed.dtype) * 0.1 for _ in range(4)]
++    # A padded cos/sin row and a strided positions view must not add a copy.
++    cs = torch.randn(max_position, 80, dtype=packed.dtype)[:, :64]
++    cs_npu = torch.empty((max_position, 80), dtype=packed.dtype, device="npu")[:, :64]
++    cs_npu.copy_(cs)
++    positions = torch.randint(max_position, (tokens,))
++    positions[0], positions[-1] = 0, max_position - 1
++    positions_npu = torch.empty((tokens, 2), dtype=torch.int64, device="npu")[:, 0]
++    positions_npu.copy_(positions)
++    # Exercise the end of each dynamic allocation, not only its first pages.
++    slots = torch.arange(blocks * block_size - tokens, blocks * block_size)
++    index_slots = slots.flip(0)
++    key = torch.zeros((blocks, block_size, 1, hd), dtype=packed.dtype, device="npu")
++    value = torch.zeros_like(key)
++    index = torch.zeros((blocks, block_size, hd), dtype=packed.dtype, device="npu")
++    q, iq = minimax_qknorm_rope_cache(
++        packed[:, : 10 * hd].contiguous().npu(),
++        cs_npu,
++        positions_npu,
++        *[w.npu() for w in weights],
++        key,
++        value,
++        index,
++        slots.npu(),
++        index_slots.npu(),
++        tokens,
++        8,
++        1,
++        1,
++        1e-6,
++        index_packed=packed[:, 10 * hd :].contiguous().npu(),
++    )
++    expected = reference(packed, cs, positions, weights, 8, 1, 1, 1e-6)
++    for actual, gold in (
++        (q, expected[0]),
++        (iq, expected[3]),
++        (key.view(-1, hd)[slots.npu()], expected[1]),
++        (value.view(-1, hd)[slots.npu()], expected[2]),
++        (index.view(-1, hd)[index_slots.npu()], expected[4]),
++    ):
++        torch.testing.assert_close(actual.cpu().float(), gold.to(packed.dtype).float(), atol=0.032, rtol=0.01)
++    assert torch.count_nonzero(key[0].float()).item() == 0
++
++
++@pytest.mark.parametrize("fp8", [False, True])
++@pytest.mark.parametrize("tokens", [8, 192])
++@torch.inference_mode()
++def test_cache_graph_replay_updates_slots_and_preserves_strides(fp8, tokens):
++    if fp8 and not any(tag in torch.npu.get_device_name(0).lower() for tag in ("950", "910_95")):
++        pytest.skip("FP8 cache conversion requires A5")
++    torch.manual_seed(29)
++    qh, kh, ih, hd, actual = 8, 1, 1, 128, 5
++    cache_dtype = torch.float8_e4m3fn if fp8 else torch.bfloat16
++    packed = torch.randn(tokens, 12 * hd, dtype=torch.bfloat16, device="npu")
++    if fp8:
++        # V saturation is independent of normalization.
++        packed[:, 9 * hd : 10 * hd] *= 1000
++    weights = [torch.randn(hd, dtype=packed.dtype, device="npu") * 0.1 for _ in range(4)]
++    cs = torch.randn(tokens + 32, 64, dtype=packed.dtype, device="npu")
++    positions = torch.arange(tokens, device="npu")
++    # Different main/index block sizes and padded block strides.
++    key = torch.zeros((3, 17, kh, hd), dtype=cache_dtype, device="npu")[:, :16]
++    value = torch.zeros((3, 18, kh, hd), dtype=cache_dtype, device="npu")[:, :16]
++    index = torch.zeros((6, 9, hd), dtype=cache_dtype, device="npu")[:, :8]
++    slots = torch.full((tokens,), -1, dtype=torch.int64, device="npu")
++    index_slots = slots.clone()
++
++    def run():
++        return minimax_qknorm_rope_cache(
++            packed,
++            cs,
++            positions,
++            *weights,
++            key,
++            value,
++            index,
++            slots,
++            index_slots,
++            actual,
++            qh,
++            kh,
++            ih,
++            1e-6,
++        )
++
++    # An all-padding warmup must leave every cache row untouched.
++    run()
++    assert torch.count_nonzero(key.float()).item() == 0
++    assert torch.count_nonzero(value.float()).item() == 0
++    assert torch.count_nonzero(index.float()).item() == 0
++    torch.npu.synchronize()
++    graph = torch.npu.NPUGraph()
++    with torch.npu.graph(graph):
++        q, iq = run()
++    # Change device data after capture: positions and slots must not be baked in.
++    positions.copy_(torch.arange(tokens, device="npu") + 11)
++    slots[:8].copy_(torch.tensor([17, -1, 0, 35, 7, 20, 21, 22], device="npu"))
++    index_slots[:8].copy_(torch.tensor([4, 18, -1, 9, 34, 30, 31, 32], device="npu"))
++    graph.replay()
++    torch.npu.synchronize()
++    expected = reference(packed.cpu(), cs.cpu(), positions.cpu(), [w.cpu() for w in weights], qh, kh, ih, 1e-6)
++    torch.testing.assert_close(q.cpu().float(), expected[0].to(q.dtype).float(), atol=0.032, rtol=0.01)
++    expected_iq = expected[3].clamp(-448, 448) if fp8 else expected[3]
++    torch.testing.assert_close(
++        iq.cpu().float(), expected_iq.to(iq.dtype).float(), atol=0.25 if fp8 else 0.032, rtol=0.01
++    )
++    for cache, part, mapping in (
++        (key, expected[1], slots),
++        (value, expected[2], slots),
++        (index, expected[4], index_slots),
++    ):
++        gold = torch.zeros(cache.shape, dtype=cache_dtype)
++        part = part.to(packed.dtype) if cache is not index else part
++        if fp8:
++            part = part.float().clamp(-448, 448)
++        for token, slot in enumerate(mapping.cpu().tolist()[:actual]):
++            if slot >= 0:
++                gold[slot // cache.shape[1], slot % cache.shape[1]] = part[token].reshape_as(gold[0, 0]).to(cache_dtype)
++        torch.testing.assert_close(cache.cpu().float(), gold.float(), atol=0.25 if fp8 else 0.032, rtol=0.01)
++    # Replay repeatedly while another stream generates memory traffic.
++    traffic = torch.empty(1 << 20, device="npu")
++    stream = torch.npu.Stream()
++    saved_q, saved_iq = q.clone(), iq.clone()
++    saved_key, saved_index = key.clone(), index.clone()
++    for _ in range(100):
++        with torch.npu.stream(stream):
++            traffic.fill_(1.0)
++        graph.replay()
++    torch.npu.synchronize()
++    assert torch.equal(q.cpu(), saved_q.cpu())
++    assert torch.equal(iq.cpu().float(), saved_iq.cpu().float())
++    assert torch.equal(key.cpu().float(), saved_key.cpu().float())
++    assert torch.equal(index.cpu().float(), saved_index.cpu().float())
++
++
++@pytest.fixture
++def isolated_fused_kernel(monkeypatch):
++    """Keep the real JIT cache isolated from tests that ran earlier in this process."""
++    original = fused_module._minimax_qknorm_rope_cache_kernel
++    kernel = triton.jit(original.fn, do_not_specialize=original.do_not_specialize)
++    compile_spy = Mock(wraps=kernel._do_compile)
++    monkeypatch.setattr(kernel, "_do_compile", compile_spy)
++    monkeypatch.setattr(fused_module, "_minimax_qknorm_rope_cache_kernel", kernel)
++    return kernel, compile_spy
++
++
++def jit_variant_count(kernel):
++    # Ascend's Triton 3.2 runtime uses cache[device]; newer Triton uses
++    # device_caches[device][0]. Count actual dispatch variants, not disk files.
++    if hasattr(kernel, "device_caches"):
++        return sum(len(entry[0]) for entry in kernel.device_caches.values())
++    return sum(len(cache) for cache in kernel.cache.values())
++
++
++def make_compile_case(tokens=192, actual=192, blocks=64, layout="dense", q_heads=8):
++    """Allocate aligned inputs while varying one explicit layout attribute."""
++    hd, block_size = 128, 128
++    main_width = (q_heads + 2) * hd
++    separate = layout != "packed"
++    width = main_width if separate else main_width + 2 * hd
++    main = torch.randn((tokens, width + (32 if layout == "input" else 0)), device="npu", dtype=torch.bfloat16)
++    main = main[:, :width]
++    index = torch.randn((tokens, 2 * hd + (32 if layout == "index_input" else 0)), device="npu", dtype=main.dtype)
++    index = index[:, : 2 * hd] if separate else None
++    cs = torch.randn((1024, 64 + (16 if layout == "rope" else 0)), device="npu", dtype=main.dtype)[:, :64]
++    step = 2 if layout == "positions" else 1
++    positions = torch.arange(tokens * step, device="npu", dtype=torch.int64)[::step]
++    weights = [torch.zeros(hd, device="npu", dtype=main.dtype) for _ in range(4)]
++    key = torch.zeros((blocks, block_size + (1 if layout == "key" else 0), 1, hd), device="npu", dtype=main.dtype)
++    value = torch.zeros((blocks, block_size + (1 if layout == "value" else 0), 1, hd), device="npu", dtype=main.dtype)
++    cache = torch.zeros(
++        (blocks, block_size + (1 if layout == "index_cache" else 0), hd), device="npu", dtype=main.dtype
++    )
++    key, value, cache = key[:, :block_size], value[:, :block_size], cache[:, :block_size]
++    # Deliberately give padding tokens valid slots. NUM_SLOTS, rather than -1
++    # padding, must suppress their writes when the runtime scalar changes.
++    slots = torch.arange(blocks * block_size - tokens, blocks * block_size, device="npu", dtype=torch.int64)
++    args = [main, cs, positions, *weights, key, value, cache, slots, slots, actual, q_heads, 1, 1, 1e-6]
++    return args, {"index_packed": index}
++
++
++@torch.inference_mode()
++def test_request_sizes_reuse_one_compiled_variant(isolated_fused_kernel):
++    kernel, compile_spy = isolated_fused_kernel
++    args, kwargs = make_compile_case()
++    minimax_qknorm_rope_cache(*args, **kwargs)
++    torch.npu.synchronize()
++    assert jit_variant_count(kernel) == compile_spy.call_count == 1
++    # These are three independent sweeps, not a parametrized test with a fresh
++    # runtime cache per case. Include 0/1 and aligned/unaligned scalar values.
++    cases = [(n, n, 64) for n in (1, 4, 8, 16, 32, 64, 128, 192, 256, 512)]
++    cases += [(192, n, 64) for n in (0, 1, 4, 15, 16, 17, 31, 32, 127, 191, 192)]
++    cases += [(192, 192, n) for n in (3, 64, 5392, 8192)]
++    for tokens, actual, blocks in cases:
++        args, kwargs = make_compile_case(tokens, actual, blocks)
++        minimax_qknorm_rope_cache(*args, **kwargs)
++        torch.npu.synchronize()
++        assert jit_variant_count(kernel) == 1, (tokens, actual, blocks)
++        assert compile_spy.call_count == 1, (tokens, actual, blocks)
++        # V has no norm/RoPE rounding: exact equality also verifies that each
++        # invocation used the new runtime NUM_SLOTS instead of the warmup value.
++        written = args[8].reshape(-1, 128)[args[10]]
++        expected = torch.zeros_like(written)
++        expected[:actual] = args[0][:actual, -128:]
++        assert torch.equal(written, expected), (tokens, actual, blocks)
++        for cache in (args[7], args[9]):
++            assert torch.count_nonzero(cache.reshape(-1, 128)[args[10][actual:]]).item() == 0
++    print(f"dynamic sweeps: {len(cases)} cases, variants=1, compile_entries=1")
++
++
++@torch.inference_mode()
++def test_layout_variants_compile_once_then_reuse(isolated_fused_kernel):
++    kernel, compile_spy = isolated_fused_kernel
++    layouts = ("dense", "input", "index_input", "positions", "rope", "key", "value", "index_cache", "packed")
++    for count, layout in enumerate(layouts, 1):
++        args, kwargs = make_compile_case(layout=layout)
++        minimax_qknorm_rope_cache(*args, **kwargs)
++        torch.npu.synchronize()
++        assert jit_variant_count(kernel) == count, layout
++        assert compile_spy.call_count == count, layout
++    # Once every layout is warm, changing request lengths and revisiting layouts
++    # must not compile again. Layout changes intentionally remain specialized.
++    for layout in reversed(layouts):
++        args, kwargs = make_compile_case(tokens=32, actual=17, blocks=3, layout=layout)
++        minimax_qknorm_rope_cache(*args, **kwargs)
++        torch.npu.synchronize()
++        assert jit_variant_count(kernel) == len(layouts), layout
++        assert compile_spy.call_count == len(layouts), layout
++    print(f"layout sweep: variants={len(layouts)}, revisit_compile_entries=0")
+diff --git a/tests/ut/models/minimax_m3/test_fused_sparse_prepare.py b/tests/ut/models/minimax_m3/test_fused_sparse_prepare.py
+new file mode 100644
+index 000000000..dd307668d
+--- /dev/null
++++ b/tests/ut/models/minimax_m3/test_fused_sparse_prepare.py
+@@ -0,0 +1,177 @@
++# SPDX-License-Identifier: Apache-2.0
++# Copyright (c) 2026 Huawei Technologies Co., Ltd. All Rights Reserved.
++
++from types import SimpleNamespace
++from unittest.mock import Mock, patch
++
++import pytest
++import torch
++
++from vllm_ascend.models.minimax_m3.minimax_m3 import MiniMaxM3SparseAttention
++from vllm_ascend.models.minimax_m3.msa_m3 import (
++    minimax_m3_fused_sparse_forward,
++    minimax_m3_fused_sparse_forward_fake,
++)
++
++
++def make_layer():
++    norm = SimpleNamespace(variance_epsilon=1e-6, weight=torch.zeros(128))
++    return SimpleNamespace(
++        indexer_proj=None,
++        head_dim=128,
++        idx_head_dim=128,
++        rotary_emb=SimpleNamespace(is_neox_style=True, rotary_dim=64),
++        q_norm=norm,
++        k_norm=norm,
++        index_q_norm=norm,
++        index_k_norm=norm,
++    )
++
++
++@pytest.mark.parametrize(
++    "unsupported",
++    [None, "dtype", "cpu", "positions", "heads", "rope", "eps", "triton", "large_batch", "cache_dtype"],
++)
++def test_fusion_guard(unsupported):
++    layer = make_layer()
++    hidden = SimpleNamespace(device=SimpleNamespace(type="npu"), dtype=torch.bfloat16, shape=(4, 128))
++    positions = torch.zeros(4, dtype=torch.int64)
++    if unsupported == "dtype":
++        hidden.dtype = torch.float16
++    elif unsupported == "cpu":
++        hidden.device.type = "cpu"
++    elif unsupported == "positions":
++        positions = positions.view(2, 2)
++    elif unsupported == "heads":
++        layer.idx_head_dim = 64
++    elif unsupported == "rope":
++        layer.rotary_emb.is_neox_style = False
++    elif unsupported == "eps":
++        layer.k_norm = SimpleNamespace(variance_epsilon=1e-5)
++    elif unsupported == "large_batch":
++        hidden.shape = (513, 128)
++    elif unsupported == "cache_dtype":
++        layer.kv_cache_torch_dtype = torch.float8_e5m2
++    with patch("vllm_ascend.models.minimax_m3.minimax_m3.HAS_TRITON", unsupported != "triton"):
++        assert MiniMaxM3SparseAttention._can_fuse_sparse_prepare(layer, positions, hidden) == (unsupported is None)
++
++
++def test_fused_forward_skips_materialized_prepare_and_insert():
++    hidden = torch.randn(4, 128, dtype=torch.bfloat16)
++    qkv = torch.randn(4, 1536, dtype=torch.bfloat16)
++    positions = torch.arange(4)
++    layer = SimpleNamespace(
++        _can_fuse_sparse_prepare=Mock(return_value=True),
++        qkv_proj=Mock(return_value=(qkv, None)),
++        indexer_proj=None,
++        _sparse_prepare=Mock(side_effect=AssertionError("separate prepare must not run")),
++        q_size=1024,
++        layer_name="layers.0.attn",
++        o_proj=Mock(side_effect=lambda x: (x, None)),
++    )
++    with patch.object(torch.ops.vllm, "minimax_m3_fused_sparse_forward") as fused:
++        output = MiniMaxM3SparseAttention.forward(layer, positions, hidden)
++    layer.qkv_proj.assert_called_once_with(hidden)
++    fused.assert_called_once_with(qkv, positions, output, layer.layer_name, None)
++    assert output.shape == (4, 1024) and output.dtype == hidden.dtype
++    layer._sparse_prepare.assert_not_called()
++
++
++@pytest.mark.parametrize("tokens, supported", [(512, True), (513, False)])
++def test_fusion_token_limit(tokens, supported):
++    hidden = SimpleNamespace(device=SimpleNamespace(type="npu"), dtype=torch.bfloat16, shape=(tokens, 128))
++    with patch("vllm_ascend.models.minimax_m3.minimax_m3.HAS_TRITON", True):
++        assert (
++            MiniMaxM3SparseAttention._can_fuse_sparse_prepare(make_layer(), torch.arange(tokens), hidden) == supported
++        )
++
++
++def test_separate_index_projection_uses_fusion_without_concatenation():
++    hidden = torch.randn(4, 128, dtype=torch.bfloat16)
++    qkv = torch.randn(4, 1280, dtype=torch.bfloat16)
++    index_qk = torch.randn(4, 256, dtype=torch.bfloat16)
++    positions = torch.arange(4)
++    layer = SimpleNamespace(
++        _can_fuse_sparse_prepare=Mock(return_value=True),
++        qkv_proj=Mock(return_value=(qkv, None)),
++        indexer_proj=Mock(return_value=(index_qk, None)),
++        q_size=1024,
++        layer_name="layers.0.attn",
++        o_proj=Mock(side_effect=lambda x: (x, None)),
++    )
++    with (
++        patch.object(torch.ops.vllm, "minimax_m3_fused_sparse_forward") as fused,
++        patch("torch.cat", side_effect=AssertionError("projections must not be concatenated")),
++    ):
++        output = MiniMaxM3SparseAttention.forward(layer, positions, hidden)
++    layer.indexer_proj.assert_called_once_with(hidden)
++    fused.assert_called_once_with(qkv, positions, output, layer.layer_name, index_qk)
++
++    guard_layer = make_layer()
++    guard_layer.indexer_proj = layer.indexer_proj
++    hidden_meta = SimpleNamespace(device=SimpleNamespace(type="npu"), dtype=torch.bfloat16, shape=(4, 128))
++    with patch("vllm_ascend.models.minimax_m3.minimax_m3.HAS_TRITON", True):
++        assert MiniMaxM3SparseAttention._can_fuse_sparse_prepare(guard_layer, positions, hidden_meta)
++
++
++def test_fused_op_dummy_does_not_touch_cache():
++    output = torch.ones(4, 1024)
++    context = SimpleNamespace(attn_metadata=None, no_compile_layers={})
++    with patch("vllm_ascend.models.minimax_m3.msa_m3.get_forward_context", return_value=context):
++        minimax_m3_fused_sparse_forward(torch.empty(4, 1536), torch.arange(4), output, "missing")
++    assert torch.count_nonzero(output) == 0
++
++
++def test_fused_op_routes_to_layer_and_fake_has_no_side_effects():
++    layer = SimpleNamespace(_run_fused_sparse_attention=Mock())
++    context = SimpleNamespace(attn_metadata={}, no_compile_layers={"layer": layer})
++    qkv, positions, output = torch.empty(4, 1536), torch.arange(4), torch.ones(4, 1024)
++    with patch("vllm_ascend.models.minimax_m3.msa_m3.get_forward_context", return_value=context):
++        minimax_m3_fused_sparse_forward(qkv, positions, output, "layer")
++        minimax_m3_fused_sparse_forward_fake(qkv, positions, output, "layer")
++    layer._run_fused_sparse_attention.assert_called_once_with(qkv, positions, output, None)
++    assert torch.all(output == 1)
++
++
++def test_fused_cache_insert_precedes_indexer_and_attention():
++    layer = make_layer()
++    layer.layer_name = "main"
++    layer.num_heads, layer.num_kv_heads, layer.num_idx_heads = 8, 1, 1
++    layer.kv_cache = torch.empty(2, 4, 16, 1, 128)
++    index_cache = torch.empty(4, 16, 128)
++    order = []
++
++    def run_indexer(query):
++        order.append("index")
++        return "topk"
++
++    layer.indexer = Mock(side_effect=run_indexer)
++    layer.indexer.index_cache = SimpleNamespace(prefix="index", kv_cache=[index_cache])
++    layer.impl = SimpleNamespace(forward=Mock(side_effect=lambda *args: order.append("attention")))
++    layer._insert_kv = Mock(side_effect=AssertionError("duplicate cache insertion"))
++    layer.rotary_emb.cos_sin_cache = torch.empty(32, 64)
++    main_slots, index_slots = torch.tensor([3, -1, 8]), torch.tensor([7, 2, -1])
++    context = SimpleNamespace(
++        attn_metadata={
++            "main": SimpleNamespace(slot_mapping=main_slots, num_actual_tokens=3),
++            "index": SimpleNamespace(slot_mapping=index_slots),
++        }
++    )
++    q, iq = torch.empty(4, 1024), torch.empty(4, 128)
++
++    def run_kernel(*args, **kwargs):
++        order.append("insert")
++        return q, iq
++
++    kernel = Mock(side_effect=run_kernel)
++    module = SimpleNamespace(minimax_qknorm_rope_cache=kernel)
++    with (
++        patch.dict("sys.modules", {"vllm_ascend.ops.triton.msa.minimax_qknorm_rope_cache": module}),
++        patch("vllm_ascend.models.minimax_m3.minimax_m3.get_forward_context", return_value=context),
++    ):
++        MiniMaxM3SparseAttention._run_fused_sparse_attention(layer, torch.empty(4, 1536), torch.arange(4), q)
++    assert order == ["insert", "index", "attention"]
++    assert kernel.call_args.args[10] is main_slots
++    assert kernel.call_args.args[11] is index_slots
++    assert kernel.call_args.args[12] == 3
++    layer._insert_kv.assert_not_called()
+diff --git a/vllm_ascend/models/minimax_m3/minimax_m3.py b/vllm_ascend/models/minimax_m3/minimax_m3.py
+index 36a957207..8f83b23d4 100644
+--- a/vllm_ascend/models/minimax_m3/minimax_m3.py
++++ b/vllm_ascend/models/minimax_m3/minimax_m3.py
+@@ -89,6 +89,7 @@ from vllm.model_executor.models.utils import (
+     maybe_prefix,
+ )
+ from vllm.sequence import IntermediateTensors
++from vllm.triton_utils import HAS_TRITON
+ from vllm.utils.torch_utils import kv_cache_dtype_str_to_dtype
+ from vllm.v1.kv_cache_interface import (
+     FullAttentionSpec,
+@@ -477,11 +478,80 @@ class MiniMaxM3SparseAttention(nn.Module, AttentionLayerBase):
+         topk_idx = self.indexer(index_query)
+         self.impl.forward(self, query, self.kv_cache, topk_idx, attn_output)
+ 
++    def _can_fuse_sparse_prepare(self, positions: torch.Tensor, hidden_states: torch.Tensor) -> bool:
++        # Direct cache stores benefit decode batches; retain the existing path
++        # for larger batches where per-token programs become more expensive.
++        max_fused_tokens = 512
++        return (
++            HAS_TRITON
++            and hidden_states.shape[0] <= max_fused_tokens
++            and hidden_states.device.type == "npu"
++            and hidden_states.dtype == torch.bfloat16
++            and positions.ndim == 1
++            and self.head_dim == self.idx_head_dim == 128
++            and getattr(self.rotary_emb, "is_neox_style", False)
++            and 0 < self.rotary_emb.rotary_dim <= self.head_dim
++            and self.rotary_emb.rotary_dim % 2 == 0
++            and self.q_norm.variance_epsilon
++            == self.k_norm.variance_epsilon
++            == self.index_q_norm.variance_epsilon
++            == self.index_k_norm.variance_epsilon
++            and getattr(self, "kv_cache_torch_dtype", torch.bfloat16) in (torch.bfloat16, torch.float8_e4m3fn)
++        )
++
++    def _run_fused_sparse_attention(
++        self,
++        qkv: torch.Tensor,
++        positions: torch.Tensor,
++        attn_output: torch.Tensor,
++        index_qk: torch.Tensor | None = None,
++    ) -> None:
++        # Lazy-load Triton only for the supported NPU path. Cache access stays
++        # inside the opaque attention op, like _run_sparse_attention.
++        from vllm_ascend.ops.triton.msa.minimax_qknorm_rope_cache import minimax_qknorm_rope_cache
++
++        metadata = get_forward_context().attn_metadata
++        main_meta = metadata[self.layer_name]
++        index_meta = metadata[self.indexer.index_cache.prefix]
++        key_cache, value_cache = self.kv_cache
++        index_cache = self.indexer.index_cache.kv_cache
++        if isinstance(index_cache, (tuple, list)):
++            index_cache = index_cache[0]
++        query, index_query = minimax_qknorm_rope_cache(
++            qkv,
++            self.rotary_emb.cos_sin_cache,
++            positions,
++            self.q_norm.weight,
++            self.k_norm.weight,
++            self.index_q_norm.weight,
++            self.index_k_norm.weight,
++            key_cache,
++            value_cache,
++            index_cache,
++            main_meta.slot_mapping,
++            index_meta.slot_mapping,
++            main_meta.num_actual_tokens,
++            self.num_heads,
++            self.num_kv_heads,
++            self.num_idx_heads,
++            self.q_norm.variance_epsilon,
++            index_packed=index_qk,
++        )
++        topk_idx = self.indexer(index_query)
++        self.impl.forward(self, query, self.kv_cache, topk_idx, attn_output)
++
+     def forward(
+         self,
+         positions: torch.Tensor,
+         hidden_states: torch.Tensor,
+     ) -> torch.Tensor:
++        if self._can_fuse_sparse_prepare(positions, hidden_states):
++            qkv, _ = self.qkv_proj(hidden_states)
++            index_qk = self.indexer_proj(hidden_states)[0] if self.indexer_proj is not None else None
++            attn_out = hidden_states.new_empty((hidden_states.shape[0], self.q_size))
++            torch.ops.vllm.minimax_m3_fused_sparse_forward(qkv, positions, attn_out, self.layer_name, index_qk)
++            projected, _ = self.o_proj(attn_out)
++            return projected
+         q, k, v, index_q, index_k = self._sparse_prepare(positions, hidden_states)
+         attn_out = torch.empty_like(q)
+         torch.ops.vllm.minimax_m3_sparse_forward(
+diff --git a/vllm_ascend/models/minimax_m3/msa_m3.py b/vllm_ascend/models/minimax_m3/msa_m3.py
+index 7225d7142..84fdf43dd 100644
+--- a/vllm_ascend/models/minimax_m3/msa_m3.py
++++ b/vllm_ascend/models/minimax_m3/msa_m3.py
+@@ -1421,6 +1421,40 @@ def minimax_m3_sparse_forward_fake(
+     return
+ 
+ 
++def minimax_m3_fused_sparse_forward(
++    qkv: torch.Tensor,
++    positions: torch.Tensor,
++    attn_output: torch.Tensor,
++    layer_name: str,
++    index_qk: torch.Tensor | None = None,
++) -> None:
++    forward_context = get_forward_context()
++    if not isinstance(forward_context.attn_metadata, dict):
++        attn_output.zero_()
++        return
++    layer = forward_context.no_compile_layers[layer_name]
++    layer._run_fused_sparse_attention(qkv, positions, attn_output, index_qk)
++
++
++def minimax_m3_fused_sparse_forward_fake(
++    qkv: torch.Tensor,
++    positions: torch.Tensor,
++    attn_output: torch.Tensor,
++    layer_name: str,
++    index_qk: torch.Tensor | None = None,
++) -> None:
++    return
++
++
++direct_register_custom_op(
++    op_name="minimax_m3_fused_sparse_forward",
++    op_func=minimax_m3_fused_sparse_forward,
++    mutates_args=["attn_output"],
++    fake_impl=minimax_m3_fused_sparse_forward_fake,
++    dispatch_key="PrivateUse1",
++)
++
++
+ direct_register_custom_op(
+     op_name="minimax_m3_sparse_forward",
+     op_func=minimax_m3_sparse_forward,
+diff --git a/vllm_ascend/ops/triton/docs/minimax_qknorm_rope_cache.md b/vllm_ascend/ops/triton/docs/minimax_qknorm_rope_cache.md
+new file mode 100644
+index 000000000..93d1d0e8e
+--- /dev/null
++++ b/vllm_ascend/ops/triton/docs/minimax_qknorm_rope_cache.md
+@@ -0,0 +1,82 @@
++# MiniMax-M3 QK norm, RoPE and KV cache insertion
++
++## Description
++
++- **Function**: `minimax_qknorm_rope_cache` applies four Gemma RMSNorms, partial NeoX RoPE, and three cache writes in one Triton kernel. Only Q and index Q are returned. K, V, and index K are written directly into their paged caches.
++- **Location**: `vllm_ascend/ops/triton/msa/minimax_qknorm_rope_cache.py` — `_minimax_qknorm_rope_cache_kernel`, wrapper `minimax_qknorm_rope_cache`.
++- **Algorithm flow**:
++  1. Each program handles one token and vectorizes Q/K and index Q/K along contiguous head rows.
++  2. Cos/sin is loaded from the RoPE cache by `positions`. No external gather, slice-contiguous, or cache-scatter kernel is launched.
++  3. The model calls this through the opaque op `minimax_m3_fused_sparse_forward`, then runs the indexer and sparse attention. The original cache-insertion path is not called again.
++- **Supported modes**: BF16 NPU input, main and index head dimension 128, at most 512 tokens including graph padding. Packed `[Q | K | V | index Q | index K]` projections and separate QKV/index projections are both supported. Other shapes keep the existing prepare path.
++
++## Parameters
++
++| Parameter | Input/Output/Attribute | Description | Data type |
++| --- | --- | --- | --- |
++| `packed` | Input | Main QKV projection, or packed QKV plus index when `index_packed` is omitted | bfloat16 |
++| `index_packed` | Input | Separate index Q/K projection. Used by W8A8 QKV with BF16 index weights | bfloat16 |
++| `cos_sin_cache` | Input | NeoX RoPE table, indexed by `positions` | floating |
++| `positions` | Input | Token positions, rank 1 | integer |
++| `q_weight`, `k_weight`, `index_q_weight`, `index_k_weight` | Input | Gemma RMSNorm weights. All four epsilons must match | floating |
++| `key_cache`, `value_cache` | Output | Main cache `[num_blocks, block_size, heads, head_dim]` | bfloat16 or float8_e4m3fn |
++| `index_cache` | Output | Index cache `[num_blocks, block_size, head_dim]` | bfloat16 or float8_e4m3fn |
++| `slot_mapping`, `index_slot_mapping` | Input | Independent main and index slots. Negative slots are not written | integer |
++| query, index query | Output | Materialized queries only | bfloat16 / index cache dtype |
++
++## Constraints
++
++- `NUM_SLOTS` is a runtime scalar with `do_not_specialize`, so varying the actual token count does not create a specialization for each value.
++- `num_blocks` is the runtime cache capacity. It is not hardcoded and is not a kernel compile parameter. Main and index block sizes may differ.
++- Cache writes use the actual tensor strides, including block padding.
++- Slots outside `num_actual_tokens`, and negative slots, do not update a cache. The caller must keep valid slots in range and must not write the same destination twice in one call.
++- Normalization accumulates in FP32 and rounds back to BF16 before RoPE. Main K is rounded to the model dtype before the cache store. FP8 E4M3 caches are clamped to ±448 before the store.
++- A forward without attention metadata only zeroes the attention output and does not touch the cache.
++- No new environment variable. MoE, FlashComm, and speculative-decoding policy are unchanged.
++
++## Origin and Differences
++
++- **Origin**: Ascend PR #15772 and vLLM `fusedMiniMaxQNormRopeKVInsertKernel`. This implementation is independent of #15772 and targets current Ascend main.
++- **Differences**: The operator lives in `ops/triton/msa` with the other MiniMax-M3 Triton kernels. Separate index projections are accepted without a concat or copy. Projection GEMMs stay on the original model path.
++
++## Test Cases
++
++```bash
++pytest -q tests/ut/models/minimax_m3
++pytest -q tests/e2e/pull_request/one_card/test_minimax_qknorm_rope_cache.py
++```
++
++Unit tests cover the fusion guard, fallback, dummy and fake forwards, separate index projections, and cache-insertion order. NPU tests cover 1 to 513 tokens, several head layouts, partial and full RoPE, shuffled and negative slots, untouched cache regions, non-contiguous inputs, empty inputs, and graph replay after `positions` or slots change. Dynamic-cache cases use 3, 64, 5392, and 8192 blocks. Two FP8 cases are skipped when A5 is not available.
++
++## Compilation and performance regression tests
++
++The request-size test uses a fresh real JIT function in a single process. After
++one warmup it independently varies launch token count, `NUM_SLOTS` (including
++0, 1, and aligned/unaligned values), and cache capacity. It asserts that the
++JIT dispatch cache still contains one variant and that the compilation entry
++point was called only once. Cache writes also verify the changing runtime bound.
++This checks actual specialization reuse rather than compilation time or disk
++cache file counts.
++
++The layout test warms nine layouts: dense, padded main/index projection rows,
++strided positions, padded RoPE rows, independently padded K/V/index cache
++blocks, and packed projection input. Each new layout creates one variant;
++revisiting every layout with different request sizes creates none. Layout strides
++remain compile-time parameters intentionally. Kernel reuse does not imply that
++ACLGraph capture buckets or captured scalar arguments change automatically.
++
++```bash
++pytest -sv tests/e2e/pull_request/one_card/test_minimax_qknorm_rope_cache.py \
++  -k 'compiled_variant or layout_variants'
++pytest -sv tests/e2e/nightly/single_node/ops/test_minimax_qknorm_rope_cache_performance.py \
++  -o junit_family=legacy --junitxml=/tmp/minimax-qk-performance.xml
++```
++
++The nightly test compares runtime `NUM_SLOTS` with a generated constexpr
++reference that uses exactly the same kernel body. It checks bit-exact outputs
++and cache writes, then alternates timing order across five samples. Measurements
++use 20 captured calls and 10 replays with NPU Events, excluding compilation.
++The 8/16-head cases cover 1, 4, 8, 16, 32, 64, 128, 192, 256 and 512 tokens with
++5392 cache blocks. JSON records and JUnit properties include both timings and
++the percentage change; no hardware-independent microsecond threshold is imposed.
++Performance coverage lives in e2e rather than a separate `benchmarks/` script.
+diff --git a/vllm_ascend/ops/triton/msa/__init__.py b/vllm_ascend/ops/triton/msa/__init__.py
+new file mode 100644
+index 000000000..208f01a7c
+--- /dev/null
++++ b/vllm_ascend/ops/triton/msa/__init__.py
+@@ -0,0 +1,2 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+diff --git a/vllm_ascend/ops/triton/msa/minimax_qknorm_rope_cache.py b/vllm_ascend/ops/triton/msa/minimax_qknorm_rope_cache.py
+new file mode 100644
+index 000000000..edd0cebfe
+--- /dev/null
++++ b/vllm_ascend/ops/triton/msa/minimax_qknorm_rope_cache.py
+@@ -0,0 +1,229 @@
++# SPDX-License-Identifier: Apache-2.0
++# Copyright (c) 2026 Huawei Technologies Co., Ltd. All Rights Reserved.
++"""MiniMax-M3 packed QKV/index normalization, RoPE and paged cache insertion.
++
++Inputs can be a packed [Q, K, V, index Q, index K] projection or separate
++main/index projections. Each program processes one token, vectorizing Q/K
++and index Q/K together along contiguous head rows. K/V and index K go directly
++to independent cache slots; only the queries are materialized. Negative slots
++and graph-padding tokens never update a cache.
++"""
++
++import torch
++from vllm.triton_utils import tl, triton
++
++from vllm_ascend.ops.triton.triton_utils import extract_slice, insert_slice
++
++FP8_E4M3_MAX: tl.constexpr = 448.0
++
++
++@triton.jit
++def _norm_rope(
++    input_ptr,
++    weight_ptr,
++    cos_sin_ptr,
++    HEADS: tl.constexpr,
++    HEAD_DIM: tl.constexpr,
++    ROTARY_DIM: tl.constexpr,
++    EPS: tl.constexpr,
++    other_weight_ptr,
++    SPLIT_HEADS: tl.constexpr,
++):
++    cols = tl.arange(0, HEAD_DIM)
++    heads = tl.arange(0, HEADS)
++    x = tl.load(input_ptr + heads[:, None] * HEAD_DIM + cols[None, :]).to(tl.float32)
++    weight = tl.load(weight_ptr + cols).to(tl.float32)
++    other_weight = tl.load(other_weight_ptr + cols).to(tl.float32)
++    weight = tl.where(heads[:, None] < SPLIT_HEADS, weight[None, :], other_weight[None, :])
++    x = x * tl.rsqrt(tl.sum(x * x, 1) / HEAD_DIM + EPS)[:, None] * (1.0 + weight)
++    x = x.to(input_ptr.dtype.element_ty).to(tl.float32)
++    half: tl.constexpr = ROTARY_DIM // 2
++    cos = tl.load(cos_sin_ptr + tl.arange(0, half)).to(tl.float32)
++    sin = tl.load(cos_sin_ptr + half + tl.arange(0, half)).to(tl.float32)
++    a = extract_slice(x, (0, 0), (HEADS, half), (1, 1))
++    b = extract_slice(x, (0, half), (HEADS, half), (1, 1))
++    x = insert_slice(x, a * cos[None, :] - b * sin[None, :], (0, 0), (HEADS, half), (1, 1))
++    x = insert_slice(x, b * cos[None, :] + a * sin[None, :], (0, half), (HEADS, half), (1, 1))
++    return x
++
++
++# Request-dependent bounds must not specialize on their value or alignment.
++# Head dimensions and layout strides below are fixed for a warmed deployment.
++@triton.jit(do_not_specialize=["NUM_SLOTS"])
++def _minimax_qknorm_rope_cache_kernel(
++    packed,
++    index_packed,
++    cos_sin,
++    positions,
++    q_weight,
++    k_weight,
++    iq_weight,
++    ik_weight,
++    query,
++    index_query,
++    key_cache,
++    value_cache,
++    index_cache,
++    slots,
++    index_slots,
++    NUM_SLOTS,
++    Q_HEADS: tl.constexpr,
++    KV_HEADS: tl.constexpr,
++    IQ_HEADS: tl.constexpr,
++    HEAD_DIM: tl.constexpr,
++    ROTARY_DIM: tl.constexpr,
++    INPUT_STRIDE: tl.constexpr,
++    INDEX_INPUT_STRIDE: tl.constexpr,
++    INDEX_OFFSET: tl.constexpr,
++    POSITION_STRIDE: tl.constexpr,
++    COS_SIN_STRIDE: tl.constexpr,
++    EPS: tl.constexpr,
++    K_BLOCK: tl.constexpr,
++    K_TOKEN: tl.constexpr,
++    K_HEAD: tl.constexpr,
++    V_BLOCK: tl.constexpr,
++    V_TOKEN: tl.constexpr,
++    V_HEAD: tl.constexpr,
++    I_BLOCK: tl.constexpr,
++    I_TOKEN: tl.constexpr,
++    BLOCK_SIZE: tl.constexpr,
++    INDEX_BLOCK_SIZE: tl.constexpr,
++    CACHE_FP8: tl.constexpr,
++    INDEX_FP8: tl.constexpr,
++):
++    token = tl.program_id(0).to(tl.int64)
++    position = tl.load(positions + token * POSITION_STRIDE).to(tl.int64)
++    cs = cos_sin + position * COS_SIN_STRIDE
++    dim = tl.arange(0, HEAD_DIM)
++    row = packed + token * INPUT_STRIDE
++    qk = _norm_rope(row, q_weight, cs, Q_HEADS + KV_HEADS, HEAD_DIM, ROTARY_DIM, EPS, k_weight, Q_HEADS)
++    q = extract_slice(qk, (0, 0), (Q_HEADS, HEAD_DIM), (1, 1))
++    offsets = token * Q_HEADS * HEAD_DIM + tl.arange(0, Q_HEADS)[:, None] * HEAD_DIM + dim[None, :]
++    tl.store(query + offsets, q)
++    slot = tl.load(slots + token, token < NUM_SLOTS, other=-1).to(tl.int64)
++    if slot >= 0:
++        k = extract_slice(qk, (Q_HEADS, 0), (KV_HEADS, HEAD_DIM), (1, 1))
++        k = k.to(packed.dtype.element_ty).to(tl.float32)
++        v = tl.load(row + (Q_HEADS + KV_HEADS) * HEAD_DIM + tl.arange(0, KV_HEADS)[:, None] * HEAD_DIM + dim[None, :])
++        if CACHE_FP8:
++            k = tl.minimum(tl.maximum(k, -FP8_E4M3_MAX), FP8_E4M3_MAX)
++            v = tl.minimum(tl.maximum(v.to(tl.float32), -FP8_E4M3_MAX), FP8_E4M3_MAX)
++        k_offset = slot // BLOCK_SIZE * K_BLOCK + slot % BLOCK_SIZE * K_TOKEN
++        v_offset = slot // BLOCK_SIZE * V_BLOCK + slot % BLOCK_SIZE * V_TOKEN
++        tl.store(key_cache + k_offset + tl.arange(0, KV_HEADS)[:, None] * K_HEAD + dim[None, :], k)
++        tl.store(value_cache + v_offset + tl.arange(0, KV_HEADS)[:, None] * V_HEAD + dim[None, :], v)
++    row = index_packed + token * INDEX_INPUT_STRIDE + INDEX_OFFSET
++    iqk = _norm_rope(row, iq_weight, cs, IQ_HEADS + 1, HEAD_DIM, ROTARY_DIM, EPS, ik_weight, IQ_HEADS)
++    if INDEX_FP8:
++        iqk = tl.minimum(tl.maximum(iqk, -FP8_E4M3_MAX), FP8_E4M3_MAX)
++    iq = extract_slice(iqk, (0, 0), (IQ_HEADS, HEAD_DIM), (1, 1))
++    offsets = token * IQ_HEADS * HEAD_DIM + tl.arange(0, IQ_HEADS)[:, None] * HEAD_DIM + dim[None, :]
++    tl.store(index_query + offsets, iq)
++    slot = tl.load(index_slots + token, token < NUM_SLOTS, other=-1).to(tl.int64)
++    if slot >= 0:
++        ik = extract_slice(iqk, (IQ_HEADS, 0), (1, HEAD_DIM), (1, 1))
++        offset = slot // INDEX_BLOCK_SIZE * I_BLOCK + slot % INDEX_BLOCK_SIZE * I_TOKEN
++        tl.store(index_cache + offset + dim, ik.reshape(HEAD_DIM))
++
++
++def minimax_qknorm_rope_cache(
++    packed: torch.Tensor,
++    cos_sin_cache: torch.Tensor,
++    positions: torch.Tensor,
++    q_weight: torch.Tensor,
++    k_weight: torch.Tensor,
++    index_q_weight: torch.Tensor,
++    index_k_weight: torch.Tensor,
++    key_cache: torch.Tensor,
++    value_cache: torch.Tensor,
++    index_cache: torch.Tensor,
++    slot_mapping: torch.Tensor,
++    index_slot_mapping: torch.Tensor,
++    num_actual_tokens: int,
++    num_q_heads: int,
++    num_kv_heads: int,
++    num_index_heads: int,
++    eps: float,
++    index_packed: torch.Tensor | None = None,
++) -> tuple[torch.Tensor, torch.Tensor]:
++    """Return Q/index Q and insert K/V/index K, with no intermediate KV tensors.
++
++    Caches use [block, token, head, dim] and [block, token, dim] layouts.
++    Head dimensions must match (the MiniMax-M3 128-wide main/index heads).
++    The caller owns cache lifetime and orders cache readers after this call.
++    """
++    head_dim = q_weight.numel()
++    rotary_dim = cos_sin_cache.shape[-1]
++    assert head_dim == k_weight.numel() == index_q_weight.numel() == index_k_weight.numel()
++    assert head_dim in (64, 128, 256) and 0 < rotary_dim <= head_dim and rotary_dim % 2 == 0
++    assert packed.ndim == 2 and packed.stride(1) == 1
++    main_width = (num_q_heads + 2 * num_kv_heads) * head_dim
++    index_width = (num_index_heads + 1) * head_dim
++    if index_packed is None:
++        assert packed.shape[1] == main_width + index_width
++        index_packed = packed
++        index_offset = main_width
++    else:
++        assert packed.shape[1] == main_width
++        assert index_packed.shape == (packed.shape[0], index_width)
++        assert index_packed.stride(1) == 1 and index_packed.dtype == packed.dtype
++        index_offset = 0
++    assert key_cache.ndim == value_cache.ndim == 4 and index_cache.ndim == 3
++    assert key_cache.shape == value_cache.shape and key_cache.shape[2:] == (num_kv_heads, head_dim)
++    assert index_cache.shape[-1] == head_dim
++    assert key_cache.stride(-1) == value_cache.stride(-1) == index_cache.stride(-1) == 1
++    assert 0 <= num_actual_tokens <= packed.shape[0]
++    assert slot_mapping.numel() >= num_actual_tokens and index_slot_mapping.numel() >= num_actual_tokens
++    assert positions.ndim == 1 and positions.numel() == packed.shape[0]
++    assert cos_sin_cache.ndim == 2 and cos_sin_cache.stride(1) == 1
++    assert packed.dtype == torch.bfloat16
++    assert key_cache.dtype == value_cache.dtype and key_cache.dtype in (packed.dtype, torch.float8_e4m3fn)
++    assert index_cache.dtype in (packed.dtype, torch.float8_e4m3fn)
++    assert all(w.ndim == 1 and w.is_contiguous() for w in (q_weight, k_weight, index_q_weight, index_k_weight))
++    assert slot_mapping.ndim == index_slot_mapping.ndim == 1
++    assert slot_mapping.is_contiguous() and index_slot_mapping.is_contiguous()
++    num_tokens = packed.shape[0]
++    query = torch.empty((num_tokens, num_q_heads * head_dim), device=packed.device, dtype=packed.dtype)
++    index_query = torch.empty((num_tokens, num_index_heads * head_dim), device=packed.device, dtype=index_cache.dtype)
++    if num_tokens == 0:
++        return query, index_query
++    # Each program reads one position, then loads its cos/sin row as vectors.
++    # No intermediate gather tensor or per-token scalar insertion loop.
++    _minimax_qknorm_rope_cache_kernel[(num_tokens,)](
++        packed,
++        index_packed,
++        cos_sin_cache,
++        positions,
++        q_weight,
++        k_weight,
++        index_q_weight,
++        index_k_weight,
++        query,
++        index_query,
++        key_cache,
++        value_cache,
++        index_cache,
++        slot_mapping,
++        index_slot_mapping,
++        num_actual_tokens,
++        num_q_heads,
++        num_kv_heads,
++        num_index_heads,
++        head_dim,
++        rotary_dim,
++        packed.stride(0),
++        index_packed.stride(0),
++        index_offset,
++        positions.stride(0),
++        cos_sin_cache.stride(0),
++        eps,
++        *key_cache.stride()[:3],
++        *value_cache.stride()[:3],
++        *index_cache.stride()[:2],
++        key_cache.shape[1],
++        index_cache.shape[1],
++        key_cache.dtype == torch.float8_e4m3fn,
++        index_cache.dtype == torch.float8_e4m3fn,
++        enable_fp_fusion=False,
++    )
++    return query, index_query

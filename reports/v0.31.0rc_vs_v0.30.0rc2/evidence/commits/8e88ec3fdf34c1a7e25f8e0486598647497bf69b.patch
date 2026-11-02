@@ -1,0 +1,859 @@
+commit 8e88ec3fdf34c1a7e25f8e0486598647497bf69b
+Author:     Feng Liu <46866849+ader47@users.noreply.github.com>
+AuthorDate: Sat Oct 17 14:58:06 2026 +0800
+Commit:     GitHub <noreply@github.com>
+CommitDate: Sat Oct 17 14:58:06 2026 +0800
+
+    [BugFix] Preserve layerwise reuse snapshots and fence cross-rank publication (#19039)
+    
+    ### What this PR does / why we need it?
+    
+    Fix three related correctness issues in the GVA-based layerwise KV cache
+    pool **with layer reuse**, organized as three signed-off commits:
+    
+    1. Preserve the preceding request-scoped snapshot identity across
+    speculative rollback. A rejected draft can reduce the logical prefix
+    without changing the key under which the preceding step saved its KV.
+    2. Preserve full blocks that do not yet have scheduler-visible hashes.
+    Save them in the request-scoped snapshot namespace and promote them to
+    full hash keys once available, without duplicate transfers or treating
+    previous-step snapshots as external prefix hits.
+    3. Fence cross-rank publication after draining deferred local saves and
+    before preparing the next step's loads. A local final-layer save fence
+    alone does not guarantee that a remote owner has published replicated
+    KV.
+    
+    The publication collective is gated by layerwise GVA transfer, layer
+    reuse and TP > 1, never by rank-local request/task counts. Snapshot
+    range overrides are scoped to the single-group, non-align-state path.
+    This is not a general redesign of layerwise pooling, and does not add
+    polling or change the existing bounded partial-lease retry policy.
+    
+    ### Does this PR introduce _any_ user-facing change?
+    
+    No new configuration or public API. Corrects missing/stale snapshot
+    lookups and invalid-GVA failures in the above path. The TP publication
+    barrier can introduce waiting; no claim of zero performance regression
+    is made. Layerwise configurations without reuse do not get the new
+    barrier.
+    
+    ### How was this patch tested?
+    
+    **Current branch checks**
+    - 12 new CPU logic tests passed, including 25 subtests, using the
+    repository dependency mocks plus a local import-only harness for
+    unavailable build metadata, placement and speculative-decode
+    dependencies. Changed snapshot/transfer logic was not mocked.
+    - Covers speculative rollback, exact/full-block boundaries, delayed
+    hashes, multi-block snapshots, external-hit separation, independent
+    layers, missing snapshots, bounded lease retry and publication-barrier
+    gating/order/failure.
+    - Ruff check, Ruff format check and git diff --check passed for the
+    changed files.
+    - Broader existing metadata/worker/scheduler tests were attempted, but
+    stopped on mock-environment limitations: missing torch.bfloat16 and
+    mocked attention-spec constructor incompatibility. They are not reported
+    as passing.
+    - bash format.sh ci was attempted but could not run because pre-commit
+    is unavailable locally.
+    - Full dependency-backed CI and hardware validation of these rebased
+    branch heads remain pending; this PR is intentionally a draft.
+    
+    To run the new tests in the supported test environment:
+    
+    ```bash
+    pytest -q tests/ut/distributed/ascend_store/test_reuse_snapshot_identity.py \
+      tests/ut/distributed/ascend_store/test_reuse_snapshot_blocks.py \
+      tests/ut/distributed/ascend_store/test_reuse_publication_fence.py
+    bash format.sh ci
+    ```
+    
+    **Earlier hardware validation of the fix before upstream adaptation**
+    (not a substitute for validating this branch head):
+    Ascend A3, TP16 with EP, GLM-5.2 W4A8, eager execution, layerwise reused
+    buffers, fused MC2, asynchronous scheduling, MTP=1, Memcache/MemFabric
+    1.3.0. Short/long/chunked prefill, repeated prefixes,
+    127/128/129/255-token boundaries and speculative rejection were
+    exercised without the reproduced invalid-GVA failure. Injected save
+    failure terminated rather than hanging.
+    
+    Current-fix-only timing samples (three rounds, not an A/B benchmark):
+    short 128-token prefill with max_tokens=1: 0.304–0.314 s; 10016-token
+    input with max_tokens=1: 1.211–1.224 s; 127-token input with
+    max_tokens=32/MTP: 5.254–5.402 s. These do not establish the incremental
+    barrier overhead.
+    
+    **Before marking ready:** run supported-environment CI and rebased-head
+    hardware regression; quantify A/B performance impact. Full P/D
+    integration, multi-group and align-state configurations have not been
+    validated by these experiments.
+    
+    ### Checklist
+    
+    - [x] Boundary / edge-case coverage added.
+    - [x] Regression tests added for the corrected snapshot/publication
+    behavior.
+    - [x] Error / failure paths covered (missing snapshot, lease failure,
+    deferred-save failure).
+    - [x] Meaningful behavior assertions, including exact transfer/key
+    identity and barrier order.
+    - [ ] Full supported-environment test suite and required formatting CI.
+    - [ ] A/B performance impact and performance regression coverage.
+    
+    Target: main. Three commits; production diff +189/-20, plus 322 lines of
+    regression tests.
+    
+    - vLLM main:
+    https://github.com/vllm-project/vllm/commit/c4df37dfcc7f72ca41cd43801a468526ecf99a2b
+    
+    ---------
+    
+    Signed-off-by: Feng Liu <liufeng248@huawei.com>
+    Co-authored-by: Feng Liu <liufeng248@huawei.com>
+
+diff --git a/tests/ut/distributed/ascend_store/test_reuse_publication_fence.py b/tests/ut/distributed/ascend_store/test_reuse_publication_fence.py
+new file mode 100644
+index 000000000..893af3fc6
+--- /dev/null
++++ b/tests/ut/distributed/ascend_store/test_reuse_publication_fence.py
+@@ -0,0 +1,48 @@
++# SPDX-License-Identifier: Apache-2.0
++# Copyright (c) 2026 Huawei Technologies Co., Ltd. All Rights Reserved.
++import unittest
++from types import SimpleNamespace
++from unittest.mock import patch
++
++import tests.ut.distributed.ascend_store._mock_deps  # noqa: F401
++from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store import pool_worker as module
++
++
++class TestReusePublicationFence(unittest.TestCase):
++    def test_fence_order_and_scope(self):
++        for transfer, reuse, tp_size, sync in [
++            (True, True, 16, True),
++            (True, True, 1, False),
++            (True, False, 16, False),
++            (False, True, 16, False),
++        ]:
++            for requests in ([], [object()]):
++                with self.subTest(transfer=transfer, reuse=reuse, tp_size=tp_size, empty=not requests):
++                    worker = module.KVPoolWorker.__new__(module.KVPoolWorker)
++                    worker.use_layerwise = True
++                    worker.use_layerwise_transfer = transfer
++                    worker.layerwise_offload = reuse
++                    worker.tp_size = tp_size
++                    calls: list[str] = []
++                    worker._drain_deferred_last_save = lambda calls=calls: calls.append("drain")
++                    worker.process_layer_data = lambda requests, calls=calls: calls.append("prepare")
++                    group = SimpleNamespace(barrier=lambda calls=calls: calls.append("barrier"))
++                    with (
++                        patch.object(module, "get_tp_group", return_value=group),
++                        patch.object(module, "reset_attention_compute_start_gate"),
++                    ):
++                        worker.prepare_layerwise_step(SimpleNamespace(requests=requests))
++                    self.assertEqual(calls, ["drain", "barrier", "prepare"] if sync else ["drain", "prepare"])
++
++    def test_failed_local_save_does_not_query(self):
++        worker = module.KVPoolWorker.__new__(module.KVPoolWorker)
++        worker.use_layerwise = True
++        with (
++            patch.object(worker, "_drain_deferred_last_save", side_effect=RuntimeError("save failed")),
++            patch.object(worker, "process_layer_data") as prepare,
++            patch.object(module, "get_tp_group") as group,
++            self.assertRaisesRegex(RuntimeError, "save failed"),
++        ):
++            worker.prepare_layerwise_step(SimpleNamespace(requests=[]))
++        prepare.assert_not_called()
++        group.assert_not_called()
+diff --git a/tests/ut/distributed/ascend_store/test_reuse_snapshot_blocks.py b/tests/ut/distributed/ascend_store/test_reuse_snapshot_blocks.py
+new file mode 100644
+index 000000000..cfac14b33
+--- /dev/null
++++ b/tests/ut/distributed/ascend_store/test_reuse_snapshot_blocks.py
+@@ -0,0 +1,237 @@
++# SPDX-License-Identifier: Apache-2.0
++# Copyright (c) 2026 Huawei Technologies Co., Ltd. All Rights Reserved.
++import threading
++import unittest
++from types import SimpleNamespace
++from unittest.mock import patch
++
++import tests.ut.distributed.ascend_store._mock_deps  # noqa: F401
++from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store import pool_worker as module
++from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.kv_transfer import LayerBatchBuilder
++from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.metadata import LoadSpec, ReqMeta, RequestTracker
++
++
++class Store:
++    def __init__(self):
++        self.data = {}
++        self.committed = set()
++        self.queries = []
++
++    def batch_alloc(self, keys, sizes, ttl):
++        for key in keys:
++            self.data.setdefault(key, len(self.data) + 100)
++        return [self.data[key] for key in keys]
++
++    def batch_is_exist(self, keys):
++        return [int(key in self.committed) for key in keys]
++
++    def batch_get_key_info(self, keys, **kwargs):
++        self.queries.extend(keys)
++        assert all(key in self.committed for key in keys), keys
++        return [SimpleNamespace(size=lambda: 4096, gva_list=lambda k=k: [self.data[k]]) for k in keys]
++
++    def batch_add_lease(self, keys, ttl):
++        assert all(key in self.committed for key in keys)
++        return [0] * len(keys)
++
++
++def worker():
++    w = module.KVPoolWorker.__new__(module.KVPoolWorker)
++    w.use_layerwise = w.use_layerwise_transfer = w.layerwise_offload = True
++    w.use_block_key_layerwise = False
++    w.tp_size = 16
++    w.kv_role, w.consumer_is_to_put = "kv_producer", False
++    w.can_put = True
++    w.num_kv_cache_groups, w.num_layers = 1, 2
++    w.grouped_block_size, w.hash_block_size = [128], 128
++    w.group_uses_align_state = [False]
++    w.cacheable_group_ids = {0}
++    w.independent_layers = [0]
++    w._is_layerwise_save_owner = lambda group: True
++    w._global_group_alloc_size = lambda group: 4096
++    w._compute_reachable_load_masks = lambda request, cached: None
++    w._make_layerwise_full_key = lambda group, key: "full:" + key
++    w._make_layerwise_partial_key = lambda r, group, block, end: f"{r.req_id}:snapshot:{block}:{end}"
++    w._invalid_block_ids, w._invalid_block_ids_lock = set(), threading.Lock()
++    w.layerwise_max_transfer_blocks = 0
++    w.m_store = Store()
++    reset(w)
++    return w
++
++
++def reset(w):
++    w._masked_runs_cache = {}
++    w._step_keyinfo_cache, w._step_lease_result, w._step_exist_cache = {}, {}, {}
++    w.layer_save_tasks, w.layer_load_tasks = [[], []], [[], []]
++
++
++def step(tracker, target, hashes, cached=None):
++    spec = (
++        None
++        if cached is None
++        else LoadSpec(
++            vllm_cached_tokens=cached,
++            kvpool_cached_tokens=cached,
++            can_load=True,
++            layerwise_previous_step=True,
++            layerwise_snapshot_end_token=tracker.last_layerwise_snapshot_end_token,
++            layerwise_snapshot_block_index=tracker.last_layerwise_snapshot_block_index,
++            layerwise_snapshot_start_block=tracker.last_layerwise_snapshot_start_block,
++        )
++    )
++    tracker.token_len = target
++    return ReqMeta.from_request_tracker(tracker, 128, block_hashes=hashes, load_spec=spec, save_partial_block=True)
++
++
++def transferred(w, is_save):
++    builder = LayerBatchBuilder.__new__(LayerBatchBuilder)
++    builder.group_id = 0
++    builder._block_ids_buf = builder._block_gvas_buf = None
++    tasks = w.layer_save_tasks[1] if is_save else w.layer_load_tasks[1]
++    if not tasks:
++        return {}
++    data = builder.build_shared(tasks[0], is_save=is_save)
++    return dict(zip(data.block_ids_arr.tolist(), data.block_gvas_arr.tolist()))
++
++
++def save(w, meta):
++    w._process_save_for_layer_batch([meta], 1)
++    w._alloc_gvas_for_save([meta])
++    addresses = transferred(w, True)
++    # Every key being committed must have a transfer, not just an allocation.
++    assert set(w.m_store.data[k] for k in meta.save_keys) == set(addresses.values())
++    w.m_store.committed.update(meta.save_keys)
++    return addresses
++
++
++class SnapshotTests(unittest.TestCase):
++    def test_crossing_then_hash_promotion(self):
++        w = worker()
++        t = RequestTracker("r", 0, allocated_block_ids_by_group=[[0, 1, 2, 3]])
++        save(w, step(t, 127, []))
++        reset(w)
++        m = step(t, 129, [], 127)
++        w._prepare_load_gvas([m])
++        saved = save(w, m)
++        self.assertEqual(set(saved), {0, 1})
++        self.assertEqual(t.num_saved_tokens, 0)
++        self.assertEqual(t.last_layerwise_snapshot_start_block, 0)
++        reset(w)
++        m = step(t, 131, ["h0"], 129)
++        w._prepare_load_gvas([m])
++        w._process_load_for_layer_batch([m], 1)
++        self.assertEqual(transferred(w, False), saved)
++        self.assertNotIn("full:h0", w.m_store.queries)
++        save(w, m)
++        self.assertIn("full:h0", w.m_store.committed)
++        self.assertEqual(t.num_saved_tokens, 128)
++        reset(w)
++        m = step(t, 133, ["h0"], 131)
++        w._prepare_load_gvas([m])
++        self.assertIn("full:h0", w.m_store.queries)
++        save(w, m)
++        self.assertNotIn("full:h0", m.save_keys)
++
++    def test_multiblock_snapshot_and_rollback(self):
++        for end in (128, 129, 256, 385):
++            for cached in (127, 128, end):
++                if cached > end:
++                    continue
++                with self.subTest(end=end, cached=cached):
++                    w = worker()
++                    t = RequestTracker("r", 0, allocated_block_ids_by_group=[[0, 1, 2, 3]])
++                    saved = save(w, step(t, end, []))
++                    self.assertEqual(set(saved), set(range((end + 127) // 128)))
++                    reset(w)
++                    m = step(t, cached + 2, ["h" + str(i) for i in range(cached // 128)], cached)
++                    w._prepare_load_gvas([m])
++                    w._process_load_for_layer_batch([m], 1)
++                    self.assertEqual(transferred(w, False), {i: saved[i] for i in range((cached + 127) // 128)})
++                    self.assertFalse(w._invalid_block_ids)
++
++    def test_known_hash_boundaries_and_prefill(self):
++        for end in (128, 129, 8192):
++            with self.subTest(end=end):
++                w = worker()
++                t = RequestTracker("r", 0, allocated_block_ids_by_group=[list(range(80))])
++                m = step(t, end, ["h" + str(i) for i in range(end // 128)])
++                saved = save(w, m)
++                self.assertEqual(len(saved), (end + 127) // 128)
++                self.assertEqual(t.num_saved_tokens, end // 128 * 128)
++                self.assertEqual(t.last_layerwise_snapshot_start_block, end // 128 if end % 128 else None)
++
++    def test_external_hit_is_not_previous_snapshot(self):
++        w = worker()
++        t = RequestTracker("r", 0, allocated_block_ids_by_group=[[0, 1]])
++        m = step(t, 129, ["h0"])
++        m.load_spec = LoadSpec(128, 128, True)
++        save(w, m)
++        self.assertNotIn("full:h0", m.save_keys)
++
++    def test_independent_layer_does_not_reload_local_prefix(self):
++        w = worker()
++        t = RequestTracker("r", 0, allocated_block_ids_by_group=[[0, 1]])
++        save(w, step(t, 129, []))
++        reset(w)
++        m = step(t, 131, ["h0"], 129)
++        w._prepare_load_gvas([m])
++        w._process_load_for_layer_batch([m], 0)
++        self.assertFalse(w.layer_load_tasks[0])
++
++    def test_missing_previous_snapshot_does_not_poll(self):
++        w = worker()
++        t = RequestTracker("r", 0, allocated_block_ids_by_group=[[0, 1]])
++        save(w, step(t, 127, []))
++        reset(w)
++        m = step(t, 129, [], 127)
++        with (
++            patch.object(w.m_store, "batch_get_key_info", return_value=[None]) as query,
++            patch.object(module.time, "sleep") as sleep,
++        ):
++            w._prepare_load_gvas([m])
++        query.assert_called_once()
++        sleep.assert_not_called()
++        self.assertEqual(w._invalid_block_ids, {0})
++        self.assertFalse(m.load_keys)
++
++    def test_partial_lease_retry_is_bounded(self):
++        for recover in (False, True):
++            with self.subTest(recover=recover):
++                w = worker()
++                t = RequestTracker("r", 0, allocated_block_ids_by_group=[[0, 1]])
++                save(w, step(t, 127, []))
++                reset(w)
++                m = step(t, 129, [], 127)
++                results = [[module.MEMCACHE_UNMATCHED_STATE], [0]] if recover else None
++                with (
++                    patch.object(
++                        w.m_store,
++                        "batch_add_lease",
++                        return_value=[module.MEMCACHE_UNMATCHED_STATE],
++                        side_effect=results,
++                    ) as lease,
++                    patch.object(module.time, "sleep") as sleep,
++                ):
++                    w._prepare_load_gvas([m])
++                expected_retries = 1 if recover else 10
++                self.assertEqual(lease.call_count, 1 + expected_retries)
++                self.assertEqual(sleep.call_count, expected_retries)
++                self.assertTrue(all(call.args == (0.001,) for call in sleep.call_args_list))
++                self.assertEqual(w._invalid_block_ids, set() if recover else {0})
++                self.assertEqual(bool(m.load_keys), recover)
++
++    def test_other_data_planes_keep_their_save_range(self):
++        legacy = LoadSpec(1, 1, True, None, 0, 7, 0, True)
++        self.assertTrue(legacy.layerwise_previous_step)
++        self.assertIsNone(legacy.layerwise_snapshot_start_block)
++        w = worker()
++        m = ReqMeta("r", target_token_len=385, save_end_token=128)
++        w.use_layerwise_transfer = False
++        self.assertEqual(w._layerwise_save_full_end(m, 0, 128, 3), 1)
++        w.use_layerwise_transfer = True
++        w.group_uses_align_state = [True]
++        self.assertEqual(w._layerwise_save_full_end(m, 0, 128, 3), 1)
++
++
++if __name__ == "__main__":
++    unittest.main(verbosity=2)
+diff --git a/tests/ut/distributed/ascend_store/test_reuse_snapshot_identity.py b/tests/ut/distributed/ascend_store/test_reuse_snapshot_identity.py
+new file mode 100644
+index 000000000..29de85db5
+--- /dev/null
++++ b/tests/ut/distributed/ascend_store/test_reuse_snapshot_identity.py
+@@ -0,0 +1,37 @@
++# SPDX-License-Identifier: Apache-2.0
++# Copyright (c) 2026 Huawei Technologies Co., Ltd. All Rights Reserved.
++import unittest
++
++import tests.ut.distributed.ascend_store._mock_deps  # noqa: F401
++from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.metadata import LoadSpec, ReqMeta, RequestTracker
++from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.pool_worker import KVPoolWorker
++
++
++class TestReuseSnapshotIdentity(unittest.TestCase):
++    def test_rollback_uses_saved_identity(self):
++        tracker = RequestTracker("request", 7, allocated_block_ids_by_group=[[0]])
++        meta = ReqMeta.from_request_tracker(tracker, 128, block_hashes=[], save_partial_block=True)
++        self.assertTrue(meta.can_save)
++        self.assertEqual(tracker.last_layerwise_snapshot_end_token, 7)
++        self.assertEqual(tracker.last_layerwise_snapshot_block_index, 0)
++        worker = KVPoolWorker.__new__(KVPoolWorker)
++        worker.layerwise_offload = True
++        worker.num_kv_cache_groups = 1
++        worker.group_uses_align_state = [False]
++        spec = LoadSpec(6, 6, True, layerwise_snapshot_end_token=7, layerwise_snapshot_block_index=0)
++        request = ReqMeta("request", target_token_len=7, load_spec=spec)
++        self.assertEqual(worker._resolve_layerwise_load_partial(request, 0, 6, 128, 0), (0, 7))
++        spec.layerwise_snapshot_end_token = 128
++        self.assertEqual(worker._resolve_layerwise_load_partial(request, 0, 128, 128, 1), (0, 128))
++        spec.layerwise_snapshot_end_token = 129
++        spec.layerwise_snapshot_block_index = 1
++        self.assertEqual(worker._resolve_layerwise_load_partial(request, 0, 128, 128, 1), (None, 128))
++        spec.layerwise_snapshot_end_token = None
++        spec.layerwise_snapshot_block_index = None
++        self.assertEqual(worker._resolve_layerwise_load_partial(request, 0, 6, 128, 0), (0, 6))
++
++    def test_no_reuse_does_not_record_snapshot(self):
++        tracker = RequestTracker("request", 129, allocated_block_ids_by_group=[[0, 1]])
++        ReqMeta.from_request_tracker(tracker, 128, block_hashes=["hash"], save_partial_block=False)
++        self.assertIsNone(tracker.last_layerwise_snapshot_end_token)
++        self.assertIsNone(tracker.last_layerwise_snapshot_block_index)
+diff --git a/vllm_ascend/distributed/kv_transfer/kv_pool/ascend_store/metadata.py b/vllm_ascend/distributed/kv_transfer/kv_pool/ascend_store/metadata.py
+index 9005904b2..4b963e178 100644
+--- a/vllm_ascend/distributed/kv_transfer/kv_pool/ascend_store/metadata.py
++++ b/vllm_ascend/distributed/kv_transfer/kv_pool/ascend_store/metadata.py
+@@ -836,6 +836,15 @@ class LoadSpec:
+ 
+     token_len: int = 0
+ 
++    # Exact request-scoped snapshot identity, separate from the logical length
++    # which can roll back after speculative-token rejection.
++    layerwise_snapshot_end_token: int | None = None
++    layerwise_snapshot_block_index: int | None = None
++    # Distinguish the preceding step of this request from external prefix hits.
++    layerwise_previous_step: bool = False
++    # First block stored under request-scoped keys, including unhashed full blocks.
++    layerwise_snapshot_start_block: int | None = None
++
+ 
+ @dataclass(init=False)
+ class RequestTracker:
+@@ -867,6 +876,11 @@ class RequestTracker:
+     gva_block_offset: int = 0
+     last_block_gva: int | None = None
+ 
++    # Identity of the latest request-scoped layerwise partial snapshot.
++    last_layerwise_snapshot_end_token: int | None = None
++    last_layerwise_snapshot_block_index: int | None = None
++    last_layerwise_snapshot_start_block: int | None = None
++
+     # Number of speculative scratch blocks for each Mamba cache group.
+     num_speculative_blocks_by_group: dict[int, int] | None = None
+ 
+@@ -888,6 +902,9 @@ class RequestTracker:
+         last_block_gva: int | None = None,
+         num_speculative_blocks_by_group: dict[int, int] | None = None,
+         block_sizes: list[int] | None = None,
++        last_layerwise_snapshot_end_token: int | None = None,
++        last_layerwise_snapshot_block_index: int | None = None,
++        last_layerwise_snapshot_start_block: int | None = None,
+     ) -> None:
+         self.req_id = req_id
+         self.token_len = token_len
+@@ -905,6 +922,9 @@ class RequestTracker:
+         self.gva_block_offset = gva_block_offset
+         self.last_block_gva = last_block_gva
+         self.block_sizes = block_sizes
++        self.last_layerwise_snapshot_end_token = last_layerwise_snapshot_end_token
++        self.last_layerwise_snapshot_block_index = last_layerwise_snapshot_block_index
++        self.last_layerwise_snapshot_start_block = last_layerwise_snapshot_start_block
+ 
+     @property
+     def allocated_block_ids(self) -> list[int]:
+@@ -1176,7 +1196,7 @@ class ReqMeta:
+         )
+         # Scheduled draft tokens can cross a page before that page has a
+         # committed request hash. Do not mark an unsent page as saved.
+-        if boundary_without_hash or (not save_partial_block and full_block_count > available_full_block_count):
++        if full_block_count > available_full_block_count:
+             num_tokens_to_save = available_full_block_count * cache_transfer_granularity
+         if tracker.last_block_gva is not None and (
+             target_token_len % cache_transfer_granularity != 0 or boundary_without_hash
+@@ -1188,7 +1208,7 @@ class ReqMeta:
+             partial_block_index = None
+ 
+         should_save_partial_block = save_partial_block and (
+-            target_token_len % cache_transfer_granularity != 0 or boundary_without_hash
++            target_token_len % cache_transfer_granularity != 0 or full_block_count > available_full_block_count
+         )
+         skip_save = skip_save or (
+             num_tokens_to_save < chunk_boundary and partial_block_index is None and not should_save_partial_block
+@@ -1207,6 +1227,16 @@ class ReqMeta:
+                 tracker.num_saved_tokens,
+                 num_tokens_to_save,
+             )
++            if should_save_partial_block:
++                tracker.last_layerwise_snapshot_end_token = target_token_len
++                tracker.last_layerwise_snapshot_start_block = min(full_block_count, available_full_block_count)
++                tracker.last_layerwise_snapshot_block_index = (
++                    full_block_count if target_token_len % cache_transfer_granularity != 0 else full_block_count - 1
++                )
++            elif save_partial_block:
++                tracker.last_layerwise_snapshot_end_token = None
++                tracker.last_layerwise_snapshot_block_index = None
++                tracker.last_layerwise_snapshot_start_block = None
+ 
+         token_ids = None
+         if tracker.token_ids and not skip_save:
+diff --git a/vllm_ascend/distributed/kv_transfer/kv_pool/ascend_store/pool_scheduler.py b/vllm_ascend/distributed/kv_transfer/kv_pool/ascend_store/pool_scheduler.py
+index d3ace1b6f..3fad11403 100644
+--- a/vllm_ascend/distributed/kv_transfer/kv_pool/ascend_store/pool_scheduler.py
++++ b/vllm_ascend/distributed/kv_transfer/kv_pool/ascend_store/pool_scheduler.py
+@@ -969,6 +969,10 @@ class KVPoolScheduler:
+         is_decoding = num_computed_tokens >= prefill_end_tokens
+         if is_decoding and not self.save_decode_cache and not self.layerwise_offload:
+             return None
++        # Capture the preceding snapshot before _build_req_meta records this step.
++        previous_snapshot_end_token = request_tracker.last_layerwise_snapshot_end_token
++        previous_snapshot_block_index = request_tracker.last_layerwise_snapshot_block_index
++        previous_snapshot_start_block = request_tracker.last_layerwise_snapshot_start_block
+         num_new_tokens = scheduler_output.num_scheduled_tokens[req_id]
+         if req_tuple:
+             request = req_tuple[0]
+@@ -993,6 +997,10 @@ class KVPoolScheduler:
+                 vllm_cached_tokens=num_current_tokens,
+                 kvpool_cached_tokens=num_current_tokens,
+                 can_load=True,
++                layerwise_snapshot_end_token=previous_snapshot_end_token,
++                layerwise_snapshot_block_index=previous_snapshot_block_index,
++                layerwise_snapshot_start_block=previous_snapshot_start_block,
++                layerwise_previous_step=True,
+             )
+         # save_decode_cache is intentionally narrower than
+         # consumer_is_to_put: a consumer keeps skipping prefill writes and is
+diff --git a/vllm_ascend/distributed/kv_transfer/kv_pool/ascend_store/pool_worker.py b/vllm_ascend/distributed/kv_transfer/kv_pool/ascend_store/pool_worker.py
+index a6ca783ee..78573707e 100644
+--- a/vllm_ascend/distributed/kv_transfer/kv_pool/ascend_store/pool_worker.py
++++ b/vllm_ascend/distributed/kv_transfer/kv_pool/ascend_store/pool_worker.py
+@@ -18,6 +18,7 @@ from vllm.distributed import (
+     get_pp_group,
+     get_tensor_model_parallel_rank,
+     get_tensor_model_parallel_world_size,
++    get_tp_group,
+ )
+ from vllm.distributed.kv_events import BlockStored
+ from vllm.logger import logger
+@@ -1239,6 +1240,11 @@ class KVPoolWorker:
+         """Prepare per-step hook state when the runner binds metadata."""
+         assert self.use_layerwise
+         self._drain_deferred_last_save()
++        # The final-layer fence drains this rank only. Readers of replicated
++        # KV must also wait for the writer before querying the previous step.
++        # Use configuration, never local requests/tasks, to gate the collective.
++        if self.use_layerwise_transfer and self.layerwise_offload and self.tp_size > 1:
++            get_tp_group().barrier()
+         self.current_layer = 0
+         self.layerwise_retrievers: list[Any] = []
+         self.next_layer_to_submit = 0
+@@ -1473,7 +1479,6 @@ class KVPoolWorker:
+             if request.can_save is None or not request.can_save:
+                 continue
+             save_start_block = request.save_start_token // block_size
+-            save_end_block = request.save_end_token // block_size
+             group_block_hashes = get_block_hashes(
+                 request.block_hashes,
+                 block_size,
+@@ -1485,10 +1490,14 @@ class KVPoolWorker:
+                 len(group_block_hashes),
+                 self.layerwise_offload,
+             )
+-            # Skip blocks that are hit in the KV pool — their KV is already
+-            # in the pool (loaded via load_prepare), so re-saving would write
+-            # to a READABLE blob and fail with MMC_UNMATCHED_KEY.
+-            if request.load_spec is not None and request.load_spec.can_load:
++            save_end_block = self._layerwise_save_full_end(request, group_id, block_size, partial_block_index)
++            # External hits already have full keys. A previous-step hit may
++            # instead use snapshots, which still need promotion to full keys.
++            if (
++                request.load_spec is not None
++                and request.load_spec.can_load
++                and not request.load_spec.layerwise_previous_step
++            ):
+                 pool_hit_tokens = (
+                     request.load_spec.kvpool_store_skip_tokens
+                     if request.load_spec.kvpool_store_skip_tokens is not None
+@@ -1595,11 +1604,14 @@ class KVPoolWorker:
+             )
+             cached_full_blocks = cached_tokens // block_size
+             full_blocks = min(cached_full_blocks, len(group_block_hashes))
+-            partial_block_index = get_partial_block_index(
++            if self._layerwise_load_snapshot_start(request, group_id, cached_tokens) is not None:
++                full_blocks = cached_full_blocks
++            partial_block_index, _ = self._resolve_layerwise_load_partial(
++                request,
++                group_id,
+                 cached_tokens,
+                 block_size,
+                 len(group_block_hashes),
+-                self.layerwise_offload,
+             )
+             if not self.layerwise_offload or layer_id in self.independent_layers:
+                 partial_block_index = None
+@@ -1620,6 +1632,20 @@ class KVPoolWorker:
+             block_runs = self._masked_block_runs_cached(
+                 "load", request, group_id, load_start_block, full_blocks, group_load_mask
+             )
++            # A preserved partial snapshot may now sit on a hash boundary
++            # after speculative rollback.  It must be transferred exactly
++            # once through the partial GVA, not also as a full-key block.
++            if partial_block_index is not None and partial_block_index < full_blocks:
++                split_runs = []
++                for run_start, run_end in block_runs:
++                    if partial_block_index < run_start or partial_block_index >= run_end:
++                        split_runs.append((run_start, run_end))
++                        continue
++                    if run_start < partial_block_index:
++                        split_runs.append((run_start, partial_block_index))
++                    if partial_block_index + 1 < run_end:
++                        split_runs.append((partial_block_index + 1, run_end))
++                block_runs = split_runs
+             if not block_runs and partial_block_index is None:
+                 continue
+             for run_idx, (run_start_block, run_end_block) in enumerate(block_runs):
+@@ -1663,6 +1689,89 @@ class KVPoolWorker:
+             group_id, block_hash_hex, self.metadata[group_id].head_or_tp_rank, self.pp_rank
+         )
+ 
++    def _resolve_layerwise_load_partial(
++        self,
++        request: ReqMeta,
++        group_id: int,
++        cached_tokens: int,
++        block_size: int,
++        hash_count: int,
++    ) -> tuple[int | None, int]:
++        """Resolve the block and key length of a layerwise partial load.
++
++        Speculative rejection may roll ``cached_tokens`` back after the prior
++        step saved a longer request-scoped snapshot.  Reuse that exact saved
++        identity when it still covers the logical prefix. A snapshot can
++        include unhashed full blocks as well as its tail; rollback can land
++        in any of those blocks. The override is limited to the current
++        single-group, non-align-state path; hybrid/Mamba layouts keep their
++        existing behavior.
++        """
++        partial_block_index = get_partial_block_index(
++            cached_tokens,
++            block_size,
++            hash_count,
++            self.layerwise_offload,
++        )
++        partial_end_token = cached_tokens
++        load_spec = request.load_spec
++        if load_spec is None or self.num_kv_cache_groups != 1 or group_id != 0 or self.group_uses_align_state[group_id]:
++            return partial_block_index, partial_end_token
++
++        snapshot_end_token = load_spec.layerwise_snapshot_end_token
++        snapshot_start = self._layerwise_load_snapshot_start(request, group_id, cached_tokens)
++        if snapshot_start is None:
++            return partial_block_index, partial_end_token
++
++        assert snapshot_end_token is not None
++        logical_last_block = (cached_tokens - 1) // block_size
++        if snapshot_start <= logical_last_block:
++            logger.debug(
++                "Reqid: %s reusing layerwise snapshot block=%d end_token=%d for logical length=%d",
++                request.req_id,
++                logical_last_block,
++                snapshot_end_token,
++                cached_tokens,
++            )
++            return logical_last_block, snapshot_end_token
++        return partial_block_index, partial_end_token
++
++    def _layerwise_load_snapshot_start(self, request: ReqMeta, group_id: int, cached_tokens: int) -> int | None:
++        """Use the preceding save's key namespace, not this step's hash availability."""
++        spec = request.load_spec
++        if (
++            not self.layerwise_offload
++            or self.num_kv_cache_groups != 1
++            or group_id != 0
++            or self.group_uses_align_state[group_id]
++            or spec is None
++            or cached_tokens <= 0
++            or spec.layerwise_snapshot_end_token is None
++            or spec.layerwise_snapshot_end_token < cached_tokens
++        ):
++            return None
++        return (
++            spec.layerwise_snapshot_start_block
++            if spec.layerwise_snapshot_start_block is not None
++            else spec.layerwise_snapshot_block_index
++        )
++
++    def _layerwise_save_full_end(
++        self, request: ReqMeta, group_id: int, block_size: int, partial_block_index: int | None
++    ) -> int:
++        """Unhashed full blocks use normal GVA slots; the tail keeps its partial slot."""
++        end = request.save_end_token // block_size
++        if (
++            self.use_layerwise_transfer
++            and self.layerwise_offload
++            and self.num_kv_cache_groups == 1
++            and not self.group_uses_align_state[group_id]
++        ):
++            end = request.target_token_len // block_size
++            if partial_block_index is not None:
++                end = min(end, partial_block_index)
++        return end
++
+     def _make_layerwise_partial_key(
+         self,
+         request: ReqMeta,
+@@ -1760,8 +1869,17 @@ class KVPoolWorker:
+                 group_block_hashes = get_block_hashes(block_hashes, effective_block_size, self.hash_block_size)
+ 
+                 save_start_block = request.save_start_token // effective_block_size
+-                save_end_block = request.save_end_token // effective_block_size
+-                if request.load_spec is not None and request.load_spec.can_load:
++                partial_block_index = get_partial_block_index(
++                    request.target_token_len, effective_block_size, len(group_block_hashes), self.layerwise_offload
++                )
++                save_end_block = self._layerwise_save_full_end(
++                    request, group_id, effective_block_size, partial_block_index
++                )
++                if (
++                    request.load_spec is not None
++                    and request.load_spec.can_load
++                    and not request.load_spec.layerwise_previous_step
++                ):
+                     pool_hit_tokens = (
+                         request.load_spec.kvpool_store_skip_tokens
+                         if request.load_spec.kvpool_store_skip_tokens is not None
+@@ -1774,7 +1892,13 @@ class KVPoolWorker:
+                     if request.store_masks is not None and group_id < len(request.store_masks)
+                     else None
+                 )
+-                end_limit = min(save_end_block, len(group_block_hashes))
++                end_limit = min(save_end_block, len(block_ids_by_group))
++                if not (
++                    self.layerwise_offload
++                    and self.num_kv_cache_groups == 1
++                    and not self.group_uses_align_state[group_id]
++                ):
++                    end_limit = min(end_limit, len(group_block_hashes))
+                 candidate_blocks = [
+                     block_idx
+                     for block_idx in range(save_start_block, end_limit)
+@@ -1785,6 +1909,8 @@ class KVPoolWorker:
+                         group_id,
+                         block_hash_to_str(group_block_hashes[block_idx]),
+                     )
++                    if block_idx < len(group_block_hashes)
++                    else self._make_layerwise_partial_key(request, group_id, block_idx, request.target_token_len)
+                     for block_idx in candidate_blocks
+                 ]
+                 # Skip blocks already committed in the pool. The exists check
+@@ -1802,10 +1928,7 @@ class KVPoolWorker:
+                 # cross-step GVA cache is kept.
+                 block_gvas: list[int] = []
+                 if transfer_blocks:
+-                    transfer_keys = [
+-                        self._make_layerwise_full_key(group_id, block_hash_to_str(group_block_hashes[blk_idx]))
+-                        for blk_idx in transfer_blocks
+-                    ]
++                    transfer_keys = [key for key in candidate_keys if key in missing_keys]
+                     transfer_gvas = self.m_store.batch_alloc(
+                         transfer_keys, [alloc_size] * len(transfer_keys), LAYERWISE_READ_LEASE_TTL_MS
+                     )
+@@ -1943,6 +2066,9 @@ class KVPoolWorker:
+                 )
+                 cached_full_blocks = cached_tokens // effective_block_size
+                 full_blocks = min(cached_full_blocks, len(group_block_hashes))
++                snapshot_start = self._layerwise_load_snapshot_start(request, group_id, cached_tokens)
++                if snapshot_start is not None:
++                    full_blocks = cached_full_blocks
+ 
+                 block_ids_by_group = (
+                     request.block_ids_by_group_np[group_id]
+@@ -1954,11 +2080,12 @@ class KVPoolWorker:
+                     continue
+                 full_len = len(block_ids_by_group)
+ 
+-                partial_block_index = get_partial_block_index(
++                partial_block_index, partial_end_token = self._resolve_layerwise_load_partial(
++                    request,
++                    group_id,
+                     cached_tokens,
+                     effective_block_size,
+                     len(group_block_hashes),
+-                    self.layerwise_offload,
+                 )
+                 if partial_block_index is not None and (
+                     partial_block_index < load_start_block or partial_block_index >= full_len
+@@ -1977,12 +2104,18 @@ class KVPoolWorker:
+                 block_indices = [
+                     block_idx
+                     for block_idx in range(load_start_block, full_blocks)
+-                    if group_load_mask is None or block_idx >= len(group_load_mask) or group_load_mask[block_idx]
+-                ]
+-                keys = [
+-                    self._make_layerwise_full_key(group_id, block_hash_to_str(group_block_hashes[block_idx]))
+-                    for block_idx in block_indices
++                    if block_idx != partial_block_index
++                    and (group_load_mask is None or block_idx >= len(group_load_mask) or group_load_mask[block_idx])
+                 ]
++                keys = []
++                for block_idx in block_indices:
++                    if snapshot_start is None or block_idx < snapshot_start:
++                        key = self._make_layerwise_full_key(group_id, block_hash_to_str(group_block_hashes[block_idx]))
++                    else:
++                        snapshot_end_token = request.load_spec.layerwise_snapshot_end_token
++                        assert snapshot_end_token is not None
++                        key = self._make_layerwise_partial_key(request, group_id, block_idx, snapshot_end_token)
++                    keys.append(key)
+                 has_partial_key = False
+                 if partial_block_index is not None:
+                     keys.append(
+@@ -1990,7 +2123,7 @@ class KVPoolWorker:
+                             request,
+                             group_id,
+                             partial_block_index,
+-                            cached_tokens,
++                            partial_end_token,
+                         )
+                     )
+                     block_indices.append(partial_block_index)

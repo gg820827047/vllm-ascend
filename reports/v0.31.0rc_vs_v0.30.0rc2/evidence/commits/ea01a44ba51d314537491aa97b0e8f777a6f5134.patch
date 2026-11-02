@@ -1,0 +1,208 @@
+commit ea01a44ba51d314537491aa97b0e8f777a6f5134
+Author:     Wei Yubo <rowan.of.leo@gmail.com>
+AuthorDate: Sat Oct 10 14:22:57 2026 +0800
+Commit:     GitHub <noreply@github.com>
+CommitDate: Sat Oct 10 14:22:57 2026 +0800
+
+    [BugFix][Spec Decode] Size DFlash query buffers for ACL graph padding (#17379)
+    
+    Fixes #18121
+    
+    ### What this PR does / why we need it?
+    
+    Fix a query-buffer capacity issue in DFlash speculative decoding on the
+    vLLM Ascend V1 model runner.
+    
+    `AscendDflashProposer` allocates its persistent query buffers using
+    `max_query_tokens = max_batch_size * (1 + num_speculative_tokens)`.
+    However, ACLGraph dispatch may select a padded execution size larger
+    than this logical limit.
+    
+    For example, 33 requests with 3 speculative tokens have a logical query
+    limit of 132. If graph dispatch selects 136 tokens, slicing a
+    132-element positions buffer with `[:136]` still returns only 132
+    elements, potentially producing inconsistent model input shapes.
+    Whether this occurs depends on the configured capture sizes.
+    
+    This PR introduces:
+    
+    `max_padded_query_tokens = max(max_query_tokens,
+    compilation_config.max_cudagraph_capture_size or 0)`
+    
+    The padded capacity is used for `positions`, `_slot_mapping_buffer`,
+    and `max_positions` / `arange_dflash`, ensuring that allocation covers
+    the configured graph execution range.
+    
+    The logical `max_query_tokens` limit, context buffers, dtypes, and
+    devices remain unchanged. The change only affects initialization-time
+    allocation and adds no per-step allocation or synchronization.
+    
+    `AscendDflash2Proposer` inherits the same allocation and is also
+    covered.
+    
+    Adapted from [vLLM PR
+    #50065](https://github.com/vllm-project/vllm/pull/50065).
+    
+    ### Does this PR introduce _any_ user-facing change?
+    
+    Corrects buffer sizing for V1 DFlash/DFlash2 configurations where graph
+    padding exceeds the logical query limit. No new configuration options
+    or API changes are introduced.
+    
+    ### How was this patch tested?
+    
+    Added 12 parameterized regression cases in
+    `tests/ut/spec_decode/test_dflash_proposer.py`, covering both DFlash
+    and DFlash2 with:
+    
+    - Padded execution larger than the logical query limit.
+    - Capture-aligned and equal-capacity cases.
+    - A logical query limit larger than the capture limit.
+    - Unset (`None`) and zero capture limits.
+    
+    The tests verify buffer slice shapes, dtypes, devices, and preservation
+    of logical query and context limits. The existing dummy slot mapping
+    cleanup test is retained.
+    
+    After merging main, commit `35815e701` passed CPU CI against both
+    vLLM `ced6857afa` and `v0.30.0`. Each run reported
+    **8341 passed, 70 skipped, 17 warnings**. All 12 new regression cases
+    and the existing cleanup test passed in both runs. Pre-commit also
+    passed.
+    
+    - [vLLM main CPU
+    CI](https://github.com/vllm-project/vllm-ascend/actions/runs/37716116727/job/113114196146)
+    - [vLLM v0.30.0 CPU
+    CI](https://github.com/vllm-project/vllm-ascend/actions/runs/37716116727/job/113114196236)
+    
+    These tests validate allocation and slicing on CPU. NPU graph
+    capture/replay, inference correctness, and memory/performance
+    validation remain outstanding. The required selected/full tests
+    are awaiting maintainer triggering.
+    
+    - vLLM main:
+    https://github.com/vllm-project/vllm/commit/ced6857afa0ea7b2e3f0846a62e1394e90f15607
+    
+    ---------
+    
+    Signed-off-by: Wei Yubo <rowan.of.leo@gmail.com>
+
+diff --git a/tests/ut/spec_decode/test_dflash_proposer.py b/tests/ut/spec_decode/test_dflash_proposer.py
+index 6e1f0fedb..f94094c22 100644
+--- a/tests/ut/spec_decode/test_dflash_proposer.py
++++ b/tests/ut/spec_decode/test_dflash_proposer.py
+@@ -19,12 +19,77 @@
+ 
+ from contextlib import contextmanager
+ from types import SimpleNamespace
+-from unittest.mock import MagicMock
++from unittest.mock import MagicMock, patch
+ 
++import pytest
+ import torch
+ from vllm.config import CUDAGraphMode
+ 
++from vllm_ascend.spec_decode.dflash2_proposer import AscendDflash2Proposer
+ from vllm_ascend.spec_decode.dflash_proposer import AscendDflashProposer
++from vllm_ascend.spec_decode.eagle_proposer import AscendEagleProposer
++
++_MAX_NUM_TOKENS = 256
++_NUM_SPECULATIVE_TOKENS = 3
++_HIDDEN_SIZE = 8
++
++
++@pytest.mark.parametrize("proposer_cls", [AscendDflashProposer, AscendDflash2Proposer])
++@pytest.mark.parametrize(
++    ("max_num_seqs", "max_capture_size", "num_input_tokens"),
++    [
++        pytest.param(33, 136, 136, id="padded-query"),
++        pytest.param(32, 128, 128, id="capture-aligned-query"),
++        pytest.param(33, 132, 132, id="equal-capacity"),
++        pytest.param(33, 128, 132, id="query-exceeds-capture"),
++        pytest.param(33, None, 132, id="unset-capture-size"),
++        pytest.param(33, 0, 132, id="disabled-capture"),
++    ],
++)
++def test_query_buffers_cover_execution_shape(proposer_cls, max_num_seqs, max_capture_size, num_input_tokens):
++    """Graph padding must not silently truncate query positions or slots."""
++    device = torch.device("cpu")
++    config = SimpleNamespace(
++        compilation_config=SimpleNamespace(max_cudagraph_capture_size=max_capture_size),
++        speculative_config=SimpleNamespace(draft_sample_method="greedy"),
++    )
++
++    def init_base(self, vllm_config, device, runner=None):
++        self.max_batch_size = max_num_seqs
++        self.num_speculative_tokens = _NUM_SPECULATIVE_TOKENS
++        self.max_num_tokens = _MAX_NUM_TOKENS
++        self.hidden_size = _HIDDEN_SIZE
++        self.dtype = torch.float32
++        self.device = device
++        self.input_ids = torch.zeros(_MAX_NUM_TOKENS, dtype=torch.int32, device=device)
++        self.uses_mrope = False
++        self.uses_xdrope_dim = 0
++        self.draft_model_config = SimpleNamespace(hf_config=SimpleNamespace(dflash_config={"selector_top_k": 2}))
++
++    with (
++        patch.object(AscendEagleProposer, "__init__", init_base),
++        patch(
++            "vllm_ascend.spec_decode.dflash_proposer.get_ascend_config",
++            return_value=SimpleNamespace(dynamic_spec_config=SimpleNamespace(method=None)),
++        ),
++    ):
++        proposer = proposer_cls(config, device)
++
++    input_ids = proposer.input_ids[:num_input_tokens]
++    assert input_ids.shape == (num_input_tokens,)
++    assert proposer._get_positions(num_input_tokens).shape == input_ids.shape
++    assert proposer._slot_mapping_buffer[:num_input_tokens].shape == input_ids.shape
++    for buffer in (proposer.positions, proposer._slot_mapping_buffer):
++        assert buffer.dtype == torch.int32
++        assert buffer.device == device
++
++    # Padding changes storage capacity, not the logical query or context limits.
++    assert proposer.max_query_tokens == max_num_seqs * (1 + _NUM_SPECULATIVE_TOKENS)
++    assert proposer.max_positions == _MAX_NUM_TOKENS + num_input_tokens
++    assert proposer.arange_dflash.shape == (proposer.max_positions + 1,)
++    assert proposer._context_positions_buffer.shape == (_MAX_NUM_TOKENS,)
++    assert proposer._context_slot_mapping_buffers.shape == (_MAX_NUM_TOKENS,)
++    assert proposer._dflash_hidden_states.shape == (_MAX_NUM_TOKENS, _HIDDEN_SIZE)
+ 
+ 
+ class TestDummySlotMappingCleanup:
+diff --git a/vllm_ascend/spec_decode/dflash_proposer.py b/vllm_ascend/spec_decode/dflash_proposer.py
+index 779e92a77..43b2201a4 100644
+--- a/vllm_ascend/spec_decode/dflash_proposer.py
++++ b/vllm_ascend/spec_decode/dflash_proposer.py
+@@ -51,7 +51,12 @@ class AscendDflashProposer(AscendEagleProposer):
+         )
+ 
+         self.max_query_tokens = self.max_batch_size * (1 + self.num_speculative_tokens)
+-        self.max_positions = self.max_num_tokens + self.max_query_tokens
++        # ACL graph batches can be padded beyond the logical query limit.
++        self.max_padded_query_tokens = max(
++            self.max_query_tokens,
++            vllm_config.compilation_config.max_cudagraph_capture_size or 0,
++        )
++        self.max_positions = self.max_num_tokens + self.max_padded_query_tokens
+ 
+         self._context_slot_mapping_buffers = torch.zeros(
+             self.max_num_tokens,
+@@ -60,7 +65,7 @@ class AscendDflashProposer(AscendEagleProposer):
+         )
+ 
+         self._slot_mapping_buffer = torch.zeros(
+-            self.max_query_tokens,
++            self.max_padded_query_tokens,
+             dtype=torch.int32,
+             device=device,
+         )
+@@ -72,7 +77,7 @@ class AscendDflashProposer(AscendEagleProposer):
+         )
+ 
+         self.positions = torch.zeros(
+-            self.max_query_tokens,
++            self.max_padded_query_tokens,
+             dtype=torch.int32,
+             device=device,
+         )

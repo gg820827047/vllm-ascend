@@ -1,0 +1,442 @@
+commit 79be4884cc24b96629f9e1f28a550d3b24bca2d4
+Author:     wzk-jazk <127732623+wzk-jazk@users.noreply.github.com>
+AuthorDate: Tue Oct 13 10:25:23 2026 +0800
+Commit:     GitHub <noreply@github.com>
+CommitDate: Tue Oct 13 10:25:23 2026 +0800
+
+    [BugFix][Scheduler] Adapt vllm#49675 deferred-free preemption guard to DyntraLB and Balance schedulers (#18207)
+    
+    ### What this PR does / why we need it?
+    
+    vllm-project/vllm#49675 (included in vLLM v0.30.0) fixed a zero-progress
+    preemption cascade in `Scheduler.schedule()`. With deferred block
+    freeing (`defer_block_free`, enabled by async scheduling or PP > 1 plus
+    a KV-consumer connector), a preempted request's blocks return to the
+    pool only after its in-flight step is processed. When an allocation
+    fails, preempting such a request cannot free anything this step, so the
+    retry loop preempted the whole running queue while the free-block count
+    stayed 0 (see #16315). Upstream now selects the victim first and stops
+    retrying when `_request_blocks_can_be_freed()` is false.
+    
+    vllm-ascend keeps its own copies of `schedule()`. The recompute and
+    profiling-chunk schedulers already received this change while syncing to
+    v0.30.0 (#17672, #17380), and `DyntraLBRecomputeScheduler` inherits it
+    from `RecomputeScheduler`. Two copies are still missing it:
+    
+    - `DyntraLBScheduler` / `AsyncDyntraLBScheduler`
+    (`vllm_ascend/core/dyntra_lb_scheduler.py`). DyntraLB requires
+    `kv_role="kv_consumer"`, so deferred freeing is on in every async
+    DyntraLB deployment and the cascade is hit whenever the KV pool is full.
+    - `BalanceScheduler`
+    (`vllm_ascend/patch/platform/patch_balance_schedule.py`), used on the
+    sync path; affected with PP > 1 and a `kv_both` connector (which vLLM
+    treats as a KV consumer).
+    
+    This PR ports the upstream guard to both, with the same structure as
+    upstream and `RecomputeScheduler`: select the victim, stop retrying if
+    its blocks cannot be freed this step, and only then remove it from the
+    running queue. No other part of the copied `schedule()` bodies is
+    changed; fully re-syncing `BalanceScheduler.schedule()` with v0.30.0 is
+    left as separate maintenance work.
+    
+    Refs #16315. Related: #16265, which addresses the same issue by patching
+    in a full copy of upstream `Scheduler.schedule()` with the guard; it was
+    opened before the v0.30.0 upgrade, and upstream `Scheduler` now carries
+    the fix itself. This PR only covers the `schedule()` copies that
+    vllm-ascend still maintains.
+    
+    ### Does this PR introduce _any_ user-facing change?
+    
+    No.
+    
+    ### How was this patch tested?
+    
+    New unit tests, modeled on upstream's
+    `tests/v1/core/test_deferred_block_free.py` from vllm#49675:
+    
+    - `tests/ut/core/test_dyntra_lb_scheduler.py`
+    -
+    `test_dyntra_lb_allocation_retry_waits_for_fence_then_succeeds[fcfs|priority]`:
+    port of upstream `test_allocation_retry_waits_for_fence_then_succeeds`.
+    While the victim is in flight the step preempts nothing; after the fence
+    advances, the expected victim is preempted and the trigger request is
+    scheduled.
+    - `test_dyntra_lb_full_pool_does_not_cascade_preempt_on_deferred_free`:
+    the KV pool is full and the previous step is still in flight. Without
+    the fix all running requests are preempted with 0 free blocks; with it
+    none are, and the next step matches upstream `AsyncScheduler`.
+    - `tests/ut/patch/platform/test_patch_balance_schedule.py`
+    -
+    `test_balance_allocation_retry_waits_for_fence_then_succeeds[fcfs|priority]`:
+    the same scenario on the sync path, where PP overlap is reproduced by
+    scheduling the next prefill chunk before the previous step's output is
+    processed.
+    - `test_balance_full_pool_does_not_cascade_preempt_on_deferred_free`: no
+    cascade while a chunked prefill needs blocks and every other request is
+    in flight; the next step matches upstream `Scheduler` (balance
+    disabled).
+    - `_make_balance_scheduler` gains optional `policy` and `num_blocks`
+    arguments; existing callers are unchanged.
+    
+    All six new tests fail without the fix. The full
+    `test_dyntra_lb_scheduler.py`, `test_patch_balance_schedule.py`,
+    `test_dyntra_lb_recompute_scheduler.py` and
+    `test_recompute_scheduler.py` pass
+    (`test_schedule_body_matches_pinned_release_tag` is skipped as before
+    this change, since the Balance copy already differed from v0.30.0).
+    
+    
+    - vLLM main:
+    https://github.com/vllm-project/vllm/commit/8cc9aa5ad350f6f80cf3bebb298d410803ff75a9
+    
+    Signed-off-by: wzk-jazk <wzk200212@gmail.com>
+    Co-authored-by: wzk-jazk <wzk200212@gmail.com>
+
+diff --git a/tests/ut/core/test_dyntra_lb_scheduler.py b/tests/ut/core/test_dyntra_lb_scheduler.py
+index 386d2da35..76fb07a23 100644
+--- a/tests/ut/core/test_dyntra_lb_scheduler.py
++++ b/tests/ut/core/test_dyntra_lb_scheduler.py
+@@ -1369,3 +1369,133 @@ def test_dyntra_lb_lifecycle_hooks_clear_paused_state(monkeypatch):
+     )
+     assert scheduler._free_request(free_req, delay_free_blocks=True) == {"ok": True}
+     assert free_req.request_id not in scheduler._lb_paused_req_ids
++
++
++# Deferred block freeing (vllm-project/vllm#49675): with async scheduling and a
++# KV-consumer connector, a preempted request's blocks return to the pool only
++# after its in-flight step is processed. Preempting such a request cannot help
++# the current allocation, so the retry loop must stop instead of cascading.
++DEFER_FREE_BLOCK_SIZE = 16
++DEFER_FREE_PROMPT_TOKENS = 33  # 3 blocks with block_size=16
++
++
++def _create_deferring_dyntra_lb_scheduler(policy: str = "fcfs", num_blocks: int = 10000) -> AsyncDyntraLBScheduler:
++    vllm_config = make_dyntra_test_config(block_size=DEFER_FREE_BLOCK_SIZE)
++    vllm_config.scheduler_config.async_scheduling = True
++    vllm_config.scheduler_config.policy = policy
++    scheduler = create_dyntra_lb_scheduler(
++        vllm_config,
++        scheduler_cls=AsyncDyntraLBScheduler,
++        num_blocks=num_blocks,
++    )
++    # The production gate also requires a KV-consumer connector; the
++    # mechanism itself is independent of it.
++    scheduler.defer_block_free = True
++    return scheduler
++
++
++def _make_output_for(scheduler, scheduler_output):
++    return create_model_runner_output([scheduler.requests[req_id] for req_id in scheduler_output.num_scheduled_tokens])
++
++
++def _fail_one_allocation(scheduler, call_number: int):
++    real_allocate = scheduler.kv_cache_manager.allocate_slots
++    calls = 0
++
++    def allocate(*args, **kwargs):
++        nonlocal calls
++        calls += 1
++        if calls == call_number:
++            return None
++        return real_allocate(*args, **kwargs)
++
++    return patch.object(scheduler.kv_cache_manager, "allocate_slots", side_effect=allocate)
++
++
++@pytest.mark.parametrize(
++    ("policy", "failed_call"),
++    [
++        ("fcfs", 1),
++        ("priority", 2),
++    ],
++)
++def test_dyntra_lb_allocation_retry_waits_for_fence_then_succeeds(policy, failed_call):
++    scheduler = _create_deferring_dyntra_lb_scheduler(policy)
++    requests = [
++        create_request(
++            request_id=i,
++            num_tokens=DEFER_FREE_PROMPT_TOKENS,
++            max_tokens=10,
++            block_size=DEFER_FREE_BLOCK_SIZE,
++        )
++        for i in range(1, 4)
++    ]
++    for request in requests:
++        scheduler.add_request(request)
++    out0 = scheduler.schedule()
++    out1 = scheduler.schedule()
++
++    worst, trigger, tail = requests
++    worst.priority, trigger.priority, tail.priority = 9, 0, 1
++
++    # Every victim is still in flight: preempting it frees nothing this step.
++    with _fail_one_allocation(scheduler, failed_call) as allocate:
++        blocked = scheduler.schedule()
++    assert allocate.call_count == failed_call
++    assert not blocked.preempted_req_ids
++    retry_trigger = requests[failed_call - 1]
++    assert retry_trigger.request_id not in blocked.num_scheduled_tokens
++
++    for output in (out0, out1, blocked):
++        if output.total_num_scheduled_tokens:
++            scheduler.update_from_output(output, _make_output_for(scheduler, output))
++
++    # Once the fence has advanced, preempting the victim makes progress.
++    expected_victim = worst if policy == "priority" else tail
++    with _fail_one_allocation(scheduler, failed_call) as allocate:
++        resumed = scheduler.schedule()
++
++    assert allocate.call_count > failed_call
++    assert expected_victim.request_id in resumed.preempted_req_ids
++    assert retry_trigger.request_id in resumed.num_scheduled_tokens
++    if policy == "priority":
++        assert tail.request_id in resumed.num_scheduled_tokens
++
++
++def test_dyntra_lb_full_pool_does_not_cascade_preempt_on_deferred_free():
++    num_reqs, prompt_blocks = 4, 2
++    # One extra block for the null block reserved by the block pool.
++    scheduler = _create_deferring_dyntra_lb_scheduler(num_blocks=num_reqs * prompt_blocks + 1)
++    pool = scheduler.kv_cache_manager.block_pool
++    requests = [
++        create_request(
++            request_id=i,
++            num_tokens=prompt_blocks * DEFER_FREE_BLOCK_SIZE,
++            max_tokens=8,
++            block_size=DEFER_FREE_BLOCK_SIZE,
++        )
++        for i in range(1, num_reqs + 1)
++    ]
++    for request in requests:
++        scheduler.add_request(request)
++
++    out0 = scheduler.schedule()
++    assert len(out0.num_scheduled_tokens) == num_reqs
++    assert pool.get_num_free_blocks() == 0
++
++    # The prefill step is still in flight and every request needs a new block
++    # for its first decode token. Without the guard the retry loop preempted
++    # the whole running queue while the free-block count stayed 0.
++    out1 = scheduler.schedule()
++    assert not out1.preempted_req_ids
++    assert len(scheduler.running) == num_reqs
++    assert not scheduler.deferred_frees
++
++    # Once the prefill output is processed, victims free their blocks at once:
++    # id-4's blocks serve id-1 and id-2, and id-3 then preempts itself, the
++    # same outcome as upstream's AsyncScheduler.
++    scheduler.update_from_output(out0, _make_output_for(scheduler, out0))
++    out2 = scheduler.schedule()
++    assert out2.preempted_req_ids == {"id-3", "id-4"}
++    assert set(out2.num_scheduled_tokens) == {"id-1", "id-2"}
++    assert not scheduler.deferred_frees
+diff --git a/tests/ut/patch/platform/test_patch_balance_schedule.py b/tests/ut/patch/platform/test_patch_balance_schedule.py
+index fa3fbae2f..2ef8a6416 100644
+--- a/tests/ut/patch/platform/test_patch_balance_schedule.py
++++ b/tests/ut/patch/platform/test_patch_balance_schedule.py
+@@ -681,7 +681,7 @@ def _make_output(scheduler):
+     )
+ 
+ 
+-def _make_balance_scheduler(*, dp_size=2, max_num_seqs=16):
++def _make_balance_scheduler(*, dp_size=2, max_num_seqs=16, policy="fcfs", num_blocks=10000):
+     from contextlib import ExitStack
+     from unittest.mock import PropertyMock
+ 
+@@ -730,6 +730,7 @@ def _make_balance_scheduler(*, dp_size=2, max_num_seqs=16):
+         model_config.runner_type = "generate"
+         scheduler_config = SchedulerConfig(
+             max_num_seqs=max_num_seqs,
++            policy=policy,
+             max_model_len=8192,
+             long_prefill_token_threshold=0,
+             disable_chunked_mm_input=False,
+@@ -750,7 +751,7 @@ def _make_balance_scheduler(*, dp_size=2, max_num_seqs=16):
+         vllm_config.parallel_config.data_parallel_size = dp_size
+         vllm_config.model_config.hf_config.is_encoder_decoder = False
+         kv_cache_config = KVCacheConfig(
+-            num_blocks=10000,
++            num_blocks=num_blocks,
+             kv_cache_tensors=[],
+             kv_cache_groups=[
+                 KVCacheGroupSpec(
+@@ -760,7 +761,7 @@ def _make_balance_scheduler(*, dp_size=2, max_num_seqs=16):
+             ],
+         )
+         kv_cache_config.hash_block_size = _BLOCK_SIZE
+-        cache_config.num_gpu_blocks = 10000
++        cache_config.num_gpu_blocks = num_blocks
+         scheduler = BalanceScheduler(
+             vllm_config=vllm_config,
+             kv_cache_config=kv_cache_config,
+@@ -955,3 +956,130 @@ def test_balance_engine_core_hooks(monkeypatch):
+             assert pe._engine_core_mod.DPEngineCoreProc is orig
+     finally:
+         pe._engine_core_mod.DPEngineCoreProc = orig
++
++
++# ---------------------------------------------------------------------------
++# Deferred block freeing (vllm-project/vllm#49675)
++# ---------------------------------------------------------------------------
++# With PP > 1 and a KV-consumer connector, a preempted request's blocks return
++# to the pool only after its in-flight step is processed. Preempting such a
++# request cannot help the current allocation, so the retry loop must stop
++# instead of cascading. BalanceScheduler runs on the sync path, so PP overlap is
++# reproduced by scheduling the next prefill chunk before the previous step's
++# output is processed.
++
++
++def _make_deferring_balance_scheduler(policy="fcfs", num_blocks=10000):
++    scheduler = _make_balance_scheduler(policy=policy, num_blocks=num_blocks)
++    # The production gate also requires PP > 1 and a KV-consumer connector;
++    # the mechanism itself is independent of them.
++    scheduler.defer_block_free = True
++    scheduler.scheduler_config.long_prefill_token_threshold = 2 * _BLOCK_SIZE
++    return scheduler
++
++
++def _schedule_step(scheduler):
++    output = scheduler.schedule()
++    # A request samples a token unless this step only ran a partial prefill chunk.
++    sampled = {req_id: not scheduler.requests[req_id].is_prefill_chunk for req_id in output.num_scheduled_tokens}
++    return output, sampled
++
++
++def _make_step_output(output, sampled):
++    from vllm.v1.outputs import ModelRunnerOutput
++
++    req_ids = list(output.num_scheduled_tokens)
++    return ModelRunnerOutput(
++        req_ids=req_ids,
++        req_id_to_index={req_id: i for i, req_id in enumerate(req_ids)},
++        sampled_token_ids=[[1000] if sampled[req_id] else [] for req_id in req_ids],
++        logprobs=None,
++        prompt_logprobs_dict={},
++        pooler_output=[],
++    )
++
++
++def _fail_one_allocation(scheduler, call_number):
++    real_allocate = scheduler.kv_cache_manager.allocate_slots
++    calls = 0
++
++    def allocate(*args, **kwargs):
++        nonlocal calls
++        calls += 1
++        if calls == call_number:
++            return None
++        return real_allocate(*args, **kwargs)
++
++    return patch.object(scheduler.kv_cache_manager, "allocate_slots", side_effect=allocate)
++
++
++@pytest.mark.parametrize(
++    ("policy", "failed_call"),
++    [
++        ("fcfs", 1),
++        ("priority", 2),
++    ],
++)
++def test_balance_allocation_retry_waits_for_fence_then_succeeds(policy, failed_call):
++    scheduler = _make_deferring_balance_scheduler(policy)
++    requests = _create_requests(3, num_tokens=4 * _BLOCK_SIZE, max_tokens=8)
++    for request in requests:
++        scheduler.add_request(request)
++    first_chunk = _schedule_step(scheduler)
++
++    worst, trigger, tail = requests
++    worst.priority, trigger.priority, tail.priority = 9, 0, 1
++
++    # The next chunk is scheduled while the first one is still in flight, so
++    # preempting any victim frees nothing this step.
++    with _fail_one_allocation(scheduler, failed_call) as allocate:
++        blocked = _schedule_step(scheduler)
++    assert allocate.call_count == failed_call
++    assert not blocked[0].preempted_req_ids
++    retry_trigger = requests[failed_call - 1]
++    assert retry_trigger.request_id not in blocked[0].num_scheduled_tokens
++
++    for output, sampled in (first_chunk, blocked):
++        if output.total_num_scheduled_tokens:
++            scheduler.update_from_output(output, _make_step_output(output, sampled))
++
++    # Once the fence has advanced, preempting the victim makes progress.
++    expected_victim = worst if policy == "priority" else tail
++    with _fail_one_allocation(scheduler, failed_call) as allocate:
++        resumed = scheduler.schedule()
++
++    assert allocate.call_count > failed_call
++    assert expected_victim.request_id in resumed.preempted_req_ids
++    assert retry_trigger.request_id in resumed.num_scheduled_tokens
++    if policy == "priority":
++        assert tail.request_id in resumed.num_scheduled_tokens
++
++
++def test_balance_full_pool_does_not_cascade_preempt_on_deferred_free():
++    def run(balance_enabled):
++        # Long prompt chunked in two steps plus three short prompts: the first
++        # step fills every block (one more for the null block).
++        scheduler = _make_deferring_balance_scheduler(num_blocks=2 + 3 * 2 + 1)
++        scheduler._balance_enabled = balance_enabled
++        long_request = _create_requests(1, num_tokens=4 * _BLOCK_SIZE, max_tokens=8, id_offset=100)[0]
++        # Skip the first one: its prompt would share a prefix-cached block with the long prompt.
++        short_requests = _create_requests(4, num_tokens=2 * _BLOCK_SIZE, max_tokens=8)[1:]
++        for request in (long_request, *short_requests):
++            scheduler.add_request(request)
++
++        first = _schedule_step(scheduler)
++        assert scheduler.kv_cache_manager.block_pool.get_num_free_blocks() == 0
++        # The long prompt's second chunk needs blocks while every other request
++        # is still in flight. Without the guard the retry loop preempted the
++        # whole running queue while the free-block count stayed 0.
++        overlapped = scheduler.schedule()
++        assert not overlapped.preempted_req_ids
++        assert len(scheduler.running) == 4
++        assert not scheduler.deferred_frees
++
++        scheduler.update_from_output(first[0], _make_step_output(*first))
++        resumed = scheduler.schedule()
++        return resumed.preempted_req_ids, set(resumed.num_scheduled_tokens)
++
++    # With balance disabled schedule() delegates to upstream Scheduler.
++    assert run(balance_enabled=True) == run(balance_enabled=False)
+diff --git a/vllm_ascend/core/dyntra_lb_scheduler.py b/vllm_ascend/core/dyntra_lb_scheduler.py
+index a5db678fe..64837d34d 100644
+--- a/vllm_ascend/core/dyntra_lb_scheduler.py
++++ b/vllm_ascend/core/dyntra_lb_scheduler.py
+@@ -573,6 +573,15 @@ class DyntraLBScheduler(DyntraLBPolicyMixin, Scheduler):
+                             self.running,
+                             key=lambda r: (r.priority, r.arrival_time),
+                         )
++                    else:
++                        preempted_req = self.running[-1]
++
++                    # A deferred free will not help with immediate allocation.
++                    # Check before removing the victim from the running queue.
++                    if not self._request_blocks_can_be_freed(preempted_req):
++                        break
++
++                    if self.policy == SchedulingPolicy.PRIORITY:
+                         self.running.remove(preempted_req)
+                         if preempted_req in scheduled_running_reqs:
+                             preempted_req_id = preempted_req.request_id
+diff --git a/vllm_ascend/patch/platform/patch_balance_schedule.py b/vllm_ascend/patch/platform/patch_balance_schedule.py
+index dd3de6b03..798f39935 100644
+--- a/vllm_ascend/patch/platform/patch_balance_schedule.py
++++ b/vllm_ascend/patch/platform/patch_balance_schedule.py
+@@ -310,6 +310,15 @@ class BalanceScheduler(Scheduler):
+                             self.running,
+                             key=lambda r: (r.priority, r.arrival_time),
+                         )
++                    else:
++                        preempted_req = self.running[-1]
++
++                    # A deferred free will not help with immediate allocation.
++                    # Check before removing the victim from the running queue.
++                    if not self._request_blocks_can_be_freed(preempted_req):
++                        break
++
++                    if self.policy == SchedulingPolicy.PRIORITY:
+                         self.running.remove(preempted_req)
+                         if preempted_req in scheduled_running_reqs:
+                             preempted_req_id = preempted_req.request_id

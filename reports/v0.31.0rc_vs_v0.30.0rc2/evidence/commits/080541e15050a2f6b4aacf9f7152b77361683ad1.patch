@@ -1,0 +1,201 @@
+commit 080541e15050a2f6b4aacf9f7152b77361683ad1
+Author:     vllm-ascend-ci <vllmcibot@gmail.com>
+AuthorDate: Sun Oct 11 21:06:01 2026 +0800
+Commit:     GitHub <noreply@github.com>
+CommitDate: Sun Oct 11 21:06:01 2026 +0800
+
+    [Cherry-pick][releases/v0.30.0][BugFix] Fix SFA KV cache grouping and Prolog V3 indexer compatibility with pipeline parallelism (from #18167) (#18198)
+    
+    Cherry-pick of PR #18167 onto `releases/v0.30.0`.
+    
+    Original PR: #18167
+    Original author: @YangShuai52
+    
+    ---
+    
+    ### What this PR does / why we need it?
+    Tightens AscendMLAAttentionSpec.merge() validation to reject indexer
+    specs during uniformity checks. The upstream caller can then select the
+    appropriate cache grouping instead of raising AttributeError:
+    'AscendSFAIndexerCacheSpec' object has no attribute
+    'cache_sparse_sfa_c8'.
+    Falls back to native preprocessing when the indexer query projection is
+    unquantized. This prevents PROLOG_V3 from passing a quantized query to
+    an indexer without weight_scale, including layers whose skip_topk state
+    can change at runtime.
+    ### Does this PR introduce _any_ user-facing change?
+    No
+    ### How was this patch tested?
+    
+    
+    - vLLM main:
+    https://github.com/vllm-project/vllm/commit/ced6857afa0ea7b2e3f0846a62e1394e90f15607
+    
+    Co-authored-by: github-actions[bot] <github-actions[bot]@users.noreply.github.com>
+
+diff --git a/tests/ut/attention/test_sfa_cp.py b/tests/ut/attention/test_sfa_cp.py
+index ac819d212..a3916b194 100644
+--- a/tests/ut/attention/test_sfa_cp.py
++++ b/tests/ut/attention/test_sfa_cp.py
+@@ -1300,7 +1300,8 @@ def test_sfa_dcp_slot_mapping_matches_parallel_layout(impl_cls, local_prefill, g
+ 
+ 
+ @pytest.mark.parametrize("is_kv_consumer,sfa_c8", [(False, False), (True, True)])
+-def test_sfa_pcp_keeps_prolog_v3_enabled(is_kv_consumer, sfa_c8):
++@pytest.mark.parametrize("quantized_indexer", [False, True])
++def test_sfa_pcp_keeps_prolog_v3_enabled(is_kv_consumer, sfa_c8, quantized_indexer):
+     impl = AscendSFAPCPImpl.__new__(AscendSFAPCPImpl)
+     impl.is_pcp_decode_sharded = False
+     quant_cls = AscendW8A8DynamicLinearMethod
+@@ -1313,9 +1314,17 @@ def test_sfa_pcp_keeps_prolog_v3_enabled(is_kv_consumer, sfa_c8):
+     impl.enable_sparse_sfa_c8 = sfa_c8
+     impl.enable_sparse_sfa_turboquant = False
+     impl.enable_mlapo = False
++    impl.has_indexer = True
++    impl.indexer = SimpleNamespace(
++        wq_b=SimpleNamespace(weight_scale=torch.ones(1)) if quantized_indexer else SimpleNamespace()
++    )
+     with patch.object(impl, "_try_enable_type", return_value=True) as prepare_weights:
+-        assert impl._resolve_preprocess_type(torch.bfloat16) == PreprocessType.PROLOG_V3
+-    prepare_weights.assert_called_once_with(PreprocessType.PROLOG_V3, torch.bfloat16)
++        expected = PreprocessType.PROLOG_V3 if quantized_indexer else PreprocessType.NATIVE
++        assert impl._resolve_preprocess_type(torch.bfloat16) == expected
++    if quantized_indexer:
++        prepare_weights.assert_called_once_with(PreprocessType.PROLOG_V3, torch.bfloat16)
++    else:
++        prepare_weights.assert_not_called()
+ 
+ 
+ @pytest.mark.parametrize(
+diff --git a/tests/ut/attention/test_sfa_v1.py b/tests/ut/attention/test_sfa_v1.py
+index 6bff66350..81449d2e2 100644
+--- a/tests/ut/attention/test_sfa_v1.py
++++ b/tests/ut/attention/test_sfa_v1.py
+@@ -1558,6 +1558,49 @@ class TestAscendSFAImpl(TestBase):
+         path = self.impl._resolve_preprocess_type(torch.bfloat16)
+         self.assertEqual(path, PreprocessType.PROLOG_V3)
+ 
++    def test_quantized_prolog_with_unquantized_indexer_uses_native(self):
++        self._set_quant(AscendW8A8DynamicLinearMethod)
++        self.impl.has_indexer = True
++        self.impl.skip_indexer_pre_process = False
++        self.impl.indexer = SimpleNamespace(wq_b=SimpleNamespace())
++        self.impl.enable_sparse_sfa_turboquant = False
++        self.impl.enable_sparse_sfa_c8 = True
++        self.assertEqual(self.impl._resolve_preprocess_type(torch.bfloat16), PreprocessType.NATIVE)
++
++    def test_quantized_prolog_with_missing_indexer_projection_uses_native(self):
++        self._set_quant(AscendW8A8DynamicLinearMethod)
++        self.impl.has_indexer = True
++        self.impl.indexer = SimpleNamespace()
++        self.impl.enable_sparse_sfa_turboquant = False
++        self.impl.enable_sparse_sfa_c8 = True
++        self.assertEqual(self.impl._resolve_preprocess_type(torch.bfloat16), PreprocessType.NATIVE)
++
++    def test_quantized_prolog_with_quantized_indexer_stays_fused(self):
++        self._set_quant(AscendW8A8DynamicLinearMethod)
++        self.impl.has_indexer = True
++        self.impl.skip_indexer_pre_process = False
++        self.impl.indexer = SimpleNamespace(wq_b=SimpleNamespace(weight_scale=torch.ones(1)))
++        self.impl.enable_sparse_sfa_turboquant = False
++        self.impl.enable_sparse_sfa_c8 = True
++        self.assertEqual(self.impl._resolve_preprocess_type(torch.bfloat16), PreprocessType.PROLOG_V3)
++
++    def test_unquantized_prolog_with_unquantized_indexer_uses_native(self):
++        self._set_quant(None)
++        self.impl.is_kv_consumer = True
++        self.impl.has_indexer = True
++        self.impl.indexer = SimpleNamespace(wq_b=SimpleNamespace())
++        self.impl.enable_sparse_sfa_turboquant = False
++        self.impl.enable_sparse_sfa_c8 = False
++        self.assertEqual(self.impl._resolve_preprocess_type(torch.bfloat16), PreprocessType.NATIVE)
++
++    def test_skipped_unquantized_indexer_preserves_native_query_path(self):
++        self._set_quant(AscendW8A8DynamicLinearMethod)
++        self.impl.has_indexer = True
++        self.impl.skip_indexer_pre_process = True
++        self.impl.indexer = SimpleNamespace(wq_b=SimpleNamespace())
++        self.impl.enable_sparse_sfa_turboquant = False
++        self.assertEqual(self.impl._resolve_preprocess_type(torch.bfloat16), PreprocessType.NATIVE)
++
+     def test_resolve_path_w8a8_mlapo_enabled_goes_mlapo(self):
+         """W8A8 + enable_mlapo → MLAPO."""
+         self._set_quant(AscendW8A8LinearMethod)
+diff --git a/tests/ut/core/test_kv_cache_interface.py b/tests/ut/core/test_kv_cache_interface.py
+index 0e4c3e075..1c8a3027b 100644
+--- a/tests/ut/core/test_kv_cache_interface.py
++++ b/tests/ut/core/test_kv_cache_interface.py
+@@ -6,6 +6,7 @@ from types import SimpleNamespace
+ import pytest
+ import torch
+ from vllm.v1.core.block_pool import BlockPool
++from vllm.v1.core.kv_cache_utils import is_kv_cache_spec_uniform
+ from vllm.v1.core.single_type_kv_cache_manager import CircularBufferManager, register_all_kvcache_specs
+ from vllm.v1.kv_cache_interface import CircularBufferSpec, UniformTypeKVCacheSpecs
+ from vllm.v1.kv_cache_spec_registry import KVCacheSpecRegistry
+@@ -13,6 +14,7 @@ from vllm.v1.kv_cache_spec_registry import KVCacheSpecRegistry
+ from vllm_ascend.core.kv_cache_interface import (
+     AscendCircularBufferSpec,
+     AscendMLAAttentionSpec,
++    AscendSFAIndexerCacheSpec,
+     AscendSlidingWindowMLASpec,
+     get_kv_cache_compression_ratio,
+     get_storage_block_size,
+@@ -29,6 +31,22 @@ def _mla_spec():
+     )
+ 
+ 
++@pytest.mark.parametrize("indexer_first", [False, True])
++def test_mixed_mla_indexer_specs_are_not_uniform(indexer_first):
++    main_spec = _mla_spec()
++    indexer_spec = AscendSFAIndexerCacheSpec(block_size=16, num_kv_heads=1, head_size=128, dtype=torch.bfloat16)
++    specs = [("main", main_spec), ("indexer", indexer_spec)]
++    if indexer_first:
++        specs.reverse()
++    assert not is_kv_cache_spec_uniform(dict(specs))
++
++
++def test_matching_ascend_mla_specs_merge():
++    spec = _mla_spec()
++    assert AscendMLAAttentionSpec.merge([spec, spec]) == spec
++    assert is_kv_cache_spec_uniform({"layer0": spec, "layer1": spec})
++
++
+ def test_get_storage_block_size_and_dcp_memory():
+     spec = _mla_spec()
+     # On main, storage_block_size is an optional dataclass field and may be
+diff --git a/vllm_ascend/attention/sfa_v1.py b/vllm_ascend/attention/sfa_v1.py
+index d52152998..c888d25e8 100644
+--- a/vllm_ascend/attention/sfa_v1.py
++++ b/vllm_ascend/attention/sfa_v1.py
+@@ -1068,6 +1068,13 @@ class AscendSFAImpl(MLAAttentionImpl):
+         quant_method = self._get_layer_quant_method(self.fused_qkv_a_proj)
+         qt = type(quant_method) if quant_method is not None else None
+         if pp_type is PreprocessType.PROLOG_V3:
++            # Prolog's indexer query can carry quantization scales independently
++            # of the MLA weight type. Preserve the native query for an
++            # unquantized indexer, including layers that later toggle skip_topk.
++            if self.has_indexer:
++                wq_b = getattr(self.indexer, "wq_b", None)
++                if not hasattr(wq_b, "weight_scale"):
++                    reasons.append("PROLOG_V3 requires a quantized indexer query projection.")
+             if self.enable_sparse_sfa_turboquant:
+                 reasons.append("PROLOG_V3 does not support the TurboQuant 4-bit latent cache.")
+             if qt is None and self.enable_sparse_sfa_c8:
+diff --git a/vllm_ascend/core/kv_cache_interface.py b/vllm_ascend/core/kv_cache_interface.py
+index afa2c354c..16e501e13 100644
+--- a/vllm_ascend/core/kv_cache_interface.py
++++ b/vllm_ascend/core/kv_cache_interface.py
+@@ -130,8 +130,10 @@ class AscendMLAAttentionSpec(MLAAttentionSpec):
+ 
+     @classmethod
+     def merge(cls, specs: list[Self]) -> Self:
+-        assert all(isinstance(spec, MLAAttentionSpec) for spec in specs), (
+-            "All attention layers in the same KV cache group must be MLAAttentionSpec."
++        # Uniformity probes may include indexer specs, which share the upstream
++        # MLA base class but do not have the main cache's layout metadata.
++        assert all(isinstance(spec, AscendMLAAttentionSpec) for spec in specs), (
++            "All attention layers in the same KV cache group must be AscendMLAAttentionSpec."
+         )
+         ascend_layouts = {
+             (

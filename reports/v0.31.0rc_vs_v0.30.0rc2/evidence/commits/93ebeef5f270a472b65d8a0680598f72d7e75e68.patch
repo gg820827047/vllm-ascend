@@ -1,0 +1,447 @@
+commit 93ebeef5f270a472b65d8a0680598f72d7e75e68
+Author:     liben <61270660+q664171689@users.noreply.github.com>
+AuthorDate: Sat Oct 17 19:42:52 2026 +0800
+Commit:     GitHub <noreply@github.com>
+CommitDate: Sat Oct 17 19:42:52 2026 +0800
+
+    [BugFix][DSpark] Preserve Kimi K3 draft checkpoint LM head (#19061)
+    
+    ### What this PR does / why we need it?
+    
+    The Kimi K3 MLA DSpark adapter inherits a weight mapper that drops
+    `lm_head` entries. When a draft checkpoint supplies its own output head,
+    loading therefore loses that head and leaves target-head sharing or
+    QuaRot alignment to supply a replacement. The checkpoint head already
+    operates in the draft hidden-state basis and must be preserved.
+    
+    This change intercepts `lm_head.weight` (including prefixed names)
+    before mapping, validates its full shape against the draft
+    configuration, and loads an unquantized `ParallelLMHead` on the draft
+    projection's device using the draft dtype and the parameter's weight
+    loader. Setting `has_own_lm_head` prevents target sharing/alignment from
+    replacing or rotating it. Duplicate heads and incompatible shapes raise
+    clear errors. Checkpoints without an output head retain the existing
+    fallback behavior.
+    
+    The patch's loading policy is retained, with logging adapted to the
+    repository's shared `vllm.logger.logger`. Adds focused regression tests
+    for the loading policy. The no-head path returns early, and a newly
+    constructed head is attached only after its weights load successfully,
+    preserving the previous head and ownership state on failure.
+    
+    ### Does this PR introduce _any_ user-facing change?
+    
+    Yes. Kimi K3 MLA DSpark checkpoints containing an output head now use
+    that head instead of discarding it. Invalid or ambiguous head weights
+    fail during loading. No new configuration is required; checkpoints
+    without a head keep their existing behavior.
+    
+    ### How was this patch tested?
+    
+    - Added `tests/ut/models/test_kimi_k3_dspark_weights.py`: 22 cases
+    covering bare/prefixed names, default/custom shard loaders, device
+    selection, missing heads and empty input, incompatible shapes,
+    duplicates, preservation through QuaRot alignment, and preservation of
+    the previous head/ownership on load failure. Six cases use the real
+    `AutoWeightsLoader` and inherited mapper with small CPU modules to check
+    PP embedding ownership, ignored confidence-head weights, and
+    head-first/head-last/absent ordering.
+    - Local isolated CPU validation: **22 passed**. The harness executes the
+    production loading/alignment bodies and the upstream
+    `AutoWeightsLoader`, `WeightsMapper`, default weight loader, and K3
+    mapper source from vLLM commit
+    `c4df37dfcc7f72ca41cd43801a468526ecf99a2b`. External vLLM/NPU imports,
+    parallel head construction, and the torchao reload decorator are
+    stubbed; this is not full-package integration or distributed TP/PP
+    validation. Against the previous PR implementation, the same suite
+    produced **2 failures / 20 passes**, reproducing both head-state
+    corruption cases on a failed load.
+    - Passed Ruff lint and format checks, Python compilation, `git diff
+    --check`, the repository logger check, codespell, forbidden-import,
+    boolean-context-manager and long-function checks for the changed files.
+    - In CI run
+    [39005458752](https://github.com/vllm-project/vllm-ascend/actions/runs/39005458752),
+    all 22 new weight-loading cases passed with both vLLM main (`c4df37d`)
+    and `v0.31.0`. The two failures in each CPU job came from the existing
+    AST-based mapper test missing a logger binding. Updated that fixture to
+    provide the logger and consume/return weights consistently with the
+    loader contract. After the fix, `python -X utf8 -m pytest -q
+    --confcutdir=tests/ut/models tests/ut/models/test_kimi_k3_pp_sp.py`
+    passed all **130 tests** locally. The initial local run used Windows GBK
+    decoding and failed on UTF-8 source text; `-X utf8` resolves this
+    environment issue without source changes. The latest commit awaits CI
+    confirmation.
+    - Attempted `bash format.sh ci`; the latest attempt again remained at
+    actionlint environment installation and was stopped after a 45-second
+    timeout. The full repository pre-commit check passed in CI on the
+    preceding revision; changed-file checks for the test-fixture fix also
+    passed locally.
+    - NPU model loading, distributed TP/PP, and end-to-end speculative
+    decoding have **not** been validated here. Before merge, validate a
+    draft checkpoint with its own head and one without, including a QuaRot
+    target, on supported Ascend hardware.
+    
+    ---
+    
+    ### Checklist
+    
+    #### Testing
+    
+    - [x] **Boundary / edge-case coverage**: Missing head, empty iterator,
+    prefixed names, and invalid shapes.
+    - [x] **Regression test**: Added cases fail against the original loading
+    method.
+    - [x] **Error / failure path coverage**: Duplicate and incompatible
+    checkpoint heads.
+    - [x] **Meaningful & reliable tests**: Assert loaded tensor values,
+    ownership, device, shard-loader dispatch, and preservation during
+    alignment.
+    - [ ] **Performance impact**: No inference hot-path change; NPU
+    validation remains pending.
+    
+    
+    
+    - vLLM main:
+    https://github.com/vllm-project/vllm/commit/c4df37dfcc7f72ca41cd43801a468526ecf99a2b
+    
+    ---------
+    
+    Signed-off-by: q664171689 <664171689@qq.com>
+
+diff --git a/tests/ut/models/test_kimi_k3_dspark_weights.py b/tests/ut/models/test_kimi_k3_dspark_weights.py
+new file mode 100644
+index 000000000..6bb75b3aa
+--- /dev/null
++++ b/tests/ut/models/test_kimi_k3_dspark_weights.py
+@@ -0,0 +1,221 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++
++from types import SimpleNamespace
++from unittest.mock import MagicMock
++
++import pytest
++import torch
++from torch import nn
++from vllm.model_executor.models.utils import AutoWeightsLoader
++
++from vllm_ascend.models import kimi_k3_dspark, qwen3_dspark
++
++
++@pytest.fixture
++def draft_model():
++    model_cls = kimi_k3_dspark.AscendK3DSparkForCausalLM
++    model = model_cls.__new__(model_cls)
++    nn.Module.__init__(model)
++    model.config = SimpleNamespace(vocab_size=4, hidden_size=2)
++    model.draft_model_config = SimpleNamespace(dtype=torch.float32)
++    model.model = nn.Module()
++    model.model.context_proj = nn.Linear(2, 2, bias=False)
++    model.lm_head = None
++    model._owns_embed_tokens = False
++    model.has_own_lm_head = False
++    return model
++
++
++@pytest.fixture
++def draft(draft_model, monkeypatch):
++    # Consume the generator as AutoWeightsLoader does, retaining the weights
++    # passed to it so interception can be checked independently of mapping.
++    forwarded = []
++
++    def load_weights(weights, *, mapper):
++        forwarded.extend(weights)
++        return {name for name, _ in forwarded}
++
++    loader = MagicMock()
++    loader.load_weights.side_effect = load_weights
++    monkeypatch.setattr(kimi_k3_dspark, "AutoWeightsLoader", lambda model: loader)
++    return draft_model, forwarded
++
++
++@pytest.mark.parametrize("name", ["lm_head.weight", "model.lm_head.weight", "language_model.lm_head.weight"])
++@pytest.mark.parametrize("sharded", [False, True])
++def test_checkpoint_head_is_loaded_before_mapping(draft, monkeypatch, name, sharded):
++    model, forwarded = draft
++    checkpoint_head = torch.arange(8, dtype=torch.float32).reshape(4, 2)
++    projection = torch.ones(2, 2)
++    shard_loader = MagicMock()
++
++    def make_head(vocab_size, hidden_size, *, params_dtype, prefix):
++        assert (vocab_size, hidden_size, prefix) == (4, 2, "lm_head")
++        assert params_dtype == model.draft_model_config.dtype
++        head = nn.Linear(hidden_size, 2 if sharded else vocab_size, bias=False, dtype=params_dtype)
++        if sharded:
++
++            def load_shard(param, weight):
++                with torch.no_grad():
++                    param.copy_(weight[2:])
++
++            shard_loader.side_effect = load_shard
++            head.weight.weight_loader = shard_loader
++        return head
++
++    monkeypatch.setattr(kimi_k3_dspark, "ParallelLMHead", make_head)
++    # A different ambient device catches accidental construction on the
++    # caller's device instead of the draft projection's device.
++    with torch.device("meta"):
++        loaded = model.load_weights(iter([(name, checkpoint_head), ("context_proj.weight", projection)]))
++
++    assert loaded == {"lm_head.weight", "context_proj.weight"}
++    assert [name for name, _ in forwarded] == ["context_proj.weight"]
++    assert forwarded[0][1] is projection
++    assert model.has_own_lm_head
++    assert model.lm_head.weight.device == model.model.context_proj.weight.device
++    expected = checkpoint_head[2:] if sharded else checkpoint_head
++    torch.testing.assert_close(model.lm_head.weight, expected)
++    if sharded:
++        shard_loader.assert_called_once_with(model.lm_head.weight, checkpoint_head)
++
++
++@pytest.mark.parametrize("empty", [False, True])
++def test_missing_checkpoint_head_preserves_target_fallback(draft, monkeypatch, empty):
++    model, forwarded = draft
++    make_head = MagicMock()
++    monkeypatch.setattr(kimi_k3_dspark, "ParallelLMHead", make_head)
++    weights = [] if empty else [("context_proj.weight", torch.ones(2, 2))]
++
++    loaded = model.load_weights(iter(weights))
++
++    assert loaded == {name for name, _ in weights}
++    assert len(forwarded) == len(weights)
++    assert model.lm_head is None
++    assert not model.has_own_lm_head
++    make_head.assert_not_called()
++
++
++@pytest.mark.parametrize("shape", [(3, 2), (4, 3), (8,)])
++def test_checkpoint_head_rejects_incompatible_shape(draft, monkeypatch, shape):
++    model, _ = draft
++    make_head = MagicMock()
++    monkeypatch.setattr(kimi_k3_dspark, "ParallelLMHead", make_head)
++
++    with pytest.raises(ValueError, match="does not match"):
++        model.load_weights(iter([("lm_head.weight", torch.empty(shape))]))
++
++    assert not model.has_own_lm_head
++    make_head.assert_not_called()
++
++
++@pytest.mark.parametrize("second_name", ["lm_head.weight", "model.lm_head.weight"])
++def test_checkpoint_head_rejects_duplicates(draft, second_name):
++    model, _ = draft
++    weight = torch.ones(4, 2)
++
++    with pytest.raises(ValueError, match="Multiple K3 DSpark checkpoint LM heads"):
++        model.load_weights(iter([("lm_head.weight", weight), (second_name, weight)]))
++
++    assert model.lm_head is None
++    assert not model.has_own_lm_head
++
++
++@pytest.mark.parametrize("existing_head", [False, True])
++def test_failed_head_load_preserves_model_state(draft, monkeypatch, existing_head):
++    model, _ = draft
++    original_head = nn.Linear(2, 4, bias=False) if existing_head else None
++    model.lm_head = original_head
++    model.has_own_lm_head = existing_head
++    original_weight = original_head.weight.detach().clone() if existing_head else None
++
++    def make_head(vocab_size, hidden_size, **kwargs):
++        head = nn.Linear(hidden_size, vocab_size, bias=False)
++        head.weight.weight_loader = MagicMock(side_effect=RuntimeError("head load failed"))
++        return head
++
++    monkeypatch.setattr(kimi_k3_dspark, "ParallelLMHead", make_head)
++    with pytest.raises(RuntimeError, match="head load failed"):
++        model.load_weights(iter([("lm_head.weight", torch.ones(4, 2))]))
++
++    assert model.lm_head is original_head
++    assert model.has_own_lm_head is existing_head
++    if existing_head:
++        torch.testing.assert_close(original_head.weight, original_weight)
++
++
++@pytest.mark.parametrize("owns_embed_tokens", [False, True])
++@pytest.mark.parametrize("head_position", ["absent", "first", "last"])
++def test_real_loader_preserves_head_and_embedding_policy(draft_model, monkeypatch, owns_embed_tokens, head_position):
++    model = draft_model
++    # Exercise the real mapper and recursive loader with small CPU modules.
++    monkeypatch.setattr(kimi_k3_dspark, "AutoWeightsLoader", AutoWeightsLoader)
++    monkeypatch.setattr(
++        kimi_k3_dspark,
++        "ParallelLMHead",
++        lambda vocab_size, hidden_size, **kwargs: nn.Linear(hidden_size, vocab_size, bias=False),
++    )
++    model._owns_embed_tokens = owns_embed_tokens
++    model.model.embed_tokens = nn.Embedding(4, 2)
++    embedding_before = model.model.embed_tokens.weight.detach().clone()
++    original_mapper = model.hf_to_vllm_mapper
++    projection = torch.arange(4, dtype=torch.float32).reshape(2, 2)
++    embedding = torch.arange(8, dtype=torch.float32).reshape(4, 2)
++    checkpoint_head = embedding + 10
++    weights = [
++        ("context_proj.weight", projection),
++        ("embed_tokens.weight", embedding),
++        ("confidence_head.weight", torch.ones(1)),
++    ]
++    has_head = head_position != "absent"
++    if has_head:
++        weights.insert(0 if head_position == "first" else len(weights), ("lm_head.weight", checkpoint_head))
++
++    loaded = model.load_weights(iter(weights))
++
++    expected_loaded = {"model.context_proj.weight"}
++    if owns_embed_tokens:
++        expected_loaded.add("model.embed_tokens.weight")
++    if has_head:
++        expected_loaded.add("lm_head.weight")
++        torch.testing.assert_close(model.lm_head.weight, checkpoint_head)
++    else:
++        assert model.lm_head is None
++    assert loaded == expected_loaded
++    assert model.has_own_lm_head is has_head
++    torch.testing.assert_close(model.model.context_proj.weight, projection)
++    torch.testing.assert_close(model.model.embed_tokens.weight, embedding if owns_embed_tokens else embedding_before)
++    # PP's mapper adjustment must not change the shared upstream mapper.
++    assert model.hf_to_vllm_mapper is original_mapper
++    assert original_mapper._map_name("embed_tokens.weight") is None
++    assert original_mapper._map_name("lm_head.weight") is None
++
++
++def test_checkpoint_head_survives_quarot_alignment(draft, monkeypatch):
++    model, _ = draft
++    monkeypatch.setattr(
++        kimi_k3_dspark,
++        "ParallelLMHead",
++        lambda vocab_size, hidden_size, **kwargs: nn.Linear(hidden_size, vocab_size, bias=False),
++    )
++    checkpoint_head = torch.arange(8, dtype=torch.float32).reshape(4, 2)
++    model.load_weights(iter([("lm_head.weight", checkpoint_head)]))
++    original_head = model.lm_head
++    # Embedding ownership is independent; isolate the head and projection.
++    model.has_own_embed_tokens = True
++    projection_before = model.model.context_proj.weight.detach().clone()
++    rotation = torch.tensor([[0.0, -1.0], [1.0, 0.0]])
++    monkeypatch.setattr(qwen3_dspark, "get_rotation_path", lambda config: "rotation.safetensors")
++    monkeypatch.setattr(qwen3_dspark, "get_rotation_matrix", lambda path: rotation)
++    target_loader = MagicMock()
++    monkeypatch.setattr(qwen3_dspark, "load_quarot_target_layer", target_loader)
++    config = SimpleNamespace(model_config=SimpleNamespace(hf_text_config=SimpleNamespace()))
++
++    model.post_process(config)
++
++    assert model.lm_head is original_head
++    torch.testing.assert_close(model.lm_head.weight, checkpoint_head)
++    torch.testing.assert_close(model.model.context_proj.weight, projection_before @ rotation)
++    target_loader.assert_not_called()
+diff --git a/tests/ut/models/test_kimi_k3_pp_sp.py b/tests/ut/models/test_kimi_k3_pp_sp.py
+index 6ca6a5c91..f28078ca8 100644
+--- a/tests/ut/models/test_kimi_k3_pp_sp.py
++++ b/tests/ut/models/test_kimi_k3_pp_sp.py
+@@ -5,6 +5,7 @@
+ import __future__
+ 
+ import ast
++import logging
+ import threading
+ from bisect import bisect_left, bisect_right
+ from concurrent.futures import ThreadPoolExecutor
+@@ -467,12 +468,16 @@ def test_draft_mapper_reuses_upstream_rules(owns_embed):
+         {".gate_proj": (".gate_up_proj", 0)},
+     )
+     captured = []
++
++    def load_weights(weights, *, mapper):
++        captured.append(mapper)
++        return {name for name, _ in weights}
++
+     namespace = {
+         "BaseModel": nn.Module,
+         "replace": replace,
+-        "AutoWeightsLoader": lambda model: SimpleNamespace(
+-            load_weights=lambda weights, mapper: captured.append(mapper)
+-        ),
++        "logger": logging.getLogger(__name__),
++        "AutoWeightsLoader": lambda model: SimpleNamespace(load_weights=load_weights),
+     }
+     load_definitions(
+         "vllm_ascend/models/kimi_k3_dspark.py",
+@@ -484,7 +489,7 @@ def test_draft_mapper_reuses_upstream_rules(owns_embed):
+     model = namespace["AscendK3DSparkForCausalLM"]()
+     model.hf_to_vllm_mapper = mapper
+     model._owns_embed_tokens = owns_embed
+-    model.load_weights([])
++    assert model.load_weights([]) == set()
+     selected = captured[0]
+     expected = dict(mapper.orig_to_new_substr)
+     if owns_embed:
+diff --git a/vllm_ascend/models/kimi_k3_dspark.py b/vllm_ascend/models/kimi_k3_dspark.py
+index 3c5058dbe..e4762eecc 100644
+--- a/vllm_ascend/models/kimi_k3_dspark.py
++++ b/vllm_ascend/models/kimi_k3_dspark.py
+@@ -9,10 +9,15 @@ import torch
+ from torch import nn
+ from vllm.config import VllmConfig
+ from vllm.distributed import get_pp_group
++from vllm.logger import logger
+ from vllm.model_executor.layers.layernorm import RMSNorm
+ from vllm.model_executor.layers.linear import ColumnParallelLinear
+ from vllm.model_executor.layers.logits_processor import LogitsProcessor
+-from vllm.model_executor.layers.vocab_parallel_embedding import VocabParallelEmbedding
++from vllm.model_executor.layers.vocab_parallel_embedding import (
++    ParallelLMHead,
++    VocabParallelEmbedding,
++)
++from vllm.model_executor.model_loader.weight_utils import default_weight_loader
+ from vllm.model_executor.models.interfaces import MultiModalEmbeddings
+ from vllm.model_executor.models.qwen3_dspark import DSparkMarkovHead
+ from vllm.model_executor.models.utils import (
+@@ -338,7 +343,46 @@ class AscendK3DSparkForCausalLM(UpstreamK3DSparkForCausalLM):
+                     key: value for key, value in mapper.orig_to_new_substr.items() if key != "embed_tokens"
+                 },
+             )
+-        return loader.load_weights(weights, mapper=mapper)
++        checkpoint_lm_head = None
++
++        def weights_without_lm_head():
++            nonlocal checkpoint_lm_head
++            for name, weight in weights:
++                # Intercept before the inherited mapper discards lm_head.
++                if name == "lm_head.weight" or name.endswith(".lm_head.weight"):
++                    if checkpoint_lm_head is not None:
++                        raise ValueError("Multiple K3 DSpark checkpoint LM heads were found.")
++                    checkpoint_lm_head = weight
++                else:
++                    yield name, weight
++
++        loaded_weights = loader.load_weights(weights_without_lm_head(), mapper=mapper)
++        if checkpoint_lm_head is None:
++            logger.debug("No K3 DSpark checkpoint LM head; using target sharing/alignment.")
++            return loaded_weights
++
++        expected_shape = (self.config.vocab_size, self.config.hidden_size)
++        if tuple(checkpoint_lm_head.shape) != expected_shape:
++            raise ValueError(
++                f"K3 DSpark checkpoint LM head shape {tuple(checkpoint_lm_head.shape)} does not match {expected_shape}."
++            )
++        # load_weights runs outside BaseModelLoader's device context.
++        with torch.device(self.model.context_proj.weight.device):
++            lm_head = ParallelLMHead(
++                self.config.vocab_size,
++                self.config.hidden_size,
++                params_dtype=self.draft_model_config.dtype,
++                prefix="lm_head",
++            )
++        weight_loader = getattr(lm_head.weight, "weight_loader", default_weight_loader)
++        weight_loader(lm_head.weight, checkpoint_lm_head)
++        self.lm_head = lm_head
++        # The checkpoint head already consumes draft hidden states. Ownership
++        # prevents target sharing/alignment from replacing or rotating it.
++        self.has_own_lm_head = True
++        loaded_weights.add("lm_head.weight")
++        logger.info("Loaded K3 DSpark checkpoint LM head, local shape: %s", tuple(lm_head.weight.shape))
++        return loaded_weights
+ 
+     def embed_input_ids(
+         self,

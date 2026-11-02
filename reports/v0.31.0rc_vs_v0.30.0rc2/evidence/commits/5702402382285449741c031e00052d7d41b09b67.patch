@@ -1,0 +1,323 @@
+commit 5702402382285449741c031e00052d7d41b09b67
+Author:     zhaoting <37293445+CaitinZhao@users.noreply.github.com>
+AuthorDate: Tue Oct 13 10:15:28 2026 +0800
+Commit:     GitHub <noreply@github.com>
+CommitDate: Tue Oct 13 10:15:28 2026 +0800
+
+    [Performance][MoE] Optimize NPU event recording for MoE multistream overlap (#17603)
+    
+    ### What this PR does / why we need it?
+    
+    The NPU events recorded around the routed-experts path (router
+    milestones `shared_input_ready`/`router_output_ready`, and
+    `before_dispatch`/`before_gmm2`/`before_combine` inside the routed path)
+    are consumed **only** by the shared-expert side stream, which exists
+    solely when `multistream_overlap_shared_expert` is enabled. When the
+    overlap is off, every `record_event` is pure host-side overhead paid per
+    MoE layer per step, and host-side record is notably slow.
+    
+    The consumers in `shared_experts.py` already gate every wait on the same
+    flag (`_wait_for_milestone` returns immediately when the overlap is off
+    and fails fast if a milestone is missing while it is on), and the
+    `RoutedMoEMilestones`/`FusedExpertsResult` event fields are already
+    `Optional`. So the producer-side records can be skipped safely with no
+    consumer changes.
+    
+    This PR gates the always-on-path record sites behind the flag via a
+    shared helper, `maybe_record_event()` (defined in
+    `ops/fused_moe/moe_mlp.py`):
+    
+    - `ops/fused_moe/moe_mlp.py`: define `maybe_record_event()` and use it
+    for the `before_gmm2_evt` record in `apply_moe_mlp`; the entry now
+    returns an Optional event;
+    - `ops/fused_moe/moe_comm_method.py`: gate `before_dispatch_evt` /
+    `before_combine_evt`;
+    - `ops/fused_moe/fused_moe.py`: gate `shared_input_ready` /
+    `router_output_ready` in `_prepare_router_and_milestones`
+    (`routed_finalize_done` is already recorded only on the SP-overlap
+    gather path, so it needs no extra gating).
+    
+    `maybe_record_event()` skips the record only when the initialized config
+    proves the overlap is off; an uninitialized config keeps the legacy
+    always-record behavior. The 310P-specific and LoRA gmm2 records are
+    intentionally left unconditional for now (not yet validated on device);
+    they can adopt the same gate in a follow-up.
+    
+    With the overlap off (default), the main MoE path no longer issues any
+    event records; with the overlap on, behavior is unchanged.
+    
+    ### Profiling
+    
+    Host-side timeline of one MoE layer step before and after this change:
+    
+    **Before (events recorded unconditionally on the routed stream):**
+    
+    <img width="1023" height="172" alt="image"
+    src="https://github.com/user-attachments/assets/7b41c554-8ee6-4c47-88e8-18b8053ca72e"
+    />
+    
+    **After (records skipped when multistream overlap is off):**
+    
+    <img width="680" height="162" alt="image"
+    src="https://github.com/user-attachments/assets/d77d873f-6409-4d3d-b819-c311417668f2"
+    />
+    
+    ### Does this PR introduce _any_ user-facing change?
+    
+    No. With `multistream_overlap_shared_expert` enabled the behavior is
+    unchanged; with it disabled only the unused event records are skipped.
+    
+    ### How was this patch tested?
+    
+    - The runner-contract unit tests (`tests/ut/ops/test_fused_moe.py`)
+    patch the overlap flag explicitly to keep exercising the record path,
+    and new cases cover the skip path (milestones stay `None` with
+    `record_event` never called); all other MoE tests (including 310P and
+    LoRA) run unchanged.
+    - CPU UT / pre-commit / DCO checks on this PR.
+    - E2E MoE serving on Ascend NPU with `multistream_overlap_shared_expert`
+    off (skip path) and on (unchanged path), plus the profiling screenshots
+    above.
+    
+    
+    - vLLM main:
+    https://github.com/vllm-project/vllm/commit/ced6857afa0ea7b2e3f0846a62e1394e90f15607
+    
+    Signed-off-by: zhao_ting_v <zhaoting23@huawei.com>
+    Co-authored-by: zhao_ting_v <zhaoting23@huawei.com>
+
+diff --git a/tests/ut/ops/test_fused_moe.py b/tests/ut/ops/test_fused_moe.py
+index 387e2239b..2a09bc8d0 100644
+--- a/tests/ut/ops/test_fused_moe.py
++++ b/tests/ut/ops/test_fused_moe.py
+@@ -2383,6 +2383,12 @@ def test_forward_impl_returns_current_runner_contract(monkeypatch, has_shared_ex
+ 
+     monkeypatch.setattr(AscendMoERunner, "is_internal_router", property(lambda _: False))
+     monkeypatch.setattr(fused_moe_module.torch.npu, "current_stream", lambda: current_stream)
++    # Milestones are only recorded when the shared-expert multistream overlap
++    # is enabled; enable it so the recording contract is exercised here.
++    monkeypatch.setattr(
++        "vllm_ascend.ops.fused_moe.moe_mlp.get_ascend_config",
++        lambda: SimpleNamespace(multistream_overlap_shared_expert=True),
++    )
+ 
+     result = runner._forward_impl(
+         hidden_states,
+@@ -2491,6 +2497,10 @@ def test_forward_impl_gathers_sp_input_before_routed_collectives(monkeypatch):
+ 
+     monkeypatch.setattr(AscendMoERunner, "is_internal_router", property(lambda _: False))
+     monkeypatch.setattr(fused_moe_module.torch.npu, "current_stream", lambda: current_stream)
++    monkeypatch.setattr(
++        "vllm_ascend.ops.fused_moe.moe_mlp.get_ascend_config",
++        lambda: SimpleNamespace(multistream_overlap_shared_expert=True),
++    )
+ 
+     result = runner._forward_impl(
+         hidden_states,
+@@ -2537,6 +2547,10 @@ def test_forward_impl_records_router_milestones(monkeypatch):
+ 
+     monkeypatch.setattr(AscendMoERunner, "is_internal_router", property(lambda _: True))
+     monkeypatch.setattr(fused_moe_module.torch.npu, "current_stream", lambda: current_stream)
++    monkeypatch.setattr(
++        "vllm_ascend.ops.fused_moe.moe_mlp.get_ascend_config",
++        lambda: SimpleNamespace(multistream_overlap_shared_expert=True),
++    )
+ 
+     result = runner._forward_impl(
+         hidden_states,
+@@ -2621,6 +2635,12 @@ def test_internal_router_releases_shared_stream_after_input_cast(monkeypatch):
+     monkeypatch.setattr(AscendMoERunner, "is_internal_router", property(lambda _: True))
+     monkeypatch.setattr(fused_moe_module.torch.npu, "current_stream", lambda: current_stream)
+     monkeypatch.setattr(fused_moe_module.F, "linear", MagicMock(side_effect=router_linear))
++    # Milestones are only recorded when the shared-expert multistream overlap
++    # is enabled; enable it so the recording contract is exercised here.
++    monkeypatch.setattr(
++        "vllm_ascend.ops.fused_moe.moe_mlp.get_ascend_config",
++        lambda: SimpleNamespace(multistream_overlap_shared_expert=True),
++    )
+ 
+     router_logits, actual_shared_ready, actual_router_ready, actual_submitted_gate_up = (
+         runner._prepare_router_and_milestones(
+@@ -2690,6 +2710,12 @@ def test_internal_router_without_precast_keeps_registered_gate_forward(monkeypat
+     current_stream.record_event.side_effect = record_event
+     monkeypatch.setattr(AscendMoERunner, "is_internal_router", property(lambda _: True))
+     monkeypatch.setattr(fused_moe_module.torch.npu, "current_stream", lambda: current_stream)
++    # Milestones are only recorded when the shared-expert multistream overlap
++    # is enabled; enable it so the recording contract is exercised here.
++    monkeypatch.setattr(
++        "vllm_ascend.ops.fused_moe.moe_mlp.get_ascend_config",
++        lambda: SimpleNamespace(multistream_overlap_shared_expert=True),
++    )
+ 
+     result = runner._prepare_router_and_milestones(prepared_input, hidden_states, object())
+ 
+@@ -2704,6 +2730,41 @@ def test_internal_router_without_precast_keeps_registered_gate_forward(monkeypat
+     hidden_states.float.assert_not_called()
+ 
+ 
++def test_forward_impl_skips_milestones_when_overlap_disabled(monkeypatch):
++    runner = AscendMoERunner.__new__(AscendMoERunner)
++    nn.Module.__init__(runner)
++    runner.routed_input_transform = None
++    runner.routed_output_transform = None
++    hidden_states = torch.randn(2, 4)
++    router_logits = torch.randn(2, 3)
++    routed_out = torch.randn(2, 4)
++    shared_out = torch.randn(2, 4)
++    milestones = RoutedMoEMilestones()
++    runner.routed_experts = SimpleNamespace(forward_impl=MagicMock(return_value=(routed_out, milestones)))
++    runner.ascend_shared_experts = SimpleNamespace(
++        multistream_overlap=False,
++        prepare_input_before_routed=MagicMock(return_value=PreparedSharedExpertInput(hidden_states)),
++        forward=MagicMock(return_value=shared_out),
++    )
++    runner._sequence_parallel_context = MagicMock(return_value=nullcontext())
++    current_stream = MagicMock()
++
++    monkeypatch.setattr(AscendMoERunner, "is_internal_router", property(lambda _: False))
++    monkeypatch.setattr(fused_moe_module.torch.npu, "current_stream", lambda: current_stream)
++    monkeypatch.setattr(
++        "vllm_ascend.ops.fused_moe.moe_mlp.get_ascend_config",
++        lambda: SimpleNamespace(multistream_overlap_shared_expert=False),
++    )
++
++    result = runner._forward_impl(hidden_states, router_logits, shared_experts_input=None)
++
++    assert result[0] is shared_out
++    assert result[1] is routed_out
++    current_stream.record_event.assert_not_called()
++    assert milestones.shared_input_ready is None
++    assert milestones.router_output_ready is None
++
++
+ @pytest.mark.parametrize("has_shared_experts", [False, True])
+ @pytest.mark.parametrize("has_fp32_input", [False, True])
+ def test_internal_router_reuses_fused_fp32_input(monkeypatch, has_shared_experts, has_fp32_input):
+diff --git a/vllm_ascend/ops/fused_moe/fused_moe.py b/vllm_ascend/ops/fused_moe/fused_moe.py
+index 85224d998..13dbf44f9 100644
+--- a/vllm_ascend/ops/fused_moe/fused_moe.py
++++ b/vllm_ascend/ops/fused_moe/fused_moe.py
+@@ -33,6 +33,7 @@ from vllm_ascend.ascend_forward_context import _EXTRA_CTX, MoECommType
+ from vllm_ascend.distributed.parallel_state import get_mc2_group
+ from vllm_ascend.ops.fused_moe.dataclass.shared_experts import PreparedSharedExpertInput, RoutedMoEMilestones
+ from vllm_ascend.ops.fused_moe.moe_comm_method import get_moe_comm_method, setup_moe_comm_method
++from vllm_ascend.ops.fused_moe.moe_mlp import maybe_record_event
+ from vllm_ascend.ops.fused_moe.routed_experts import AscendRoutedExperts
+ from vllm_ascend.ops.fused_moe.shared_experts import (
+     AscendSharedExperts,
+@@ -448,24 +449,27 @@ class AscendMoERunner(MoERunner):  # type: ignore[no-redef]
+         router_logits: torch.Tensor,
+     ) -> tuple[
+         torch.Tensor,
+-        torch.npu.Event,
+-        torch.npu.Event,
++        torch.npu.Event | None,
++        torch.npu.Event | None,
+         SubmittedSharedExpertGateUp | None,
+     ]:
++        # The milestones are consumed only by the shared-expert side stream,
++        # which runs only when multistream overlap is enabled; skip the record
++        # (notably slow host-side) when it is off.
+         if self.is_internal_router:
+             router_input = self._prepare_router_input(shared_hidden_states, router_logits)
+             # Release shared Vector/AIV preparation only after the router input
+             # Cast. It then overlaps the Cube-heavy gate matmul instead of
+             # competing with another Vector/AIV operation.
+-            shared_input_ready = torch.npu.current_stream().record_event()
++            shared_input_ready = maybe_record_event()
+             prepared_execution = self._prepare_shared_for_router_overlap(
+                 prepared_shared_input,
+                 shared_input_ready,
+             )
+             router_logits = self._apply_router_linear(router_input)
+-            router_output_ready = torch.npu.current_stream().record_event()
++            router_output_ready = maybe_record_event()
+         else:
+-            shared_input_ready = torch.npu.current_stream().record_event()
++            shared_input_ready = maybe_record_event()
+             prepared_execution = self._prepare_shared_for_router_overlap(
+                 prepared_shared_input,
+                 shared_input_ready,
+diff --git a/vllm_ascend/ops/fused_moe/moe_comm_method.py b/vllm_ascend/ops/fused_moe/moe_comm_method.py
+index fb907e3d9..de1cb8184 100644
+--- a/vllm_ascend/ops/fused_moe/moe_comm_method.py
++++ b/vllm_ascend/ops/fused_moe/moe_comm_method.py
+@@ -32,7 +32,7 @@ from vllm_ascend.ops.fused_moe.dataclass.fused_experts import MoEFusedExpertsInp
+ from vllm_ascend.ops.fused_moe.dataclass.moe_mlp import MoEMlpComputeInput, build_mlp_compute_input
+ from vllm_ascend.ops.fused_moe.dataclass.prepare_finalize import MoEPrepareOutput
+ from vllm_ascend.ops.fused_moe.dataclass.token_dispatcher import build_token_dispatch_input
+-from vllm_ascend.ops.fused_moe.moe_mlp import apply_moe_mlp
++from vllm_ascend.ops.fused_moe.moe_mlp import apply_moe_mlp, maybe_record_event
+ from vllm_ascend.ops.fused_moe.prepare_finalize import (
+     PrepareAndFinalize,
+     PrepareAndFinalizeWithAll2All,
+@@ -151,7 +151,7 @@ class MoECommMethod(ABC):
+         moe_comm_method = _EXTRA_CTX.moe_comm_method
+         assert moe_comm_method is not None, "Missing communication context"
+ 
+-        before_dispatch_evt = torch.npu.current_stream().record_event()
++        before_dispatch_evt = maybe_record_event()
+ 
+         token_dispatch_input = build_token_dispatch_input(
+             fused_experts_input=fused_experts_input,
+@@ -177,7 +177,7 @@ class MoECommMethod(ABC):
+         if shared_activation_overlap_start_evt is None:
+             shared_activation_overlap_start_evt = before_gmm2_evt
+ 
+-        before_combine_evt = torch.npu.current_stream().record_event()
++        before_combine_evt = maybe_record_event()
+         routed_out = self.token_dispatcher.token_combine(
+             hidden_states=mlp_output,
+             combine_metadata=token_dispatch_output.combine_metadata,
+diff --git a/vllm_ascend/ops/fused_moe/moe_mlp.py b/vllm_ascend/ops/fused_moe/moe_mlp.py
+index 2925040fe..19b4f57fe 100644
+--- a/vllm_ascend/ops/fused_moe/moe_mlp.py
++++ b/vllm_ascend/ops/fused_moe/moe_mlp.py
+@@ -19,15 +19,37 @@ import torch
+ import torch_npu
+ from vllm.model_executor.layers.fused_moe.activation import MoEActivation
+ 
++from vllm_ascend.ascend_config import get_ascend_config
+ from vllm_ascend.device.device_op import DeviceOperator
+ from vllm_ascend.ops.activation import AscendSwigluOAIAndMul, AscendSwigluStepAndMul
+ from vllm_ascend.ops.fused_moe.dataclass.moe_mlp import MoEMlpComputeInput
+ 
+ 
++def maybe_record_event() -> torch.npu.Event | None:
++    """Record an NPU event on the current stream for the shared-expert overlap.
++
++    Host-side record_event is expensive, and the events are consumed only by
++    the shared-expert side stream, which exists solely when multistream overlap
++    is enabled (the wait sites in shared_experts.py gate on the same flag);
++    skip the record only when the initialized config proves the overlap is off.
++    An uninitialized config cannot prove that, so it keeps the legacy
++    always-record behavior instead of changing what the caller sees.
++    """
++    try:
++        overlap = get_ascend_config().multistream_overlap_shared_expert
++    except RuntimeError:
++        # Ascend config not initialized yet (e.g. unit-test or early-tracing
++        # contexts): fall back to the unconditional record.
++        return torch.npu.current_stream().record_event()
++    if overlap:
++        return torch.npu.current_stream().record_event()
++    return None
++
++
+ def apply_moe_mlp(
+     mlp_compute_input: MoEMlpComputeInput,
+     quant_method,
+-) -> tuple[torch.Tensor, torch.npu.Event]:
++) -> tuple[torch.Tensor, torch.npu.Event | None]:
+     """
+     Unified MoE MLP entry.
+     Quant path is dispatched by each FusedMoEMethod with explicit typed kernel flags.
+@@ -52,7 +74,7 @@ def apply_moe_mlp(
+         hidden_states = _unified_apply_activation(mlp_compute_input, hidden_states, quant_method)
+         hidden_states, act_out_scale = quant_method.apply_act_quant(mlp_compute_input, hidden_states)
+ 
+-    before_gmm2_evt = torch.npu.current_stream().record_event()
++    before_gmm2_evt = maybe_record_event()
+     hidden_states = quant_method.apply_gmm2(mlp_compute_input, hidden_states, act_out_scale)
+     return hidden_states, before_gmm2_evt
+ 

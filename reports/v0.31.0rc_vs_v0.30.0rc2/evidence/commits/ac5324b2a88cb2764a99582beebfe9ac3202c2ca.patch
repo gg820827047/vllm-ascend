@@ -1,0 +1,2489 @@
+commit ac5324b2a88cb2764a99582beebfe9ac3202c2ca
+Author:     ZT-AIA <1028681969@qq.com>
+AuthorDate: Sat Oct 10 21:38:35 2026 +0800
+Commit:     GitHub <noreply@github.com>
+CommitDate: Sat Oct 10 21:38:35 2026 +0800
+
+    [Refactor] Remove StoreKVBlock optimization and c8_enable_reshape_optim switch (#18128)
+    
+    ## Description
+    
+    The StoreKVBlock grouped cache-write optimization for LightningIndexer
+    C8 is no longer used. This PR removes it end to end:
+    
+    - The `c8_enable_reshape_optim` config switch and its derived
+    `c8_reshape_optim_enabled` state in `ascend_config.py`
+    - The `store_kv_block` call path in
+    `AscendSFAIndexerBackend.write_cache`, which now exclusively uses
+    `scatter_cache`
+    - The group metadata plumbing (`group_len` / `group_key_idx` /
+    `group_key_cache_idx`) threaded through the indexer metadata builder,
+    `AscendCommonAttentionMetadata`, the model runner buffers, and the
+    spec-decode proposer
+    - The C++ operator implementations (`csrc/attention/store_kv_block`,
+    `csrc/attention/store_kv_block_metadata`), their torch binding
+    definitions, `build_aclnn.sh` entries, and the e2e test
+    - Related UT cases and documentation entries (`additional_config.md`,
+    GLM5/GLM5.2 tutorials, zh_CN `.po`)
+    
+    ## Test
+    
+    - `python -m py_compile` on all modified Python sources
+    - Updated UTs: `tests/ut/attention/test_indexer.py`, `test_sfa_v1.py`,
+    `test_cache_store.py`, `test_sfa_nope_metadata.py`,
+    `tests/ut/ops/test_mla.py`, `tests/ut/test_ascend_config.py`,
+    `tests/ut/model_loader/rfork/test_identity_validation.py`
+    
+    - vLLM main:
+    https://github.com/vllm-project/vllm/commit/ced6857afa0ea7b2e3f0846a62e1394e90f15607
+    
+    ---------
+    
+    Signed-off-by: ZT-AIA <1028681969@qq.com>
+
+diff --git a/csrc/attention/store_kv_block/CMakeLists.txt b/csrc/attention/store_kv_block/CMakeLists.txt
+deleted file mode 100644
+index 86b308249..000000000
+--- a/csrc/attention/store_kv_block/CMakeLists.txt
++++ /dev/null
+@@ -1,19 +0,0 @@
+-# -----------------------------------------------------------------------------------------------------------
+-# Copyright (c) 2025 Huawei Technologies Co., Ltd.
+-# This program is free software, you can redistribute it and/or modify it under the terms and conditions of
+-# CANN Open Software License Agreement Version 2.0 (the "License").
+-# Please refer to the License for details. You may not use this file except in compliance with the License.
+-# THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
+-# INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
+-# See LICENSE in the root of the software repository for the full text of the License.
+-# -----------------------------------------------------------------------------------------------------------
+-
+-file(GLOB CURRENT_DIRS RELATIVE ${CMAKE_CURRENT_SOURCE_DIR} ${CMAKE_CURRENT_SOURCE_DIR}/*)
+-if(NOT ENABLE_TEST AND NOT BENCHMARK)
+-    list(REMOVE_ITEM CURRENT_DIRS tests)
+-endif()
+-foreach(SUB_DIR ${CURRENT_DIRS})
+-    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/${SUB_DIR}/CMakeLists.txt")
+-        add_subdirectory(${SUB_DIR})
+-    endif()
+-endforeach()
+\ No newline at end of file
+diff --git a/csrc/attention/store_kv_block/op_host/CMakeLists.txt b/csrc/attention/store_kv_block/op_host/CMakeLists.txt
+deleted file mode 100644
+index 1b4d5da4d..000000000
+--- a/csrc/attention/store_kv_block/op_host/CMakeLists.txt
++++ /dev/null
+@@ -1,29 +0,0 @@
+-# This program is free software, you can redistribute it and/or modify it.
+-# Copyright (c) 2025 Huawei Technologies Co., Ltd.
+-# This file is a part of the CANN Open Software.
+-# Licensed under CANN Open Software License Agreement Version 2.0 (the "License").
+-# Please refer to the License for details. You may not use this file except in compliance with the License.
+-# THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
+-# See LICENSE in the root of the software repository for the full text of the License.
+-# ======================================================================================================================
+-add_op_to_compiled_list()
+-
+-if (BUILD_OPEN_PROJECT)
+-    target_sources(op_host_aclnn PRIVATE
+-        store_kv_block_def.cpp
+-    )
+-endif()
+-
+-add_ops_compile_options(
+-    OP_NAME StoreKVBlock
+-    OPTIONS
+-        --cce-auto-sync=off
+-        -Wno-deprecated-declarations
+-)
+-
+-if (NOT BUILD_OPS_RTY_KERNEL)
+-    add_modules_sources(OPTYPE store_kv_block ACLNNTYPE aclnn)
+-    target_include_directories(${OPHOST_NAME}_tiling_obj PRIVATE
+-        ${CMAKE_CURRENT_SOURCE_DIR}
+-    )
+-endif()
+diff --git a/csrc/attention/store_kv_block/op_host/store_kv_block_def.cpp b/csrc/attention/store_kv_block/op_host/store_kv_block_def.cpp
+deleted file mode 100644
+index f5e989321..000000000
+--- a/csrc/attention/store_kv_block/op_host/store_kv_block_def.cpp
++++ /dev/null
+@@ -1,65 +0,0 @@
+-/**
+- * Copyright (c) Huawei Technologies Co., Ltd. 2025. All rights reserved.
+- *
+- * Licensed under the Apache License, Version 2.0 (the "License");
+- * you may not use this file except in compliance with the License.
+- * You may obtain a copy of the License at
+- *
+- * http://www.apache.org/licenses/LICENSE-2.0
+- *
+- * Unless required by applicable law or agreed to in writing, software
+- * distributed under the License is distributed on an "AS IS" BASIS,
+- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+- * See the License for the specific language governing permissions and
+- * limitations under the License.
+- */
+-
+-/*!
+- * \file store_kv_block_def.cpp
+- * \brief Operator definition for StoreKVBlock
+- */
+-#include "register/op_def_registry.h"
+-
+-namespace ops {
+-class StoreKVBlock : public OpDef {
+- public:
+-  explicit StoreKVBlock(const char* name) : OpDef(name) {
+-    this->Input("keyIn")
+-        .ParamType(REQUIRED)
+-        .DataType({ge::DT_INT8, ge::DT_FLOAT16, ge::DT_BF16})
+-        .Format({ge::FORMAT_ND, ge::FORMAT_ND, ge::FORMAT_ND})
+-        .UnknownShapeFormat({ge::FORMAT_ND, ge::FORMAT_ND, ge::FORMAT_ND})
+-        .AutoContiguous();
+-    this->Input("keyCacheIn")
+-        .ParamType(REQUIRED)
+-        .DataType({ge::DT_INT8, ge::DT_FLOAT16, ge::DT_BF16})
+-        .Format({ge::FORMAT_ND, ge::FORMAT_ND, ge::FORMAT_ND})
+-        .UnknownShapeFormat({ge::FORMAT_ND, ge::FORMAT_ND, ge::FORMAT_ND})
+-        .AutoContiguous();
+-    this->Input("groupLen")
+-        .ParamType(REQUIRED)
+-        .DataType({ge::DT_INT32 , ge::DT_INT32 , ge::DT_INT32 })
+-        .Format({ge::FORMAT_ND, ge::FORMAT_ND, ge::FORMAT_ND})
+-        .UnknownShapeFormat({ge::FORMAT_ND, ge::FORMAT_ND, ge::FORMAT_ND})
+-        .AutoContiguous();
+-    this->Input("groupKeyIdx")
+-        .ParamType(REQUIRED)
+-        .DataType({ge::DT_INT32 , ge::DT_INT32 , ge::DT_INT32 })
+-        .Format({ge::FORMAT_ND, ge::FORMAT_ND, ge::FORMAT_ND})
+-        .UnknownShapeFormat({ge::FORMAT_ND, ge::FORMAT_ND, ge::FORMAT_ND})
+-        .AutoContiguous();
+-    this->Input("groupKeyCacheIdx")
+-        .ParamType(REQUIRED)
+-        .DataType({ge::DT_INT32 , ge::DT_INT32 , ge::DT_INT32 })
+-        .Format({ge::FORMAT_ND, ge::FORMAT_ND, ge::FORMAT_ND})
+-        .UnknownShapeFormat({ge::FORMAT_ND, ge::FORMAT_ND, ge::FORMAT_ND})
+-        .AutoContiguous();
+-    this->Attr("blockSize").Int();
+-    this->AICore().AddConfig("ascend910b");
+-    this->AICore().AddConfig("ascend910_93");
+-    this->AICore().AddConfig("ascend950");
+-  }
+-};
+-
+-OP_ADD(StoreKVBlock);
+-}  // namespace ops
+\ No newline at end of file
+diff --git a/csrc/attention/store_kv_block/op_host/store_kv_block_infershape.cpp b/csrc/attention/store_kv_block/op_host/store_kv_block_infershape.cpp
+deleted file mode 100644
+index 07dd60236..000000000
+--- a/csrc/attention/store_kv_block/op_host/store_kv_block_infershape.cpp
++++ /dev/null
+@@ -1,33 +0,0 @@
+-/**
+- * This program is free software, you can redistribute it and/or modify.
+- * Copyright (c) 2025 Huawei Technologies Co., Ltd.
+- * This file is a part of the CANN Open Software.
+- * Licensed under CANN Open Software License Agreement Version 2.0 (the "License").
+- * Please refer to the License for details. You may not use this file except in compliance with the License.
+- * THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
+- * See LICENSE in the root of the software repository for the full text of the License.
+- */
+-
+-/*!
+- * \file store_kv_block_infershape.cpp
+- * \brief InferShape implementation for StoreKVBlock
+- */
+-#include <graph/utils/type_utils.h>
+-#include <register/op_impl_registry.h>
+-#include "error/ops_error.h"
+-
+-using namespace ge;
+-namespace ops {
+-
+-static ge::graphStatus InferShape4StoreKVBlock(gert::InferShapeContext* context)
+-{
+-    return GRAPH_SUCCESS;
+-}
+-
+-static graphStatus InferDataType4StoreKVBlock(gert::InferDataTypeContext* context)
+-{
+-    return GRAPH_SUCCESS;
+-}
+-
+-IMPL_OP_INFERSHAPE(StoreKVBlock).InferShape(InferShape4StoreKVBlock).InferDataType(InferDataType4StoreKVBlock);
+-} // namespace ops
+diff --git a/csrc/attention/store_kv_block/op_host/store_kv_block_tiling.cpp b/csrc/attention/store_kv_block/op_host/store_kv_block_tiling.cpp
+deleted file mode 100644
+index ace8daaba..000000000
+--- a/csrc/attention/store_kv_block/op_host/store_kv_block_tiling.cpp
++++ /dev/null
+@@ -1,160 +0,0 @@
+-/**
+- * Copyright (c) Huawei Technologies Co., Ltd. 2025. All rights reserved.
+- *
+- * Licensed under the Apache License, Version 2.0 (the "License");
+- * you may not use this file except in compliance with the License.
+- * You may obtain a copy of the License at
+- *
+- * http://www.apache.org/licenses/LICENSE-2.0
+- *
+- * Unless required by applicable law or agreed to in writing, software
+- * distributed under the License is distributed on an "AS IS" BASIS,
+- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+- * See the License for the specific language governing permissions and
+- * limitations under the License.
+- */
+-
+-#include "store_kv_block_tiling.h"
+-#include "register/op_def_registry.h"
+-#include "tiling/platform/platform_ascendc.h"
+-#include "tiling_base/error_log.h"
+-
+-namespace optiling {
+-
+-constexpr uint32_t DIM_0 = 0;
+-constexpr uint32_t DIM_1 = 1;
+-constexpr uint32_t DIM_2 = 2;
+-constexpr int32_t MAX_UB_USE_SIZE = 180 * 1024;
+-
+-struct StoreKVBlockParams {
+-    uint32_t numTokens{0};
+-    uint32_t numCache{0};
+-    uint32_t numHeads{1};
+-    uint32_t headSize[5]{1, 1, 1, 1, 1};
+-    uint32_t blockTableSize{0};
+-    uint32_t typeByte{0};
+-    uint32_t tokenSize{1};
+-    uint32_t tilingKey{1};
+-    uint64_t workspaceSize{0};
+-    uint32_t groupInfoLen{0};
+-    uint32_t corepernum{0};
+-    uint32_t coretail{0};
+-    uint64_t sysWorkspaceSize{0};
+-    uint32_t coreNum{0};
+-};
+-
+-static ge::graphStatus DoCommonTiling(gert::TilingContext* context, StoreKVBlockParams& params) {
+-    auto kShape = context->GetInputShape(DIM_0);
+-    auto kDimNum = kShape->GetStorageShape().GetDimNum();
+-    if (kDimNum < 2 || kDimNum > 7) {
+-        OP_LOGE(context->GetNodeName(), "StoreKVBlock Input kDimNum dim < 2 || kDimNum>7");
+-        return ge::GRAPH_FAILED;
+-    }
+-
+-    for (int i = 0; i < kDimNum; i++) {
+-        if (i == 0) params.numTokens = static_cast<uint32_t>(kShape->GetStorageShape().GetDim(i));
+-        else if (i == 1) params.numHeads = static_cast<uint32_t>(kShape->GetStorageShape().GetDim(i));
+-        else if (static_cast<uint32_t>(kShape->GetStorageShape().GetDim(i)) != 0)
+-            params.headSize[i - 2] = static_cast<uint32_t>(kShape->GetStorageShape().GetDim(i));
+-    }
+-
+-    auto kCacheShape = context->GetInputShape(DIM_1);
+-    auto kCacheDimNum = kCacheShape->GetStorageShape().GetDimNum();
+-    if (kCacheDimNum < 2 || kCacheDimNum > 7) {
+-        OP_LOGE(context->GetNodeName(), "StoreKVBlock Input kCacheDimNum < 2");
+-        return ge::GRAPH_FAILED;
+-    }
+-    params.numCache = kCacheShape->GetStorageShape().GetDim(0) * kCacheShape->GetStorageShape().GetDim(1);
+-
+-    const int64_t* blockSizePtr = context->GetAttrs()->GetInt(0);
+-    uint32_t blockSize = static_cast<uint32_t>(*blockSizePtr);
+-    params.tokenSize = params.numHeads * params.headSize[0] * params.headSize[1] * params.headSize[2] * params.headSize[3] * params.headSize[4];
+-    params.blockTableSize = blockSize;
+-
+-    uint32_t typeByte = 0;
+-    auto xDataType = context->GetInputDesc(DIM_0)->GetDataType();
+-    if (xDataType == ge::DataType::DT_INT8) {
+-        typeByte = sizeof(int8_t);
+-        params.tilingKey = 1;
+-    } else if (xDataType == ge::DataType::DT_FLOAT16 || xDataType == ge::DataType::DT_BF16) {
+-        typeByte = sizeof(uint16_t);
+-        params.tilingKey = 2;
+-    } else if (xDataType == ge::DataType::DT_INT32 || xDataType == ge::DataType::DT_UINT32) {
+-        typeByte = sizeof(uint32_t);
+-        params.tilingKey = 4;
+-    } else {
+-        OP_LOGE(context->GetNodeName(), "Unsupported type.");
+-        return ge::GRAPH_FAILED;
+-    }
+-
+-    params.typeByte = typeByte;
+-
+-    auto groupInfoShape = context->GetInputShape(DIM_2);
+-    params.groupInfoLen = static_cast<uint32_t>(groupInfoShape->GetStorageShape().GetDim(0));
+-    params.corepernum = params.groupInfoLen / params.coreNum;
+-    params.coretail = params.groupInfoLen % params.coreNum;
+-
+-    uint32_t pageBlockEleSize = params.blockTableSize * params.tokenSize;
+-    if (pageBlockEleSize > MAX_UB_USE_SIZE) {
+-        OP_LOGE(context->GetNodeName(), "pageBlockEleSize > MaxUBSize");
+-        return ge::GRAPH_FAILED;
+-    }
+-    return ge::GRAPH_SUCCESS;
+-}
+-
+-static ge::graphStatus StoreKVBlockTilingFunc(gert::TilingContext* context) {
+-    StoreKVBlockParams params;
+-
+-    auto platformInfo = context->GetPlatformInfo();
+-    OP_CHECK_NULL_WITH_CONTEXT(context, platformInfo);
+-    auto ascendcPlatform = platform_ascendc::PlatformAscendC(platformInfo);
+-    // Arch35 (Ascend950) runs the kernel on vector cores; fall back to GetCoreNum for 910b/910_93.
+-    params.coreNum = ascendcPlatform.GetCoreNumAiv();
+-    if (params.coreNum == 0) {
+-        params.coreNum = ascendcPlatform.GetCoreNum();
+-    }
+-    if (params.coreNum == 0) {
+-        OP_LOGE(context->GetNodeName(), "Failed to get core num.");
+-        return ge::GRAPH_FAILED;
+-    }
+-    params.sysWorkspaceSize = ascendcPlatform.GetLibApiWorkSpaceSize();
+-
+-    auto ret = DoCommonTiling(context, params);
+-    if (ret != ge::GRAPH_SUCCESS) {
+-        return ret;
+-    }
+-
+-    StoreKVBlockTilingData tilingData;
+-    // if (params.blockTableSize > 0) tilingData.set_blockTableSize(params.blockTableSize);
+-    // if (params.typeByte > 0) tilingData.set_typeByte(params.typeByte);
+-    // if (params.tokenSize > 0) tilingData.set_tokenSize(params.tokenSize);
+-    // if (params.corepernum > 0 || params.coretail != 0) tilingData.set_corePerNum(params.corepernum);
+-    tilingData.set_blockTableSize(params.blockTableSize);
+-    tilingData.set_typeByte(params.typeByte);
+-    tilingData.set_tokenSize(params.tokenSize);
+-    tilingData.set_corePerNum(params.corepernum);
+-    if (params.coretail < params.coreNum) tilingData.set_coreTail(params.coretail);     
+-    if (params.numTokens > 0) tilingData.set_numTokens(params.numTokens);
+-    if (params.numCache > 0) tilingData.set_numCache(params.numCache);
+-    if (params.groupInfoLen > 0) tilingData.set_groupInfoLen(params.groupInfoLen);
+-
+-    size_t* workspaceSize = context->GetWorkspaceSizes(1);
+-    *workspaceSize = params.workspaceSize + params.sysWorkspaceSize;
+-    context->SetTilingKey(params.tilingKey);
+-    if (params.coreNum > 0) context->SetBlockDim(params.coreNum);
+-
+-    tilingData.SaveToBuffer(context->GetRawTilingData()->GetData(), context->GetRawTilingData()->GetCapacity());
+-    context->GetRawTilingData()->SetDataSize(tilingData.GetDataSize());
+-
+-    return ge::GRAPH_SUCCESS;
+-}
+-
+-static ge::graphStatus TilingParseForStoreKVBlock(gert::TilingParseContext* context) {
+-    return ge::GRAPH_SUCCESS;
+-}
+-
+-IMPL_OP_OPTILING(StoreKVBlock)
+-    .Tiling(StoreKVBlockTilingFunc)
+-    .TilingParse<StoreKVBlockCompileInfo>(TilingParseForStoreKVBlock);
+-
+-} // namespace optiling
+diff --git a/csrc/attention/store_kv_block/op_host/store_kv_block_tiling.h b/csrc/attention/store_kv_block/op_host/store_kv_block_tiling.h
+deleted file mode 100644
+index ff43c6055..000000000
+--- a/csrc/attention/store_kv_block/op_host/store_kv_block_tiling.h
++++ /dev/null
+@@ -1,23 +0,0 @@
+-#include "register/tilingdata_base.h"
+-
+-namespace optiling {
+-BEGIN_TILING_DATA_DEF(StoreKVBlockTilingData)
+-    TILING_DATA_FIELD_DEF(uint32_t, blockTableSize);
+-    TILING_DATA_FIELD_DEF(uint32_t, typeByte);
+-    TILING_DATA_FIELD_DEF(uint32_t, tokenSize);
+-    TILING_DATA_FIELD_DEF(uint32_t, corePerNum);
+-    TILING_DATA_FIELD_DEF(uint32_t, coreTail);
+-    TILING_DATA_FIELD_DEF(uint32_t, numTokens);
+-    TILING_DATA_FIELD_DEF(uint32_t, numCache);
+-    TILING_DATA_FIELD_DEF(uint32_t, groupInfoLen);
+-END_TILING_DATA_DEF;
+-
+-REGISTER_TILING_DATA_CLASS(StoreKVBlock, StoreKVBlockTilingData)
+-
+-struct StoreKVBlockCompileInfo {
+-    uint32_t coreNum;
+-    uint64_t ubSizePlatForm;
+-    uint32_t sysWorkspaceSize;
+-};
+-
+-} // namespace optiling
+diff --git a/csrc/attention/store_kv_block/op_kernel/store_kv_block.cpp b/csrc/attention/store_kv_block/op_kernel/store_kv_block.cpp
+deleted file mode 100644
+index cb6c89112..000000000
+--- a/csrc/attention/store_kv_block/op_kernel/store_kv_block.cpp
++++ /dev/null
+@@ -1,43 +0,0 @@
+-/**
+- * Copyright (c) Huawei Technologies Co., Ltd. 2025. All rights reserved.
+- *
+- * Licensed under the Apache License, Version 2.0 (the "License");
+- * you may not use this file except in compliance with the License.
+- * You may obtain a copy of the License at
+- *
+- * http://www.apache.org/licenses/LICENSE-2.0
+- *
+- * Unless required by applicable law or agreed to in writing, software
+- * distributed under the License is distributed on an "AS IS" BASIS,
+- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+- * See the License for the specific language governing permissions and
+- * limitations under the License.
+- */
+-
+-/*!
+- * \file store_kv_block.cpp
+- * \brief Kernel entry for StoreKVBlock operator
+- */
+-#include "store_kv_block.h"
+-
+-extern "C" __global__ __aicore__ void store_kv_block(
+-    GM_ADDR keyIn, GM_ADDR keyCacheIn, GM_ADDR groupLen, GM_ADDR groupKeyIdx, GM_ADDR groupKeyCacheIdx, GM_ADDR workspace, GM_ADDR tiling)
+-{
+-    AscendC::TPipe pipe;
+-    REGISTER_TILING_DEFAULT(StoreKVBlock::StoreKVBlockTilingData);
+-    GET_TILING_DATA(tilingData, tiling);
+-
+-    if (TILING_KEY_IS(1)) {
+-        StoreKVBlock::StoreKVBlockBase<uint8_t> op;
+-        op.Init( &pipe, &tilingData);
+-        op.Process(keyIn,keyCacheIn, groupLen, groupKeyIdx, groupKeyCacheIdx);
+-    } else if (TILING_KEY_IS(2)) {
+-        StoreKVBlock::StoreKVBlockBase<half> op;
+-        op.Init( &pipe, &tilingData);
+-        op.Process(keyIn,keyCacheIn, groupLen, groupKeyIdx, groupKeyCacheIdx);
+-    } else if (TILING_KEY_IS(4)) {
+-        StoreKVBlock::StoreKVBlockBase<int32_t> op;
+-        op.Init( &pipe, &tilingData);
+-        op.Process(keyIn,keyCacheIn, groupLen, groupKeyIdx, groupKeyCacheIdx);
+-    }
+-}
+diff --git a/csrc/attention/store_kv_block/op_kernel/store_kv_block.h b/csrc/attention/store_kv_block/op_kernel/store_kv_block.h
+deleted file mode 100644
+index 22a3dc367..000000000
+--- a/csrc/attention/store_kv_block/op_kernel/store_kv_block.h
++++ /dev/null
+@@ -1,133 +0,0 @@
+-/**
+- * Copyright (c) Huawei Technologies Co., Ltd. 2025. All rights reserved.
+- *
+- * Licensed under the Apache License, Version 2.0 (the "License");
+- * you may not use this file except in compliance with the License.
+- * You may obtain a copy of the License at
+- *
+- * http://www.apache.org/licenses/LICENSE-2.0
+- *
+- * Unless required by applicable law or agreed to in writing, software
+- * distributed under the License is distributed on an "AS IS" BASIS,
+- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+- * See the License for the specific language governing permissions and
+- * limitations under the License.
+- */
+-
+-/*!
+- * \file store_kv_block.h
+- * \brief StoreKVBlock kernel operator
+- */
+-
+-#ifndef ASCEND_STORE_KV_BLOCK_H
+-#define ASCEND_STORE_KV_BLOCK_H
+-
+-#include "kernel_operator.h"
+-
+-namespace StoreKVBlock {
+-using namespace AscendC;
+-
+-
+-#ifndef STORE_KV_BLOCK_TILING_DATA_H_
+-#define STORE_KV_BLOCK_TILING_DATA_H_
+-struct StoreKVBlockTilingData{
+-    uint32_t blockTableSize;    
+-    uint32_t typeByte;
+-    uint32_t tokenSize;
+-    uint32_t corePerNum;
+-    uint32_t coreTail;
+-    uint32_t numTokens;
+-    uint32_t numCache;
+-    uint32_t groupInfoLen;
+-
+-};
+-#endif
+-template <typename T>
+-class StoreKVBlockBase {
+-public:
+-
+-    uint32_t tokenSize = 0;
+-    uint32_t tokenByteSize = 0;
+-    uint32_t blockTableSize = 0;
+-    uint32_t typeByte = 0;
+-    uint32_t numTokens = 0;
+-    uint32_t numCache = 0;
+-    uint32_t groupInfoLen = 0;
+-
+-    uint32_t coreId = 0;
+-    uint32_t coreTail = 0;
+-    uint32_t corePerNum = 0;
+-    uint32_t blockNum = 0;
+-    AscendC::TPipe* pipeThis;
+-    AscendC::LocalTensor<T> tokenLocal;
+-    AscendC::GlobalTensor<T> keyInputGt;
+-    AscendC::GlobalTensor<T> keyCacheInputGt;
+-    AscendC::GlobalTensor<int32_t> groupLenGt;
+-    AscendC::GlobalTensor<int32_t> groupKeyIdxGt;
+-    AscendC::GlobalTensor<int32_t> groupKeyCacheIdxGt;
+-    AscendC::TBuf<AscendC::TPosition::VECCALC> tokenBuf;
+-    __aicore__ inline StoreKVBlockBase() {}
+-
+-    __aicore__ inline uint32_t RoundUp(uint32_t x, uint32_t y = 16)
+-    {
+-        return y == 0 ? 0 : (x + y - 1) / y * y;
+-    }
+-
+-    __aicore__ inline void Init( AscendC::TPipe *pipe, StoreKVBlockTilingData *tilingData)
+-    {
+-        pipeThis = pipe;
+-        typeByte = tilingData->typeByte;
+-        tokenSize = tilingData->tokenSize;
+-        tokenByteSize = tokenSize*typeByte;
+-        blockTableSize = tilingData->blockTableSize;
+-        numTokens = tilingData->numTokens;
+-        numCache = tilingData->numCache;
+-        groupInfoLen = tilingData->groupInfoLen;
+-
+-        coreId = AscendC::GetBlockIdx();
+-        coreTail = tilingData->coreTail;
+-        blockNum = AscendC::GetBlockNum();
+-        if (coreId < coreTail){
+-            // Not all cores have corePerNum+1 items; only coreTail cores get one extra.
+-            // If corePerNum is 0, cores beyond coreTail have no work and will not access any address.
+-            corePerNum = tilingData->corePerNum+1;
+-        }else {
+-            corePerNum = tilingData->corePerNum;
+-        }
+-    }
+-    __aicore__ inline void Process(GM_ADDR keyIn, GM_ADDR keyCacheIn, GM_ADDR groupLen, GM_ADDR groupKeyIdx, GM_ADDR groupKeyCacheIdx)
+-    {
+-        
+-        keyInputGt.SetGlobalBuffer(reinterpret_cast<__gm__ T*>(keyIn));
+-        keyCacheInputGt.SetGlobalBuffer(reinterpret_cast<__gm__ T*>(keyCacheIn));
+-        groupLenGt.SetGlobalBuffer(reinterpret_cast<__gm__ int32_t*>(groupLen));
+-        groupKeyIdxGt.SetGlobalBuffer(reinterpret_cast<__gm__ int32_t*>(groupKeyIdx));
+-        groupKeyCacheIdxGt.SetGlobalBuffer(reinterpret_cast<__gm__ int32_t*>(groupKeyCacheIdx));
+-
+-        pipeThis->InitBuffer(tokenBuf,  blockTableSize*tokenByteSize);
+-        tokenLocal = tokenBuf.Get<T>();
+-
+-        AscendC::DataCopyExtParams copyParams{1, 0,  0, 0, 0}; // todo: full block length
+-        AscendC::DataCopyPadExtParams<T> padParams{false, 0, 0, 0};
+-        for (int32_t i = 0; i < corePerNum; i++) {
+-            int32_t idx = (coreId+i*blockNum);
+-         
+-            if( groupLenGt.GetValue(idx)<= 0 || groupKeyIdxGt.GetValue(idx)<0 || groupKeyCacheIdxGt.GetValue(idx)<0){
+-                continue;
+-            }
+-           
+-            copyParams.blockLen = groupLenGt.GetValue(idx)*tokenByteSize; // in bytes
+-            DataCopyPad(tokenLocal, keyInputGt[ groupKeyIdxGt.GetValue(idx)*tokenSize], copyParams, padParams); // note: offset order
+-            AscendC::SetFlag<AscendC::HardEvent::MTE2_MTE3>(EVENT_ID1);
+-            AscendC::WaitFlag<AscendC::HardEvent::MTE2_MTE3>(EVENT_ID1);
+-            DataCopyPad(keyCacheInputGt[groupKeyCacheIdxGt.GetValue(idx)*tokenSize], tokenLocal, copyParams);
+-            AscendC::SetFlag<AscendC::HardEvent::MTE3_MTE2>(EVENT_ID1);
+-            AscendC::WaitFlag<AscendC::HardEvent::MTE3_MTE2>(EVENT_ID1);
+-        }
+-
+-    }
+-
+-};
+-}
+-
+-#endif
+diff --git a/csrc/attention/store_kv_block/store_kv_block_torch_adpt.h b/csrc/attention/store_kv_block/store_kv_block_torch_adpt.h
+deleted file mode 100644
+index 0657146bd..000000000
+--- a/csrc/attention/store_kv_block/store_kv_block_torch_adpt.h
++++ /dev/null
+@@ -1,37 +0,0 @@
+-/*
+- * Copyright (c) Huawei Technologies Co., Ltd. 2026. All rights reserved.
+- *
+- * Licensed under the Apache License, Version 2.0 (the "License");
+- * you may not use this file except in compliance with the License.
+- * You may obtain a copy of the License at
+- *
+- * http://www.apache.org/licenses/LICENSE-2.0
+- *
+- * Unless required by applicable law or agreed to in writing, software
+- * distributed under the License is distributed on an "AS IS" BASIS,
+- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+- * See the License for the specific language governing permissions and
+- * limitations under the License.
+- */
+-//  #include "../aclnn_torch_adapter/op_api_common.h"
+-
+-#ifndef STORE_KV_BLOCK_TORCH_ADPT_H
+-#define STORE_KV_BLOCK_TORCH_ADPT_H
+-#include <climits>  
+-namespace vllm_ascend {
+-
+-void store_kv_block(
+-    const at::Tensor &key_in,
+-    const at::Tensor &key_cache_in,
+-    const at::Tensor &group_len,
+-    const at::Tensor &group_key_idx,
+-    const at::Tensor &group_key_cache_idx,
+-    int64_t block_size)
+-{
+-
+-    EXEC_NPU_CMD(aclnnStoreKVBlock, key_in, key_cache_in,group_len, group_key_idx, group_key_cache_idx, block_size);
+-    
+-} 
+-
+-}
+-#endif
+\ No newline at end of file
+diff --git a/csrc/attention/store_kv_block_metadata/CMakeLists.txt b/csrc/attention/store_kv_block_metadata/CMakeLists.txt
+deleted file mode 100644
+index a8b1c731b..000000000
+--- a/csrc/attention/store_kv_block_metadata/CMakeLists.txt
++++ /dev/null
+@@ -1,10 +0,0 @@
+-# ---------------------------------------------------------------------------------------------------------
+-# Copyright (c) 2026 Huawei Technologies Co., Ltd.
+-# This program is free software, you can redistribute it and/or modify it under the terms and conditions of
+-# CANN Open Software License Agreement Version 2.0 (the "License").
+-# Please refer to the License for details. You should not use this file except in compliance with the License.
+-# THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
+-# INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
+-# See LICENSE in the root of the software repository for the full text of the License.
+-# ---------------------------------------------------------------------------------------------------------
+-add_modules_sources_aicpu(OPTYPE store_kv_block ACLNNTYPE aclnn)
+diff --git a/csrc/attention/store_kv_block_metadata/op_api/aclnn_store_kv_block_metadata.cpp b/csrc/attention/store_kv_block_metadata/op_api/aclnn_store_kv_block_metadata.cpp
+deleted file mode 100644
+index ae21cd791..000000000
+--- a/csrc/attention/store_kv_block_metadata/op_api/aclnn_store_kv_block_metadata.cpp
++++ /dev/null
+@@ -1,79 +0,0 @@
+-/**
+- * Copyright (c) 2026 Huawei Technologies Co., Ltd.
+- * This program is free software, you can redistribute it and/or modify it under the terms and conditions of
+- * CANN Open Software License Agreement Version 2.0 (the "License").
+- * Please refer to the License for details. You should not use this file except in compliance with the License.
+- * THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
+- * INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
+- * See LICENSE in the root of the software repository for the full text of the License.
+- */
+-
+-/*!
+- * \file aclnn_store_kv_block_metadata.cpp
+- * \brief AClnn interface for StoreKvBlockMetadata operator
+- */
+-
+-#include "aclnn_store_kv_block_metadata.h"
+-#include "l0_store_kv_block_metadata.h"
+-#include "aclnn_kernels/contiguous.h"
+-#include "aclnn_kernels/reshape.h"
+-#include "aclnn/aclnn_base.h"
+-#include "aclnn_kernels/common/op_error_check.h"
+-#include "opdev/common_types.h"
+-#include "opdev/data_type_utils.h"
+-#include "opdev/format_utils.h"
+-#include "opdev/op_dfx.h"
+-#include "opdev/op_executor.h"
+-#include "opdev/op_log.h"
+-#include "opdev/tensor_view_utils.h"
+-#include "opdev/make_op_executor.h"
+-
+-#ifdef __cplusplus
+-extern "C" {
+-#endif
+-
+-aclnnStatus aclnnStoreKvBlockMetadataGetWorkspaceSize(
+-    const aclTensor *slotMapping,
+-    const aclTensor *groupLen,
+-    const aclTensor *groupKeyIdx,
+-    const aclTensor *groupKeyCacheIdx,
+-    int64_t blockSize,
+-    uint64_t *workspaceSize,
+-    aclOpExecutor **executor)
+-{
+-    L2_DFX_PHASE_1(aclnnStoreKvBlockMetadata,
+-                   DFX_IN(slotMapping, blockSize),
+-                   DFX_OUT(groupLen, groupKeyIdx, groupKeyCacheIdx));
+-
+-    auto uniqueExecutor = CREATE_EXECUTOR();
+-    CHECK_RET(uniqueExecutor.get() != nullptr, ACLNN_ERR_INNER_CREATE_EXECUTOR);
+-
+-    // basic parameter checks
+-    CHECK_RET(slotMapping != nullptr, ACLNN_ERR_INNER_NULLPTR);
+-    CHECK_RET(groupLen != nullptr, ACLNN_ERR_INNER_NULLPTR);
+-    CHECK_RET(groupKeyIdx != nullptr, ACLNN_ERR_INNER_NULLPTR);
+-    CHECK_RET(groupKeyCacheIdx != nullptr, ACLNN_ERR_INNER_NULLPTR);
+-    CHECK_RET(blockSize > 0, ACLNN_ERR_PARAM_INVALID);
+-
+-    auto slotMappingContiguous = l0op::Contiguous(slotMapping, uniqueExecutor.get());
+-    CHECK_RET(slotMappingContiguous != nullptr, ACLNN_ERR_INNER_NULLPTR);
+-
+-    auto ret = l0op::StoreKvBlockMetadata(slotMappingContiguous,  groupLen, groupKeyIdx, groupKeyCacheIdx,blockSize,
+-                                          uniqueExecutor.get());
+-    CHECK_RET(ret != nullptr, ACLNN_ERR_INNER_NULLPTR);
+-
+-    *workspaceSize = 0;
+-    uniqueExecutor.ReleaseTo(executor);
+-    return ACLNN_SUCCESS;
+-}
+-
+-__attribute__((visibility("default"))) aclnnStatus aclnnStoreKvBlockMetadata(void *workspace, uint64_t workspaceSize,
+-                                                                             aclOpExecutor *executor, aclrtStream stream)
+-{
+-    L2_DFX_PHASE_2(aclnnStoreKvBlockMetadata);
+-    return CommonOpExecutorRun(workspace, workspaceSize, executor, stream);
+-}
+-
+-#ifdef __cplusplus
+-}
+-#endif
+diff --git a/csrc/attention/store_kv_block_metadata/op_api/aclnn_store_kv_block_metadata.h b/csrc/attention/store_kv_block_metadata/op_api/aclnn_store_kv_block_metadata.h
+deleted file mode 100644
+index d00e1c8fe..000000000
+--- a/csrc/attention/store_kv_block_metadata/op_api/aclnn_store_kv_block_metadata.h
++++ /dev/null
+@@ -1,36 +0,0 @@
+-/**
+- * Copyright (c) 2026 Huawei Technologies Co., Ltd.
+- * This program is free software, you can redistribute it and/or modify it under the terms and conditions of
+- * CANN Open Software License Agreement Version 2.0 (the "License").
+- * Please refer to the License for details. You should not use this file except in compliance with the License.
+- * THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
+- * INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
+- * See LICENSE in the root of the software repository for the full text of the License.
+- */
+-
+-#ifndef ACLNN_STORE_KV_BLOCK_METADATA_H
+-#define ACLNN_STORE_KV_BLOCK_METADATA_H
+-
+-#include "aclnn/aclnn_base.h"
+-
+-#ifdef __cplusplus
+-extern "C" {
+-#endif
+-
+-__attribute__((visibility("default"))) aclnnStatus aclnnStoreKvBlockMetadataGetWorkspaceSize(
+-    const aclTensor *slotMapping,
+-    const aclTensor *groupLen,
+-    const aclTensor *groupKeyIdx,
+-    const aclTensor *groupKeyCacheIdx,
+-    int64_t blockSize,
+-    uint64_t *workspaceSize,
+-    aclOpExecutor **executor);
+-
+-__attribute__((visibility("default"))) aclnnStatus aclnnStoreKvBlockMetadata(void *workspace, uint64_t workspaceSize,
+-                                                                             aclOpExecutor *executor, aclrtStream stream);
+-
+-#ifdef __cplusplus
+-}
+-#endif
+-
+-#endif // ACLNN_STORE_KV_BLOCK_METADATA_H
+diff --git a/csrc/attention/store_kv_block_metadata/op_api/l0_store_kv_block_metadata.cpp b/csrc/attention/store_kv_block_metadata/op_api/l0_store_kv_block_metadata.cpp
+deleted file mode 100644
+index b1e4f031a..000000000
+--- a/csrc/attention/store_kv_block_metadata/op_api/l0_store_kv_block_metadata.cpp
++++ /dev/null
+@@ -1,53 +0,0 @@
+-/**
+- * Copyright (c) 2026 Huawei Technologies Co., Ltd.
+- * This program is free software, you can redistribute it and/or modify it under the terms and conditions of
+- * CANN Open Software License Agreement Version 2.0 (the "License").
+- * Please refer to the License for details. You should not use this file except in compliance with the License.
+- * THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
+- * INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
+- * See LICENSE in the root of the software repository for the full text of the License.
+- */
+-
+-/*!
+- * \file l0_store_kv_block_metadata.cpp
+- * \brief L0 interface for StoreKvBlockMetadata, adds AICPU task to launcher list
+- */
+-
+-#include "l0_store_kv_block_metadata.h"
+-#include "opdev/aicpu/aicpu_task.h"
+-#include "opdev/make_op_executor.h"
+-#include "opdev/op_def.h"
+-#include "opdev/op_dfx.h"
+-#include "opdev/op_executor.h"
+-#include "opdev/op_log.h"
+-#include "opdev/shape_utils.h"
+-
+-using namespace op;
+-namespace l0op {
+-OP_TYPE_REGISTER(StoreKvBlockMetadata);
+-
+-const aclTensor *StoreKvBlockMetadata(
+-    const aclTensor *slotMapping,
+-    const aclTensor *groupLen,
+-    const aclTensor *groupKeyIdx,
+-    const aclTensor *groupKeyCacheIdx,
+-    int64_t blockSize,
+-    aclOpExecutor *executor)
+-{
+-    L0_DFX(StoreKvBlockMetadata, slotMapping, groupLen, groupKeyIdx, groupKeyCacheIdx, blockSize);
+-
+-    static internal::AicpuTaskSpace space("StoreKvBlockMetadata");
+-
+-    auto ret = ADD_TO_LAUNCHER_LIST_AICPU(
+-        StoreKvBlockMetadata,
+-        OP_ATTR_NAMES({"block_size"}),
+-        OP_INPUT(slotMapping,groupLen, groupKeyIdx, groupKeyCacheIdx),
+-        OP_ATTR(blockSize));
+-    OP_CHECK(ret == ACL_SUCCESS,
+-             OP_LOGE(ACLNN_ERR_INNER_NULLPTR, "StoreKvBlockMetadata"
+-                                              " ADD_TO_LAUNCHER_LIST_AICPU failed."),
+-             return nullptr);
+-    return groupLen;
+-}
+-
+-} // namespace l0op
+diff --git a/csrc/attention/store_kv_block_metadata/op_api/l0_store_kv_block_metadata.h b/csrc/attention/store_kv_block_metadata/op_api/l0_store_kv_block_metadata.h
+deleted file mode 100644
+index b10e66b10..000000000
+--- a/csrc/attention/store_kv_block_metadata/op_api/l0_store_kv_block_metadata.h
++++ /dev/null
+@@ -1,26 +0,0 @@
+-/**
+- * Copyright (c) 2026 Huawei Technologies Co., Ltd.
+- * This program is free software, you can redistribute it and/or modify it under the terms and conditions of
+- * CANN Open Software License Agreement Version 2.0 (the "License").
+- * Please refer to the License for details. You should not use this file except in compliance with the License.
+- * THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
+- * INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
+- * See LICENSE in the root of the software repository for the full text of the License.
+- */
+-
+-#ifndef L0_STORE_KV_BLOCK_METADATA_H
+-#define L0_STORE_KV_BLOCK_METADATA_H
+-
+-#include "opdev/op_executor.h"
+-
+-namespace l0op {
+-const aclTensor* StoreKvBlockMetadata(
+-    const aclTensor* slotMapping,
+-    const aclTensor* groupLen,
+-    const aclTensor* groupKeyIdx,
+-    const aclTensor* groupKeyCacheIdx,
+-    int64_t blockSize,
+-    aclOpExecutor* executor);
+-} // namespace l0op
+-
+-#endif // L0_STORE_KV_BLOCK_METADATA_H
+diff --git a/csrc/attention/store_kv_block_metadata/op_graph/store_kv_block_metadata_proto.h b/csrc/attention/store_kv_block_metadata/op_graph/store_kv_block_metadata_proto.h
+deleted file mode 100644
+index c7dc3bfac..000000000
+--- a/csrc/attention/store_kv_block_metadata/op_graph/store_kv_block_metadata_proto.h
++++ /dev/null
+@@ -1,33 +0,0 @@
+-/**
+- * Copyright (c) 2026 Huawei Technologies Co., Ltd.
+- * This program is free software, you can redistribute it and/or modify it under the terms and conditions of
+- * CANN Open Software License Agreement Version 2.0 (the "License").
+- * Please refer to the License for details. You should not use this file except in compliance with the License.
+- * THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
+- * INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
+- * See LICENSE in the root of the software repository for the full text of the License.
+- */
+-
+-/*!
+- * \file store_kv_block_metadata_proto.h
+- * \brief Operator registration for StoreKvBlockMetadata
+- */
+-#ifndef STORE_KV_BLOCK_METADATA_PROTO_H
+-#define STORE_KV_BLOCK_METADATA_PROTO_H
+-
+-#include "graph/operator_reg.h"
+-#include "graph/types.h"
+-
+-namespace ge {
+-
+-REG_OP(StoreKvBlockMetadata)
+-    .INPUT(slot_mapping, TensorType({DT_INT32}))
+-    .INPUT(group_len, TensorType({DT_INT32}))
+-    .INPUT(group_key_idx, TensorType({DT_INT32}))
+-    .INPUT(group_key_cache_idx, TensorType({DT_INT32}))
+-    .REQUIRED_ATTR(block_size, Int)
+-    .OP_END_FACTORY_REG(StoreKvBlockMetadata)
+-
+-} // namespace ge
+-
+-#endif // STORE_KV_BLOCK_METADATA_PROTO_H
+diff --git a/csrc/attention/store_kv_block_metadata/op_host/store_kv_block_metadata_infershape.cpp b/csrc/attention/store_kv_block_metadata/op_host/store_kv_block_metadata_infershape.cpp
+deleted file mode 100644
+index ec8cb3a8c..000000000
+--- a/csrc/attention/store_kv_block_metadata/op_host/store_kv_block_metadata_infershape.cpp
++++ /dev/null
+@@ -1,43 +0,0 @@
+-/**
+- * Copyright (c) 2026 Huawei Technologies Co., Ltd.
+- * This program is free software, you can redistribute it and/or modify it under the terms and conditions of
+- * CANN Open Software License Agreement Version 2.0 (the "License").
+- * Please refer to the License for details. You should not use this file except in compliance with the License.
+- * THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
+- * INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
+- * See LICENSE in the root of the software repository for the full text of the License.
+- */
+-
+-/*!
+- * \file store_kv_block_metadata_infershape.cpp
+- * \brief InferShape implementation for StoreKvBlockMetadata
+- */
+-#include <register/op_impl_registry.h>
+-
+-using namespace ge;
+-
+-namespace ops {
+-
+-static constexpr int DIM_0 = 0;
+-
+-static ge::graphStatus InferShape4StoreKvBlockMetadata(gert::InferShapeContext* context)
+-{
+-    // All tensors are inputs now; nothing to infer for outputs.
+-    // Validate that slot_mapping (input 0) exists.
+-    auto inputShape = context->GetInputShape(DIM_0);
+-    if (inputShape == nullptr) {
+-        return GRAPH_FAILED;
+-    }
+-    return GRAPH_SUCCESS;
+-}
+-
+-static graphStatus InferDataType4StoreKvBlockMetadata(gert::InferDataTypeContext* context)
+-{
+-    return GRAPH_SUCCESS;
+-}
+-
+-IMPL_OP_INFERSHAPE(StoreKvBlockMetadata)
+-    .InferShape(InferShape4StoreKvBlockMetadata)
+-    .InferDataType(InferDataType4StoreKvBlockMetadata);
+-
+-} // namespace ops
+diff --git a/csrc/attention/store_kv_block_metadata/op_kernel_aicpu/store_kv_block_metadata_aicpu.cpp b/csrc/attention/store_kv_block_metadata/op_kernel_aicpu/store_kv_block_metadata_aicpu.cpp
+deleted file mode 100644
+index ebf8d9ff7..000000000
+--- a/csrc/attention/store_kv_block_metadata/op_kernel_aicpu/store_kv_block_metadata_aicpu.cpp
++++ /dev/null
+@@ -1,133 +0,0 @@
+-/**
+- * Copyright (c) 2026 Huawei Technologies Co., Ltd.
+- * This program is free software, you can redistribute it and/or modify it under the terms and conditions of
+- * CANN Open Software License Agreement Version 2.0 (the "License").
+- * Please refer to the License for details. You should not use this file except in compliance with the License.
+- * THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
+- * INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
+- * See LICENSE in the root of the software repository for the full text of the License.
+- */
+-
+-/*!
+- * \file store_kv_block_metadata_aicpu.cpp
+- * \brief AICPU kernel implementation for StoreKvBlockMetadata
+- *
+- * Ports the logic from store_kv_block_pre: groups contiguous slot_mapping entries
+- * that belong to the same block, producing group_len / group_key_idx / group_key_cache_idx.
+- */
+-
+-#include "log.h"
+-#include "status.h"
+-#include <cstring>
+-#include "store_kv_block_metadata_aicpu.h"
+-
+-namespace aicpu {
+-
+-uint32_t StoreKvBlockMetadataCpuKernel::Compute(CpuKernelContext &ctx)
+-{
+-    bool success = Prepare(ctx);
+-    if (!success) {
+-        return KERNEL_STATUS_PARAM_INVALID;
+-    }
+-    return GenMetaData() ? KERNEL_STATUS_OK : KERNEL_STATUS_PARAM_INVALID;
+-}
+-
+-bool StoreKvBlockMetadataCpuKernel::Prepare(CpuKernelContext &ctx)
+-{
+-    // inputs
+-    slotMapping_ = ctx.Input(static_cast<uint32_t>(ParamId::slotMapping));
+-    groupLen_ = ctx.Input(static_cast<uint32_t>(ParamId::groupLen));
+-    groupKeyIdx_ = ctx.Input(static_cast<uint32_t>(ParamId::groupKeyIdx));
+-    groupKeyCacheIdx_ = ctx.Input(static_cast<uint32_t>(ParamId::groupKeyCacheIdx));
+-
+-    // attribute
+-    auto attr = ctx.GetAttr("block_size");
+-    if (attr == nullptr) {
+-        KERNEL_LOG_ERROR("attr block_size is null");
+-        return false;
+-    }
+-    blockSize_ = static_cast<int32_t>(attr->GetInt());
+-    if (blockSize_ <= 0) {
+-        KERNEL_LOG_ERROR("block_size must be positive, got %d", blockSize_);
+-        return false;
+-    }
+-    return true;
+-}
+-
+-bool StoreKvBlockMetadataCpuKernel::GenMetaData()
+-{
+-    if (slotMapping_ == nullptr || slotMapping_->GetData() == nullptr) {
+-        KERNEL_LOG_ERROR("slot_mapping is empty");
+-        return false;
+-    }
+-    if (groupLen_ == nullptr || groupLen_->GetData() == nullptr ||
+-        groupKeyIdx_ == nullptr || groupKeyIdx_->GetData() == nullptr ||
+-        groupKeyCacheIdx_ == nullptr || groupKeyCacheIdx_->GetData() == nullptr) {
+-        KERNEL_LOG_ERROR("input tensor is empty");
+-        return false;
+-    }
+-
+-    int32_t *slotMappingData = static_cast<int32_t *>(slotMapping_->GetData());
+-    int32_t *groupLenData = static_cast<int32_t *>(groupLen_->GetData());
+-    int32_t *groupKeyIdxData = static_cast<int32_t *>(groupKeyIdx_->GetData());
+-    int32_t *groupKeyCacheIdxData = static_cast<int32_t *>(groupKeyCacheIdx_->GetData());
+-
+-    // total elements in slot_mapping (1-D tensor)
+-    int64_t slotMappingLen = slotMapping_->GetTensorShape()->GetDimSize(0);
+-
+-    // total capacity of output tensors (1-D, same shape as input)
+-    int64_t outCapacity = groupLen_->GetTensorShape()->GetDimSize(0);
+-
+-    int32_t idxSlotmap = 0;
+-    int32_t idxGroups = 0;
+-
+-    while (idxSlotmap < slotMappingLen) {
+-        // Skip dirty values (negative slots)
+-        int32_t cacheSlot = slotMappingData[idxSlotmap];
+-        if (cacheSlot < 0) {
+-            idxSlotmap++;
+-            continue;
+-        }
+-
+-        int32_t blockId = cacheSlot / blockSize_;
+-
+-        // Record group start: source index and destination cache index
+-        groupKeyIdxData[idxGroups] = idxSlotmap;
+-        groupKeyCacheIdxData[idxGroups] = cacheSlot;
+-
+-        // Find the end of consecutive slots within the same block
+-        int32_t groupEndIdx = idxSlotmap;
+-        while (groupEndIdx + 1 < slotMappingLen
+-               && slotMappingData[groupEndIdx + 1] / blockSize_ == blockId
+-               && slotMappingData[groupEndIdx + 1] == slotMappingData[groupEndIdx] + 1) {
+-            groupEndIdx++;
+-        }
+-        groupEndIdx++;
+-
+-        groupLenData[idxGroups] = groupEndIdx - idxSlotmap;
+-
+-        idxSlotmap = groupEndIdx;
+-        idxGroups++;
+-    }
+-
+-    // 0 fill the remaining output entries. store_kv_block kernel reads groupLen as uint32_t,
+-    // so negative fillers would be interpreted as huge positive values and bypass the
+-    // `groupLen <= 0` guard, causing out-of-range MTE writes. Use 0 so that guard works.
+-    if (idxGroups < outCapacity) {
+-        std::memset(groupLenData + idxGroups, 0,
+-                    static_cast<size_t>(outCapacity - idxGroups) * sizeof(int32_t));
+-        std::memset(groupKeyIdxData + idxGroups, 0,
+-                    static_cast<size_t>(outCapacity - idxGroups) * sizeof(int32_t));
+-        std::memset(groupKeyCacheIdxData + idxGroups, 0,
+-                    static_cast<size_t>(outCapacity - idxGroups) * sizeof(int32_t));
+-    }
+-
+-    return true;
+-}
+-
+-namespace {
+-static const char *kernelType = "StoreKvBlockMetadata";
+-REGISTER_CPU_KERNEL(kernelType, StoreKvBlockMetadataCpuKernel);
+-} // namespace
+-
+-} // namespace aicpu
+diff --git a/csrc/attention/store_kv_block_metadata/op_kernel_aicpu/store_kv_block_metadata_aicpu.h b/csrc/attention/store_kv_block_metadata/op_kernel_aicpu/store_kv_block_metadata_aicpu.h
+deleted file mode 100644
+index 94a2ac7f2..000000000
+--- a/csrc/attention/store_kv_block_metadata/op_kernel_aicpu/store_kv_block_metadata_aicpu.h
++++ /dev/null
+@@ -1,58 +0,0 @@
+-/**
+- * Copyright (c) 2026 Huawei Technologies Co., Ltd.
+- * This program is free software, you can redistribute it and/or modify it under the terms and conditions of
+- * CANN Open Software License Agreement Version 2.0 (the "License").
+- * Please refer to the License for details. You may not use this file except in compliance with the License.
+- * THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
+- * INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
+- * See LICENSE in the root of the software repository for the full text of the License.
+- */
+-
+-/*!
+- * \file store_kv_block_metadata_aicpu.h
+- * \brief AICPU kernel for StoreKvBlockMetadata: groups contiguous slot_mapping entries
+- */
+-
+-#ifndef STORE_KV_BLOCK_METADATA_AICPU_H
+-#define STORE_KV_BLOCK_METADATA_AICPU_H
+-
+-#include <string>
+-#include <vector>
+-#include "cpu_context.h"
+-#include "cpu_kernel.h"
+-#include "cpu_tensor.h"
+-
+-namespace aicpu {
+-
+-class StoreKvBlockMetadataCpuKernel : public CpuKernel {
+-public:
+-    StoreKvBlockMetadataCpuKernel() = default;
+-    ~StoreKvBlockMetadataCpuKernel() = default;
+-    uint32_t Compute(CpuKernelContext &ctx) override;
+-
+-private:
+-    bool Prepare(CpuKernelContext &ctx);
+-    bool GenMetaData();
+-
+-private:
+-    // input tensor
+-    Tensor *slotMapping_ = nullptr;
+-    Tensor *groupLen_ = nullptr;
+-    Tensor *groupKeyIdx_ = nullptr;
+-    Tensor *groupKeyCacheIdx_ = nullptr;
+-    // attribute
+-    int32_t blockSize_ = 0;
+-
+-private:
+-    enum class ParamId : uint32_t {
+-        // input
+-        slotMapping = 0,
+-        groupLen = 1,
+-        groupKeyIdx = 2,
+-        groupKeyCacheIdx = 3,
+-    };
+-};
+-
+-} // namespace aicpu
+-
+-#endif // STORE_KV_BLOCK_METADATA_AICPU_H
+diff --git a/csrc/attention/store_kv_block_metadata/op_kernel_aicpu/store_kv_block_metadata_aicpu.json b/csrc/attention/store_kv_block_metadata/op_kernel_aicpu/store_kv_block_metadata_aicpu.json
+deleted file mode 100644
+index 591b9d411..000000000
+--- a/csrc/attention/store_kv_block_metadata/op_kernel_aicpu/store_kv_block_metadata_aicpu.json
++++ /dev/null
+@@ -1,15 +0,0 @@
+-{
+-    "StoreKvBlockMetadata":{
+-        "opInfo":{
+-            "computeCost":"100",
+-            "engine":"DNN_VM_AICPU",
+-            "flagAsync":"False",
+-            "flagPartial":"False",
+-            "functionName":"RunCpuKernel",
+-            "kernelSo":"libtransformer_aicpu_kernels.so",
+-            "opKernelLib":"CUSTAICPUKernel",
+-            "userDefined":"True",
+-            "workspaceSize":"100"
+-        }
+-    }
+-}
+diff --git a/csrc/attention/store_kv_block_metadata/store_kv_block_metadata_torch_adpt.cpp b/csrc/attention/store_kv_block_metadata/store_kv_block_metadata_torch_adpt.cpp
+deleted file mode 100644
+index dea78c204..000000000
+--- a/csrc/attention/store_kv_block_metadata/store_kv_block_metadata_torch_adpt.cpp
++++ /dev/null
+@@ -1,49 +0,0 @@
+-/*
+- * Copyright (c) Huawei Technologies Co., Ltd. 2026. All rights reserved.
+- *
+- * Licensed under the Apache License, Version 2.0 (the "License");
+- * you may not use this file except in compliance with the License.
+- * You may obtain a copy of the License at
+- *
+- * http://www.apache.org/licenses/LICENSE-2.0
+- *
+- * Unless required by applicable law or agreed to in writing, software
+- * distributed under the License is distributed on an "AS IS" BASIS,
+- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+- * See the License for the specific language governing permissions and
+- * limitations under the License.
+- */
+-#ifndef STORE_KV_BLOCK_METADATA_TORCH_ADPT_H
+-#define STORE_KV_BLOCK_METADATA_TORCH_ADPT_H
+-// #include "aclnn_torch_adapter/op_api_common.h"
+-
+-namespace vllm_ascend {
+-
+-// Compute grouping metadata (group_len / group_key_idx / group_key_cache_idx)
+-// for slot_mapping on AICPU. The AICPU kernel reads slot_mapping directly from
+-// device memory, so the host-side slot_mapping_list is no longer needed.
+-//
+-// Outputs are pre-allocated with the same length as slot_mapping and zero-filled
+-// by the kernel for unused entries. The caller can detect the actual group count
+-// by scanning for the first zero group_len entry.
+-void store_kv_block_metadata(
+-    const at::Tensor &slot_mapping_npu,
+-    const at::Tensor &group_len,
+-    const at::Tensor &group_key_idx,
+-    const at::Tensor &group_key_cache_idx,
+-    int64_t block_size)
+-{
+-    TORCH_CHECK(slot_mapping_npu.numel() > 0, "Tensor slot_mapping_npu is empty.");
+-    TORCH_CHECK(block_size > 0, "block_size must be positive, but got ", block_size);
+-
+-    EXEC_NPU_CMD(aclnnStoreKvBlockMetadata,
+-                 slot_mapping_npu,
+-                 group_len,
+-                 group_key_idx,
+-                 group_key_cache_idx,
+-                 block_size);
+-}
+-
+-}  // namespace vllm_ascend
+-
+-#endif  // STORE_KV_BLOCK_METADATA_TORCH_ADPT_H
+diff --git a/csrc/build_aclnn.sh b/csrc/build_aclnn.sh
+index b9dc5b92d..516d6ce99 100755
+--- a/csrc/build_aclnn.sh
++++ b/csrc/build_aclnn.sh
+@@ -127,8 +127,6 @@ elif [[ "$SOC_VERSION" =~ ^ascend910b ]]; then
+         "chunk_fwd_o_vllm"
+         "kda_gate_cumsum_vllm"
+         "kda_layout_swap12"
+-        "store_kv_block"
+-        "store_kv_block_metadata"
+         "sparse_attention_score"
+         "k2q_csr"
+         "msa_index_score"
+@@ -184,8 +182,6 @@ elif [[ "$SOC_VERSION" =~ ^ascend910_93 ]]; then
+         "chunk_fwd_o_vllm"
+         "kda_gate_cumsum_vllm"
+         "kda_layout_swap12"
+-        "store_kv_block"
+-        "store_kv_block_metadata"
+         "sparse_attention_score"
+         "k2q_csr"
+         "msa_index_score"
+@@ -228,8 +224,6 @@ elif [[ "$SOC_VERSION" =~ ^ascend950 ]]; then
+         "chunk_fwd_o_vllm"
+         "kda_gate_cumsum_vllm"
+         "kda_layout_swap12"
+-        "store_kv_block"
+-        "store_kv_block_metadata"
+         "k2q_csr"
+         "sparse_attention_score"
+         "msa_index_score"
+diff --git a/csrc/torch_binding.cpp b/csrc/torch_binding.cpp
+index 4cd2ba038..617114d76 100644
+--- a/csrc/torch_binding.cpp
++++ b/csrc/torch_binding.cpp
+@@ -58,8 +58,6 @@
+ #include "attention/k2q_csr/k2q_csr_torch_adpt.h"
+ #include "attention/msa_index_score/msa_index_score_torch_adpt.h"
+ #include "attention/sparse_attention_score/sparse_attention_score_torch_adpt.h"
+-#include "attention/store_kv_block/store_kv_block_torch_adpt.h"
+-#include "attention/store_kv_block_metadata/store_kv_block_metadata_torch_adpt.cpp"
+ #include "moe/dequant_situ_quant/dequant_situ_quant_torch_adpt.h"
+ #include "moe/situ_mx_quant/situ_mx_quant_torch_adpt.h"
+ #include "gmm/gmm_dequant_situ_quant/gmm_dequant_situ_quant_torch_adpt.h"
+@@ -3635,18 +3633,6 @@ TORCH_LIBRARY_EXPAND(CONCAT(_C, _ascend), ops)
+     );
+     ops.impl("kda_layout_swap12", torch::kPrivateUse1, &vllm_ascend::kda_layout_swap12);
+ 
+-    //store_kv_block
+-     ops.def(
+-        "store_kv_block_metadata(Tensor slot_mapping_npu, Tensor group_len, Tensor group_key_idx, Tensor group_key_cache_idx, int block_size=0)"
+-         "-> ()"
+-     );
+-    ops.impl("store_kv_block_metadata", torch::kPrivateUse1, &vllm_ascend::store_kv_block_metadata);
+-
+-    ops.def(
+-        "store_kv_block(Tensor key_in, Tensor key_cache_in, Tensor group_len, Tensor group_key_idx,Tensor group_key_cache_idx, int block_size=0) -> ()"
+-    );
+-    ops.impl("store_kv_block", torch::kPrivateUse1, &vllm_ascend::store_kv_block);
+-
+     ops.def(
+         "npu_sparse_attention_score("
+         "Tensor query, Tensor key, Tensor value, Tensor select_idx, "
+diff --git a/csrc/torch_binding_meta.cpp b/csrc/torch_binding_meta.cpp
+index 1283f6539..b04c87dd6 100644
+--- a/csrc/torch_binding_meta.cpp
++++ b/csrc/torch_binding_meta.cpp
+@@ -1624,27 +1624,6 @@ at::Tensor kda_layout_swap12_meta(
+     return at::empty_symint(y_sizes, x.options());
+ }
+ 
+-void store_kv_block_metadata(
+-    const at::Tensor &slot_mapping_npu,
+-    const at::Tensor &group_len,
+-    const at::Tensor &group_key_idx,
+-    const at::Tensor &group_key_cache_idx,
+-    int64_t block_size)
+- {
+-    return;
+- }
+-
+-void store_kv_block(
+-    const at::Tensor &key_in,
+-    const at::Tensor &key_cache_in,
+-    const at::Tensor &group_len,
+-    const at::Tensor &group_key_idx,
+-    const at::Tensor &group_key_cache_idx,
+-    int64_t block_size)
+-{
+-    return;
+-
+-}
+ std::tuple<at::Tensor, at::Tensor> dequant_situ_quant_meta(
+     const at::Tensor& x,
+     const c10::optional<at::Tensor>& weight_scale,
+@@ -1958,9 +1937,6 @@ TORCH_LIBRARY_IMPL_EXPAND(CONCAT(_C, _ascend), Meta, ops) {
+     ops.impl("kda_gate_cumsum_vllm", &vllm_ascend::meta::kda_gate_cumsum_vllm_meta);
+     // kda_layout_swap12
+     ops.impl("kda_layout_swap12", &vllm_ascend::meta::kda_layout_swap12_meta);
+-     // store_kv_block
+-    ops.impl("store_kv_block_pre", &vllm_ascend::meta::store_kv_block_metadata);
+-    ops.impl("store_kv_block", &vllm_ascend::meta::store_kv_block);
+ }
+ }
+ #endif
+diff --git a/docs/source/locale/zh_CN/LC_MESSAGES/user_guide/configuration/additional_config.po b/docs/source/locale/zh_CN/LC_MESSAGES/user_guide/configuration/additional_config.po
+index d78a9b7f0..04e579539 100644
+--- a/docs/source/locale/zh_CN/LC_MESSAGES/user_guide/configuration/additional_config.po
++++ b/docs/source/locale/zh_CN/LC_MESSAGES/user_guide/configuration/additional_config.po
+@@ -1067,16 +1067,6 @@ msgstr ""
+ "| `enable_kv_nz`                      | bool | `False` | 是否启用 KV cache NZ "
+ "布局。该选项仅对使用 MLA 的模型（例如 DeepSeek）生效。                                      |"
+ 
+-msgid ""
+-"| `c8_enable_reshape_optim`           | bool | `True`  | Whether to use the "
+-"StoreKVBlock operator to accelerate LightningIndexer C8 cache writes. When "
+-"enabled, the optimization takes effect only when SFA and LightningIndexer C8"
+-" are active on a PD prefill (P) node. |"
+-msgstr ""
+-"| `c8_enable_reshape_optim`           | bool | `True`  | 是否使用 StoreKVBlock "
+-"算子加速 LightningIndexer C8 缓存写入。启用后，该优化仅在 PD 预填充（P）节点上 SFA 和 LightningIndexer "
+-"C8 均处于活动状态时生效。 |"
+-
+ msgid ""
+ "| `enable_flashcomm1`                 | bool | `False` | Whether to enable "
+ "SP MoE. See [Sequence Parallelism](../feature_guide/sequence_parallelism.md). |"
+@@ -1095,13 +1085,6 @@ msgstr ""
+ "TP 分片内跨 PCP rank 对 embedding 和 LM Head 权重进行分片。该选项默认启用，在 PCP size 大于 1 时生效，且与"
+ " `enable_reduce_sample` 以及这些模块的细粒度 TP 不兼容。 |"
+ 
+-msgid ""
+-"> [!WARNING]\n"
+-"> With HDK 0.26.0 or earlier, `c8_enable_reshape_optim` may conflict with pooling models that use AICPU operators. Set `c8_enable_reshape_optim` to `false` to disable the optimization and avoid the conflict. See [issue #15896](https://github.com/vllm-project/vllm-ascend/issues/15896) for details."
+-msgstr ""
+-"> [!WARNING]\n"
+-"> 在 HDK 0.26.0 或更早版本中，`c8_enable_reshape_optim` 可能与使用 AICPU 算子的池化模型冲突。将 `c8_enable_reshape_optim` 设置为 `false` 可禁用该优化并避免冲突。详情请参见 [issue #15896](https://github.com/vllm-project/vllm-ascend/issues/15896)。"
+-
+ msgid ""
+ "| `enable_super_kernel` | bool | Inherits `enable_static_kernel` | Whether "
+ "to enable Super Kernel optimization. When omitted, it follows "
+diff --git a/docs/source/tutorials/models/GLM5.2.md b/docs/source/tutorials/models/GLM5.2.md
+index 603bcd718..07e71389b 100644
+--- a/docs/source/tutorials/models/GLM5.2.md
++++ b/docs/source/tutorials/models/GLM5.2.md
+@@ -215,7 +215,7 @@ The parameters are explained as follows:
+     --quantization ascend \
+     --compilation-config '{"cudagraph_mode": "FULL_DECODE_ONLY"}' \
+     --attention_config.indexer_kv_dtype int8 \
+-    --additional-config '{"enable_dsa_cp": true, "enable_balance_scheduling": true,"fuse_muls_add":true,"multistream_overlap_shared_expert":true,"c8_enable_reshape_optim":false, "enable_flashcomm1": true, "enable_fused_mc2": 1}'  \
++    --additional-config '{"enable_dsa_cp": true, "enable_balance_scheduling": true,"fuse_muls_add":true,"multistream_overlap_shared_expert":true, "enable_flashcomm1": true, "enable_fused_mc2": 1}'  \
+     --speculative-config '{"num_speculative_tokens": 3, "method": "deepseek_mtp","enforce_eager":true}'
+     ```
+ 
+@@ -262,7 +262,7 @@ The parameters are explained as follows:
+     --quantization ascend \
+     --compilation-config '{"cudagraph_mode": "FULL_DECODE_ONLY"}' \
+     --attention_config.indexer_kv_dtype int8 \
+-    --additional-config '{"enable_dsa_cp": true, "enable_balance_scheduling": true,"fuse_muls_add":true,"multistream_overlap_shared_expert":true,"c8_enable_reshape_optim":false, "enable_flashcomm1": true, "enable_fused_mc2": 1}'  \
++    --additional-config '{"enable_dsa_cp": true, "enable_balance_scheduling": true,"fuse_muls_add":true,"multistream_overlap_shared_expert":true, "enable_flashcomm1": true, "enable_fused_mc2": 1}'  \
+     --speculative-config '{"num_speculative_tokens": 3, "method": "deepseek_mtp","enforce_eager":true}'
+     ```
+ 
+@@ -1272,7 +1272,7 @@ prepare the script `run_dp_template.sh` on each node.
+         --safetensors-load-strategy 'prefetch' \
+         --kv-cache-dtype int8 \
+         --attention_config.indexer_kv_dtype int8 \
+-        --additional-config '{"fuse_muls_add":true, "multistream_overlap_shared_expert": true, "enable_dsa_cp":true, "c8_enable_reshape_optim":true, "mega_moe_max_tokens": 8192, "enable_flashcomm1": true, "enable_fused_mc2": 1}' \
++        --additional-config '{"fuse_muls_add":true, "multistream_overlap_shared_expert": true, "enable_dsa_cp":true, "mega_moe_max_tokens": 8192, "enable_flashcomm1": true, "enable_fused_mc2": 1}' \
+         --max-num-batched-tokens 8192 \
+         --trust-remote-code \
+         --enable-prefix-caching \
+@@ -1336,7 +1336,7 @@ prepare the script `run_dp_template.sh` on each node.
+         --safetensors-load-strategy 'prefetch' \
+         --kv-cache-dtype int8 \
+         --attention_config.indexer_kv_dtype int8 \
+-        --additional-config '{"fuse_muls_add":true, "multistream_overlap_shared_expert": true, "c8_enable_reshape_optim":true, "mega_moe_max_tokens": 8192, "enable_flashcomm1": true, "enable_fused_mc2": 1}' \
++        --additional-config '{"fuse_muls_add":true, "multistream_overlap_shared_expert": true, "mega_moe_max_tokens": 8192, "enable_flashcomm1": true, "enable_fused_mc2": 1}' \
+         --max-num-batched-tokens 8192 \
+         --trust-remote-code \
+         --enable-prefix-caching \
+diff --git a/docs/source/tutorials/models/GLM5.md b/docs/source/tutorials/models/GLM5.md
+index 846dea415..9df32de42 100644
+--- a/docs/source/tutorials/models/GLM5.md
++++ b/docs/source/tutorials/models/GLM5.md
+@@ -1080,7 +1080,7 @@ if __name__ == "__main__":
+             --max-model-len 202752 \
+             --kv-cache-dtype int8 \
+             --attention_config.indexer_kv_dtype int8 \
+-            --additional-config '{"fuse_muls_add": true, "recompute_scheduler_enable": false, "multistream_overlap_shared_expert": true, "enable_dsa_cp": true, "c8_enable_reshape_optim": true, "enable_flashcomm1": true, "enable_fused_mc2": true}' \
++            --additional-config '{"fuse_muls_add": true, "recompute_scheduler_enable": false, "multistream_overlap_shared_expert": true, "enable_dsa_cp": true, "enable_flashcomm1": true, "enable_fused_mc2": true}' \
+             --max-num-batched-tokens 16384 \
+             --trust-remote-code \
+             --enable-prefix-caching \
+@@ -1142,7 +1142,7 @@ if __name__ == "__main__":
+             --max-model-len 202752 \
+             --kv-cache-dtype int8 \
+             --attention_config.indexer_kv_dtype int8 \
+-            --additional-config '{"fuse_muls_add": true, "recompute_scheduler_enable": false, "multistream_overlap_shared_expert": true, "enable_dsa_cp": true, "c8_enable_reshape_optim": true, "enable_flashcomm1": true, "enable_fused_mc2": true}' \
++            --additional-config '{"fuse_muls_add": true, "recompute_scheduler_enable": false, "multistream_overlap_shared_expert": true, "enable_dsa_cp": true, "enable_flashcomm1": true, "enable_fused_mc2": true}' \
+             --max-num-batched-tokens 16384 \
+             --trust-remote-code \
+             --enable-prefix-caching \
+diff --git a/docs/source/user_guide/configuration/additional_config.md b/docs/source/user_guide/configuration/additional_config.md
+index 7556e5c84..8fa8d8dc4 100644
+--- a/docs/source/user_guide/configuration/additional_config.md
++++ b/docs/source/user_guide/configuration/additional_config.md
+@@ -61,7 +61,6 @@ The following table lists additional configuration options available in vLLM Asc
+ | `enable_cpu_binding`                | bool | `True`  | Enables Ascend-native CPU binding on ARM servers. Set to `False` to disable. See [CPU Binding](../feature_guide/cpu_binding.md). |
+ | `pa_shape_list`                     | list | `[]`    | The custom shape list of page attention ops.                                                              |
+ | `enable_kv_nz`                      | bool | `False` | Whether to enable KV cache NZ layout. This option only takes effect on models using MLA (e.g., DeepSeek).                                      |
+-| `c8_enable_reshape_optim`           | bool | `True`  | Whether to use the StoreKVBlock operator to accelerate LightningIndexer C8 cache writes. When enabled, the optimization takes effect only when SFA and LightningIndexer C8 are active on a PD prefill (P) node. |
+ | `mc2_comm_alg`                      | str  | `""`    | set dispatch/combine op's `comm_alg` param, only supports `""/"fullmesh"/"hierarchy"/"fullmesh_v2"`. `"hierarchy"` is only supported by A2/A3, and `"fullmesh_v2"` is only supported by A3 now. |
+ | `enable_mc2_hierarchy_comm`         | bool | `False` | Enable dispatch/combine op inter-node communication by ROCE. This param will be deprecated and be replaced by mc2_comm_alg = "hierarchy" |
+ | `enable_prefill_mc2`                | bool | `False` | Whether to reserve mc2_token_capacity for prefill batches. When enabled, `max_num_batched_tokens` is used to calculate the mc2_token_capacity instead of the decode-only capacity. In this scenario, the recommended maximum value of `max_num_batched_tokens` is `tp_size * 512`. This is a temporary switch; once MC2 operators are complete for all scenarios, this switch will be removed and MC2 will be enabled by default. |
+@@ -84,9 +83,6 @@ The following table lists additional configuration options available in vLLM Asc
+ 
+ The details of each configuration option are as follows:
+ 
+-> [!WARNING]
+-> With HDK 0.26.0 or earlier, `c8_enable_reshape_optim` may conflict with pooling models that use AICPU operators. Set `c8_enable_reshape_optim` to `false` to disable the optimization and avoid the conflict. See [issue #15896](https://github.com/vllm-project/vllm-ascend/issues/15896) for details.
+-
+ **xlite_graph_config**
+ 
+ | Name | Type | Default | Description |
+diff --git a/tests/e2e/nightly/single_node/ops/singlecard_ops/test_scatter_nd_update_sk.py b/tests/e2e/nightly/single_node/ops/singlecard_ops/test_scatter_nd_update_sk.py
+index fb9f6cc71..fba2390af 100644
+--- a/tests/e2e/nightly/single_node/ops/singlecard_ops/test_scatter_nd_update_sk.py
++++ b/tests/e2e/nightly/single_node/ops/singlecard_ops/test_scatter_nd_update_sk.py
+@@ -264,7 +264,6 @@ def test_indexer_cache_dispatch_for_keys_and_scales(key_dtype, scale_dtype, row_
+     indexer = SimpleNamespace(
+         enable_sparse_li_c8=scale_dtype is not None,
+         k_cache=SimpleNamespace(kv_cache=tuple(caches)),
+-        _use_c8_reshape_optim=lambda: False,
+     )
+     with (
+         patch.object(
+@@ -280,7 +279,6 @@ def test_indexer_cache_dispatch_for_keys_and_scales(key_dtype, scale_dtype, row_
+             keys[0] if scale_dtype else keys[0].unsqueeze(1),
+             keys[1] if scale_dtype else None,
+             slots,
+-            SimpleNamespace(num_actual_tokens=tokens // 2),
+         )
+         torch.npu.synchronize()
+         a5 = get_current_hardware_profile().device_adaptor_family == DeviceAdaptorFamily.FP8_OPTIMIZED
+diff --git a/tests/e2e/nightly/single_node/ops/singlecard_ops/test_store_kv_block.py b/tests/e2e/nightly/single_node/ops/singlecard_ops/test_store_kv_block.py
+deleted file mode 100644
+index 784666305..000000000
+--- a/tests/e2e/nightly/single_node/ops/singlecard_ops/test_store_kv_block.py
++++ /dev/null
+@@ -1,104 +0,0 @@
+-import gc
+-import time
+-
+-import numpy as np
+-import pytest
+-import torch
+-import torch_npu
+-
+-from vllm_ascend.utils import enable_custom_op
+-
+-torch.set_printoptions(threshold=np.inf)
+-
+-enable_custom_op()
+-
+-
+-def cal_slot(key, key_cache, slot_mapping, block_size):
+-    key_expect = key_cache.clone()
+-    for i, slot in enumerate(slot_mapping):
+-        if slot < 0:
+-            continue
+-        token_key = key[i]
+-        block_index = slot // block_size
+-        block_offset = slot % block_size
+-        key_expect[block_index][block_offset] = token_key
+-    return key_expect.npu()
+-
+-
+-def cal_scatternd(key, key_cache, slot_mapping, block_size):
+-    key_expect = key_cache.clone()
+-    for i, slot in enumerate(slot_mapping):
+-        if slot < 0:
+-            continue
+-        token_key = key[i]
+-        key_expect[slot] = token_key
+-
+-    return key_expect.npu()
+-
+-
+-@pytest.mark.parametrize("num_tokens", [16])  # 6398
+-@pytest.mark.parametrize("num_head", [1])  # 512
+-@pytest.mark.parametrize("block_size", [128])  # 128
+-@pytest.mark.parametrize("num_blocks", [1773])  # 1599
+-@pytest.mark.parametrize("count", [1])
+-def test_scatter(num_tokens, num_head, block_size, num_blocks, count):
+-    head_size_k = 64
+-    key = torch.randint(low=0, high=128, size=(num_tokens, num_head, head_size_k), dtype=torch.int8).npu()
+-
+-    key_cache = torch.randint(
+-        low=0, high=128, size=(num_blocks * block_size, num_head, head_size_k), dtype=torch.int8
+-    ).npu()
+-
+-    slot_list = []
+-    for i in range(0, num_tokens):
+-        slot_list.append([2 + i])
+-        # slot_list.append(6+i)
+-    assert num_tokens == len(slot_list)
+-    slot_list_np = np.array(slot_list)
+-    slot_mapping_npu = torch.from_numpy(slot_list_np).to(torch.int32).npu()
+-
+-    key_expect = cal_scatternd(key, key_cache, slot_mapping_npu, block_size)
+-    N = 101
+-    for i in range(N):
+-        torch_npu.npu_scatter_nd_update_(key_cache, slot_mapping_npu, key)
+-    torch.testing.assert_close(key_expect, key_cache, atol=0.001, rtol=0.1)
+-
+-
+-@pytest.mark.parametrize("num_tokens", [52])  # 6398
+-@pytest.mark.parametrize("num_head", [1])  # 512
+-@pytest.mark.parametrize("block_size", [1])  # 128
+-@pytest.mark.parametrize("num_blocks", [1773])  # 1599
+-@pytest.mark.parametrize("count", [1])
+-def test_myops(num_tokens, num_head, block_size, num_blocks, count):
+-    head_size_k = 2
+-    key_cache = torch.randint(low=0, high=128, size=(num_blocks, block_size, num_head, head_size_k), dtype=torch.int8)
+-    key_cache_npu = key_cache.npu()
+-
+-    slot_list = []
+-    for i in range(0, num_tokens):
+-        slot_list.append(2 + i)
+-
+-    slot_list_np = np.array(slot_list)
+-    slot_mapping_npu = torch.from_numpy(slot_list_np).to(torch.int32).npu()
+-
+-    key = torch.randint(low=0, high=128, size=(num_tokens, head_size_k), dtype=torch.int8)
+-    key_npu = key.npu()
+-    key_expect = cal_slot(key_npu, key_cache_npu, slot_list_np, block_size)
+-
+-    time.sleep(0.1)
+-
+-    group_len = torch.empty(num_tokens, dtype=torch.int32).npu()
+-    group_key_idx = torch.empty(num_tokens, dtype=torch.int32).npu()
+-    group_key_cache_idx = torch.empty(num_tokens, dtype=torch.int32).npu()
+-    torch.ops._C_ascend.store_kv_block_metadata(
+-        slot_mapping_npu, group_len, group_key_idx, group_key_cache_idx, block_size
+-    )
+-    torch.ops._C_ascend.store_kv_block(
+-        key_npu, key_cache_npu, group_len, group_key_idx, group_key_cache_idx, block_size
+-    )
+-
+-    torch.testing.assert_close(key_expect, key_cache_npu, atol=0.001, rtol=0.1)
+-
+-    gc.collect()
+-    torch.npu.empty_cache()
+-    torch.npu.reset_peak_memory_stats()
+diff --git a/tests/ut/attention/test_cache_store.py b/tests/ut/attention/test_cache_store.py
+index b57aa8907..2df39a207 100644
+--- a/tests/ut/attention/test_cache_store.py
++++ b/tests/ut/attention/test_cache_store.py
+@@ -232,10 +232,6 @@ def test_main_cache_write_delegates_with_own_slots(tokens, state, producer, cons
+     slots[tokens:] = -1
+     meta = metadata(num_actual_tokens=tokens, attn_state=state)
+     with (
+-        patch(
+-            "vllm_ascend.ascend_config.get_ascend_config",
+-            return_value=SimpleNamespace(c8_enable_reshape_optim=False, c8_reshape_optim_enabled=False),
+-        ),
+         patch("vllm_ascend.attention.context_parallel.sfa_cp.DeviceOperator.scatter_cache", return_value=None) as store,
+         patch("torch_npu.npu_scatter_nd_update_", create=True) as scatter,
+     ):
+@@ -330,14 +326,11 @@ def test_indexer_cache_writes_all_gathered_rows(monkeypatch, family, key_dtype,
+         enable_sparse_li_c4=False,
+         enable_sparse_li_quant=scale_dtype is not None,
+         k_cache=SimpleNamespace(kv_cache=tuple(caches)),
+-        _use_c8_reshape_optim=lambda: False,
+     )
+     # Non-quantized forward_k produces [tokens, 1, head_dim]. Metadata still
+     # describes only the local tokens; write_cache receives the gathered rows.
+     k_li = keys[0] if scale_dtype else keys[0].unsqueeze(1)
+-    AscendSFAIndexerBackend.write_cache(
+-        indexer, k_li, keys[1] if scale_dtype else None, slots, SimpleNamespace(num_actual_tokens=2)
+-    )
++    AscendSFAIndexerBackend.write_cache(indexer, k_li, keys[1] if scale_dtype else None, slots)
+     expected_sk = fast_available and family == AscendDeviceType.A3
+     expected_pa = fast_available and family == AscendDeviceType.A5 and not row_gap
+     assert sk.call_count == (len(caches) if expected_sk else 0)
+@@ -345,25 +338,3 @@ def test_indexer_cache_writes_all_gathered_rows(monkeypatch, family, key_dtype,
+     assert pa.call_count == (len(caches) if expected_pa else 0)
+     for backing, reference in zip(backings, expected):
+         torch.testing.assert_close(backing.view(torch.uint8), reference, rtol=0, atol=0)
+-
+-
+-def test_indexer_grouped_cache_write_keeps_store_kv_block(monkeypatch):
+-    key, scale = torch.zeros(4, 128, dtype=torch.int8), torch.ones(4, 1, dtype=torch.float16)
+-    caches = (torch.empty(2, 4, 1, 128, dtype=key.dtype), torch.empty(2, 4, 1, 1, dtype=scale.dtype))
+-    indexer = SimpleNamespace(
+-        enable_sparse_li_c8=True,
+-        enable_sparse_li_c4=False,
+-        enable_sparse_li_quant=True,
+-        k_cache=SimpleNamespace(kv_cache=caches),
+-        _use_c8_reshape_optim=lambda: True,
+-    )
+-    meta = SimpleNamespace(group_len=object(), group_key_idx=object(), group_key_cache_idx=object(), block_size=4)
+-    grouped, scatter = Mock(), Mock()
+-    monkeypatch.setattr(torch.ops._C_ascend, "store_kv_block", grouped, raising=False)
+-    monkeypatch.setattr("vllm_ascend.attention.indexer.DeviceOperator.scatter_cache", scatter)
+-    AscendSFAIndexerBackend.write_cache(indexer, key, scale, torch.arange(4), meta)
+-    assert grouped.call_count == 2
+-    for call, updates, cache in zip(grouped.call_args_list, (key, scale), caches):
+-        assert call.args[0] is updates and call.args[1] is cache
+-        assert call.args[2:] == (meta.group_len, meta.group_key_idx, meta.group_key_cache_idx, 4)
+-    scatter.assert_not_called()
+diff --git a/tests/ut/attention/test_indexer.py b/tests/ut/attention/test_indexer.py
+index 876323188..2a203238f 100644
+--- a/tests/ut/attention/test_indexer.py
++++ b/tests/ut/attention/test_indexer.py
+@@ -82,9 +82,6 @@ def _make_common_metadata() -> SimpleNamespace:
+         is_prefilling=torch.tensor([True, True]),
+         context_parallel_metadata=None,
+         block_table_tensor=torch.arange(6).view(3, 2),
+-        group_len=MagicMock(name="group_len"),
+-        group_key_idx=MagicMock(name="group_key_idx"),
+-        group_key_cache_idx=MagicMock(name="group_key_cache_idx"),
+     )
+ 
+     def replace(**changes):
+@@ -157,7 +154,6 @@ def test_sfa_indexer_backend_contract():
+ @patch("vllm_ascend.attention.indexer.get_ascend_config")
+ @patch("vllm_ascend.attention.indexer.get_cos_and_sin_mla")
+ def test_sfa_indexer_metadata_builder_builds_kernel_metadata(mock_cos_sin, mock_get_ascend_config):
+-    mock_get_ascend_config.return_value.c8_reshape_optim_enabled = False
+     cos = torch.zeros(5, 1, 1, 8)
+     sin = torch.zeros(5, 1, 1, 8)
+     mock_cos_sin.return_value = (cos, sin)
+@@ -176,9 +172,6 @@ def test_sfa_indexer_metadata_builder_builds_kernel_metadata(mock_cos_sin, mock_
+     assert torch.equal(metadata.cum_query_lens, common.query_start_loc[1:3])
+     assert torch.equal(metadata.block_table, common.block_table_tensor[:2])
+     assert metadata.block_size == _KERNEL_BLOCK_SIZE
+-    assert metadata.group_len is None
+-    assert metadata.group_key_idx is None
+-    assert metadata.group_key_cache_idx is None
+     assert torch.equal(metadata.actual_seq_lengths_query, common.query_start_loc[1:3])
+     assert torch.equal(metadata.actual_seq_lengths_key, common.seq_lens[:2])
+     assert metadata.num_decode_tokens == 0
+@@ -197,7 +190,6 @@ def test_sfa_indexer_metadata_builder_builds_kernel_metadata(mock_cos_sin, mock_
+ @patch("vllm_ascend.attention.indexer.get_ascend_config")
+ @patch("vllm_ascend.attention.indexer.get_cos_and_sin_mla")
+ def test_sfa_indexer_metadata_builder_emits_full_slot_mapping_under_pcp(mock_cos_sin, mock_get_ascend_config):
+-    mock_get_ascend_config.return_value.c8_reshape_optim_enabled = False
+     mock_cos_sin.return_value = (torch.zeros(5, 1, 1, 8), torch.zeros(5, 1, 1, 8))
+ 
+     builder = _make_builder(pcp_size=2)
+@@ -215,7 +207,6 @@ def test_sfa_indexer_metadata_builder_emits_full_slot_mapping_under_pcp(mock_cos
+ def test_sfa_indexer_metadata_builder_preserves_pcp_decode_boundary(
+     mock_cos_sin, mock_get_ascend_config, dcp_size, expected_decode_tokens
+ ):
+-    mock_get_ascend_config.return_value.c8_reshape_optim_enabled = False
+     mock_cos_sin.return_value = (torch.zeros(4, 1, 1, 8), torch.zeros(4, 1, 1, 8))
+     common = _make_common_metadata()
+     common.query_start_loc = torch.tensor([0, 1, 4], dtype=torch.int32)
+@@ -238,7 +229,6 @@ def test_sfa_indexer_metadata_builder_preserves_rescheduled_prefill_boundary(
+     pd_decode_recompute,
+     expected_decode_tokens,
+ ):
+-    mock_get_ascend_config.return_value.c8_reshape_optim_enabled = False
+     mock_cos_sin.return_value = (torch.zeros(2, 1, 1, 8), torch.zeros(2, 1, 1, 8))
+     common = _make_common_metadata()
+     common.num_actual_tokens = 2
+@@ -259,39 +249,12 @@ def test_sfa_indexer_metadata_builder_preserves_rescheduled_prefill_boundary(
+     assert metadata.num_decode_tokens == expected_decode_tokens
+ 
+ 
+-@patch("vllm_ascend.attention.indexer.get_ascend_config")
+-@patch("vllm_ascend.attention.indexer.get_cos_and_sin_mla")
+-@patch("vllm_ascend.attention.indexer.torch.ops._C_ascend.store_kv_block_metadata", create=True)
+-def test_sfa_indexer_metadata_builder_primes_reshape_optim(
+-    mock_store_kv_block_metadata,
+-    mock_cos_sin,
+-    mock_get_ascend_config,
+-):
+-    mock_get_ascend_config.return_value.c8_reshape_optim_enabled = True
+-    mock_cos_sin.return_value = (torch.zeros(5, 1, 1, 8), torch.zeros(5, 1, 1, 8))
+-
+-    builder = _make_builder()
+-    common = _make_common_metadata()
+-    metadata = builder.build(0, common)
+-
+-    mock_store_kv_block_metadata.assert_called_once_with(
+-        metadata.slot_mapping,
+-        metadata.group_len,
+-        metadata.group_key_idx,
+-        metadata.group_key_cache_idx,
+-        _KERNEL_BLOCK_SIZE,
+-    )
+-    assert metadata.group_len is not common.group_len
+-    assert metadata.group_len.numel() == metadata.slot_mapping.numel()
+-
+-
+ @patch("vllm_ascend.attention.indexer.get_ascend_config")
+ @patch("vllm_ascend.attention.indexer.get_cos_and_sin_mla")
+ def test_sfa_indexer_metadata_builder_owns_replicated_dcp_addresses(
+     mock_cos_sin,
+     mock_get_ascend_config,
+ ):
+-    mock_get_ascend_config.return_value.c8_reshape_optim_enabled = False
+     mock_cos_sin.return_value = (torch.zeros(5, 1, 1, 8), torch.zeros(5, 1, 1, 8))
+     common = _make_common_metadata()
+ 
+@@ -320,7 +283,6 @@ def test_sfa_indexer_metadata_builder_pads_dsa_slots(
+ ):
+     mock_get_tp_group.return_value.world_size = 4
+     mock_get_tp_group.return_value.rank_in_group = 0
+-    mock_get_ascend_config.return_value.c8_reshape_optim_enabled = False
+     mock_cos_sin.return_value = (torch.zeros(3, 1, 1, 8), torch.zeros(3, 1, 1, 8))
+     common = _make_common_metadata()
+     common.num_actual_tokens = 3
+@@ -348,7 +310,6 @@ def test_sfa_indexer_draft_metadata_owns_per_step_dsa_buffers(
+     mock_get_ascend_config,
+ ):
+     mock_get_tp_group.return_value.rank_in_group = 0
+-    mock_get_ascend_config.return_value.c8_reshape_optim_enabled = False
+     mock_cos_sin.return_value = (
+         torch.zeros(3, 1, 1, 8),
+         torch.zeros(3, 1, 1, 8),
+@@ -382,7 +343,6 @@ def test_sfa_indexer_draft_metadata_owns_per_step_dcp_buffers(
+     mock_cos_sin,
+     mock_get_ascend_config,
+ ):
+-    mock_get_ascend_config.return_value.c8_reshape_optim_enabled = False
+     mock_cos_sin.return_value = (
+         torch.zeros(5, 1, 1, 8),
+         torch.zeros(5, 1, 1, 8),
+@@ -413,7 +373,6 @@ def test_sfa_indexer_graph_capture_owns_stable_per_step_buffers(
+     mock_get_tp_group, mock_cos_sin, mock_get_ascend_config, dsa_cp
+ ):
+     mock_get_tp_group.return_value.rank_in_group = 0
+-    mock_get_ascend_config.return_value.c8_reshape_optim_enabled = False
+     mock_cos_sin.side_effect = [
+         (torch.full((4, 1, 1, 8), value), torch.full((4, 1, 1, 8), -value)) for value in range(4)
+     ]
+@@ -439,14 +398,11 @@ def test_sfa_indexer_graph_capture_owns_stable_per_step_buffers(
+ @pytest.mark.parametrize("for_cudagraph_capture", [False, True])
+ @patch("vllm_ascend.attention.indexer.get_ascend_config")
+ @patch("vllm_ascend.attention.indexer.get_cos_and_sin_mla")
+-@patch("vllm_ascend.attention.indexer.torch.ops._C_ascend.store_kv_block_metadata", create=True)
+-def test_sfa_indexer_metadata_builder_builds_pcp_dcp_slots_and_c8_groups(
+-    mock_store_kv_block_metadata,
++def test_sfa_indexer_metadata_builder_builds_pcp_dcp_slots(
+     mock_cos_sin,
+     mock_get_ascend_config,
+     for_cudagraph_capture,
+ ):
+-    mock_get_ascend_config.return_value.c8_reshape_optim_enabled = True
+     mock_cos_sin.return_value = (torch.zeros(5, 1, 1, 8), torch.zeros(5, 1, 1, 8))
+     common = _make_common_metadata()
+     global_batch = SimpleNamespace(
+@@ -483,15 +439,6 @@ def test_sfa_indexer_metadata_builder_builds_pcp_dcp_slots_and_c8_groups(
+         metadata.slot_mapping,
+         torch.tensor([2816, 2560, 2688, -1], dtype=torch.int32),
+     )
+-    mock_store_kv_block_metadata.assert_called_once_with(
+-        metadata.slot_mapping,
+-        metadata.group_len,
+-        metadata.group_key_idx,
+-        metadata.group_key_cache_idx,
+-        _KERNEL_BLOCK_SIZE,
+-    )
+-    assert metadata.group_len is not common.group_len
+-    assert metadata.group_len.numel() == metadata.slot_mapping.numel()
+ 
+ 
+ @pytest.mark.parametrize("with_dependency", [False, True])
+@@ -540,8 +487,7 @@ def test_indexer_orders_cache_gathers_after_query_dependency(with_dependency, qu
+     assert events == expected + ["write_cache"]
+ 
+ 
+-@pytest.mark.parametrize("reshape_enabled", [False, True])
+-def test_c4_cache_write_preserves_packed_bytes(monkeypatch, reshape_enabled):
++def test_c4_cache_write_preserves_packed_bytes(monkeypatch):
+     indexer = AscendSFAIndexerBackend.__new__(AscendSFAIndexerBackend)
+     indexer.enable_sparse_li_c4 = True
+     indexer.enable_sparse_li_c8 = False
+@@ -554,21 +500,15 @@ def test_c4_cache_write_preserves_packed_bytes(monkeypatch, reshape_enabled):
+     # A CPU tensor cannot use the NPU-only FP4 dtype. Its one-byte storage
+     # surrogate exercises the packed-dtype branch without an NPU allocation.
+     monkeypatch.setattr(torch_npu, "float4_e2m1fn_x2", torch.uint8, raising=False)
+-    monkeypatch.setattr(
+-        "vllm_ascend.attention.indexer.get_ascend_config",
+-        lambda: SimpleNamespace(c8_reshape_optim_enabled=reshape_enabled),
+-    )
+ 
+     def scatter(cache, indices, updates):
+         assert cache.dtype == updates.dtype == torch.uint8
+         cache[indices.flatten()] = updates
+ 
+     scatter_op = Mock(side_effect=scatter)
+-    grouped = Mock()
+     monkeypatch.setattr("vllm_ascend.attention.indexer.DeviceOperator.scatter_cache", scatter_op)
+-    monkeypatch.setattr(torch.ops._C_ascend, "store_kv_block", grouped, raising=False)
+ 
+-    indexer.write_cache(packed_key, scale.view(torch.float8_e8m0fnu), slots, SimpleNamespace())
++    indexer.write_cache(packed_key, scale.view(torch.float8_e8m0fnu), slots)
+ 
+     expected_key = torch.full_like(key_cache, 23).view(-1, 64)
+     expected_scale = torch.full_like(scale_bytes, 23).view(-1, 2, 2)
+@@ -577,8 +517,6 @@ def test_c4_cache_write_preserves_packed_bytes(monkeypatch, reshape_enabled):
+     assert torch.equal(key_cache.view(-1, 64), expected_key)
+     assert torch.equal(scale_bytes.view(-1, 2, 2), expected_scale)
+     assert scatter_op.call_count == 2
+-    # C8 grouped-write configuration must never redirect the C4 path.
+-    grouped.assert_not_called()
+ 
+ 
+ @pytest.mark.parametrize("query_lengths,key_lengths", [([2, 3], [2, 3]), ([1, 1], [31, 65])])
+diff --git a/tests/ut/attention/test_sfa_nope_metadata.py b/tests/ut/attention/test_sfa_nope_metadata.py
+index aff13f09b..9e8a55108 100644
+--- a/tests/ut/attention/test_sfa_nope_metadata.py
++++ b/tests/ut/attention/test_sfa_nope_metadata.py
+@@ -42,7 +42,6 @@ def _builder(block_size, a5, monkeypatch, rope_dim=0, builder_cls=sfa.AscendSFAM
+         "get_current_hardware_profile",
+         lambda: SimpleNamespace(device_adaptor_family=DeviceAdaptorFamily.FP8_OPTIMIZED if a5 else None),
+     )
+-    monkeypatch.setattr(sfa, "get_ascend_config", lambda: SimpleNamespace(c8_reshape_optim_enabled=False))
+     monkeypatch.setattr(sfa, "select_common_block_size", lambda *args: 128)
+     monkeypatch.setattr(
+         sfa, "AttentionMaskBuilder", lambda device: SimpleNamespace(get_attention_mask=lambda *args: None)
+@@ -79,9 +78,6 @@ def _common(block_size):
+         block_table_tensor=expanded,
+         max_query_len=2,
+         max_seq_len=block_size + 2,
+-        group_len=None,
+-        group_key_idx=None,
+-        group_key_cache_idx=None,
+         attn_state=sfa.AscendAttentionState.ChunkedPrefill,
+         causal=True,
+     )
+diff --git a/tests/ut/attention/test_sfa_v1.py b/tests/ut/attention/test_sfa_v1.py
+index 6bff66350..20d73129b 100644
+--- a/tests/ut/attention/test_sfa_v1.py
++++ b/tests/ut/attention/test_sfa_v1.py
+@@ -285,20 +285,6 @@ class TestAscendSFACacheComposition(TestBase):
+                 for actual_tensor, expected_tensor in zip(composed, expected):
+                     self.assertIs(actual_tensor, expected_tensor)
+ 
+-    @patch("vllm_ascend.attention.indexer.get_ascend_config")
+-    def test_li_c8_reshape_optim_requires_layer_li_c8(self, mock_get_ascend_config):
+-        indexer = AscendSFAIndexerBackend.__new__(AscendSFAIndexerBackend)
+-        mock_get_ascend_config.return_value.c8_reshape_optim_enabled = True
+-
+-        indexer.enable_sparse_li_c8 = False
+-        self.assertFalse(indexer._use_c8_reshape_optim())
+-
+-        indexer.enable_sparse_li_c8 = True
+-        self.assertTrue(indexer._use_c8_reshape_optim())
+-
+-        mock_get_ascend_config.return_value.c8_reshape_optim_enabled = False
+-        self.assertFalse(indexer._use_c8_reshape_optim())
+-
+     @patch("vllm_ascend.attention.sfa_v1.get_forward_context")
+     def test_get_indexer_attn_metadata_fetches_by_k_cache_prefix(self, mock_get_forward_context):
+         impl = AscendSFAImpl.__new__(AscendSFAImpl)
+@@ -808,7 +794,6 @@ class TestAscendSFAMetadataBuilder(TestBase):
+         self.patcher.start()
+ 
+         mock_ascend_config = MagicMock()
+-        mock_ascend_config.c8_reshape_optim_enabled = False
+         mock_ascend_config.enable_mlapo = True
+         mock_ascend_config.enable_shared_expert_dp = False
+         self.ascend_config_patcher = patch(
+@@ -1002,90 +987,6 @@ class TestAscendSFAMetadataBuilder(TestBase):
+         assert isinstance(attn_metadata, AscendSFAMetadata)
+         assert attn_metadata.attn_state == AscendAttentionState.DecodeOnly
+ 
+-    @patch("vllm_ascend.attention.sfa_v1.get_current_vllm_config")
+-    @patch("vllm_ascend.attention.sfa_v1.get_cos_and_sin_mla")
+-    @patch("torch.ops._C_ascend.store_kv_block_metadata", create=True)
+-    def test_ascend_sfa_metadata_builder_does_not_build_indexer_c8_metadata(
+-        self,
+-        store_kv_block_metadata,
+-        mock_get_cos_and_sin_mla,
+-        mock_get_current_vllm_config,
+-    ):
+-        cfg = MagicMock()
+-        cfg.model_config = MagicMock()
+-        cfg.model_config.hf_text_config = MagicMock()
+-
+-        mock_get_current_vllm_config.return_value = cfg
+-        kv_cache_spec = MagicMock()
+-        kv_cache_spec.block_size = 128
+-        layer_names = ["layer1", "layer2"]
+-        vllm_config = MagicMock()
+-        vllm_config.cache_config.block_size = 16
+-        vllm_config.scheduler_config.max_num_seqs = 16
+-        vllm_config.parallel_config.prefill_context_parallel_size = 1
+-        vllm_config.model_config.max_model_len = 1024
+-        vllm_config.model_config.get_head_size.return_value = 64
+-        vllm_config.model_config.dtype = torch.float16
+-        vllm_config.model_config.hf_text_config.qk_rope_head_dim = 64
+-        vllm_config.kv_transfer_config = SimpleNamespace(
+-            kv_role="kv_producer",
+-            is_kv_producer=True,
+-            is_kv_consumer=False,
+-        )
+-        speculative_config = MagicMock()
+-        speculative_config.num_speculative_tokens = 4
+-        vllm_config.speculative_config = speculative_config
+-        device = torch.device("cpu")
+-
+-        common_attn_metadata = MagicMock()
+-        common_attn_metadata.decode_token_per_req = 1
+-        common_attn_metadata.context_parallel_metadata = None
+-        common_attn_metadata.max_query_len = 10
+-        common_attn_metadata.num_reqs = 10
+-        common_attn_metadata.num_actual_tokens = 100
+-        common_attn_metadata.query_start_loc = torch.arange(0, 101, 10, dtype=torch.int32)
+-        common_attn_metadata.query_start_loc_cpu = common_attn_metadata.query_start_loc.cpu()
+-        common_attn_metadata.slot_mapping = torch.randint(0, 10000, (100, 4, 1024), dtype=torch.int64)
+-        common_attn_metadata.seq_lens = torch.full((10,), 10, dtype=torch.int32)
+-        common_attn_metadata.seq_lens_cpu = common_attn_metadata.seq_lens.cpu()
+-        common_attn_metadata._seq_lens_cpu = None
+-        common_attn_metadata.positions = torch.randn(100)
+-        common_attn_metadata.attn_mask = None
+-        common_attn_metadata.attn_state = AscendAttentionState.ChunkedPrefill
+-        common_attn_metadata.block_table_tensor = torch.randn(100, 4)
+-        common_attn_metadata.cos = None
+-        common_attn_metadata.sin = None
+-        common_attn_metadata.num_input_tokens = 100
+-
+-        mock_get_cos_and_sin_mla.return_value = (torch.randn(100), torch.randn(100))
+-
+-        with patch("vllm_ascend.attention.sfa_v1.get_ascend_config") as mock_get_ascend_config:
+-            mock_ascend_config = MagicMock()
+-            mock_ascend_config.c8_reshape_optim_enabled = True
+-            mock_get_ascend_config.return_value = mock_ascend_config
+-
+-            builder = AscendSFAMetadataBuilder(
+-                kv_cache_spec=kv_cache_spec,
+-                layer_names=layer_names,
+-                vllm_config=vllm_config,
+-                device=device,
+-            )
+-
+-            metadata = builder.build(
+-                common_prefix_len=10,
+-                common_attn_metadata=common_attn_metadata,
+-            )
+-
+-        assert isinstance(metadata, AscendSFAMetadata)
+-        assert metadata.num_actual_tokens == common_attn_metadata.num_actual_tokens
+-        assert metadata.slot_mapping.shape == (100, 4, 1024)
+-
+-        store_kv_block_metadata.assert_not_called()
+-        assert metadata.block_size == 128
+-        assert metadata.group_len is None
+-        assert metadata.group_key_idx is None
+-        assert metadata.group_key_cache_idx is None
+-
+ 
+ class TestAscendSFAImpl(TestBase):
+     @patch("vllm.distributed.parallel_state._TP", new_callable=lambda: MagicMock(spec=GroupCoordinator))
+diff --git a/tests/ut/model_loader/rfork/test_identity_validation.py b/tests/ut/model_loader/rfork/test_identity_validation.py
+index ced510f6b..cca50357f 100644
+--- a/tests/ut/model_loader/rfork/test_identity_validation.py
++++ b/tests/ut/model_loader/rfork/test_identity_validation.py
+@@ -244,7 +244,6 @@ def _ascend_config(**overrides):
+         "mlapo_keep_prefill_weights": False,
+         "enable_sparse_sfa_c8": False,
+         "enable_sparse_li_c8": False,
+-        "c8_reshape_optim_enabled": False,
+         "enable_dsa_cp": False,
+         "mix_placement": False,
+         "enable_shared_expert_dp": False,
+@@ -301,7 +300,6 @@ def test_ascend_layout_switches_do_not_partition_weight_seeds(identity_module, m
+         ("mlapo_keep_prefill_weights", False, True),
+         ("enable_sparse_sfa_c8", False, True),
+         ("enable_sparse_li_c8", False, True),
+-        ("c8_reshape_optim_enabled", False, True),
+         ("enable_dsa_cp", False, True),
+         ("enable_shared_expert_dp", False, True),
+         ("enable_sp_by_pass", False, True),
+diff --git a/tests/ut/ops/test_mla.py b/tests/ut/ops/test_mla.py
+index 8197c33d0..fe51da644 100644
+--- a/tests/ut/ops/test_mla.py
++++ b/tests/ut/ops/test_mla.py
+@@ -188,7 +188,6 @@ class TestAscendSFAIndexerBackend(TestBase):
+             k_li,
+             None,
+             indexer_metadata.slot_mapping,
+-            indexer_attn_metadata=indexer_metadata,
+         )
+ 
+     def test_forward_skip_topk_still_persists_cache(self):
+@@ -270,10 +269,8 @@ class TestAscendSFAIndexerBackend(TestBase):
+         self.assertIsNone(out_scale)
+         self.assertIs(out_slots, indexer_metadata.slot_mapping)
+ 
+-    @patch("vllm_ascend.attention.indexer.get_ascend_config")
+     @patch("vllm_ascend.attention.indexer.DeviceOperator.scatter_cache")
+-    def test_write_cache_scatter_path(self, mock_scatter, mock_get_ascend_config):
+-        mock_get_ascend_config.return_value.c8_reshape_optim_enabled = False
++    def test_write_cache_scatter_path(self, mock_scatter):
+         indexer = AscendSFAIndexerBackend.__new__(AscendSFAIndexerBackend)
+         indexer.enable_sparse_li_c8 = True
+         indexer.enable_sparse_li_c4 = False
+@@ -285,7 +282,7 @@ class TestAscendSFAIndexerBackend(TestBase):
+         indexer_scale_cache = torch.zeros(8, 1)
+         indexer.k_cache = SimpleNamespace(kv_cache=(indexer_k_cache, indexer_scale_cache))
+ 
+-        indexer.write_cache(k_li, k_li_scale, slot_mapping, MagicMock())
++        indexer.write_cache(k_li, k_li_scale, slot_mapping)
+ 
+         self.assertEqual(mock_scatter.call_count, 2)
+         k_call, scale_call = mock_scatter.call_args_list
+@@ -298,10 +295,8 @@ class TestAscendSFAIndexerBackend(TestBase):
+         self.assertEqual(scale_call.args[2].data_ptr(), k_li_scale.data_ptr())
+         self.assertEqual(len(scale_call.args), 3)
+ 
+-    @patch("vllm_ascend.attention.indexer.get_ascend_config")
+     @patch("vllm_ascend.attention.indexer.DeviceOperator.scatter_cache")
+-    def test_write_cache_without_li_c8_writes_k_only(self, mock_scatter, mock_get_ascend_config):
+-        mock_get_ascend_config.return_value.c8_reshape_optim_enabled = False
++    def test_write_cache_without_li_c8_writes_k_only(self, mock_scatter):
+         indexer = AscendSFAIndexerBackend.__new__(AscendSFAIndexerBackend)
+         indexer.enable_sparse_li_c8 = False
+         indexer.enable_sparse_li_c4 = False
+@@ -311,7 +306,7 @@ class TestAscendSFAIndexerBackend(TestBase):
+         indexer_k_cache = torch.zeros(8, 4)
+         indexer.k_cache = SimpleNamespace(kv_cache=(indexer_k_cache,))
+ 
+-        indexer.write_cache(k_li, None, slot_mapping, MagicMock())
++        indexer.write_cache(k_li, None, slot_mapping)
+ 
+         mock_scatter.assert_called_once()
+         self.assertEqual(mock_scatter.call_args.args[0].data_ptr(), indexer_k_cache.data_ptr())
+@@ -319,30 +314,6 @@ class TestAscendSFAIndexerBackend(TestBase):
+         self.assertEqual(mock_scatter.call_args.args[2].data_ptr(), k_li.data_ptr())
+         self.assertEqual(len(mock_scatter.call_args.args), 3)
+ 
+-    @patch("vllm_ascend.attention.indexer.get_ascend_config")
+-    @patch("vllm_ascend.attention.indexer.torch.ops._C_ascend.store_kv_block", create=True)
+-    def test_write_cache_reshape_optim_path(self, mock_store_kv_block, mock_get_ascend_config):
+-        mock_get_ascend_config.return_value.c8_reshape_optim_enabled = True
+-        indexer = AscendSFAIndexerBackend.__new__(AscendSFAIndexerBackend)
+-        indexer.enable_sparse_li_c8 = True
+-        indexer.enable_sparse_li_c4 = False
+-
+-        k_li = torch.zeros(2, 4)
+-        k_li_scale = torch.zeros(2, 1)
+-        indexer_k_cache = torch.zeros(8, 4)
+-        indexer_scale_cache = torch.zeros(8, 1)
+-        indexer.k_cache = SimpleNamespace(kv_cache=(indexer_k_cache, indexer_scale_cache))
+-        attn_metadata = MagicMock()
+-
+-        indexer.write_cache(k_li, k_li_scale, torch.tensor([3, 5]), attn_metadata)
+-
+-        self.assertEqual(mock_store_kv_block.call_count, 2)
+-        k_call, scale_call = mock_store_kv_block.call_args_list
+-        self.assertIs(k_call.args[0], k_li)
+-        self.assertIs(k_call.args[1], indexer_k_cache)
+-        self.assertIs(scale_call.args[0], k_li_scale)
+-        self.assertIs(scale_call.args[1], indexer_scale_cache)
+-
+ 
+ class TestIndexerWrapper(TestBase):
+     @patch("vllm_ascend.ops.mla.AscendSFAIndexerBackend")
+diff --git a/tests/ut/test_ascend_config.py b/tests/ut/test_ascend_config.py
+index d74730e50..06f278073 100644
+--- a/tests/ut/test_ascend_config.py
++++ b/tests/ut/test_ascend_config.py
+@@ -1845,51 +1845,6 @@ class TestTopLevelSwitchTypeValidation(TestBase):
+ 
+         self.assertTrue(config.enable_sparse_sfa_c8)
+ 
+-    @_clean_up
+-    @patch("vllm_ascend.utils.model_uses_sfa_sparse")
+-    @patch("vllm_ascend.platform.NPUPlatform.check_and_update_config")
+-    def test_c8_reshape_optim_is_initialized_from_sfa_li_c8_and_pd_role(
+-        self,
+-        mock_fix,
+-        mock_uses_sfa,
+-    ):
+-        cases = (
+-            (None, True, True, "kv_producer", True),
+-            (False, True, True, "kv_producer", False),
+-            (True, False, True, "kv_producer", False),
+-            (True, True, False, "kv_producer", False),
+-            (True, True, True, "kv_consumer", False),
+-            (True, True, True, "kv_both", False),
+-            (True, True, True, None, False),
+-        )
+-        for reshape_optim, uses_sfa, enable_li_c8, kv_role, expected in cases:
+-            with self.subTest(
+-                reshape_optim=reshape_optim,
+-                uses_sfa=uses_sfa,
+-                enable_li_c8=enable_li_c8,
+-                kv_role=kv_role,
+-            ):
+-                mock_uses_sfa.return_value = uses_sfa
+-                vc = VllmConfig()
+-                vc.additional_config = {
+-                    "refresh": True,
+-                    "enable_sparse_li_c8": enable_li_c8,
+-                }
+-                if reshape_optim is not None:
+-                    vc.additional_config["c8_enable_reshape_optim"] = reshape_optim
+-                # enable_sparse_li_c8 is derived from indexer_kv_dtype (see
+-                # init_ascend_config); the per-case flag is expressed there.
+-                vc.attention_config.indexer_kv_dtype = "int8" if enable_li_c8 else "auto"
+-                if kv_role is not None:
+-                    vc.kv_transfer_config = KVTransferConfig(
+-                        kv_connector="MooncakeConnectorV1",
+-                        kv_role=kv_role,
+-                    )
+-
+-                config = init_ascend_config(vc)
+-
+-                self.assertEqual(config.c8_reshape_optim_enabled, expected)
+-
+     @_clean_up
+     @patch("vllm_ascend.platform.NPUPlatform.check_and_update_config")
+     def test_rejection_sampler_config_survives_factory(self, mock_fix):
+diff --git a/vllm_ascend/ascend_config.py b/vllm_ascend/ascend_config.py
+index aa06e1430..6bebb788c 100644
+--- a/vllm_ascend/ascend_config.py
++++ b/vllm_ascend/ascend_config.py
+@@ -449,7 +449,6 @@ class AscendConfig:
+             "enable_sparse_sfa_c8": false,
+             "enable_sparse_li_c8": false,
+             "enable_sparse_li_c4": false,
+-            "c8_enable_reshape_optim": true,
+             "ascend_compilation_config": {
+                 "enable_npugraph_ex": true,
+                 "enable_static_kernel": false,
+@@ -642,8 +641,6 @@ class AscendConfig:
+     enable_sparse_sfa_c8: bool = False
+     enable_sparse_li_c8: bool = False
+     enable_sparse_li_c4: bool = False
+-    # See https://github.com/vllm-project/vllm-ascend/issues/15896
+-    c8_enable_reshape_optim: bool = True
+     pd_tp_ratio: int = 1
+     pd_head_ratio: int = 1
+     num_head_replica: int = 1
+@@ -654,7 +651,6 @@ class AscendConfig:
+     _sparse_li_c4_layer_ids: set[int] = dataclasses.field(default_factory=set, init=False, repr=False)
+     _sparse_li_c4_layer_names: set[str] = dataclasses.field(default_factory=set, init=False, repr=False)
+     _sparse_li_layer_filter_enabled: bool = dataclasses.field(default=False, init=False, repr=False)
+-    _c8_reshape_optim_enabled: bool = dataclasses.field(default=False, init=False, repr=False)
+ 
+     @model_validator(mode="after")
+     def _validate_user_input_ranges(self):
+@@ -916,15 +912,6 @@ class AscendConfig:
+         self.enable_sparse_li_c4 = vllm_config.attention_config.indexer_kv_dtype == "mxfp4" and use_sparse
+         if self.enable_sparse_li_c8 and self.enable_sparse_li_c4:
+             raise ValueError("enable_sparse_li_c8 and enable_sparse_li_c4 are mutually exclusive.")
+-        kv_transfer_config = vc.kv_transfer_config
+-        is_prefill_node = kv_transfer_config is not None and (
+-            getattr(kv_transfer_config, "kv_role", None) == "kv_producer"
+-            or (
+-                bool(getattr(kv_transfer_config, "is_kv_producer", False))
+-                and not bool(getattr(kv_transfer_config, "is_kv_consumer", False))
+-            )
+-        )
+-        self._c8_reshape_optim_enabled = self.c8_enable_reshape_optim and self.enable_sparse_li_c8 and is_prefill_node
+         quant_config = getattr(vc, "quant_config", None)
+         (
+             self._sparse_li_c8_layer_ids,
+@@ -1260,11 +1247,6 @@ class AscendConfig:
+             self._sparse_li_c4_layer_ids,
+         )
+ 
+-    @property
+-    def c8_reshape_optim_enabled(self) -> bool:
+-        """Whether SFA should use StoreKVBlock for LI C8 cache writes."""
+-        return self._c8_reshape_optim_enabled
+-
+     @staticmethod
+     def _get_compile_ranges(compilation_config):
+         return compilation_config.compile_ranges_endpoints or []
+diff --git a/vllm_ascend/attention/indexer.py b/vllm_ascend/attention/indexer.py
+index bd227cf38..04d8c281c 100644
+--- a/vllm_ascend/attention/indexer.py
++++ b/vllm_ascend/attention/indexer.py
+@@ -77,9 +77,6 @@ class AscendSFAIndexerMetadata:
+     sin: torch.Tensor
+     cos: torch.Tensor
+     block_size: int = 0
+-    group_len: torch.Tensor | None = None
+-    group_key_idx: torch.Tensor | None = None
+-    group_key_cache_idx: torch.Tensor | None = None
+     # Parallel-layout sequence lengths consumed by the top-k kernel. Base/PCP
+     # modes use the unsharded values; DSA-CP uses rank-local lengths.
+     actual_seq_lengths_query: torch.Tensor | None = None
+@@ -267,7 +264,6 @@ class AscendSFAIndexerBackend(nn.Module, AttentionBackend):
+         k_li: torch.Tensor,
+         k_li_scale: torch.Tensor | None,
+         slot_mapping: torch.Tensor,
+-        indexer_attn_metadata: Any | None = None,
+     ) -> None:
+         """Persist ``k_li`` (and ``k_li_scale`` when LI quant is enabled) into
+         this indexer's own cache tensors: slot 0 of ``self.k_cache.kv_cache``
+@@ -276,33 +272,18 @@ class AscendSFAIndexerBackend(nn.Module, AttentionBackend):
+         ``forward`` calls this after ``_gather_cache_inputs`` has resolved
+         the parallel layout of the tensors and the slot mapping; variants
+         with a different cache layout should override it.
+-        ``indexer_attn_metadata`` is this indexer's own layer metadata; the
+-        LI quant reshape-optim path reads its group fields.
+         """
+         indexer_k_cache = self.k_cache.kv_cache[INDEXER_K_CACHE_SLOT]
+-        use_reshape_optim = self._use_c8_reshape_optim()
+-        # float4_e2m1fn_x2 / float8_e8m0fnu are not supported by the scatter /
+-        # store_kv_block kernels; view as uint8 (same 1-byte layout) for the
+-        # cache write.
++        # float4_e2m1fn_x2 / float8_e8m0fnu are not supported by the scatter
++        # kernel; view as uint8 (same 1-byte layout) for the cache write.
+         if k_li.dtype == torch_npu.float4_e2m1fn_x2:
+             indexer_k_cache = indexer_k_cache.view(torch.uint8)
+             k_li = k_li.view(torch.uint8)
+-        if use_reshape_optim:
+-            assert indexer_attn_metadata is not None
+-            torch.ops._C_ascend.store_kv_block(
+-                k_li,
+-                indexer_k_cache,
+-                indexer_attn_metadata.group_len,
+-                indexer_attn_metadata.group_key_idx,
+-                indexer_attn_metadata.group_key_cache_idx,
+-                indexer_attn_metadata.block_size,
+-            )
+-        else:
+-            DeviceOperator.scatter_cache(
+-                indexer_k_cache.view(-1, k_li.shape[-1]),
+-                slot_mapping.view(-1, 1),
+-                k_li.view(-1, k_li.shape[-1]),
+-            )
++        DeviceOperator.scatter_cache(
++            indexer_k_cache.view(-1, k_li.shape[-1]),
++            slot_mapping.view(-1, 1),
++            k_li.view(-1, k_li.shape[-1]),
++        )
+         if self.enable_sparse_li_quant:
+             assert k_li_scale is not None
+             # C4 scale is multi-dimensional (b*s, d/64, 2); C8 is (b*s, 1).
+@@ -312,26 +293,11 @@ class AscendSFAIndexerBackend(nn.Module, AttentionBackend):
+             if indexer_scale_cache.dtype == torch.float8_e8m0fnu:
+                 indexer_scale_cache = indexer_scale_cache.view(torch.uint8)
+                 k_li_scale = k_li_scale.view(torch.uint8)
+-            if use_reshape_optim:
+-                assert indexer_attn_metadata is not None
+-                torch.ops._C_ascend.store_kv_block(
+-                    k_li_scale,
+-                    indexer_scale_cache,
+-                    indexer_attn_metadata.group_len,
+-                    indexer_attn_metadata.group_key_idx,
+-                    indexer_attn_metadata.group_key_cache_idx,
+-                    indexer_attn_metadata.block_size,
+-                )
+-            else:
+-                DeviceOperator.scatter_cache(
+-                    indexer_scale_cache.view(-1, *scale_per_token),
+-                    slot_mapping.view(-1, 1),
+-                    k_li_scale.view(-1, *scale_per_token),
+-                )
+-
+-    def _use_c8_reshape_optim(self) -> bool:
+-        """Whether this indexer can use the LI C8 cache-write operator."""
+-        return self.enable_sparse_li_c8 and get_ascend_config().c8_reshape_optim_enabled
++            DeviceOperator.scatter_cache(
++                indexer_scale_cache.view(-1, *scale_per_token),
++                slot_mapping.view(-1, 1),
++                k_li_scale.view(-1, *scale_per_token),
++            )
+ 
+     def forward_k(
+         self,
+@@ -460,7 +426,7 @@ class AscendSFAIndexerBackend(nn.Module, AttentionBackend):
+             # collectives during graph replay. wait() adds a stream dependency.
+             attn_q_gather_handle.wait()
+         k_li, k_li_scale, slot_mapping = self._gather_cache_inputs(k_li, k_li_scale, indexer_metadata)
+-        self.write_cache(k_li, k_li_scale, slot_mapping, indexer_attn_metadata=indexer_metadata)
++        self.write_cache(k_li, k_li_scale, slot_mapping)
+         if not compute_topk:
+             return None
+ 
+@@ -964,29 +930,6 @@ class AscendSFAIndexerMetadataBuilder(AttentionMetadataBuilder[AscendSFAIndexerM
+         sin_view.copy_(sin)
+         return cos_view, sin_view
+ 
+-    def _get_group_metadata_buffers(
+-        self,
+-        draft_index: object,
+-        num_slots: int,
+-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+-        if num_slots > self._slot_capacity:
+-            raise RuntimeError(
+-                f"Indexer C8 group metadata buffer is too small: capacity={self._slot_capacity}, required={num_slots}."
+-            )
+-        buffers = self._group_metadata_buffers.get(draft_index)
+-        if buffers is None:
+-            buffers = (
+-                torch.empty(self._slot_capacity, dtype=torch.int32, device=self.device),
+-                torch.empty(self._slot_capacity, dtype=torch.int32, device=self.device),
+-                torch.empty(self._slot_capacity, dtype=torch.int32, device=self.device),
+-            )
+-            self._group_metadata_buffers[draft_index] = buffers
+-        return (
+-            buffers[0][:num_slots],
+-            buffers[1][:num_slots],
+-            buffers[2][:num_slots],
+-        )
+-
+     def build(
+         self,
+         common_prefix_len: int,
+@@ -1146,22 +1089,6 @@ class AscendSFAIndexerMetadataBuilder(AttentionMetadataBuilder[AscendSFAIndexerM
+                 ),
+             )
+ 
+-        group_len = None
+-        group_key_idx = None
+-        group_key_cache_idx = None
+-        if get_ascend_config().c8_reshape_optim_enabled:
+-            group_len, group_key_idx, group_key_cache_idx = self._get_group_metadata_buffers(
+-                buffer_key,
+-                slot_mapping.numel(),
+-            )
+-            torch.ops._C_ascend.store_kv_block_metadata(
+-                slot_mapping,
+-                group_len,
+-                group_key_idx,
+-                group_key_cache_idx,
+-                block_size,
+-            )
+-
+         return AscendSFAIndexerMetadata(
+             num_actual_tokens=common_attn_metadata.num_actual_tokens,
+             slot_mapping=slot_mapping,
+@@ -1171,9 +1098,6 @@ class AscendSFAIndexerMetadataBuilder(AttentionMetadataBuilder[AscendSFAIndexerM
+             sin=sin,
+             cos=cos,
+             block_size=block_size,
+-            group_len=group_len,
+-            group_key_idx=group_key_idx,
+-            group_key_cache_idx=group_key_cache_idx,
+             actual_seq_lengths_query=actual_seq_lengths_query,
+             actual_seq_lengths_key=actual_seq_lengths_key,
+             num_decode_tokens=num_decode_tokens,
+diff --git a/vllm_ascend/attention/sfa_v1.py b/vllm_ascend/attention/sfa_v1.py
+index 3c850959f..1c440d463 100644
+--- a/vllm_ascend/attention/sfa_v1.py
++++ b/vllm_ascend/attention/sfa_v1.py
+@@ -458,9 +458,6 @@ class AscendSFAMetadata:
+     num_decode_tokens: int = 0
+     num_prefills: int = 0
+     block_size: int = 0
+-    group_len: torch.Tensor | None = None
+-    group_key_idx: torch.Tensor | None = None
+-    group_key_cache_idx: torch.Tensor | None = None
+     # Request identity for the Sparse KV offload resident LRU; only populated
+     # by AscendSFAKVOffloadMetadataBuilder.
+     req_ids_tensor: torch.Tensor | None = None
+diff --git a/vllm_ascend/attention/utils.py b/vllm_ascend/attention/utils.py
+index f238eb988..e20f67d93 100644
+--- a/vllm_ascend/attention/utils.py
++++ b/vllm_ascend/attention/utils.py
+@@ -293,9 +293,6 @@ class AscendCommonAttentionMetadata(CommonAttentionMetadata):
+ 
+     # Metadata for Decode Context Parallelism (DCP) operations.
+     context_parallel_metadata: AscendDCPMetadata | None = None
+-    group_len: torch.Tensor = None
+-    group_key_idx: torch.Tensor = None
+-    group_key_cache_idx: torch.Tensor = None
+     # Per-request / per-token request identity used by the Sparse KV offload
+     # resident LRU (adler32-hashed request ids and token->request mapping).
+     req_ids_tensor: torch.Tensor | None = None
+@@ -367,9 +364,6 @@ class AscendCommonAttentionMetadata(CommonAttentionMetadata):
+             encoder_seq_lens_cpu=_slice_reqs(self.encoder_seq_lens_cpu),
+             logits_indices_padded=self.logits_indices_padded,
+             num_logits_indices=self.num_logits_indices,
+-            group_len=self.group_len,
+-            group_key_idx=self.group_key_idx,
+-            group_key_cache_idx=self.group_key_cache_idx,
+             req_topk_buffer_slots=_slice_reqs(self.req_topk_buffer_slots),
+             req_topk_buffer_active=_slice_reqs(self.req_topk_buffer_active),
+             copy_sfa_draft_index=self.copy_sfa_draft_index,
+diff --git a/vllm_ascend/spec_decode/llm_base_proposer.py b/vllm_ascend/spec_decode/llm_base_proposer.py
+index dfabbc4cb..2d7b79d9e 100644
+--- a/vllm_ascend/spec_decode/llm_base_proposer.py
++++ b/vllm_ascend/spec_decode/llm_base_proposer.py
+@@ -862,9 +862,6 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
+                     decode_token_per_req=self.runner.decode_token_per_req,
+                     is_prefilling=torch.zeros(num_reqs, dtype=torch.bool),
+                     max_seq_len=0,
+-                    group_len=self.runner.group_len.gpu[:num_reqs],
+-                    group_key_idx=self.runner.group_key_idx.gpu[:num_reqs],
+-                    group_key_cache_idx=self.runner.group_key_cache_idx.gpu[:num_reqs],
+                     req_topk_buffer_slots=(
+                         self.runner._offload_pool_slots.cpu[:num_reqs]
+                         if self.runner._offload_pool_slots is not None
+@@ -2375,9 +2372,6 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
+             decode_token_per_req=self.runner.decode_token_per_req,
+             is_prefilling=common_attn_metadata.is_prefilling,
+             max_seq_len=0,
+-            group_len=common_attn_metadata.group_len,
+-            group_key_idx=common_attn_metadata.group_key_idx,
+-            group_key_cache_idx=common_attn_metadata.group_key_cache_idx,
+             req_topk_buffer_slots=common_attn_metadata.req_topk_buffer_slots,
+             req_topk_buffer_active=common_attn_metadata.req_topk_buffer_active,
+             offload_dummy=common_attn_metadata.offload_dummy,
+@@ -2475,9 +2469,6 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
+             seq_lens=common_attn_metadata.seq_lens,
+             is_prefilling=common_attn_metadata.is_prefilling,
+             max_seq_len=0,
+-            group_len=common_attn_metadata.group_len,
+-            group_key_idx=common_attn_metadata.group_key_idx,
+-            group_key_cache_idx=common_attn_metadata.group_key_cache_idx,
+             req_topk_buffer_slots=common_attn_metadata.req_topk_buffer_slots,
+             req_topk_buffer_active=common_attn_metadata.req_topk_buffer_active,
+             offload_dummy=common_attn_metadata.offload_dummy,
+diff --git a/vllm_ascend/worker/model_runner_v1.py b/vllm_ascend/worker/model_runner_v1.py
+index 986f9d6e6..698b4a744 100644
+--- a/vllm_ascend/worker/model_runner_v1.py
++++ b/vllm_ascend/worker/model_runner_v1.py
+@@ -391,15 +391,6 @@ class NPUModelRunner(GPUModelRunner):
+             self.max_num_reqs + 2,  # type: ignore[has-type]
+             dtype=torch.int32,
+         )
+-        self.group_len = self._make_buffer(
+-            vllm_config.scheduler_config.max_num_batched_tokens , dtype=torch.int32
+-        )        
+-        self.group_key_idx = self._make_buffer(
+-           vllm_config.scheduler_config.max_num_batched_tokens , dtype=torch.int32
+-        )        
+-        self.group_key_cache_idx = self._make_buffer(
+-            vllm_config.scheduler_config.max_num_batched_tokens, dtype=torch.int32
+-        )
+ 
+         # Now, query_start_loc is padded.
+         # But gdn needs an unpadded one.
+@@ -3674,9 +3665,6 @@ class NPUModelRunner(GPUModelRunner):
+             attn_state=self.attn_state,
+             decode_token_per_req=self.decode_token_per_req,
+             context_parallel_metadata=self.long_seq_metadata,
+-            group_len = self.group_len.gpu[:num_reqs_padded],
+-            group_key_idx = self.group_key_idx.gpu[:num_reqs_padded],
+-            group_key_cache_idx = self.group_key_cache_idx.gpu[:num_reqs_padded],
+             req_ids_tensor=(
+                 self._offload_req_ids_tensor.gpu[:num_reqs_padded]
+                 if self._offload_req_ids_tensor is not None

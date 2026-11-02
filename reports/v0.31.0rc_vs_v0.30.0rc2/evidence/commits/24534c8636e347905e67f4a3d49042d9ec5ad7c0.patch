@@ -1,0 +1,389 @@
+commit 24534c8636e347905e67f4a3d49042d9ec5ad7c0
+Author:     ZYang6263 <50876451+ZYang6263@users.noreply.github.com>
+AuthorDate: Mon Oct 19 09:53:21 2026 +0800
+Commit:     GitHub <noreply@github.com>
+CommitDate: Mon Oct 19 09:53:21 2026 +0800
+
+    [Performance][GLM] Eliminate copy_conv_state launches for SD states (#18917)
+    
+    ### What this PR does / why we need it?
+    
+    Eliminate the two `copy_conv_state` launches per GLM short-convolution
+    call on supported SD layouts: gathering state before AscendC and
+    scattering it back afterwards. AscendC can read and update these page-
+    and row-strided states directly when channels are contiguous.
+    
+    Prepare contiguous per-request convolution indices in metadata so every
+    layer in the same cache group reuses them. The existing
+    `AscendGDNHostMetadataBuilder` reads GLM's `use_contiguous_conv_indices`
+    layer capability and prepares the first column once per
+    speculative/non-speculative branch; prefill and ordinary decode share
+    the non-speculative vector. Existing contiguous 1D indices are reused
+    directly.
+    
+    Speculative graph inputs use fixed-address buffers, include the parent's
+    padded rows, and clear the new convolution vector with the existing
+    no-draft reset. The recurrent KDA/MTP index matrix retains its original
+    layout. GLM retains the existing host backend. The shared builder
+    allocates convolution-index buffers only for layers that enable the
+    capability; other host metadata paths retain their original index views.
+    DS staging and its padding convention remain as in the PR base. No new
+    Triton operator is introduced.
+    
+    ### Does this PR introduce _any_ user-facing change?
+    
+    No new service flags or public APIs. Supported SD convolution states
+    update in place, and convolution-index preparation is shared across each
+    cache group's layers.
+    
+    ### How was this patch tested?
+    
+    **Runtime revision `3e2a85a6e` has not been executed or profiled, at the
+    user's request.** Revision `538c33965` only simplifies the GDN metadata
+    tests, reducing that file's PR diff from 95 added lines to 39 additions
+    and 2 deletions.
+    
+    Changed-file Ruff check, Ruff format, Python syntax validation and `git
+    diff --check` passed. Unit tests remain unrun because the local Windows
+    environment lacks PyTorch and pytest. `bash format.sh ci` was attempted
+    but stopped during actionlint dependency installation; complete
+    repository checks remain pending.
+    
+    Focused coverage:
+    
+    - `tests/ut/models/test_glm5next_conv_dispatch.py`: SD state identity
+    and in-place updates, contiguous first-column indices, and preservation
+    of DS staging.
+    - `tests/ut/models/test_glm5next_kda_dispatch.py`: existing dispatch
+    expectations for the contiguous first-column interface.
+    - `tests/ut/ops/test_gdn_attn_builder.py`: GLM capability selection,
+    unchanged unmarked host indices, shared prefill/decode indices and
+    buffer refresh, and speculative graph padding/no-draft reset through the
+    existing parameterized reset test.
+    
+    Earlier revision `daaa712d2` had CPU/NPU validation and approximately
+    two-second prefill/decode profiles. Those results apply to that earlier
+    implementation and do not validate this revision.
+    
+    - vLLM main:
+    https://github.com/vllm-project/vllm/commit/c4df37dfcc7f72ca41cd43801a468526ecf99a2b
+    
+    ---------
+    
+    Signed-off-by: ZYang6263 <50876451+ZYang6263@users.noreply.github.com>
+
+diff --git a/tests/ut/models/test_glm5next_conv_dispatch.py b/tests/ut/models/test_glm5next_conv_dispatch.py
+index 490da6c84..8569dc2b3 100644
+--- a/tests/ut/models/test_glm5next_conv_dispatch.py
++++ b/tests/ut/models/test_glm5next_conv_dispatch.py
+@@ -9,31 +9,45 @@ import torch
+ conv_ops = importlib.import_module("vllm_ascend.models.glm5next.ops.causal_conv1d")
+ 
+ 
+-@pytest.mark.parametrize("packed", [False, True])
++@pytest.mark.parametrize("layout", ["page_strided", "row_strided", "dim_first"])
+ @pytest.mark.parametrize("run_mode", [0, 1])
+-def test_packed_first_row_is_not_a_null_block(monkeypatch, packed, run_mode):
+-    state = torch.zeros(4, 3, 8)
+-    if packed:
+-        state = state[::2]
+-    indices = torch.tensor([[1]], dtype=torch.int32)
+-    starts = torch.tensor([0, 1], dtype=torch.int32)
+-    x = torch.ones(1, 8)
++def test_conv_dispatch_passes_contiguous_indices_and_stages_only_ds(monkeypatch, layout, run_mode):
++    dim_first = layout == "dim_first"
++    if dim_first:
++        state = torch.zeros(4, 8, 3).transpose(1, 2)
++    elif layout == "row_strided":
++        state = torch.zeros(8, 6, 8)[::2, ::2]
++    else:
++        state = torch.zeros(8, 3, 8)[::2]
++    indices = torch.tensor([[1, 3, 2, 0], [2, 1, 3, 0]], dtype=torch.int32)
++    starts = torch.tensor([0, 1, 2], dtype=torch.int32)
++    x = torch.ones(2, 8)
+     calls = []
+ 
+     def copy_state(cache, staging, ids, query_starts, staging_ids, *, write_back):
+         calls.append(write_back)
+         if not write_back:
+-            staging.copy_(cache[1:2])
+-            staging_ids.zero_()
++            staging.copy_(cache[1:3])
++            staging_ids.copy_(torch.tensor([0, 1], dtype=torch.int32))
++        else:
++            cache[1:3].copy_(staging)
+ 
+     def prefill(x, weight, bias, **kwargs):
+-        assert kwargs["null_block_id"] == (-1 if packed else 0)
+-        assert kwargs["cache_indices"].item() == (0 if packed else 1)
+-        assert kwargs["cache_indices"].item() != kwargs["null_block_id"]
++        kernel_indices = kwargs["cache_indices"]
++        assert kernel_indices.ndim == 1 and kernel_indices.stride() == (1,)
++        assert kwargs["null_block_id"] == (-1 if dim_first else 0)
++        expected = torch.tensor([0, 1] if dim_first else [1, 2], dtype=torch.int32)
++        torch.testing.assert_close(kernel_indices, expected)
++        assert torch.all(kernel_indices != kwargs["null_block_id"])
++        if not dim_first:
++            assert kwargs["conv_states"] is state
++        first_slot = 0 if dim_first else 1
++        kwargs["conv_states"][first_slot : first_slot + 2].fill_(5)
+         return x + 2
+ 
+     def decode(x, state, weight, **kwargs):
+         kwargs["cache_indices"] = kwargs["conv_state_indices"]
++        kwargs["conv_states"] = state
+         return prefill(x, weight, **kwargs)
+ 
+     monkeypatch.setattr(conv_ops, "copy_conv_state", copy_state)
+@@ -41,4 +55,7 @@ def test_packed_first_row_is_not_a_null_block(monkeypatch, packed, run_mode):
+     monkeypatch.setattr(conv_ops, "causal_conv1d_update", decode)
+     result = conv_ops.causal_conv1d(x, torch.ones(4, 8), state, starts, indices, run_mode=run_mode)
+     torch.testing.assert_close(result, x + 2)
+-    assert calls == ([False, True] if packed else [])
++    assert calls == ([False, True] if dim_first else [])
++    torch.testing.assert_close(state[1:3], torch.full_like(state[1:3], 5))
++    assert torch.count_nonzero(state[0]).item() == 0
++    assert torch.count_nonzero(state[3:]).item() == 0
+diff --git a/tests/ut/models/test_glm5next_kda_dispatch.py b/tests/ut/models/test_glm5next_kda_dispatch.py
+index afac1ea51..562d596e2 100644
+--- a/tests/ut/models/test_glm5next_kda_dispatch.py
++++ b/tests/ut/models/test_glm5next_kda_dispatch.py
+@@ -111,12 +111,13 @@ def test_decode_and_prefill_use_their_own_metadata_and_merge_outputs(monkeypatch
+         torch.testing.assert_close(weight, expected_weight)
+         assert weight is layer._merged_conv_weight
+         if kwargs["run_mode"] == 0:
+-            assert kwargs["cache_indices_opt"] is prefill_conv.cache_indices
++            torch.testing.assert_close(kwargs["cache_indices_opt"], prefill_conv.cache_indices[:, 0])
+             assert kwargs["initial_state_mode_opt"] is prefill_conv.initial_state_mode
+             assert kwargs["num_accepted_tokens_opt"] is None
+         else:
+             spec_conv = metadata.spec_decode_metadata.spec_causal_conv1d
+-            assert kwargs["cache_indices_opt"] is spec_conv.cache_indices
++            torch.testing.assert_close(kwargs["cache_indices_opt"], spec_conv.cache_indices[:, 0])
++            assert kwargs["cache_indices_opt"].is_contiguous()
+             assert kwargs["num_accepted_tokens_opt"] is spec_conv.num_accepted_tokens
+             assert kwargs["initial_state_mode_opt"] is None
+         return x.clone()
+diff --git a/tests/ut/ops/test_gdn_attn_builder.py b/tests/ut/ops/test_gdn_attn_builder.py
+index 345f56eee..b58395cc5 100644
+--- a/tests/ut/ops/test_gdn_attn_builder.py
++++ b/tests/ut/ops/test_gdn_attn_builder.py
+@@ -343,6 +343,7 @@ def test_ascend_gdn_attention_uses_ascend_backend():
+     assert AscendGatedDeltaNetAttention.get_attn_backend(object()) is AscendGDNFusedAttentionBackend
+     assert AscendKimiK3DeltaAttention.get_attn_backend(object()) is AscendGDNHostMetadataBackend
+     assert Glm5NextLinearAttention.get_attn_backend(object()) is AscendGDNHostMetadataBackend
++    assert Glm5NextLinearAttention.use_contiguous_conv_indices
+     assert AscendGDNAttentionBackend.get_builder_cls() is AscendGDNAttentionMetadataBuilder
+ 
+ 
+@@ -1099,7 +1100,8 @@ def test_spec_width_prompt_chunk_retains_prefill_metadata(
+         assert metadata.num_accepted_tokens is None
+ 
+ 
+-def test_full_graph_without_runtime_spec_resets_captured_spec_inputs():
++@pytest.mark.parametrize("builder_cls", [AscendGDNAttentionMetadataBuilder, AscendGDNHostMetadataBuilder])
++def test_full_graph_without_runtime_spec_resets_captured_spec_inputs(builder_cls):
+     capture_common_metadata = create_common_attn_metadata(
+         batch_spec=BatchSpec(
+             seq_lens=[4, 4],
+@@ -1119,7 +1121,12 @@ def test_full_graph_without_runtime_spec_resets_captured_spec_inputs():
+         num_heads=32,
+         num_speculative_tokens=3,
+         cudagraph_mode=CUDAGraphMode.FULL_DECODE_ONLY,
++        builder_cls=builder_cls,
+     )
++    if builder_cls is AscendGDNHostMetadataBuilder:
++        builder.compilation_config.static_forward_context = {
++            "layer0": SimpleNamespace(use_contiguous_conv_indices=True),
++        }
+     captured_metadata = builder.build(
+         0,
+         capture_common_metadata,
+@@ -1129,6 +1136,9 @@ def test_full_graph_without_runtime_spec_resets_captured_spec_inputs():
+     captured_spec_metadata = captured_metadata.spec_decode_metadata
+     captured_conv1d_metadata = captured_spec_metadata.spec_causal_conv1d
+ 
++    if builder_cls is AscendGDNHostMetadataBuilder:
++        assert captured_conv1d_metadata.cache_indices.is_contiguous()
++        assert captured_conv1d_metadata.cache_indices.tolist() == [10, 20, NULL_BLOCK_ID, NULL_BLOCK_ID]
+     assert torch.count_nonzero(captured_conv1d_metadata.query_start_loc) > 0
+     assert torch.count_nonzero(captured_spec_metadata.actual_seq_lengths) > 0
+ 
+@@ -1150,9 +1160,10 @@ def test_full_graph_without_runtime_spec_resets_captured_spec_inputs():
+ 
+     assert replay_metadata.spec_sequence_masks is None
+     assert replay_metadata.spec_decode_metadata is None
++    expected_shape = (4,) if builder_cls is AscendGDNHostMetadataBuilder else (4, 4)
+     assert torch.equal(
+         captured_conv1d_metadata.cache_indices,
+-        torch.full((4, 4), PAD_SLOT_ID, dtype=torch.int32),
++        torch.full(expected_shape, PAD_SLOT_ID, dtype=torch.int32),
+     )
+     assert torch.count_nonzero(captured_conv1d_metadata.query_start_loc) == 0
+     assert torch.count_nonzero(captured_conv1d_metadata.num_accepted_tokens) == 0
+@@ -1459,3 +1470,29 @@ def test_spec_graph_real_prefill_is_not_treated_as_padding():
+ 
+     assert runtime.num_spec_decodes == 1
+     assert runtime.num_prefills == 1
++
++
++def test_host_conv_indices_are_shared_and_refreshed(monkeypatch):
++    _patch_missing_runtime_cdiv(monkeypatch)
++    builder = _make_builder(
++        device=torch.device("cpu"),
++        num_heads=32,
++        num_speculative_tokens=0,
++        builder_cls=AscendGDNHostMetadataBuilder,
++    )
++    common = create_common_attn_metadata(BatchSpec([5, 12], [1, 8]), 16, torch.device("cpu"))
++    common.block_table_tensor = torch.tensor([[10, 11], [20, 21]], dtype=torch.int32)
++    unmarked = builder.build(0, common).non_spec_prefill_metadata.causal_conv1d.cache_indices
++    assert unmarked.data_ptr() == common.block_table_tensor.data_ptr()
++    builder.compilation_config.static_forward_context = {
++        "layer0": SimpleNamespace(use_contiguous_conv_indices=True),
++    }
++    metadata = builder.build(0, common)
++    indices = metadata.non_spec_prefill_metadata.causal_conv1d.cache_indices
++    assert indices.is_contiguous()
++    assert indices.tolist() == [10, 20]
++    assert indices.data_ptr() == metadata.non_spec_decode_metadata.causal_conv1d.cache_indices.data_ptr()
++    common.block_table_tensor.add_(30)
++    refreshed = builder.build(0, common).non_spec_prefill_metadata.causal_conv1d.cache_indices
++    assert refreshed.data_ptr() == indices.data_ptr()
++    assert indices.tolist() == [40, 50]
+diff --git a/vllm_ascend/models/glm5next/kda.py b/vllm_ascend/models/glm5next/kda.py
+index 17eb6f7e1..5ad1e449d 100644
+--- a/vllm_ascend/models/glm5next/kda.py
++++ b/vllm_ascend/models/glm5next/kda.py
+@@ -106,6 +106,8 @@ class _Glm5NextMergedColumnParallelLinear(MergedColumnParallelLinear):
+ 
+ 
+ class Glm5NextLinearAttention(GatedDeltaNetAttention):
++    use_contiguous_conv_indices = True
++
+     head_dim: int
+     num_heads: int
+     conv_size: int
+diff --git a/vllm_ascend/models/glm5next/ops/causal_conv1d.py b/vllm_ascend/models/glm5next/ops/causal_conv1d.py
+index 092ed0984..7d12f85ea 100644
+--- a/vllm_ascend/models/glm5next/ops/causal_conv1d.py
++++ b/vllm_ascend/models/glm5next/ops/causal_conv1d.py
+@@ -26,12 +26,14 @@ def causal_conv1d(
+     if cache_indices.shape[0] == 0:
+         return output
+     kernel_state = conv_state
+-    kernel_indices = cache_indices
++    # GLM metadata shares a contiguous vector across this group's layers.
++    # Standalone callers can still pass a matrix, using its first column.
++    kernel_indices = cache_indices[:, 0] if cache_indices.ndim == 2 else cache_indices
+     null_block_id = 0
+-    # aclnnCausalConv1d materializes a non-contiguous state without writing its
+-    # mutations back to the view. Stage only this batch's rows, retaining both
+-    # page strides and DS layouts; never copy the entire persistent cache.
+-    if not conv_state.is_contiguous():
++    # AscendC updates page- and row-strided SD states in place. Keep staging
++    # for unsupported layouts, such as DS views with strided channels.
++    needs_state_copy = conv_state.stride(0) <= 0 or conv_state.stride(1) <= 0 or conv_state.stride(2) != 1
++    if needs_state_copy:
+         requests = cache_indices.shape[0]
+         state_len, dim = conv_state.shape[1:]
+         kernel_state = torch.empty((requests, state_len, dim), dtype=conv_state.dtype, device=conv_state.device)
+@@ -66,6 +68,6 @@ def causal_conv1d(
+             query_start_loc=query_start_loc,
+             null_block_id=null_block_id,
+         )
+-    if not conv_state.is_contiguous():
++    if needs_state_copy:
+         copy_conv_state(conv_state, kernel_state, cache_indices, query_start_loc, kernel_indices, write_back=True)
+     return result
+diff --git a/vllm_ascend/ops/gdn_attn_builder.py b/vllm_ascend/ops/gdn_attn_builder.py
+index f04156395..250ae06c1 100644
+--- a/vllm_ascend/ops/gdn_attn_builder.py
++++ b/vllm_ascend/ops/gdn_attn_builder.py
+@@ -1001,6 +1001,86 @@ class AscendGDNHostMetadataBuilder(AscendGDNAttentionMetadataBuilder):
+ 
+     build_device_chunk_metadata = False
+ 
++    def __init__(
++        self,
++        kv_cache_spec: AttentionSpec,
++        layer_names: list[str],
++        vllm_config: VllmConfig,
++        device: torch.device,
++    ):
++        super().__init__(kv_cache_spec, layer_names, vllm_config, device)
++        self._conv_layer_name = layer_names[0] if layer_names else None
++        self._spec_conv_indices: torch.Tensor | None = None
++        self._non_spec_conv_indices: torch.Tensor | None = None
++
++    def _ensure_conv_index_buffers(self) -> None:
++        if self._spec_conv_indices is not None:
++            return
++        # Resolve the group's representative layer when building metadata.
++        # Only opted-in models allocate the additional convolution buffers.
++        layers = getattr(self.compilation_config, "static_forward_context", {})
++        if not getattr(layers.get(self._conv_layer_name), "use_contiguous_conv_indices", False):
++            return
++        # Each group owns its buffers, with fixed addresses for graph replay.
++        device = self.spec_sequence_masks.device
++        self._spec_conv_indices = torch.empty(self.spec_sequence_masks.numel(), dtype=torch.int32, device=device)
++        self._non_spec_conv_indices = torch.empty_like(self._spec_conv_indices)
++
++    @staticmethod
++    def _prepare_conv_indices(indices: torch.Tensor, buffer: torch.Tensor) -> torch.Tensor:
++        # Mixed batches and ordinary graph decode already provide a contiguous
++        # vector. Matrix sources are prepared once, including single-row MTP.
++        if indices.ndim == 1 and indices.is_contiguous():
++            return indices
++        column = indices[:, 0] if indices.ndim == 2 else indices
++        requests = column.numel()
++        if requests > buffer.numel():
++            raise ValueError("Convolution index count exceeds the cache-group buffer capacity")
++        prepared = buffer[:requests]
++        prepared.copy_(column, non_blocking=True)
++        return prepared
++
++    def _reset_spec_decode_graph_inputs(self, graph_batch_size: int) -> None:
++        super()._reset_spec_decode_graph_inputs(graph_batch_size)
++        if self._spec_conv_indices is not None:
++            self._spec_conv_indices[:graph_batch_size].fill_(PAD_SLOT_ID)
++
++    def build(
++        self,
++        common_prefix_len: int,
++        common_attn_metadata: CommonAttentionMetadata,
++        num_accepted_tokens: torch.Tensor | None = None,
++        num_decode_draft_tokens_cpu: torch.Tensor | None = None,
++        fast_build: bool = False,
++        num_actual_reqs: int | None = None,
++    ) -> GDNAttentionMetadata:
++        self._ensure_conv_index_buffers()
++        metadata = super().build(
++            common_prefix_len,
++            common_attn_metadata,
++            num_accepted_tokens=num_accepted_tokens,
++            num_decode_draft_tokens_cpu=num_decode_draft_tokens_cpu,
++            fast_build=fast_build,
++            num_actual_reqs=num_actual_reqs,
++        )
++        if self._spec_conv_indices is None:
++            return metadata
++        assert self._non_spec_conv_indices is not None
++        # Parent build has finalized request counts and graph padding. Keep
++        # recurrent indices intact and only replace the convolution view.
++        if metadata.spec_decode_metadata is not None:
++            conv = metadata.spec_decode_metadata.spec_causal_conv1d
++            conv.cache_indices = self._prepare_conv_indices(conv.cache_indices, self._spec_conv_indices)
++        non_spec_phases = (metadata.non_spec_prefill_metadata, metadata.non_spec_decode_metadata)
++        conv_metadata = [phase.causal_conv1d for phase in non_spec_phases if phase is not None]
++        if conv_metadata:
++            # Both phases reference prefixes of the same non-spec index table.
++            source = max(conv_metadata, key=lambda conv: conv.cache_indices.shape[0])
++            prepared = self._prepare_conv_indices(source.cache_indices, self._non_spec_conv_indices)
++            for conv in conv_metadata:
++                conv.cache_indices = prepared[: conv.cache_indices.shape[0]]
++        return metadata
++
+ 
+ class AscendGDNHostMetadataBackend(AscendGDNAttentionBackend):
+     @staticmethod

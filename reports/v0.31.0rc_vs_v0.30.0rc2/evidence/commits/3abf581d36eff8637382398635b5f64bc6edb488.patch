@@ -1,0 +1,652 @@
+commit 3abf581d36eff8637382398635b5f64bc6edb488
+Author:     Jiahui Deng <80486981+djh95@users.noreply.github.com>
+AuthorDate: Tue Oct 20 11:50:15 2026 +0800
+Commit:     GitHub <noreply@github.com>
+CommitDate: Tue Oct 20 11:50:15 2026 +0800
+
+    [Observability][BugFix] Optimize hot-path overhead via static idle bypass and fix robustness issues (#18644)
+    
+    ### What this PR does / why we need it?
+    This pull request introduces a "static idle" (`is_fully_off`) fast-path
+    for `RuntimeGuard` to minimize hot-path overhead when observability is
+    disabled. When hot-reload, detectors, dump, and manual triggers are all
+    off, the runtime guard bypasses hot-path shells such as wave sync,
+    sample wrapping, and end-of-wave draining.
+    
+    Additionally, this PR addresses several robustness and edge-case issues:
+    - Fix `_group_rank`: drop the `src+1` non-source fallback (raise if rank
+    cannot be resolved); keep `rank_in_group` and `is_first_rank→src` so a
+    broken source cannot skip packing the broadcast payload.
+    - Prevent `IndexError` in `req_index_for_flat_token` by clamping the
+    loop limit against the query-start-loc (`qsl`) array length.
+    - Guard `None` values in `accepted_token_nums` within the speculative
+    acceptance detector.
+    - Allow empty `list[int]` in `is_int_list` so nested truncation works
+    for empty speculative steps.
+    
+    ### Does this PR introduce _any_ user-facing change?
+    No. These are internal performance optimizations and robustness fixes.
+    
+    ### How was this patch tested?
+    Covered by unit tests under `tests/ut/runtime_config/` and
+    `tests/ut/runtime_guard/` (including `_group_rank`, report sanitize,
+    hot-path overhead, and related regressions).
+    
+    - vLLM main:
+    https://github.com/vllm-project/vllm/commit/c4df37dfcc7f72ca41cd43801a468526ecf99a2b
+    
+    ---------
+    
+    Signed-off-by: djh95 <dengjiahui95@gmail.com>
+    Co-authored-by: Cursor <cursoragent@cursor.com>
+
+diff --git a/tests/ut/runtime_config/test_dist.py b/tests/ut/runtime_config/test_dist.py
+index 1e3c61f2e..5e5098269 100644
+--- a/tests/ut/runtime_config/test_dist.py
++++ b/tests/ut/runtime_config/test_dist.py
+@@ -124,6 +124,37 @@ def _patch_dist(monkeypatch, fake_broadcast):
+     monkeypatch.setattr(torch.distributed, "get_process_group_ranks", lambda g: [7, 8])
+ 
+ 
++def test_group_rank_uses_rank_in_group():
++    group = SimpleNamespace(rank_in_group=2)
++    assert dist._group_rank(group, src=0) == 2
++
++
++def test_group_rank_is_first_rank_fallback_returns_src():
++    group = SimpleNamespace(is_first_rank=True)
++    assert dist._group_rank(group, src=0) == 0
++
++
++def test_group_rank_unknown_group_raises():
++    group = SimpleNamespace(world_size=2)
++    with pytest.raises(RuntimeError, match="cannot resolve group rank"):
++        dist._group_rank(group, src=0)
++
++
++def test_sync_due_bits_from_src_source_packs_without_rank_in_group(monkeypatch):
++    """Missing rank_in_group still lets the source pack when is_first_rank."""
++    seen = {}
++
++    def fake_broadcast(tensor, src=0, group=None):
++        seen["payload"] = [float(x) for x in tensor.tolist()]
++
++    _patch_dist(monkeypatch, fake_broadcast)
++    group = SimpleNamespace(world_size=2, is_first_rank=True, cpu_group=object())
++    out = sync_due_bits_from_src(group, [True, False], wave_idx=3)
++    assert out == [True, False]
++    assert seen["payload"][0] == 3.0
++    assert seen["payload"][1:] == [1.0, 0.0]
++
++
+ def test_sync_due_bits_from_src_none_group_returns_local():
+     assert sync_due_bits_from_src(None, [False, True]) == [False, True]
+     assert sync_due_bits_from_src(None, [], wave_idx=3) == []
+diff --git a/tests/ut/runtime_guard/_helpers.py b/tests/ut/runtime_guard/_helpers.py
+index f77f79faa..e94591cbb 100644
+--- a/tests/ut/runtime_guard/_helpers.py
++++ b/tests/ut/runtime_guard/_helpers.py
+@@ -61,6 +61,9 @@ def bare_processor(*, boom_detectors: bool = False) -> RuntimeGuardProcessor:
+     p._merged_bus_warn_ts = 0.0
+     # End-of-wave gate uses collectives; bare shells no-op it.
+     p.runtime_config = MagicMock()
++    # Default MagicMock.is_fully_off() is truthy — force False so hook
++    # shells still run unless a test opts into the fully-off fast path.
++    p.runtime_config.is_fully_off.return_value = False
+     p.end_of_wave_sync = MagicMock()  # type: ignore[method-assign]
+     return p
+ 
+diff --git a/tests/ut/runtime_guard/test_hooks.py b/tests/ut/runtime_guard/test_hooks.py
+index d4282ad87..d5c2fcf1f 100644
+--- a/tests/ut/runtime_guard/test_hooks.py
++++ b/tests/ut/runtime_guard/test_hooks.py
+@@ -71,8 +71,15 @@ def _scheduler_output(total: int = 4) -> SimpleNamespace:
+     return SimpleNamespace(total_num_scheduled_tokens=total)
+ 
+ 
+-def test_step_runs_sync_inside_inference_mode():
++def _active_guard() -> MagicMock:
++    """Guard mock that is not fully off (full sync / sample shells)."""
+     guard = MagicMock()
++    guard.is_fully_off.return_value = False
++    return guard
++
++
++def test_step_runs_sync_inside_inference_mode():
++    guard = _active_guard()
+     runner = _StepRunner(guard)
+     so = _scheduler_output()
+ 
+@@ -87,7 +94,7 @@ def test_step_runs_sync_inside_inference_mode():
+ 
+ 
+ def test_step_idle_scheduler_never_arms():
+-    guard = MagicMock()
++    guard = _active_guard()
+     runner = _StepRunner(guard)
+     so = _scheduler_output(total=0)
+ 
+@@ -96,7 +103,7 @@ def test_step_idle_scheduler_never_arms():
+ 
+ 
+ def test_step_skips_flush_when_sample_phase_will_run():
+-    guard = MagicMock()
++    guard = _active_guard()
+     runner = _StepRunner(guard)
+     runner.execute_model_state = object()  # sample_tokens will pop it
+ 
+@@ -105,7 +112,7 @@ def test_step_skips_flush_when_sample_phase_will_run():
+ 
+ 
+ def test_step_flushes_dummy_wave_even_with_state():
+-    guard = MagicMock()
++    guard = _active_guard()
+     runner = _StepRunner(guard)
+     runner.execute_model_state = object()  # dummy waves never reach sample_tokens
+ 
+@@ -114,7 +121,7 @@ def test_step_flushes_dummy_wave_even_with_state():
+ 
+ 
+ def test_step_reads_positional_dummy_run():
+-    guard = MagicMock()
++    guard = _active_guard()
+     runner = _StepRunner(guard)
+     runner.execute_model_state = object()
+ 
+@@ -124,7 +131,7 @@ def test_step_reads_positional_dummy_run():
+ 
+ 
+ def test_step_flushes_on_body_exception():
+-    guard = MagicMock()
++    guard = _active_guard()
+     runner = _RaisingStepRunner(guard)
+ 
+     with pytest.raises(RuntimeError):
+@@ -165,7 +172,7 @@ class _IdleWorker:
+ 
+ 
+ def test_idle_step_syncs_without_arming():
+-    guard = MagicMock()
++    guard = _active_guard()
+     worker = _IdleWorker(SimpleNamespace(runtime_guard=guard))
+ 
+     assert worker.execute_dummy_batch() == "done"
+@@ -176,7 +183,7 @@ def test_idle_step_syncs_without_arming():
+ 
+ def test_idle_step_propagates_sync_failure():
+     """Idle sync is a lockstep gate — do not soft-fail (matches busy path)."""
+-    guard = MagicMock()
++    guard = _active_guard()
+     guard.sync_for_step.side_effect = RuntimeError("boom")
+     worker = _IdleWorker(SimpleNamespace(runtime_guard=guard))
+ 
+@@ -231,8 +238,29 @@ class _SampleRunner:
+         self.order.append("postprocess")
+ 
+ 
+-def test_sample_tokens_orchestrates_guard_around_body():
++def test_step_fully_off_skips_sync_shells():
++    """Default-off guard: execute_model body only (no sync / eow)."""
++    guard = MagicMock()
++    guard.is_fully_off.return_value = True
++    runner = _StepRunner(guard)
++
++    assert runner.execute_model(_scheduler_output()) == "output"
++    assert runner.body_ran
++    guard.sync_for_step.assert_not_called()
++    guard.end_of_wave_sync.assert_not_called()
++
++
++def test_idle_step_fully_off_skips_sync():
+     guard = MagicMock()
++    guard.is_fully_off.return_value = True
++    worker = _IdleWorker(SimpleNamespace(runtime_guard=guard))
++
++    assert worker.execute_dummy_batch() == "done"
++    guard.sync_for_step.assert_not_called()
++
++
++def test_sample_tokens_orchestrates_guard_around_body():
++    guard = _active_guard()
+     guard.runtime_config.detector_get.return_value = False  # need_pre_sample_hook -> False
+     guard.needs_sample_phase_hooks.return_value = False
+     runner = _SampleRunner(guard)
+@@ -271,8 +299,19 @@ def test_sample_tokens_guardless_keeps_bare_path():
+     assert runner.order == ["body"]
+ 
+ 
+-def test_sample_tokens_passes_accepted_token_nums_fn_for_spec():
++def test_sample_tokens_fully_off_bypasses_orchestration():
+     guard = MagicMock()
++    guard.is_fully_off.return_value = True
++    runner = _SampleRunner(guard)
++
++    out = runner.sample_tokens("grammar")
++    assert out.sampled_token_ids == [[7]]
++    assert runner.order == ["body", "postprocess"]
++    guard.run_sample_phase.assert_not_called()
++
++
++def test_sample_tokens_passes_accepted_token_nums_fn_for_spec():
++    guard = _active_guard()
+     guard.runtime_config.detector_get.return_value = False  # need_pre_sample_hook -> False
+     guard.needs_sample_phase_hooks.return_value = False
+     runner = _SampleRunner(guard)
+diff --git a/tests/ut/runtime_guard/test_hot_path_overhead.py b/tests/ut/runtime_guard/test_hot_path_overhead.py
+index 881ddbb3e..dc101e228 100644
+--- a/tests/ut/runtime_guard/test_hot_path_overhead.py
++++ b/tests/ut/runtime_guard/test_hot_path_overhead.py
+@@ -124,34 +124,35 @@ def test_hot_path_gates_cache_and_local_interval_skip(tmp_path: Path):
+     assert cfg.needs_sample_phase_hooks() is True
+ 
+ 
+-def test_sync_for_step_skips_refresh_when_reload_off_idle(tmp_path: Path):
+-    """T1 idle shell: reload=0 + idle gates → advance only, no refresh."""
++def test_is_fully_off_default_off(tmp_path: Path):
+     cfg = _cfg(tmp_path, reload=0.0)
+-    assert cfg.hot_reload_enabled is False
+-    with (
+-        patch.object(RuntimeGuardProcessor, "refresh_config") as refresh,
+-        patch.object(RuntimeGuardProcessor, "_claim_dump_jobs_to_deferred_via_tp") as claim,
+-        patch(
+-            "vllm_ascend.observability.runtime_guard.processor.get_pp_group",
+-            side_effect=Exception("no pp"),
+-        ),
+-    ):
+-        proc = _bind(cfg)
+-        proc.sync_for_step(allow_manual_dump=True, scheduler_output=None)
+-        proc.wave_tracker.advance.assert_called_once_with(allow_manual_dump=True)
+-        refresh.assert_not_called()
+-        # dump defaults off → skip TP claim bus entirely (lockstep).
+-        claim.assert_not_called()
+-    RuntimeGuardProcessor.reset_for_tests()
++    assert cfg.is_fully_off() is True
+ 
++    cfg._data["detector"]["token_repeat"]["enabled"] = True
++    cfg._invalidate_hot_path_gates()
++    assert cfg.is_fully_off() is False
+ 
+-def test_idle_allow_manual_dump_defers_end_of_wave_to_sample(tmp_path: Path):
+-    """Static idle + allow_manual_dump=True must not end_of_wave at sync; sample does once."""
+     cfg = _cfg(tmp_path, reload=0.0)
++    cfg._data["dump"]["auto_max_times"] = 1
++    cfg._invalidate_hot_path_gates()
++    assert cfg.is_fully_off() is False
++
++    cfg = _cfg(tmp_path, reload=5.0)
++    assert cfg.is_fully_off() is False
++
++
++def test_dump_only_still_end_of_wave_on_sample(tmp_path: Path):
++    """dump_only (detectors off, dump on) ≠ fully off — sample still flushes eow."""
++    cfg = _cfg(tmp_path, reload=0.0)
++    cfg._data["dump"]["auto_max_times"] = 1
++    cfg._invalidate_hot_path_gates()
++    assert cfg.is_fully_off() is False
+     assert cfg.needs_sample_phase_hooks() is False
++    assert cfg.dump_enabled() is True
+     with (
+         patch.object(RuntimeGuardProcessor, "refresh_config"),
+         patch.object(RuntimeGuardProcessor, "end_of_wave_sync") as eow,
++        patch.object(RuntimeGuardProcessor, "_claim_dump_jobs_to_deferred_via_tp"),
+         patch(
+             "vllm_ascend.observability.runtime_guard.processor.get_pp_group",
+             side_effect=Exception("no pp"),
+@@ -181,13 +182,43 @@ def test_idle_allow_manual_dump_defers_end_of_wave_to_sample(tmp_path: Path):
+     RuntimeGuardProcessor.reset_for_tests()
+ 
+ 
+-def test_sync_for_step_claims_dump_when_idle_but_dump_on(tmp_path: Path):
+-    """Static idle with dump active still claims (TP bus may run)."""
++def test_sample_tokens_decorator_fully_off_bypasses_wrap(tmp_path: Path):
++    """Decorator must call bare sample_tokens when fully off (no wrap/eow)."""
++    from vllm_ascend.observability.runtime_guard.hooks import runtime_guard_sample_tokens
++
++    cfg = _cfg(tmp_path, reload=0.0)
++    assert cfg.is_fully_off() is True
++    proc = _bind(cfg)
++    runner = proc.runner
++    runner.runtime_guard = proc
++    calls: list[str] = []
++
++    def bare_sample(self, grammar_output):
++        calls.append("bare")
++        return "out"
++
++    wrapped = runtime_guard_sample_tokens(bare_sample)
++    with (
++        patch.object(proc, "run_sample_phase") as rsp,
++        patch(
++            "vllm_ascend.observability.runtime_guard.hooks.wrap_postprocess_sampled",
++        ) as wrap_pp,
++    ):
++        assert wrapped(runner, None) == "out"
++        assert calls == ["bare"]
++        rsp.assert_not_called()
++        wrap_pp.assert_not_called()
++    RuntimeGuardProcessor.reset_for_tests()
++
++
++def test_sync_for_step_dump_only_claims(tmp_path: Path):
++    """dump_only (detectors off, dump on): advance + claim; not fully off."""
+     cfg = _cfg(tmp_path, reload=0.0)
+     cfg._data["dump"]["auto_max_times"] = 1
+     cfg._invalidate_hot_path_gates()
+     assert cfg.dump_enabled() is True
+     assert cfg.needs_sample_phase_hooks() is False
++    assert cfg.is_fully_off() is False
+     with (
+         patch.object(RuntimeGuardProcessor, "refresh_config") as refresh,
+         patch.object(RuntimeGuardProcessor, "_claim_dump_jobs_to_deferred_via_tp") as claim,
+@@ -198,13 +229,14 @@ def test_sync_for_step_claims_dump_when_idle_but_dump_on(tmp_path: Path):
+     ):
+         proc = _bind(cfg)
+         proc.sync_for_step(allow_manual_dump=True, scheduler_output=None)
++        proc.wave_tracker.advance.assert_called_once_with(allow_manual_dump=True)
+         refresh.assert_not_called()
+         claim.assert_called_once()
+     RuntimeGuardProcessor.reset_for_tests()
+ 
+ 
+-def test_sync_for_step_refreshes_when_reload_on_idle(tmp_path: Path):
+-    """T2 idle: hot-reload on → always refresh (broadcast lockstep)."""
++def test_sync_for_step_refreshes_when_reload_on_without_detectors(tmp_path: Path):
++    """Hot-reload on (never fully off): refresh even with detectors off."""
+     cfg = _cfg(tmp_path, reload=5.0)
+     cfg._last_reload_ts = time.time()
+     cfg._initial_broadcast_done = True
+diff --git a/tests/ut/runtime_guard/test_report_sanitize.py b/tests/ut/runtime_guard/test_report_sanitize.py
+index a0dcc8251..487fec7ca 100644
+--- a/tests/ut/runtime_guard/test_report_sanitize.py
++++ b/tests/ut/runtime_guard/test_report_sanitize.py
+@@ -62,6 +62,19 @@ def test_truncate_token_id_fields_caps_and_flags():
+     assert out["output_token_count"] == 30
+ 
+ 
++def test_truncate_nested_token_ids_with_empty_step():
++    """Nested truncation keeps empty steps and caps long int lists."""
++    long_step = list(range(20))
++    detail = {"window_token_ids": [[1, 2], [], long_step]}
++    out = truncate_token_id_fields(
++        detail,
++        max_prompt_token_ids=1000,
++        max_output_token_ids=5,
++    )
++    assert out["window_token_ids"] == [[1, 2], [], long_step[:5]]
++    assert out["window_token_ids_truncated"] is True
++
++
+ def test_sanitize_nested_requests_redact_and_truncate():
+     nested = {
+         "requests": [
+diff --git a/tests/ut/runtime_guard/test_review_regressions.py b/tests/ut/runtime_guard/test_review_regressions.py
+index b03463936..2b56ac82f 100644
+--- a/tests/ut/runtime_guard/test_review_regressions.py
++++ b/tests/ut/runtime_guard/test_review_regressions.py
+@@ -461,6 +461,16 @@ def test_v10b_unknown_top_level_key_rejected_on_reload(tmp_path: Path):
+ # ---------------------------------------------------------------- V12 (P1-A1)
+ 
+ 
++def test_req_index_for_flat_token_short_qsl():
++    import numpy as np
++
++    from vllm_ascend.observability.runtime_guard.detector.logits_finite import req_index_for_flat_token
++
++    qsl = np.asarray([0, 3], dtype=np.int64)  # only one interval, but num_reqs=3
++    assert req_index_for_flat_token(1, qsl, num_reqs=3) == 0
++    assert req_index_for_flat_token(5, qsl, num_reqs=3) is None
++
++
+ def test_v12_logits_finite_unattributable_row_warns_not_misattributes():
+     from ._helpers import capture_logger_text
+ 
+@@ -820,6 +830,36 @@ def test_v17_spec_acceptance_short_batch_no_index_error():
+     assert isinstance(alerts, list)
+ 
+ 
++def test_v17_spec_acceptance_none_accepted_token_nums_returns_empty():
++    from vllm_ascend.observability.runtime_guard.detector.spec_acceptance import SpecAcceptanceDetector
++
++    section = {
++        "enabled": True,
++        "window": 2,
++        "low_threshold": 0.3,
++        "len_low_threshold": 1.4,
++        "high_threshold": 0.96,
++        "len_high_threshold": 2.8,
++    }
++    rc = SimpleNamespace(
++        detector_section=lambda name: section,
++        detector_get=lambda sec, key, default=None: section.get(key, default),
++    )
++    runner = SimpleNamespace(
++        tp_rank=1,
++        speculative_config=SimpleNamespace(),
++        input_batch=SimpleNamespace(req_ids=["a"], num_draft_tokens_per_req=None),
++        requests=None,
++    )
++    det = SpecAcceptanceDetector(runtime_config=rc, runner=runner)
++    sampled = torch.tensor([[7, 8, 9, 10]])
++    with patch(
++        "vllm_ascend.observability.runtime_guard.detector.spec_acceptance.get_pp_group",
++        return_value=SimpleNamespace(is_last_rank=True),
++    ):
++        assert det.check_all(sampled, None) == []
++
++
+ def test_v17d_spec_acceptance_high_rate_below_len_high_no_alert():
+     """Normal high accept: rate can be 1.0 but accept_len below len_high → no alert."""
+     from vllm_ascend.observability.runtime_guard.detector.spec_acceptance import SpecAcceptanceDetector
+@@ -2185,8 +2225,8 @@ def test_v28d_merged_bus_collective_failure_refunds_handed_off_jobs():
+         worker.stop()
+ 
+ 
+-def test_v28e_static_idle_drop_refunds_quota(monkeypatch):
+-    """Static-idle clear (dump inactive, no reload) must refund armed arms."""
++def test_v28e_dump_only_dump_off_drops_pending(monkeypatch):
++    """dump_only path with dump inactive refunds unclaimed arms (not fully off)."""
+     from vllm_ascend.observability.runtime_guard import processor_dump
+ 
+     monkeypatch.setattr(processor_dump, "runner_tp_rank", lambda _r: 0)
+@@ -2195,6 +2235,7 @@ def test_v28e_static_idle_drop_refunds_quota(monkeypatch):
+     p.runner = SimpleNamespace()
+     p.wave_tracker = MagicMock()
+     p.runtime_config = MagicMock()
++    # Sync enters dump_only branch (detectors off, hot-reload off).
+     p.runtime_config.manual_trigger.return_value = False
+     p.runtime_config.needs_sample_phase_hooks.return_value = False
+     p.runtime_config.hot_reload_enabled = False
+@@ -2205,6 +2246,7 @@ def test_v28e_static_idle_drop_refunds_quota(monkeypatch):
+     p._end_of_wave_sync_if_no_sample = MagicMock()
+ 
+     RuntimeGuardProcessor.sync_for_step(p, allow_manual_dump=True)
++    p.wave_tracker.advance.assert_called_once_with(allow_manual_dump=True)
+     p.quota.refund.assert_called_once_with(consume_quota=True)
+     assert p._kv_dump_jobs == []
+ 
+diff --git a/vllm_ascend/observability/runtime_config/config.py b/vllm_ascend/observability/runtime_config/config.py
+index d59480384..9c4d6f42c 100644
+--- a/vllm_ascend/observability/runtime_config/config.py
++++ b/vllm_ascend/observability/runtime_config/config.py
+@@ -808,6 +808,26 @@ class RuntimeConfig:
+         """
+         return bool(self._hot_path_gates_cached()["needs_sample_phase_hooks"])
+ 
++    def is_fully_off(self) -> bool:
++        """True when observability is fully off (default-off cold path).
++
++        Requires: hot-reload off, no detectors, no dump, no manual trigger.
++        Distinct from dump-only (detectors off but dump still active) — that
++        path still runs wave advance / claim / end-of-wave.
++
++        When True, hooks skip sync/sample shells entirely. Enabling any axis
++        needs restart if hot-reload is off; with hot-reload on this is always
++        False and full shells run.
++        """
++        if self.hot_reload_enabled:
++            return False
++        gates = self._hot_path_gates_cached()
++        return (
++            not gates["needs_sample_phase_hooks"]
++            and not gates["dump_enabled"]
++            and int(gates["manual_trigger_count"]) <= 0
++        )
++
+     # Detector section order comes from ``detector_catalog``.
+     DETECTOR_SECTIONS = _CATALOG_DETECTOR_SECTIONS
+ 
+diff --git a/vllm_ascend/observability/runtime_config/dist.py b/vllm_ascend/observability/runtime_config/dist.py
+index abab97445..36d936814 100644
+--- a/vllm_ascend/observability/runtime_config/dist.py
++++ b/vllm_ascend/observability/runtime_config/dist.py
+@@ -225,12 +225,23 @@ def _is_json_writer() -> bool:
+ 
+ 
+ def _group_rank(group: Any, src: int = 0) -> int:
++    """Resolve this process's rank inside ``group``.
++
++    Prefer ``rank_in_group``. If that is unavailable but ``is_first_rank`` is
++    set, treat this process as ``src`` (broadcast source). Otherwise raise —
++    never invent ``src + 1``, which made a broken source skip packing the
++    broadcast payload.
++    """
+     try:
+         return int(group.rank_in_group)
+     except Exception:
+         if bool(getattr(group, "is_first_rank", False)):
+             return int(src)
+-        return int(src) + 1
++        raise RuntimeError(
++            "[runtime_config] cannot resolve group rank "
++            f"(tried=rank_in_group, is_first_rank="
++            f"{bool(getattr(group, 'is_first_rank', False))}, src={src})"
++        ) from None
+ 
+ 
+ def _cpu_gate(group: Any) -> Any | None:
+diff --git a/vllm_ascend/observability/runtime_guard/detector/logits_finite.py b/vllm_ascend/observability/runtime_guard/detector/logits_finite.py
+index b344c60c6..8729c97ac 100644
+--- a/vllm_ascend/observability/runtime_guard/detector/logits_finite.py
++++ b/vllm_ascend/observability/runtime_guard/detector/logits_finite.py
+@@ -65,7 +65,13 @@ def query_start_loc_np(
+ 
+ 
+ def req_index_for_flat_token(flat_idx: int, qsl: np.ndarray, num_reqs: int) -> int | None:
+-    for r in range(num_reqs):
++    """Map a flat token index into a request via query-start-loc prefixes.
++
++    Scan at most ``min(num_reqs, len(qsl) - 1)`` intervals (``qsl`` is normally
++    length ``num_reqs + 1``).
++    """
++    limit = min(int(num_reqs), max(0, len(qsl) - 1))
++    for r in range(limit):
+         if int(qsl[r]) <= flat_idx < int(qsl[r + 1]):
+             return r
+     return None
+diff --git a/vllm_ascend/observability/runtime_guard/detector/spec_acceptance.py b/vllm_ascend/observability/runtime_guard/detector/spec_acceptance.py
+index 05e5a7cf4..2e7ad2fa5 100644
+--- a/vllm_ascend/observability/runtime_guard/detector/spec_acceptance.py
++++ b/vllm_ascend/observability/runtime_guard/detector/spec_acceptance.py
+@@ -150,6 +150,9 @@ class SpecAcceptanceDetector(ConfigBackedDetector):
+         if not req_ids:
+             return []
+ 
++        if accepted_token_nums is None:
++            return []
++
+         num_reqs = len(req_ids)
+         if torch.is_tensor(accepted_token_nums):
+             accepted_list = accepted_token_nums[:num_reqs].tolist()
+diff --git a/vllm_ascend/observability/runtime_guard/hooks.py b/vllm_ascend/observability/runtime_guard/hooks.py
+index a3b3f96ba..1ed3e095b 100644
+--- a/vllm_ascend/observability/runtime_guard/hooks.py
++++ b/vllm_ascend/observability/runtime_guard/hooks.py
+@@ -73,6 +73,8 @@ def runtime_guard_step(execute_model_fn):
+         guard = getattr(self, "runtime_guard", None)
+         if guard is None:
+             return execute_model_fn(self, scheduler_output, *args, **kwargs)
++        if guard.is_fully_off():
++            return execute_model_fn(self, scheduler_output, *args, **kwargs)
+         setattr(self, _SCHEDULER_OUTPUT_ATTR, scheduler_output)
+         dummy_run = kwargs.get("dummy_run", args[1] if len(args) > 1 else False)
+         allow_manual_dump = int(getattr(scheduler_output, "total_num_scheduled_tokens", 0) or 0) > 0
+@@ -99,7 +101,7 @@ def runtime_guard_idle_step(dummy_batch_fn):
+     def wrapper(self, *args, **kwargs):
+         # Worker may still construct unwired v1 runners — skip when unbound.
+         guard = getattr(self.model_runner, "runtime_guard", None)
+-        if guard is not None:
++        if guard is not None and not guard.is_fully_off():
+             guard.sync_for_step(allow_manual_dump=False)
+         return dummy_batch_fn(self, *args, **kwargs)
+ 
+@@ -137,6 +139,9 @@ def runtime_guard_sample_tokens(sample_tokens_fn):
+     The decorated method keeps its original functional body (PCP swap, spec-PP
+     draft broadcast). This wrapper adds ``run_sample_phase`` around it, reading
+     the ``postprocess_sampled`` stash and the pre-pop ``execute_model_state`` peek.
++
++    Fully off (default-off: no hot-reload / detectors / dump) returns the
++    bare ``sample_tokens`` body — no stash wrap, SamplePhaseResult, or eow.
+     """
+ 
+     @functools.wraps(sample_tokens_fn)
+@@ -145,6 +150,8 @@ def runtime_guard_sample_tokens(sample_tokens_fn):
+         if guard is None:
+             # UT shells / unbound runners: keep the bare sample path.
+             return sample_tokens_fn(self, grammar_output)
++        if guard.is_fully_off():
++            return sample_tokens_fn(self, grammar_output)
+         note_postprocess_sampled(self, None, None)  # clear prior-step stash
+         # Peek before the method pops execute_model_state (inside the parent
+         # sample_tokens). The method's PCP swap rewrites input_batch on
+diff --git a/vllm_ascend/observability/runtime_guard/io.py b/vllm_ascend/observability/runtime_guard/io.py
+index 6f24b2d9e..40ad478c9 100644
+--- a/vllm_ascend/observability/runtime_guard/io.py
++++ b/vllm_ascend/observability/runtime_guard/io.py
+@@ -29,14 +29,12 @@ from vllm_ascend.observability.runtime_guard.state import RequestGuardStore
+ 
+ 
+ def is_int_list(value: Any) -> bool:
+-    """True when ``value`` is a non-empty ``list[int]`` (bool excluded)."""
+-    return (
+-        isinstance(value, list) and bool(value) and all(isinstance(x, int) and not isinstance(x, bool) for x in value)
+-    )
++    """True when ``value`` is a ``list[int]`` (bool excluded; empty allowed)."""
++    return isinstance(value, list) and all(isinstance(x, int) and not isinstance(x, bool) for x in value)
+ 
+ 
+ def is_list_of_int_lists(value: Any) -> bool:
+-    """True when ``value`` is a non-empty list of int lists."""
++    """True when ``value`` is a non-empty list of ``list[int]`` (inners may be empty)."""
+     return isinstance(value, list) and bool(value) and all(is_int_list(x) for x in value)
+ 
+ 
+diff --git a/vllm_ascend/observability/runtime_guard/processor.py b/vllm_ascend/observability/runtime_guard/processor.py
+index d211e827e..1e76d0dda 100644
+--- a/vllm_ascend/observability/runtime_guard/processor.py
++++ b/vllm_ascend/observability/runtime_guard/processor.py
+@@ -296,10 +296,10 @@ class RuntimeGuardProcessor(RuntimeGuardBusMixin, RuntimeGuardDumpMixin, Runtime
+         try:
+             self.wave_tracker.advance(allow_manual_dump=allow_manual_dump)
+             cfg = self.runtime_config
+-            idle = not cfg.manual_trigger() and not cfg.needs_sample_phase_hooks()
+-            if idle and not cfg.hot_reload_enabled:
+-                # Static idle: no config bus. Claim leftover auto jobs only when
+-                # dump is active (shared gate → all ranks take the same branch).
++            # dump_only: no detectors / manual trigger, hot-reload off; dump may
++            # still be on (not fully off). No config bus — claim or drop.
++            dump_only = not cfg.manual_trigger() and not cfg.needs_sample_phase_hooks()
++            if dump_only and not cfg.hot_reload_enabled:
+                 if cfg.dump_enabled():
+                     self._claim_dump_jobs_to_deferred_via_tp()
+                 elif self._kv_dump_jobs:
+@@ -398,6 +398,10 @@ class RuntimeGuardProcessor(RuntimeGuardBusMixin, RuntimeGuardDumpMixin, Runtime
+         """True when sample-phase runtime_guard hooks must run (else pure ``sample_fn``)."""
+         return bool(self.runtime_config.needs_sample_phase_hooks())
+ 
++    def is_fully_off(self) -> bool:
++        """True when fully off — skip hot shells (see RuntimeConfig.is_fully_off)."""
++        return bool(self.runtime_config.is_fully_off())
++
+     def _soft_fail(self, hook: str, fn: Callable[[], Any]) -> Any:
+         # Guard hooks are observational: any exception must stay inside the
+         # guard and never reach the engine loop / async copy thread.

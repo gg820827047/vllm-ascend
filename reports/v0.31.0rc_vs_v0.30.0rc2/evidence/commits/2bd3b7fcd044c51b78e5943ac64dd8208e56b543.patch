@@ -1,0 +1,1269 @@
+commit 2bd3b7fcd044c51b78e5943ac64dd8208e56b543
+Author:     Jinzhu Jia <jiajinzhu@huawei.com>
+AuthorDate: Thu Oct 22 05:06:14 2026 -0700
+Commit:     GitHub <noreply@github.com>
+CommitDate: Thu Oct 22 20:06:14 2026 +0800
+
+    [Performance][Attention] Enable CANN FlashAttn for A5 V2 GLM DFlash2 eager drafts (#18717)
+    
+    ### What this PR does / why we need it?
+    
+    Enable CANN FlashAttn for **GLM-5.3 + DFlash2** on Ascend A5. Use
+    device-side sequence lengths and reuse attention metadata across draft
+    layers to reduce CPU synchronization and preparation overhead.
+    
+    ### Does this PR introduce _any_ user-facing change?
+    
+    Improves speculative decoding performance for GLM-5.3 + DFlash2.
+    
+    ### How was this patch tested?
+    
+    Focused CPU unit tests: **671 passed, 1 skipped**, using vLLM
+    `c4df37dfcc7f72ca41cd43801a468526ecf99a2b`. Coverage includes backend
+    selection, per-step plan reuse, rejection and request reordering,
+    unsupported configurations, PP exact counts, DeepSeek V4.1 and KV
+    reinitialization.
+    
+    #### 64-concurrency GSM8K A/B
+    
+    Measured on 2026-10-21 with **8 x Ascend950DT, TP8 + EP, V2 model
+    runner**:
+    
+    - Target: `GLM-5.3-W4A4C8-MXFP4-0916`; draft: `GLM-5.3-DFlash2`, K=5.
+    - Target graph configuration: `FULL_DECODE_ONLY`; draft: eager; async
+    scheduling enabled; `max-num-batched-tokens=8192`.
+    - AISBench client concurrency limit: **64**; full **1319-question
+    GSM8K** test set, 0-shot CoT chat prompt.
+    - Each variant received a separate 64-request warmup, followed by one
+    measured run. Profiler collection was inactive during measurement.
+    - Sampling: `temperature=0`, `seed=1024`, normal EOS, maximum output
+    8192 tokens, streaming enabled. Both variants used the same AISBench
+    named configurations and `--debug --dump-eval-details`.
+    - Accuracy was evaluated offline from the same saved performance-run
+    answers, without another inference run.
+    
+    A/B code and environment:
+    
+    - **Without PR:** frozen Ascend main
+    `ff62595360a069343ecdc3b2cd3a0daf45b4f1f0` plus a shared QuaRot
+    weight-alignment fix.
+    - **With PR:** the same baseline plus PR18717 changes from
+    `1ec618290b2ab2ffd46f344bd27992503ef6fb88`.
+    - Both variants used vLLM `a98247ab4db686ee03c66d5feb3c761e52a2f8ab`,
+    the same launch scripts, physical weights, dependencies and native
+    extension. Baseline ran first, then PR.
+    
+    | Metric | Without PR | With PR | Relative change |
+    | --- | ---: | ---: | ---: |
+    | Mean ITL (ms) | 214.6 | 192.5 | -10.30% |
+    | Median ITL (ms) | 238.1 | 184.0 | -22.72% |
+    | P95 ITL (ms) | 394.1 | 383.2 | -2.77% |
+    | P99 ITL (ms) | 410.7 | 389.9 | -5.06% |
+    | Mean TPOT (ms) | 49.6 | 44.8 | -9.68% |
+    | Mean TTFT (ms) | 801.3 | 727.2 | -9.25% |
+    | Mean end-to-end latency (ms) | 15849.9 | 13950.3 | -11.98% |
+    | Output throughput (tokens/s) | 1022.3938 | 1132.2313 | +10.74% |
+    | Benchmark duration (s) | 400.9834 | 355.9343 | -11.23% |
+    | Total output tokens | 409963 | 403000 | -1.70% |
+    | Successful / failed requests | 1319 / 0 | 1319 / 0 | — |
+    | GSM8K correct answers | 1283/1319 | 1281/1319 | -2 questions |
+    | GSM8K accuracy | 97.2707% | 97.1190% | -0.1516 percentage points |
+    | Draft acceptance | 70.9104% | 71.3225% | +0.4120 percentage points |
+    | Requests reaching the 8192-token output cap | 3 | 3 | — |
+    
+    ITL is AISBench's interval between streamed messages; one speculative
+    message may contain multiple tokens, so TPOT is also reported. These
+    results measure the combined FlashAttn backend and runner CPU-length
+    synchronization changes. Output lengths and asynchronous batching
+    differ, and this is one A/B run; the throughput increase is not an
+    equal-work speedup measurement.
+    
+    Original AISBench CSV/JSON, per-request outputs, accuracy results,
+    launch/configuration files and actual CLI invocations are retained in
+    the `glm53_pr18717_c64_cli_20261021_144132` result archive.
+    
+    The A5 operator precision matrix and V2 P/D validation remain pending.
+    The full formatting/CI check remains partially unverified for
+    markdownlint, actionlint, gitleaks and shellcheck.
+    
+    - vLLM main:
+    https://github.com/vllm-project/vllm/commit/a98247ab4db686ee03c66d5feb3c761e52a2f8ab
+    
+    ---------
+    
+    Signed-off-by: jiajinzhu2 <jiajinzhu@huawei.com>
+
+diff --git a/.github/workflows/scripts/estimated_times.yaml b/.github/workflows/scripts/estimated_times.yaml
+index 41ba34f1c..3e8551aab 100644
+--- a/.github/workflows/scripts/estimated_times.yaml
++++ b/.github/workflows/scripts/estimated_times.yaml
+@@ -9,6 +9,7 @@
+ # do not trigger the full CI suite.
+ 
+ estimated_times:
++  tests/e2e/pull_request/one_card/test_flash_attn_precision.py: 30
+   tests/e2e/pull_request/four_card/model_runner_v2/test_kvpp_pp.py: 300
+   tests/e2e/pull_request/four_card/test_kvpp_pd.py: 230
+   tests/e2e/pull_request/two_card/test_kvpp.py: 290
+diff --git a/.github/workflows/scripts/test_config.yaml b/.github/workflows/scripts/test_config.yaml
+index e8009c5b6..6517911d8 100644
+--- a/.github/workflows/scripts/test_config.yaml
++++ b/.github/workflows/scripts/test_config.yaml
+@@ -46,6 +46,7 @@ curated_tests:
+   a5:
+     - tests/e2e/pull_request/four_card/test_data_parallel_tp2.py
+     - tests/e2e/pull_request/one_card/test_mla_fp8_decode_layout_a5.py
++    - tests/e2e/pull_request/one_card/test_flash_attn_precision.py
+ 
+ # === Skipped Tests ===
+ # Removed from any selection after directory scanning, so they are never
+@@ -108,6 +109,8 @@ accuracy_tests:
+ # for files whose name contains ``_310p``.
+ # Patterns are evaluated longest first (most specific wins).
+ runner_mapping:
++  tests/e2e/pull_request/one_card/test_flash_attn_precision\.py$:
++    default: a5-4
+   tests/e2e/pull_request/one_card:
+     default: a2-1
+     310p: 310p-1
+@@ -122,6 +125,9 @@ runner_mapping:
+ # Maps logical test buckets to exact labels from runner_label.json and controls
+ # how many load-balanced groups are created for each bucket.
+ partition:
++  a5-4:
++    runner_label: linux-aarch64-a5-4
++    count: 1
+   310p-1:
+     runner_label: linux-aarch64-310p-1
+     count: 2
+diff --git a/tests/e2e/pull_request/one_card/test_flash_attn_precision.py b/tests/e2e/pull_request/one_card/test_flash_attn_precision.py
+new file mode 100644
+index 000000000..88fced10e
+--- /dev/null
++++ b/tests/e2e/pull_request/one_card/test_flash_attn_precision.py
+@@ -0,0 +1,99 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vllm-ascend project
++"""Compare eager DFlash2 FlashAttn with explicit matmul/softmax."""
++
++from types import SimpleNamespace
++
++import pytest
++import torch
++import torch_npu  # noqa: F401
++
++from vllm_ascend.attention.attention_v1 import AscendAttentionState
++from vllm_ascend.attention.fa_v1 import AscendFlashAttentionImpl, AscendFlashAttentionMetadataBuilder
++
++
++def golden(query, key, value, block_table, lengths, window, query_len, causal):
++    results = []
++    offset = 0
++    ratio = query.shape[1] // key.shape[2]
++    for req, length in enumerate(lengths):
++        size = query_len
++        indices = block_table[req].long()
++        k = key[indices].flatten(0, 1)[:length].float().repeat_interleave(ratio, dim=1)
++        v = value[indices].flatten(0, 1)[:length].float().repeat_interleave(ratio, dim=1)
++        q = query[offset : offset + size].float()
++        offset += size
++        scores = torch.matmul(q.transpose(0, 1), k.permute(1, 2, 0)) * query.shape[-1] ** -0.5
++        if window is not None or causal:
++            q_pos = torch.arange(size, device=query.device) + length - size
++            kv_pos = torch.arange(length, device=query.device)
++            delta = kv_pos[None, :] - q_pos[:, None]
++            mask = delta.abs() >= window if window is not None else torch.zeros_like(delta, dtype=torch.bool)
++            if causal:
++                mask = mask | (delta > 0)
++            scores = scores.masked_fill(mask, float("-inf"))
++        results.append(torch.matmul(scores.softmax(-1), v.transpose(0, 1)).transpose(0, 1))
++    return torch.cat(results).to(query.dtype)
++
++
++@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
++@pytest.mark.parametrize("window", [None, 2048])
++@pytest.mark.parametrize("layout", ["PA_BBND", "PA_BNBD"])
++@pytest.mark.parametrize("causal", [False, True])
++def test_strided_paged_flash_attn_matches_golden(dtype, window, layout, causal):
++    torch.npu.set_device(0)
++    torch.manual_seed(42)
++    device = "npu"
++    block_size, head_dim, query_len = 128, 128, 6
++    num_blocks = 56
++    page_stride = 2 * block_size * head_dim + 128
++    backing = torch.full((num_blocks, page_stride), float("nan"), dtype=dtype, device=device)
++    key = backing.as_strided((num_blocks, block_size, 1, head_dim), (page_stride, head_dim, head_dim, 1))
++    value = backing.as_strided(key.shape, key.stride(), storage_offset=block_size * head_dim)
++    key.copy_(torch.randn(key.shape, dtype=key.dtype, device=device))
++    value.copy_(torch.randn(value.shape, dtype=value.dtype, device=device))
++    query = torch.randn(3 * query_len, 8, head_dim, dtype=key.dtype, device=device)
++    permutation = torch.randperm(num_blocks, device=device).to(torch.int32)
++    block_table = torch.zeros(3, 32, dtype=torch.int32, device=device)
++    block_table[0].copy_(permutation[:32])
++    block_table[1, :24].copy_(permutation[32:])
++    optimistic = torch.tensor([4096, 3072, 0], dtype=torch.int32, device=device)
++    rejected = torch.tensor([0, 2, 0], dtype=torch.int32, device=device)
++    mask = torch.triu(torch.ones(2048, 2048, dtype=torch.int8, device=device), diagonal=1)
++    builder = AscendFlashAttentionMetadataBuilder.__new__(AscendFlashAttentionMetadataBuilder)
++    builder.model_config = SimpleNamespace(runner_type="draft")
++    builder.attn_mask_builder = SimpleNamespace(
++        get_splitfuse_attn_mask=lambda: mask,
++    )
++    common = SimpleNamespace(
++        num_reqs=3,
++        num_actual_tokens=query.shape[0],
++        query_start_loc=torch.tensor([0, 6, 12, 12], dtype=torch.int32, device=device),
++        block_table_tensor=block_table,
++        slot_mapping=torch.arange(query.shape[0], dtype=torch.int32, device=device),
++        max_query_len=query_len,
++        causal=causal,
++        attn_state=AscendAttentionState.ChunkedPrefill,
++    )
++    k_view, v_view = (key, value) if layout == "PA_BBND" else (key.transpose(1, 2), value.transpose(1, 2))
++    impl = AscendFlashAttentionImpl.__new__(AscendFlashAttentionImpl)
++    impl.key_cache, impl.value_cache = k_view, v_view
++    impl.num_heads, impl.num_kv_heads = 8, 1
++    impl.scale, impl.sliding_window = head_dim**-0.5, window
++    impl.use_bnsd_kv_cache, impl.sinks = layout == "PA_BNBD", None
++    output = torch.empty_like(query)
++
++    def run():
++        common.seq_lens = optimistic - rejected
++        metadata = builder.build(0, common)
++        for _ in range(6):
++            result = impl.forward_impl(query, None, None, (k_view, v_view), metadata, output)
++        return result
++
++    result = run()
++    reference = golden(query, key, value, block_table, [4096, 3070], window, query_len, causal)
++    torch.testing.assert_close(result[:12], reference, rtol=1e-2, atol=1e-3)
++    rejected.copy_(torch.tensor([3, 5, 0], dtype=torch.int32, device=device))
++    result = run()
++    reference = golden(query, key, value, block_table, [4093, 3067], window, query_len, causal)
++    torch.testing.assert_close(result[:12], reference, rtol=1e-2, atol=1e-3)
+diff --git a/tests/ut/attention/test_flash_attn.py b/tests/ut/attention/test_flash_attn.py
+new file mode 100644
+index 000000000..75fef8a05
+--- /dev/null
++++ b/tests/ut/attention/test_flash_attn.py
+@@ -0,0 +1,282 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vllm-ascend project
++
++import sys
++from types import SimpleNamespace
++from unittest.mock import Mock
++
++import pytest
++import torch
++from vllm.compilation.backends import set_model_tag
++from vllm.v1.attention.selector import AttentionSelectorConfig
++
++from vllm_ascend.attention.fa_v1 import AscendFlashAttentionImpl
++
++
++@pytest.fixture
++def dflash2_config():
++    return SimpleNamespace(
++        model_config=SimpleNamespace(runner_type="generate"),
++        speculative_config=SimpleNamespace(
++            method="dflash",
++            target_model_config=SimpleNamespace(hf_text_config=SimpleNamespace(model_type="glm_moe_dsa")),
++            draft_model_config=SimpleNamespace(architectures=["DFlash2DraftModel"]),
++            draft_sample_method="greedy",
++            enforce_eager=True,
++        ),
++    )
++
++
++def make_impl(query, *, num_kv_heads=1, window=None, layout="PA_BBND", sinks=None):
++    impl = AscendFlashAttentionImpl.__new__(AscendFlashAttentionImpl)
++    impl.num_heads, impl.num_kv_heads = query.shape[1], num_kv_heads
++    impl.scale, impl.sliding_window = query.shape[-1] ** -0.5, window
++    impl.use_bnsd_kv_cache, impl.sinks = layout == "PA_BNBD", sinks
++    impl.key_cache = impl.value_cache = None
++    return impl
++
++
++@pytest.fixture
++def select_flash_attn(monkeypatch):
++    from vllm_ascend import platform
++    from vllm_ascend.device.hardware_profile import AttentionBackendFamily
++
++    profile = SimpleNamespace(supports=lambda _: True, attention_backend_family=AttentionBackendFamily.STANDARD)
++    monkeypatch.setattr(platform, "get_current_hardware_profile", lambda: profile)
++    monkeypatch.setattr(platform, "_validate_fa3_backend", lambda *_: False)
++
++    def select(config, selector):
++        monkeypatch.setattr("vllm.config.get_current_vllm_config_or_none", lambda: config)
++        with set_model_tag("dflash_head"):
++            backend = platform.NPUPlatform.get_attn_backend_cls(None, selector)
++        return backend == "vllm_ascend.attention.fa_v1.AscendFlashAttentionBackend"
++
++    return select, profile
++
++
++def test_flash_attn_is_selected_only_for_a5_dflash2_eager_drafts(select_flash_attn, dflash2_config):
++    select, profile = select_flash_attn
++    config = dflash2_config
++    selector = AttentionSelectorConfig(head_size=128, block_size=128, dtype=torch.bfloat16, kv_cache_dtype="auto")
++    assert select(config, selector)
++    profile.supports = lambda _: False
++    assert not select(config, selector)
++    profile.supports = lambda _: True
++    config.speculative_config = None
++    config.model_config = None
++    assert not select(config, selector)
++    assert not select(None, selector)
++
++
++@pytest.mark.parametrize("tag", ["backbone", "eagle_head", "dflash2_candidate_selector"])
++def test_flash_attn_requires_live_dflash_loader_tag(monkeypatch, select_flash_attn, dflash2_config, tag):
++    from vllm.compilation import backends
++
++    from vllm_ascend import platform
++
++    monkeypatch.setattr("vllm.config.get_current_vllm_config_or_none", lambda: dflash2_config)
++    monkeypatch.setattr(backends, "model_tag", tag)
++    selector = AttentionSelectorConfig(head_size=128, block_size=128, dtype=torch.bfloat16, kv_cache_dtype="auto")
++    assert not platform._validate_flash_attn_backend((False, False, False), selector)
++
++
++@pytest.mark.parametrize("sampling", ["greedy", "probabilistic"])
++def test_flash_attn_selection_is_independent_of_draft_sampling(select_flash_attn, dflash2_config, sampling):
++    select, _ = select_flash_attn
++    dflash2_config.speculative_config.draft_sample_method = sampling
++    selector = AttentionSelectorConfig(head_size=128, block_size=128, dtype=torch.bfloat16, kv_cache_dtype="auto")
++    assert select(dflash2_config, selector)
++
++
++@pytest.mark.parametrize(
++    "field,value",
++    [
++        ("method", "eagle3"),
++        ("method", "mtp"),
++        ("enforce_eager", False),
++        ("enforce_eager", None),
++        ("architectures", ["DFlashDraftModel"]),
++        ("architectures", None),
++    ],
++)
++def test_other_drafts_and_graph_mode_retain_legacy_backend(select_flash_attn, dflash2_config, field, value):
++    select, _ = select_flash_attn
++    spec = dflash2_config.speculative_config
++    setattr(spec.draft_model_config if field == "architectures" else spec, field, value)
++    selector = AttentionSelectorConfig(head_size=128, block_size=128, dtype=torch.bfloat16, kv_cache_dtype="auto")
++    assert not select(dflash2_config, selector)
++
++
++@pytest.mark.parametrize("model_type", ["qwen3", "deepseek_v32", "glm5_next"])
++def test_other_target_architectures_retain_legacy_backend(select_flash_attn, dflash2_config, model_type):
++    select, _ = select_flash_attn
++    dflash2_config.speculative_config.target_model_config.hf_text_config.model_type = model_type
++    selector = AttentionSelectorConfig(head_size=128, block_size=128, dtype=torch.bfloat16, kv_cache_dtype="auto")
++    assert not select(dflash2_config, selector)
++
++
++@pytest.mark.parametrize(
++    "field,value",
++    [
++        ("use_mla", True),
++        ("use_sparse", True),
++        ("use_pcp", True),
++        ("use_dcp", True),
++        ("use_compress", True),
++        ("use_mm_prefix", True),
++        ("use_rswa", True),
++        ("use_batch_invariant", True),
++        ("use_per_head_quant_scales", True),
++        ("dtype", torch.float32),
++        ("kv_cache_dtype", "fp8"),
++        ("kv_cache_dtype", "int8"),
++    ],
++)
++def test_unsupported_gqa_features_retain_legacy_backend(select_flash_attn, dflash2_config, field, value):
++    select, _ = select_flash_attn
++    selector = AttentionSelectorConfig(head_size=128, block_size=128, dtype=torch.bfloat16, kv_cache_dtype="auto")
++    if field == "use_compress":
++        selector = SimpleNamespace(**{**selector._asdict(), "use_mla": True, field: value})
++    else:
++        selector = selector._replace(**{field: value})
++        if field == "use_sparse":
++            selector = selector._replace(use_mla=True)
++    assert not select(dflash2_config, selector)
++
++
++@pytest.mark.parametrize(
++    "window,causal,mask_mode,win_right",
++    [(None, False, 0, -1), (None, True, 3, -1), (2048, False, 4, 2047), (2048, True, 4, 0)],
++)
++def test_flash_attn_reuses_plans_within_each_draft_step(monkeypatch, window, causal, mask_mode, win_right):
++    from vllm_ascend.attention.fa_v1 import AscendFlashAttentionMetadata
++
++    plan = torch.empty(16, dtype=torch.int32)
++    query = torch.zeros(12, 8, 128, dtype=torch.bfloat16)
++    sinks = torch.zeros(8)
++    impl = make_impl(query, window=window, sinks=sinks)
++    output = torch.empty_like(query)
++    ops = SimpleNamespace(flash_attn_metadata=Mock(return_value=plan), flash_attn=Mock(return_value=(query, None)))
++    monkeypatch.setitem(sys.modules, "cann_ops_transformer.ops", ops)
++    metadata_args = dict(
++        query_start_loc_gpu=torch.tensor([0, 6, 12, -1], dtype=torch.int32),
++        block_tables=torch.tensor([[1, 0], [3, 2], [0, 0]], dtype=torch.int32),
++        max_query_len=6,
++        causal=causal,
++        flash_attn_mask=torch.ones(2, 2, dtype=torch.int8),
++    )
++    for step, lengths in enumerate(([256, 254, 0], [253, 251, 0]), start=1):
++        metadata = AscendFlashAttentionMetadata(seq_lens_gpu=torch.tensor(lengths, dtype=torch.int32), **metadata_args)
++        for _ in range(6):
++            impl.forward_impl(query, None, None, None, metadata, output)
++        assert ops.flash_attn_metadata.call_count == step
++        assert ops.flash_attn.call_count == 6 * step
++        meta_args = ops.flash_attn_metadata.call_args.kwargs
++        args = ops.flash_attn.call_args.kwargs
++        assert args["metadata"] is plan
++        assert args["sinks"] is sinks
++        assert args["attn_mask"] is (metadata.flash_attn_mask if mask_mode else None)
++        torch.testing.assert_close(meta_args["seqused_kv"], torch.tensor(lengths, dtype=torch.int32).clamp(min=1))
++        torch.testing.assert_close(meta_args["cu_seqlens_q"], torch.tensor([0, 6, 12, 12], dtype=torch.int32))
++        assert meta_args["mask_mode"] == mask_mode
++        assert meta_args["win_left"] == (2047 if window else -1)
++        assert meta_args["win_right"] == win_right
++
++
++@pytest.mark.parametrize("cpu_mirrors", [False, True])
++def test_metadata_builder_does_not_materialize_exact_device_lengths(monkeypatch, cpu_mirrors):
++    from vllm_ascend.attention import fa_v1 as module
++    from vllm_ascend.attention.attention_v1 import AscendAttentionState
++
++    builder = module.AscendFlashAttentionMetadataBuilder.__new__(module.AscendFlashAttentionMetadataBuilder)
++    builder.model_config = SimpleNamespace(runner_type="draft")
++    builder.attn_mask_builder = SimpleNamespace(
++        get_splitfuse_attn_mask=Mock(return_value=torch.ones(2, 2)),
++    )
++    common = SimpleNamespace(
++        num_reqs=2,
++        num_actual_tokens=12,
++        query_start_loc_cpu=torch.tensor([0, 999, 1998], dtype=torch.int32) if cpu_mirrors else None,
++        query_start_loc=torch.tensor([0, 6, 12], dtype=torch.int32),
++        block_table_tensor=torch.zeros(2, 2, dtype=torch.int32),
++        seq_lens=torch.tensor([256, 254], dtype=torch.int32),
++        _seq_lens_cpu=torch.tensor([999, 999], dtype=torch.int32) if cpu_mirrors else None,
++        seq_lens_cpu=torch.tensor([888, 888], dtype=torch.int32) if cpu_mirrors else None,
++        max_seq_len=256,
++        slot_mapping=torch.arange(12),
++        causal=False,
++        max_query_len=6,
++        attn_mask=None,
++        attn_state=AscendAttentionState.ChunkedPrefill,
++    )
++
++    def forbidden_host_materialization(*args, **kwargs):
++        raise AssertionError("draft length metadata must not be materialized or staged on the host")
++
++    with monkeypatch.context() as patches:
++        for operation in ("tolist", "item", "cpu"):
++            patches.setattr(torch.Tensor, operation, forbidden_host_materialization)
++        result = builder.build_for_drafting(common, draft_index=0)
++    assert result.seq_lens_gpu.data_ptr() == common.seq_lens.data_ptr()
++    assert result.query_start_loc_gpu.data_ptr() == common.query_start_loc.data_ptr()
++    assert not result.causal
++    assert result.flash_attn_mask is builder.attn_mask_builder.get_splitfuse_attn_mask.return_value
++
++
++def test_metadata_builder_slices_request_extent():
++    from vllm_ascend.attention.fa_v1 import AscendFlashAttentionMetadataBuilder
++
++    builder = AscendFlashAttentionMetadataBuilder.__new__(AscendFlashAttentionMetadataBuilder)
++    builder.model_config = SimpleNamespace(runner_type="generate")
++    builder.attn_mask_builder = SimpleNamespace(get_splitfuse_attn_mask=lambda: None)
++    common = SimpleNamespace(
++        num_reqs=2,
++        num_actual_tokens=12,
++        query_start_loc=torch.tensor([0, 6, 12, 999, 999], dtype=torch.int32),
++        seq_lens=torch.tensor([100, 200, 999, 999], dtype=torch.int32),
++        block_table_tensor=torch.zeros(4, 8, dtype=torch.int32),
++        slot_mapping=torch.arange(24, dtype=torch.int32),
++        max_query_len=6,
++        causal=False,
++        attn_state=None,
++    )
++    metadata = builder.build(0, common)
++    assert metadata.block_tables.shape == (2, 8)
++    assert metadata.slot_mapping.shape == (12,)
++    torch.testing.assert_close(metadata.query_start_loc_gpu, torch.tensor([0, 6, 12], dtype=torch.int32))
++    torch.testing.assert_close(metadata.seq_lens_gpu, torch.tensor([100, 200], dtype=torch.int32))
++    assert metadata.seq_lens_gpu.data_ptr() == common.seq_lens.data_ptr()
++    assert metadata.query_start_loc_gpu.data_ptr() == common.query_start_loc.data_ptr()
++
++
++def test_distinct_attention_geometries_do_not_share_plans(monkeypatch):
++    from vllm_ascend.attention.fa_v1 import AscendFlashAttentionMetadata
++
++    ops = SimpleNamespace(
++        flash_attn_metadata=Mock(return_value=torch.empty(16)),
++        flash_attn=Mock(side_effect=lambda query, *args, **kwargs: (query, None)),
++    )
++    monkeypatch.setitem(sys.modules, "cann_ops_transformer.ops", ops)
++    metadata = AscendFlashAttentionMetadata(
++        query_start_loc_gpu=torch.tensor([0, 6], dtype=torch.int32),
++        seq_lens_gpu=torch.tensor([256], dtype=torch.int32),
++        block_tables=torch.zeros(1, 2, dtype=torch.int32),
++        max_query_len=6,
++        causal=False,
++        flash_attn_mask=torch.ones(2, 2),
++    )
++    geometries = [
++        (8, 1, 128, None, "PA_BBND"),
++        (16, 1, 128, None, "PA_BBND"),
++        (8, 2, 128, None, "PA_BBND"),
++        (8, 1, 64, None, "PA_BBND"),
++        (8, 1, 128, 2048, "PA_BBND"),
++        (8, 1, 128, None, "PA_BNBD"),
++    ]
++    for _ in range(2):
++        for heads, kv_heads, dim, window, layout in geometries:
++            query = torch.empty(6, heads, dim)
++            impl = make_impl(query, num_kv_heads=kv_heads, window=window, layout=layout)
++            impl.forward_impl(query, None, None, None, metadata, torch.empty_like(query))
++    assert ops.flash_attn_metadata.call_count == len(geometries)
++    assert ops.flash_attn.call_count == 2 * len(geometries)
+diff --git a/tests/ut/device/test_hardware_profile.py b/tests/ut/device/test_hardware_profile.py
+index d3b56d9cd..a3a9fc40e 100644
+--- a/tests/ut/device/test_hardware_profile.py
++++ b/tests/ut/device/test_hardware_profile.py
+@@ -83,6 +83,7 @@ _EXPECTED_CAPABILITIES = {
+             HardwareCapability.CANN_MEGAMOE,
+             HardwareCapability.CANN_MEGAMOE_MXFP,
+             HardwareCapability.CHUNKED_PREFILL_PHASE_SPLIT,
++            HardwareCapability.DEVICE_LENGTH_FLASH_ATTN,
+             HardwareCapability.CLUSTER_CPU_TOPOLOGY,
+             HardwareCapability.DSA_C128_STATE_SMALL_BLOCK_SIZES,
+             HardwareCapability.DSV4_COMPRESSED_CACHE,
+diff --git a/tests/ut/models/test_kimi_k3_pp_sp.py b/tests/ut/models/test_kimi_k3_pp_sp.py
+index f28078ca8..80c82a5af 100644
+--- a/tests/ut/models/test_kimi_k3_pp_sp.py
++++ b/tests/ut/models/test_kimi_k3_pp_sp.py
+@@ -582,9 +582,17 @@ def test_host_positions_after_rejection_or_chunk(
+         {"NPUModelRunner"},
+         namespace,
+         bases={"NPUModelRunner": "BaseStateRunner"},
+-        methods={"NPUModelRunner": {"postprocess_sampled", "postprocess_num_computed_tokens", "_update_seq_lens_cpu"}},
++        methods={
++            "NPUModelRunner": {
++                "_can_skip_spec_cpu_length_sync",
++                "postprocess_sampled",
++                "postprocess_num_computed_tokens",
++                "_update_seq_lens_cpu",
++            }
++        },
+     )
+     runner = namespace["NPUModelRunner"]()
++    runner.speculative_config = None
+     runner.speculator = object() if owns_speculator else None
+     runner.use_pp = use_pp
+     runner.is_last_pp_rank = not use_pp
+diff --git a/tests/ut/spec_decode/test_dflash2_v2.py b/tests/ut/spec_decode/test_dflash2_v2.py
+index 8b2f50cc4..847f48a6e 100644
+--- a/tests/ut/spec_decode/test_dflash2_v2.py
++++ b/tests/ut/spec_decode/test_dflash2_v2.py
+@@ -18,12 +18,13 @@
+ """Unit tests for the V2 DFlash2 speculator (worker/v2/spec_decode/dflash2)."""
+ 
+ from contextlib import nullcontext
++from dataclasses import make_dataclass
+ from types import SimpleNamespace
+ from unittest.mock import MagicMock, patch
+ 
+ import pytest
+ import torch
+-from vllm.config.compilation import CUDAGraphMode
++from vllm.config.compilation import CompilationMode, CUDAGraphMode
+ from vllm.v1.worker.gpu.spec_decode.dflash.speculator import DFlashSpeculator
+ 
+ import vllm_ascend.worker.v2.spec_decode.dflash.speculator as dflash_module
+@@ -36,6 +37,198 @@ from vllm_ascend.worker.v2.spec_decode.dflash2.speculator import (
+ )
+ 
+ 
++@pytest.mark.parametrize("causal", [False, True])
++@pytest.mark.parametrize("fail", [False, True])
++def test_v2_loader_selects_flash_attn_and_restores_target_context(monkeypatch, causal, fail):
++    from vllm.compilation import backends
++    from vllm.config import AttentionConfig, CacheConfig, set_current_vllm_config
++    from vllm.v1.attention import selector as selector_module
++    from vllm.v1.attention.selector import AttentionSelectorConfig
++    from vllm.v1.worker.gpu.spec_decode.dflash import utils as loader
++
++    from vllm_ascend import platform
++    from vllm_ascend.device.hardware_profile import AttentionBackendFamily
++
++    target_config = SimpleNamespace(runner_type="generate", hf_text_config=SimpleNamespace(model_type="glm_moe_dsa"))
++    draft_config = SimpleNamespace(
++        architectures=["DFlash2DraftModel"],
++        hf_config=SimpleNamespace(num_hidden_layers=6, is_causal=causal),
++    )
++    spec = SimpleNamespace(
++        method="dflash",
++        target_model_config=target_config,
++        draft_model_config=draft_config,
++        enforce_eager=True,
++        attention_backend=None,
++        kv_cache_dtype="auto",
++    )
++    # Keep the real V2 loader's config cloning, causality and model-tag scopes.
++    fields = {
++        "use_v2_model_runner": True,
++        "model_config": target_config,
++        "speculative_config": spec,
++        "attention_config": AttentionConfig(),
++        "cache_config": CacheConfig(cache_dtype="fp8"),
++        "load_config": object(),
++        "parallel_config": SimpleNamespace(pipeline_parallel_size=1),
++    }
++    config_cls = make_dataclass("LoaderConfig", [(name, object) for name in fields])
++    config = config_cls(**fields)
++    draft_model = SimpleNamespace(model=object(), config=draft_config.hf_config)
++    target_model = SimpleNamespace(model=object())
++    monkeypatch.setattr(loader, "get_draft_load_config", lambda _: config.load_config)
++    monkeypatch.setattr(loader, "get_pp_safe_draft_load_config", lambda value: value)
++    monkeypatch.setattr(loader, "maybe_share_target_embed", lambda *_: None)
++    monkeypatch.setattr(loader, "get_target_lm_head", lambda *_: None)
++    monkeypatch.setattr(
++        platform,
++        "get_current_hardware_profile",
++        lambda: SimpleNamespace(supports=lambda _: True, attention_backend_family=AttentionBackendFamily.STANDARD),
++    )
++    monkeypatch.setattr(platform, "_validate_fa3_backend", lambda *_: False)
++    monkeypatch.setattr("vllm.platforms.current_platform", platform.NPUPlatform)
++    monkeypatch.setattr(selector_module, "resolve_obj_by_qualname", lambda path: path)
++    select = selector_module._cached_get_attn_backend
++    target_selector = AttentionSelectorConfig(
++        head_size=128, block_size=128, dtype=torch.bfloat16, kv_cache_dtype="fp8", use_mla=True, use_sparse=True
++    )
++    initial_tag = backends.model_tag
++
++    def get_model(*, vllm_config, model_config):
++        assert model_config is draft_config
++        assert vllm_config.model_config is target_config
++        assert vllm_config.cache_config.cache_dtype == "auto"
++        assert vllm_config.attention_config.use_non_causal is (not causal)
++        assert backends.model_tag == "dflash_head"
++        selector = target_selector._replace(
++            use_mla=False, use_sparse=False, kv_cache_dtype="auto", use_non_causal=not causal
++        )
++        with set_current_vllm_config(vllm_config):
++            assert select(None, selector) == "vllm_ascend.attention.fa_v1.AscendFlashAttentionBackend"
++        if fail:
++            raise RuntimeError("draft load failed")
++        return draft_model
++
++    monkeypatch.setattr(loader, "get_model", get_model)
++    speculator = AscendDFlash2Speculator.__new__(AscendDFlash2Speculator)
++    speculator.vllm_config = config
++    select.cache_clear()
++    try:
++        with set_current_vllm_config(config):
++            assert select(None, target_selector) == "vllm_ascend.attention.sfa_v1.AscendSFABackend"
++            expected = pytest.raises(RuntimeError, match="draft load failed") if fail else nullcontext()
++            with expected:
++                assert speculator.load_draft_model(target_model, set()) is draft_model
++            assert backends.model_tag == initial_tag
++            assert select(None, target_selector) == "vllm_ascend.attention.sfa_v1.AscendSFABackend"
++        assert config.model_config is target_config
++        assert config.cache_config.cache_dtype == "fp8"
++        assert not config.attention_config.use_non_causal
++        assert select.cache_info().currsize == 2
++    finally:
++        select.cache_clear()
++
++
++@pytest.mark.parametrize("causal", [False, True])
++def test_v2_flash_attn_uses_exact_lengths_after_rejection_and_reordering(monkeypatch, causal):
++    import sys
++
++    from vllm.v1.kv_cache_interface import FullAttentionSpec, KVCacheConfig, KVCacheGroupSpec
++    from vllm.v1.worker.gpu.cudagraph_utils import BatchExecutionDescriptor
++
++    from vllm_ascend.attention.fa_v1 import AscendFlashAttentionImpl, AscendFlashAttentionMetadataBuilder
++
++    num_query = 6
++    layer_names = [f"draft.layers.{i}" for i in range(6)]
++    builder = AscendFlashAttentionMetadataBuilder.__new__(AscendFlashAttentionMetadataBuilder)
++    builder.model_config = SimpleNamespace(runner_type="generate")
++    builder.attn_mask_builder = SimpleNamespace(get_splitfuse_attn_mask=lambda: None)
++    group = SimpleNamespace(layer_names=layer_names, get_metadata_builder=lambda _: builder)
++    kv_spec = FullAttentionSpec(block_size=128, num_kv_heads=1, head_size=128, dtype=torch.bfloat16)
++    speculator = AscendDFlash2Speculator.__new__(AscendDFlash2Speculator)
++    speculator.arange_np = torch.arange(5, dtype=torch.int32).numpy()
++    speculator.max_model_len = speculator.draft_max_seq_len = 1024
++    speculator.dcp_size = 1
++    speculator.input_buffers = SimpleNamespace(
++        query_start_loc=torch.zeros(5, dtype=torch.int32),
++        seq_lens=torch.zeros(4, dtype=torch.int32),
++        positions=torch.zeros(4 * num_query, dtype=torch.int64),
++    )
++    speculator.draft_is_prefilling = torch.zeros(4, dtype=torch.bool)
++    speculator.attn_groups = [[group]]
++    speculator.kv_cache_config = KVCacheConfig(
++        num_blocks=8,
++        kv_cache_tensors=[],
++        kv_cache_groups=[KVCacheGroupSpec(layer_names=layer_names, kv_cache_spec=kv_spec)],
++    )
++    speculator.block_tables = SimpleNamespace(
++        input_block_tables=[torch.zeros(4, 8, dtype=torch.int32)],
++        slot_mappings=torch.arange(4 * num_query, dtype=torch.int32).view(1, -1),
++    )
++    ops = SimpleNamespace(
++        flash_attn_metadata=MagicMock(side_effect=lambda *_args, **_kwargs: torch.empty(16)),
++        flash_attn=MagicMock(side_effect=lambda query, *_args, **_kwargs: (query, None)),
++    )
++    monkeypatch.setitem(sys.modules, "cann_ops_transformer.ops", ops)
++    impl = AscendFlashAttentionImpl.__new__(AscendFlashAttentionImpl)
++    impl.num_heads, impl.num_kv_heads, impl.sliding_window = 8, 1, None
++    impl.use_bnsd_kv_cache, impl.sinks, impl.scale = True, None, 128**-0.5
++    impl.key_cache = impl.value_cache = torch.empty(0)
++    upper_bounds = torch.tensor([110, 210, 0, 0], dtype=torch.int32)
++    previous = None
++    # Reuse buffer addresses while requests are reordered, rejected and removed.
++    for step, (lengths, order, rejected, padded) in enumerate(
++        [([100, 200], [0, 1], [0, 2], 3), ([210, 110], [1, 0], [3, 1], 2), ([220], [1], [4], 2)], start=1
++    ):
++        num_reqs = len(lengths)
++        upper_bounds.zero_()
++        upper_bounds[:num_reqs] = torch.tensor(lengths, dtype=torch.int32) + 20
++        seq_lens = speculator.input_buffers.seq_lens
++        seq_lens.zero_()
++        exact_lengths = torch.tensor(lengths, dtype=torch.int32) - torch.tensor(rejected, dtype=torch.int32)
++        seq_lens[:num_reqs].copy_(exact_lengths)
++        boundaries = speculator.input_buffers.query_start_loc
++        boundaries.fill_(num_reqs * num_query)
++        boundaries[: num_reqs + 1].copy_(torch.arange(num_reqs + 1, dtype=torch.int32) * num_query)
++        speculator.block_tables.input_block_tables[0][:num_reqs, 0] = torch.tensor(order, dtype=torch.int32)
++        desc = BatchExecutionDescriptor(cg_mode=CUDAGraphMode.NONE, num_tokens=padded * num_query, num_reqs=padded)
++
++        def forbid_host_lengths(*_args, **_kwargs):
++            raise AssertionError("exact draft lengths must remain on device")
++
++        with monkeypatch.context() as no_host:
++            for operation in ("tolist", "item", "cpu"):
++                no_host.setattr(torch.Tensor, operation, forbid_host_lengths)
++            with dflash_module.build_attn_metadata_wrapper():
++                metadata_by_layer = speculator._build_uniform_attn_metadata(
++                    batch_desc=desc,
++                    num_reqs=num_reqs,
++                    num_query_per_req=num_query,
++                    seq_lens_cpu_upper_bound=upper_bounds,
++                    step=num_query,
++                    causal={0: causal},
++                )
++            metadata = metadata_by_layer[layer_names[0]]
++            query = torch.zeros(padded * num_query, 8, 128, dtype=torch.bfloat16)
++            output = torch.empty_like(query)
++            for name in layer_names:
++                assert metadata_by_layer[name] is metadata
++                impl.forward_impl(query, None, None, None, metadata, output)
++        assert metadata is not previous
++        previous = metadata
++        assert metadata.num_actual_tokens == num_reqs * num_query
++        assert metadata.causal is causal
++        assert metadata.seq_lens_gpu.data_ptr() == seq_lens.data_ptr()
++        assert ops.flash_attn_metadata.call_count == step
++        assert ops.flash_attn.call_count == step * len(layer_names)
++        attrs = ops.flash_attn_metadata.call_args.kwargs
++        expected_lengths = torch.ones(padded, dtype=torch.int32)
++        expected_lengths[:num_reqs] = exact_lengths
++        torch.testing.assert_close(attrs["seqused_kv"], expected_lengths)
++        torch.testing.assert_close(attrs["cu_seqlens_q"], boundaries[: padded + 1])
++        torch.testing.assert_close(metadata.block_tables[:num_reqs, 0], torch.tensor(order, dtype=torch.int32))
++
++
+ @pytest.mark.parametrize("fail", [False, True])
+ def test_dflash_loader_temporarily_disables_profiling_chunk(monkeypatch, fail):
+     additional_config = {"profiling_chunk_config": {"enabled": "true", "min_chunk": 64}}
+@@ -97,6 +290,25 @@ def test_init_speculator_routes_dflash2_draft_model():
+         d2.assert_not_called()
+ 
+ 
++def test_eager_speculator_keeps_target_compilation_and_graph_config():
++    spec = _spec_config("DFlash2DraftModel")
++    spec.enforce_eager = True
++    config = SimpleNamespace(
++        speculative_config=spec,
++        compilation_config=SimpleNamespace(
++            mode=CompilationMode.VLLM_COMPILE, cudagraph_mode=CUDAGraphMode.FULL_DECODE_ONLY
++        ),
++    )
++    with patch("vllm_ascend.worker.v2.spec_decode.dflash2.speculator.AscendDFlash2Speculator") as draft:
++        init_speculator(config, torch.device("cpu"))
++    draft_config = draft.call_args.args[0]
++    assert draft_config is not config
++    assert draft_config.compilation_config is not config.compilation_config
++    assert draft_config.compilation_config.mode == CompilationMode.NONE
++    assert config.compilation_config.mode == CompilationMode.VLLM_COMPILE
++    assert config.compilation_config.cudagraph_mode == CUDAGraphMode.FULL_DECODE_ONLY
++
++
+ def test_init_cudagraph_manager_requires_enforce_eager(monkeypatch):
+     calls: list[CUDAGraphMode] = []
+     monkeypatch.setattr(
+diff --git a/tests/ut/worker/test_model_runner_v2.py b/tests/ut/worker/test_model_runner_v2.py
+index 6fb25cb97..f172376db 100644
+--- a/tests/ut/worker/test_model_runner_v2.py
++++ b/tests/ut/worker/test_model_runner_v2.py
+@@ -35,6 +35,7 @@ def _make_runner(need_timing: bool = True):
+     runner.ascend_config = SimpleNamespace(
+         scheduler_config=SimpleNamespace(profiling_chunk_config=SimpleNamespace(need_timing=need_timing)),
+         sparse_kv_offload_config=SimpleNamespace(enabled=False),
++        kvpp_config=SimpleNamespace(size=1),
+     )
+     runner.vllm_config = SimpleNamespace(kv_transfer_config=None)
+     runner.model_config = SimpleNamespace(hf_config=SimpleNamespace(model_type="other_model"))
+@@ -56,6 +57,7 @@ def _make_runner(need_timing: bool = True):
+     runner.compilation_config = SimpleNamespace(cudagraph_mode=CUDAGraphMode.NONE)
+     runner.use_fia = False
+     runner.sync_spec_pp_cpu_counts = False
++    runner.speculative_config = None
+     # Set by NPUModelRunner.__init__ on real instances.
+     runner._finegrained_tp_requires_graph = False
+     # Empty groups keep prepare_dummy_attn's V4.1 ring-state prep a no-op;
+@@ -1949,11 +1951,15 @@ def test_cpu_length_sync_preserves_original_condition_except_v41(model_type, spe
+     output.scheduled_cached_reqs.req_ids = batch.req_ids
+     runner.model_config.hf_config.model_type = model_type
+     runner.sync_spec_pp_cpu_counts = pp_sync
+-    runner._copy_num_computed_tokens_to_cpu = MagicMock()
++    runner.num_computed_tokens_stream = MagicMock()
+     expected = pp_sync or (speculative and model_type != "deepseek_v41")
+-    with patch.object(GPUModelRunner, "postprocess_sampled"):
++    with (
++        patch.object(GPUModelRunner, "postprocess_sampled"),
++        patch("torch.cuda.current_stream"),
++        patch("torch.npu.stream", return_value=nullcontext()),
++    ):
+         runner.postprocess_sampled("idx", "tok", 3, 2)
+-    assert runner._copy_num_computed_tokens_to_cpu.call_count == int(expected)
++    assert runner.num_computed_tokens_event.record.call_count == int(expected)
+     runner._update_seq_lens_cpu(output, batch.req_ids)
+     assert runner.num_computed_tokens_event.synchronize.call_count == int(expected)
+     if expected:
+@@ -1964,11 +1970,11 @@ def test_device_only_postprocess_keeps_device_update_without_d2h():
+     runner = _make_runner()
+     runner.speculator = object()
+     runner.model_config.hf_config.model_type = "deepseek_v41"
+-    runner._copy_num_computed_tokens_to_cpu = MagicMock()
++    runner.num_computed_tokens_event = MagicMock()
+     with patch.object(GPUModelRunner, "postprocess_sampled") as parent:
+         runner.postprocess_sampled("idx", "tok", 3, 2, query_start_loc="q")
+     parent.assert_called_once_with("idx", "tok", 3, 2, "q")
+-    runner._copy_num_computed_tokens_to_cpu.assert_not_called()
++    runner.num_computed_tokens_event.record.assert_not_called()
+ 
+ 
+ def test_device_only_cpu_lengths_remain_upper_bounds_without_event_wait():
+@@ -1981,3 +1987,82 @@ def test_device_only_cpu_lengths_remain_upper_bounds_without_event_wait():
+     for i, req_id in enumerate(batch.req_ids):
+         index = runner.req_states.req_id_to_index[req_id]
+         assert runner.input_buffers.seq_lens_cpu[i] == before[index] + output.num_scheduled_tokens[req_id]
++
++
++def _device_length_runner():
++    runner, output, batch, _ = _prepare_inputs_runner(speculator=True)
++    runner.model_config.hf_text_config = SimpleNamespace(model_type="glm_moe_dsa")
++    runner.speculative_config = SimpleNamespace(
++        method="dflash",
++        draft_model_config=SimpleNamespace(architectures=["DFlash2DraftModel"]),
++    )
++    return runner, output, batch
++
++
++def test_glm_dflash2_device_lengths_do_not_require_attention_groups():
++    runner, _, _ = _device_length_runner()
++    del runner.attn_groups
++    assert runner._can_skip_spec_cpu_length_sync() is True
++
++
++@pytest.mark.parametrize(
++    "unsupported",
++    ["no_spec_config", "no_speculator", "method", "no_draft_config", "draft_arch", "target_arch"],
++)
++def test_dflash_device_length_policy_falls_back(unsupported):
++    runner, _, _ = _device_length_runner()
++    if unsupported == "no_spec_config":
++        runner.speculative_config = None
++    elif unsupported == "no_speculator":
++        runner.speculator = None
++    elif unsupported == "method":
++        runner.speculative_config.method = "eagle"
++    elif unsupported == "no_draft_config":
++        runner.speculative_config.draft_model_config = None
++    elif unsupported == "draft_arch":
++        runner.speculative_config.draft_model_config.architectures = ["OtherDraftModel"]
++    elif unsupported == "target_arch":
++        runner.model_config.hf_text_config.model_type = "other_model"
++    assert runner._can_skip_spec_cpu_length_sync() is False
++
++
++@pytest.mark.parametrize("model_type", ["deepseek_v41", "glm_moe_dsa"])
++def test_pp_exact_counts_override_device_length_exemption(model_type):
++    runner, _, _ = _device_length_runner()
++    runner.model_config.hf_config.model_type = model_type
++    runner.sync_spec_pp_cpu_counts = True
++    assert runner._can_skip_spec_cpu_length_sync() is False
++
++
++@pytest.mark.parametrize("rejected", [0, 1, 5])
++def test_dflash_rejection_reorder_and_padding_keep_device_lengths_without_d2h(rejected):
++    runner, output, _ = _device_length_runner()
++    runner.num_computed_tokens_cpu.fill_(-99)  # An old staging snapshot must never be read.
++    runner.input_buffers.seq_lens_cpu.fill_(777)
++    runner.req_states.num_computed_tokens_cpu[:] = torch.tensor([100, 200, 0, 0])
++    runner.req_states.num_computed_tokens.gpu[:] = torch.tensor([98, 195, 0, 0])
++    expected_device = runner.req_states.num_computed_tokens.gpu.clone()
++
++    def reject(_self, idx_mapping, _tokens, _num_sampled, num_rejected, _query_start_loc):
++        runner.req_states.num_computed_tokens.gpu[idx_mapping] -= num_rejected
++
++    for req_ids in (["r1", "r0"], ["r0", "r1"]):
++        expected_device[:2] -= rejected
++        before = runner.req_states.num_computed_tokens_cpu.clone()
++        with patch.object(GPUModelRunner, "postprocess_sampled", reject):
++            runner.postprocess_sampled(torch.tensor([1, 0]), None, 1, rejected)
++        runner._update_seq_lens_cpu(output, req_ids)
++        torch.testing.assert_close(runner.req_states.num_computed_tokens.gpu, expected_device)
++        torch.testing.assert_close(runner.req_states.num_computed_tokens_cpu, before)
++        assert runner.input_buffers.seq_lens_cpu[:2].tolist() == [
++            int(before[runner.req_states.req_id_to_index[req_id]]) + output.num_scheduled_tokens[req_id]
++            for req_id in req_ids
++        ]
++        assert runner.input_buffers.seq_lens_cpu[2:].tolist() == [777, 777]
++        # Simulate the upstream optimistic host count advancing to the next step.
++        runner.req_states.num_computed_tokens_cpu[:2] += 6
++        runner.req_states.num_computed_tokens.gpu[:2] += 6
++        expected_device[:2] += 6
++    runner.num_computed_tokens_event.record.assert_not_called()
++    runner.num_computed_tokens_event.synchronize.assert_not_called()
++    assert runner.num_computed_tokens_cpu.tolist() == [-99] * 4
+diff --git a/tests/ut/worker/test_spec_pp_cpu_counts.py b/tests/ut/worker/test_spec_pp_cpu_counts.py
+index 16066b52e..a4de9bf4c 100644
+--- a/tests/ut/worker/test_spec_pp_cpu_counts.py
++++ b/tests/ut/worker/test_spec_pp_cpu_counts.py
+@@ -35,7 +35,13 @@ def runner_cls(mamba_state_cls):
+         node
+         for node in cls.body
+         if getattr(node, "name", None)
+-        in {"__init__", "postprocess_sampled", "postprocess_num_computed_tokens", "_update_seq_lens_cpu"}
++        in {
++            "__init__",
++            "_can_skip_spec_cpu_length_sync",
++            "postprocess_sampled",
++            "postprocess_num_computed_tokens",
++            "_update_seq_lens_cpu",
++        }
+     ]
+     cls.bases = [ast.Name(id="Parent", ctx=ast.Load())]
+ 
+@@ -92,6 +98,7 @@ def test_exact_counts_after_rejection_or_chunk(
+     runner.model_config = SimpleNamespace(
+         architecture=architecture, hf_config=SimpleNamespace(architectures=[architecture])
+     )
++    runner.speculative_config = None
+     runner.__init__(None, None)
+     assert runner.sync_spec_pp_cpu_counts == (enabled and use_pp and steps > 0)
+     runner.speculator = object() if owns_speculator else None
+diff --git a/vllm_ascend/attention/fa_v1.py b/vllm_ascend/attention/fa_v1.py
+new file mode 100644
+index 000000000..7a1d02d3a
+--- /dev/null
++++ b/vllm_ascend/attention/fa_v1.py
+@@ -0,0 +1,117 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vllm-ascend project
++
++"""Device-length CANN FlashAttn for A5 V2 DFlash2 eager drafts."""
++
++from dataclasses import dataclass, field
++
++import torch
++
++from vllm_ascend.attention.attention_v1 import (
++    AscendAttentionBackend,
++    AscendAttentionBackendImpl,
++    AscendAttentionMetadataBuilder,
++    AscendMetadata,
++)
++from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.attention_fence import attention_transfer_window
++
++
++@dataclass
++class AscendFlashAttentionMetadata(AscendMetadata):
++    flash_attn_mask: torch.Tensor | None = None
++    # Share plans only within an attention group and draft step.
++    flash_attn_plans: dict = field(default_factory=dict)
++    flash_attn_lengths: tuple[torch.Tensor, torch.Tensor] | None = None
++
++
++class AscendFlashAttentionMetadataBuilder(AscendAttentionMetadataBuilder):
++    metadata_cls = AscendFlashAttentionMetadata
++
++    def build(self, common_prefix_len, common_attn_metadata, fast_build=False):
++        """Build from exact device lengths; CPU mirrors may be stale after rejection."""
++        num_tokens = common_attn_metadata.num_actual_tokens
++        num_reqs = common_attn_metadata.num_reqs
++        query_start_loc = common_attn_metadata.query_start_loc[: num_reqs + 1]
++        seq_lens = common_attn_metadata.seq_lens[:num_reqs]
++        return self.metadata_cls(
++            num_actual_tokens=num_tokens,
++            num_decode_tokens=num_tokens,
++            num_decodes=num_reqs,
++            block_tables=common_attn_metadata.block_table_tensor[:num_reqs],
++            query_start_loc=query_start_loc,
++            query_start_loc_gpu=query_start_loc,
++            seq_lens=seq_lens,
++            seq_lens_gpu=seq_lens,
++            max_query_len=common_attn_metadata.max_query_len,
++            slot_mapping=common_attn_metadata.slot_mapping[:num_tokens],
++            causal=common_attn_metadata.causal,
++            attn_state=common_attn_metadata.attn_state,
++            model_runner_type=self.model_config.runner_type,
++            flash_attn_mask=self.attn_mask_builder.get_splitfuse_attn_mask(),
++        )
++
++
++class AscendFlashAttentionBackend(AscendAttentionBackend):
++    @staticmethod
++    def get_impl_cls():
++        return AscendFlashAttentionImpl
++
++    @staticmethod
++    def get_builder_cls():
++        return AscendFlashAttentionMetadataBuilder
++
++
++class AscendFlashAttentionImpl(AscendAttentionBackendImpl):
++    def forward_impl(self, query, key, value, kv_cache, attn_metadata, output):
++        """Reuse device lengths and tiling plans across layers in one draft step."""
++        # Load CANN only in workers using this backend.
++        from cann_ops_transformer.ops import flash_attn, flash_attn_metadata
++
++        metadata = attn_metadata
++        if metadata.flash_attn_lengths is None:
++            num_reqs = metadata.block_tables.shape[0]
++            boundaries = metadata.query_start_loc_gpu[: num_reqs + 1].int()
++            # Dummy requests may have repeated or negative query boundaries.
++            boundaries = boundaries.clamp(min=0, max=query.shape[0]).cummax(dim=0).values
++            lengths = metadata.seq_lens_gpu[:num_reqs].int().clamp(min=1)
++            metadata.flash_attn_lengths = boundaries, lengths
++
++        layout_kv = "PA_BNBD" if self.use_bnsd_kv_cache else "PA_BBND"
++        plan_key = (self.num_heads, self.num_kv_heads, query.shape[-1], self.sliding_window, layout_kv)
++        cached = metadata.flash_attn_plans.get(plan_key)
++        if cached is None:
++            window = self.sliding_window - 1 if self.sliding_window is not None else -1
++            # Both CANN operators require the same lengths, mask and layout.
++            # Mask modes: 0 = unmasked, 3 = causal, 4 = sliding window.
++            attrs = dict(
++                cu_seqlens_q=metadata.flash_attn_lengths[0],
++                seqused_kv=metadata.flash_attn_lengths[1],
++                max_seqlen_q=metadata.max_query_len,
++                max_seqlen_kv=-1,
++                mask_mode=4 if self.sliding_window is not None else 3 if metadata.causal else 0,
++                win_left=window,
++                win_right=0 if metadata.causal and self.sliding_window is not None else window,
++                layout_q="TND",
++                layout_kv=layout_kv,
++                layout_out="TND",
++            )
++            cached = flash_attn_metadata(self.num_heads, self.num_kv_heads, query.shape[-1], **attrs), attrs
++            metadata.flash_attn_plans[plan_key] = cached
++        plan, attrs = cached
++
++        with attention_transfer_window():
++            result, _ = flash_attn(
++                query,
++                self.key_cache,
++                self.value_cache,
++                block_table=metadata.block_tables,
++                metadata=plan,
++                attn_mask=metadata.flash_attn_mask if attrs["mask_mode"] else None,
++                sinks=self.sinks,
++                softmax_scale=self.scale,
++                return_softmax_lse=False,
++                **attrs,
++            )
++            # CANN returns a new tensor; vLLM requires its supplied output buffer.
++            output[: query.shape[0]].copy_(result)
++            return output
+diff --git a/vllm_ascend/device/hardware_profile.py b/vllm_ascend/device/hardware_profile.py
+index e7cd33729..7516763f6 100644
+--- a/vllm_ascend/device/hardware_profile.py
++++ b/vllm_ascend/device/hardware_profile.py
+@@ -70,6 +70,8 @@ class HardwareCapability(Enum):
+     CANN_MEGAMOE_MXFP = auto()
+     # Split a mixed chunked-prefill batch into separate prefill and decode FIA calls.
+     CHUNKED_PREFILL_PHASE_SPLIT = auto()
++    # CANN device-side FlashAttn metadata with strided paged GQA K/V.
++    DEVICE_LENGTH_FLASH_ATTN = auto()
+     # Build CPU-affinity pools from the cluster-aware CPU topology.
+     CLUSTER_CPU_TOPOLOGY = auto()
+     # Legacy implementation selector: install the 310P-specific operator overrides.
+@@ -351,6 +353,7 @@ _HARDWARE_PROFILES: Mapping[AscendDeviceType, HardwareProfile] = MappingProxyTyp
+                     HardwareCapability.BGMV_SGMV_META_REGISTRATION,
+                     HardwareCapability.CANN_MEGAMOE,
+                     HardwareCapability.CANN_MEGAMOE_MXFP,
++                    HardwareCapability.DEVICE_LENGTH_FLASH_ATTN,
+                     HardwareCapability.CHUNKED_PREFILL_PHASE_SPLIT,
+                     HardwareCapability.CLUSTER_CPU_TOPOLOGY,
+                     HardwareCapability.DSA_C128_STATE_SMALL_BLOCK_SIZES,
+diff --git a/vllm_ascend/platform.py b/vllm_ascend/platform.py
+index 8af666519..e650ae20c 100644
+--- a/vllm_ascend/platform.py
++++ b/vllm_ascend/platform.py
+@@ -258,6 +258,11 @@ class NPUPlatform(Platform):
+         if not attn_selector_config.use_pcp and _validate_fa3_backend(key, attn_selector_config):
+             return "vllm_ascend.attention.fa3_v1.AscendFABackend"
+ 
++        # PCP keeps its distributed backend; eligible local draft layers use CANN FlashAttn.
++        if not attn_selector_config.use_pcp and _validate_flash_attn_backend(backend_key, attn_selector_config):
++            # vLLM resolves this import path to the backend class.
++            return "vllm_ascend.attention.fa_v1.AscendFlashAttentionBackend"
++
+         backend_map = {
+             (True, False, False): "vllm_ascend.attention.mla_v1.AscendMLABackend",
+             (False, False, False): "vllm_ascend.attention.attention_v1.AscendAttentionBackend",
+@@ -1602,6 +1607,47 @@ def _disable_expandable_segments() -> None:
+         logger.info("Removed expandable_segments from PYTORCH_NPU_ALLOC_CONF: %s", updated_configs)
+ 
+ 
++def _validate_flash_attn_backend(backend_key, selector) -> bool:
++    """Select CANN FlashAttn for A5 V2 DFlash2 eager drafts with GLM MoE DSA targets."""
++    # backend_key is (use_mla, use_sparse, use_compress).
++    if backend_key != (False, False, False) or not get_current_hardware_profile().supports(
++        HardwareCapability.DEVICE_LENGTH_FLASH_ATTN
++    ):
++        return False
++
++    from vllm.compilation import backends
++    from vllm.config import get_current_vllm_config_or_none
++
++    config = get_current_vllm_config_or_none()
++    spec = config.speculative_config if config is not None else None
++    if spec is None or not spec.enforce_eager:
++        return False
++    # V2 keeps the target model_config while loading the draft. Read the live
++    # loader tag rather than relying on V1's runner_type="draft" convention.
++    if backends.model_tag != "dflash_head":
++        return False
++    target = spec.target_model_config
++    # Restrict target models to the GLM MoE DSA family, including GLM-5.3.
++    if target.hf_text_config.model_type != "glm_moe_dsa":
++        return False
++
++    return (
++        spec.method == "dflash"
++        and "DFlash2DraftModel" in (spec.draft_model_config.architectures or [])
++        # CANN FlashAttn requires FP16/BF16 Q and unquantized KV.
++        and selector.dtype in (torch.float16, torch.bfloat16)
++        and selector.kv_cache_dtype in (None, "auto", "float16", "bfloat16")
++        # These features require additional metadata or batch-invariance guarantees.
++        and not (
++            selector.use_dcp
++            or selector.use_mm_prefix
++            or selector.use_rswa
++            or selector.use_batch_invariant
++            or selector.use_per_head_quant_scales
++        )
++    )
++
++
+ def _validate_fa3_backend(key, _attn_selector_config):
+     rl_config = get_ascend_config().rl_config
+     if not (rl_config.enabled and rl_config.enable_training_consistency):
+diff --git a/vllm_ascend/worker/v2/model_runner.py b/vllm_ascend/worker/v2/model_runner.py
+index 9c5bf360f..7e3ce1d74 100644
+--- a/vllm_ascend/worker/v2/model_runner.py
++++ b/vllm_ascend/worker/v2/model_runner.py
+@@ -1258,6 +1258,26 @@ class NPUModelRunner(GPUModelRunner):
+         self._finalize_dump_data(dump=False)
+         return output
+ 
++    def _can_skip_spec_cpu_length_sync(self) -> bool:
++        """Allow device lengths for GLM-5.3 with a DFlash2 draft."""
++        if self.sync_spec_pp_cpu_counts:
++            return False
++
++        if is_deepseek_v41(self.model_config.hf_config):
++            return True
++
++        spec = self.speculative_config
++        if (  # noqa: SIM103
++            spec is not None
++            and self.speculator is not None
++            and spec.method == "dflash"
++            and self.model_config.hf_text_config.model_type == "glm_moe_dsa"
++            and spec.draft_model_config is not None
++            and "DFlash2DraftModel" in (spec.draft_model_config.architectures or [])
++        ):
++            return True
++        return False
++
+     def postprocess_sampled(
+         self,
+         idx_mapping,
+@@ -1266,10 +1286,7 @@ class NPUModelRunner(GPUModelRunner):
+         num_rejected,
+         query_start_loc=None,
+     ):
+-        """Override GPUModelRunner.postprocess_sampled for Ascend NPUs.
+-        npu attention backends need seq_lens_cpu to work.
+-        so we need to copy num_computed_tokens back to cpu here.
+-        """
++        """Update device state and refresh exact CPU counts when required."""
+         if (
+             self.use_pp
+             and not self.is_last_pp_rank
+@@ -1288,13 +1305,8 @@ class NPUModelRunner(GPUModelRunner):
+             query_start_loc,
+         )
+ 
+-        # TODO: Gate CPU length synchronization by backend requirements, not
+-        # speculative decoding alone. V4.1 uses device lengths; extend this
+-        # exemption to other backends that do not need exact CPU seq_lens.
+         # Non-last PP stages receive rejections without owning a speculator.
+-        if (
+-            self.speculator is not None and not is_deepseek_v41(self.model_config.hf_config)
+-        ) or self.sync_spec_pp_cpu_counts:
++        if self.speculator is not None or self.sync_spec_pp_cpu_counts:
+             self._copy_num_computed_tokens_to_cpu()
+ 
+     def postprocess_num_computed_tokens(self, input_batch: AscendInputBatch) -> None:
+@@ -1304,9 +1316,10 @@ class NPUModelRunner(GPUModelRunner):
+             self._copy_num_computed_tokens_to_cpu()
+ 
+     def _copy_num_computed_tokens_to_cpu(self):
+-        # Attention metadata still needs exact CPU lengths. This non-blocking
+-        # D2H is waited on in _update_seq_lens_cpu, introducing a host/device
+-        # sync point that can break asynchronous scheduling overlap.
++        if self._can_skip_spec_cpu_length_sync():
++            return
++
++        # Match this D2H and event with the consumer in _update_seq_lens_cpu.
+         default_stream = torch.cuda.current_stream()
+         assert self.num_computed_tokens_stream is not None
+         assert self.num_computed_tokens_cpu is not None
+@@ -1325,12 +1338,9 @@ class NPUModelRunner(GPUModelRunner):
+     ):
+         num_scheduled_tokens = scheduler_output.num_scheduled_tokens
+ 
+-        # Speculative decoding needs corrected num_computed_tokens after rejection.
+-        # req_states.num_computed_tokens_cpu shares storage with its NumPy view,
+-        # so this update also corrects the num_computed_tokens_np used by PCP.
+-        if (
+-            self.speculator is not None and not is_deepseek_v41(self.model_config.hf_config)
+-        ) or self.sync_spec_pp_cpu_counts:
++        # Wait for and consume the snapshot only when its producer runs.
++        # req_states.num_computed_tokens_cpu also backs the NumPy view used by PCP.
++        if (self.speculator is not None or self.sync_spec_pp_cpu_counts) and not self._can_skip_spec_cpu_length_sync():
+             # Blocks CPU submission until D2H completes; may stall the async pipeline.
+             self.num_computed_tokens_event.synchronize()
+             for req_id in scheduler_output.scheduled_cached_reqs.req_ids:

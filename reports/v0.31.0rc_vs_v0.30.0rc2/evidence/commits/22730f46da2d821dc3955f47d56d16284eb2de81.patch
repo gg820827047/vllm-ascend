@@ -1,0 +1,500 @@
+commit 22730f46da2d821dc3955f47d56d16284eb2de81
+Author:     zxr2333 <64738772+nwpu-zxr@users.noreply.github.com>
+AuthorDate: Sat Oct 17 23:18:17 2026 +0800
+Commit:     GitHub <noreply@github.com>
+CommitDate: Sat Oct 17 23:18:17 2026 +0800
+
+    [BugFix][KV Transfer] Fix Mooncake V2 scheduler resource cleanup (#18956)
+    
+    ### What this PR does / why we need it?
+    
+    Mooncake Connector V2 retains completed request IDs indefinitely,
+    requeues failed completion notifications without a limit, and does not
+    stop its scheduler control threads during shutdown.
+    
+    Use pending delayed-free requests to report completion only once, while
+    acknowledging duplicate or stale DONE messages. Rely on the existing
+    bounded socket retries and producer delayed-free timeout instead of
+    requeueing failed notifications forever. Add scheduler shutdown
+    forwarding, wake and join control threads, close ZMQ resources in their
+    owning thread, and clear pending request state. Connection-cache
+    eviction is unchanged.
+    
+    Add regression coverage for completion deduplication, request-state
+    cleanup, failed notifications, idle-thread shutdown, and resource
+    cleanup.
+    
+    ### Does this PR introduce _any_ user-facing change?
+    
+    A warning is logged when an invalid request is received.
+    
+    ### How was this patch tested?
+    
+    by CI
+    
+    ---
+    
+    ### Checklist
+    
+    #### Testing
+    
+    - [x] **Boundary / edge-case coverage**: Added coverage for duplicate,
+    unknown, and late completion messages.
+    - [x] **Regression test**: Added coverage for completed request IDs not
+    accumulating.
+    - [x] **Error / failure path coverage**: Covered completion after
+    timeout and ACKs for unknown requests.
+    - [x] **Meaningful & reliable tests**: Tests check completion reporting,
+    ACK responses, and state cleanup.
+    - [ ] **Performance impact**: Benchmark results attached.
+    
+    - vLLM main:
+    https://github.com/vllm-project/vllm/commit/c4df37dfcc7f72ca41cd43801a468526ecf99a2b
+    
+    ---------
+    
+    Signed-off-by: nwpu-zxr <zhouxuerong2@huawei.com>
+
+diff --git a/tests/ut/kv_offload/mooncake_v2/test_pull_scheduler.py b/tests/ut/kv_offload/mooncake_v2/test_pull_scheduler.py
+index 37068a26b..0c71e47b4 100644
+--- a/tests/ut/kv_offload/mooncake_v2/test_pull_scheduler.py
++++ b/tests/ut/kv_offload/mooncake_v2/test_pull_scheduler.py
+@@ -23,6 +23,7 @@ from vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake.metadata import (
+ )
+ from vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake.pull_scheduler import (
+     ACK_MSG,
++    DONE_RECVING_MSG,
+     MooncakePullConnectorScheduler,
+     MooncakeSchedulerRecvingThread,
+     MooncakeSchedulerSendingThread,
+@@ -257,18 +258,61 @@ def test_sending_thread_rejects_incomplete_or_inconsistent_workers() -> None:
+         make_sending_thread({0: metadata, 1: mismatched}, tp_size=2)
+ 
+ 
+-def test_sending_thread_handles_early_and_normal_completion_once() -> None:
++def test_sending_thread_handles_completion_once() -> None:
+     thread = make_sending_thread()
+ 
+-    thread._handle_finished_request("early")
+-    assert thread.get_and_clear_finished_requests() == set()
+-    thread.add_delayed_request("early", time.time())
+-    assert thread.get_and_clear_finished_requests() == {"early"}
+-
+     thread.add_delayed_request("normal", time.time())
+     thread._handle_finished_request("normal")
+     thread._handle_finished_request("normal")
+     assert thread.get_and_clear_finished_requests() == {"normal"}
++    assert not thread.delayed_free_requests
++
++    thread._handle_finished_request("normal")
++    assert thread.get_and_clear_finished_requests() == set()
++
++
++def test_sending_thread_ignores_unknown_completion() -> None:
++    thread = make_sending_thread()
++
++    thread._handle_finished_request("unknown")
++    assert thread.get_and_clear_finished_requests() == set()
++    thread.add_delayed_request("unknown", time.time())
++    assert thread.get_and_clear_finished_requests() == set()
++    thread._handle_finished_request("unknown")
++    assert thread.get_and_clear_finished_requests() == {"unknown"}
++
++
++def test_sending_thread_acks_duplicate_and_unknown_completion() -> None:
++    thread = make_sending_thread()
++    thread.add_delayed_request("normal", time.time())
++    sock = MagicMock()
++    sock.recv_multipart.side_effect = [
++        [b"consumer", b"", msgspec.msgpack.encode((DONE_RECVING_MSG, request_id))]
++        for request_id in ("normal", "normal", "unknown")
++    ] + [KeyboardInterrupt()]
++
++    with pytest.raises(KeyboardInterrupt):
++        thread._run_busy_loop(sock)
++
++    assert sock.send_multipart.call_args_list == [call((b"consumer", b"", ACK_MSG))] * 3
++    assert thread.get_and_clear_finished_requests() == {"normal"}
++
++
++def test_sending_thread_does_not_retain_completed_request_ids() -> None:
++    thread = make_sending_thread()
++
++    for index in range(100):
++        request_id = f"request-{index}"
++        thread.add_delayed_request(request_id, time.time())
++        thread._handle_finished_request(request_id)
++        assert thread.get_and_clear_finished_requests() == {request_id}
++        thread._handle_finished_request(request_id)
++
++    assert thread.get_and_clear_finished_requests() == set()
++    assert not thread.delayed_free_requests
++    assert thread.finished_requests.empty()
++    assert not getattr(thread, "finished_request_ids", set())
++    assert not getattr(thread, "early_finished_requests", set())
+ 
+ 
+ def test_sending_thread_force_frees_expired_request(monkeypatch: pytest.MonkeyPatch) -> None:
+@@ -288,6 +332,9 @@ def test_sending_thread_force_frees_expired_request(monkeypatch: pytest.MonkeyPa
+     assert thread.get_and_clear_finished_requests() == {"expired"}
+     assert not thread.delayed_free_requests
+ 
++    thread._handle_finished_request("expired")
++    assert thread.get_and_clear_finished_requests() == set()
++
+ 
+ def test_recving_thread_reuses_socket_after_ack_and_discards_it_on_error(
+     monkeypatch: pytest.MonkeyPatch,
+@@ -554,21 +601,22 @@ def test_sending_busy_loop_serves_metadata_and_completion_ack() -> None:
+     thread._handle_finished_request.assert_called_once_with("request-p")
+ 
+ 
+-def test_recving_run_requeues_failed_completion() -> None:
++def test_recving_run_discards_failed_completion_and_cleans_queue() -> None:
+     ready_event = threading.Event()
+     thread = MooncakeSchedulerRecvingThread(ready_event)
+     request = ("10.0.0.1", 6000, "request-p")
+-    request_queue = MagicMock()
+-    request_queue.get.side_effect = [request, _StopLoop()]
+-    thread.request_queue = request_queue
++    thread.request_queue.put(request)
++    thread.request_queue.put(None)
++    # Pending work after the stop sentinel must also be cleared on exit.
++    thread.request_queue.put(("10.0.0.2", 6000, "pending"))
+     thread._send_done_recving = MagicMock(side_effect=RuntimeError("network error"))  # type: ignore[method-assign]
+ 
+-    with pytest.raises(_StopLoop):
+-        thread.run()
++    thread.run()
+ 
+     assert ready_event.is_set()
+-    request_queue.put.assert_called_once_with(request)
+-    request_queue.task_done.assert_called_once_with()
++    thread._send_done_recving.assert_called_once_with(*request)
++    assert thread.request_queue.empty()
++    assert thread.request_queue.unfinished_tasks == 0
+ 
+ 
+ def test_set_worker_metadata_starts_only_one_producer_sending_thread(
+@@ -695,3 +743,109 @@ def test_matched_token_query_does_not_change_prompt_length(prefix_connector):
+     assert prefix_connector.get_num_new_matched_tokens(request, 512) == (0, False)
+     assert request.num_prompt_tokens == 513
+     assert len(request.all_token_ids) == 513
++
++
++def test_recving_thread_does_not_requeue_failed_notification() -> None:
++    thread = MooncakeSchedulerRecvingThread(threading.Event())
++    thread.add_request("10.0.0.1", 6000, "failed")
++    thread.add_request("10.0.0.2", 6000, "healthy")
++    thread.request_queue.put(None)
++    thread._send_done_recving = MagicMock(side_effect=[RuntimeError("unreachable"), None])
++
++    thread.run()
++
++    assert thread._send_done_recving.call_args_list == [
++        call("10.0.0.1", 6000, "failed"),
++        call("10.0.0.2", 6000, "healthy"),
++    ]
++    assert thread.request_queue.empty()
++    assert thread.request_queue.unfinished_tasks == 0
++
++
++def test_recving_thread_shutdown_wakes_idle_thread() -> None:
++    thread = MooncakeSchedulerRecvingThread(threading.Event())
++    thread.start()
++    assert thread.ready_event.wait(timeout=5)
++
++    thread.shutdown()
++    thread.shutdown()
++
++    assert not thread.is_alive()
++    assert thread.request_queue.empty()
++    assert thread.request_queue.unfinished_tasks == 0
++
++
++def test_recving_thread_shutdown_closes_resources_in_owner_thread() -> None:
++    thread = MooncakeSchedulerRecvingThread(threading.Event())
++    socket = MagicMock()
++    context = MagicMock()
++    cleanup_threads = []
++    socket.close.side_effect = lambda **kwargs: cleanup_threads.append(threading.get_ident())
++    context.destroy.side_effect = lambda **kwargs: cleanup_threads.append(threading.get_ident())
++
++    def send_done(*args):
++        thread.remote_sockets["tcp://10.0.0.1:6000"].append(socket)
++        thread.zmq_context = context
++        thread.stop_event.set()
++
++    thread._send_done_recving = MagicMock(side_effect=send_done)
++    thread.add_request("10.0.0.1", 6000, "first")
++    thread.add_request("10.0.0.1", 6000, "pending")
++    thread.start()
++    thread.join(timeout=5)
++    assert not thread.is_alive()
++    thread.shutdown()
++
++    socket.close.assert_called_once_with(linger=0)
++    context.destroy.assert_called_once_with(linger=0)
++    assert cleanup_threads == [thread.ident, thread.ident]
++    assert not thread.remote_sockets
++    assert thread.zmq_context is None
++    assert thread.request_queue.empty()
++    assert thread.request_queue.unfinished_tasks == 0
++    assert thread._send_done_recving.call_count == 1
++
++
++def test_sending_thread_shutdown_exits_receive_loop(monkeypatch: pytest.MonkeyPatch) -> None:
++    thread = make_sending_thread()
++    socket = MagicMock()
++    context = MagicMock()
++    context.__enter__.return_value = socket
++    monkeypatch.setattr(pull_scheduler, "zmq_ctx", MagicMock(return_value=context))
++
++    def recv():
++        thread.stop_event.wait(timeout=5)
++        raise zmq.Again()  # type: ignore[attr-defined]
++
++    socket.recv_multipart.side_effect = recv
++    thread.add_delayed_request("pending", time.time())
++    thread.start()
++    assert thread.ready_event.wait(timeout=5)
++    thread.shutdown()
++    thread.shutdown()
++
++    assert not thread.is_alive()
++    context.__exit__.assert_called_once()
++    assert not thread.delayed_free_requests
++    assert thread.finished_requests.empty()
++
++
++def test_scheduler_shutdown_stops_threads_and_clears_request_state() -> None:
++    scheduler = make_pull_scheduler()
++    scheduler._sending_thread = MagicMock()
++    scheduler._recving_thread = MagicMock()
++    scheduler._reqs_need_recv["recv"] = MagicMock()
++    scheduler._reqs_need_send["send"] = time.time()
++    scheduler._reqs_in_batch.add("recv")
++    scheduler._reqs_recv_info["recv"] = ("10.0.0.1", 6000, "remote")
++    connector = MooncakePullConnector.__new__(MooncakePullConnector)
++    connector.connector_scheduler = scheduler
++
++    connector.shutdown()
++
++    scheduler._sending_thread.shutdown.assert_called_once()
++    scheduler._recving_thread.shutdown.assert_called_once()
++    assert not scheduler._reqs_need_recv
++    assert not scheduler._reqs_need_send
++    assert not scheduler._reqs_in_batch
++    assert not scheduler._reqs_recv_info
+diff --git a/vllm_ascend/distributed/kv_transfer/kv_p2p/mooncake/base_scheduler.py b/vllm_ascend/distributed/kv_transfer/kv_p2p/mooncake/base_scheduler.py
+index 4b39695c8..f1343872c 100644
+--- a/vllm_ascend/distributed/kv_transfer/kv_p2p/mooncake/base_scheduler.py
++++ b/vllm_ascend/distributed/kv_transfer/kv_p2p/mooncake/base_scheduler.py
+@@ -184,6 +184,10 @@ class MooncakeBaseConnectorScheduler:
+         if params is not None and params.get("do_remote_decode") and self.need_truncate:
+             self._truncate_request_for_prefill(request)
+ 
++    def shutdown(self) -> None:
++        """Release scheduler-side resources when the engine shuts down."""
++        raise NotImplementedError
++
+     def update_connector_output(self, connector_output: KVConnectorOutput) -> None:
+         raise NotImplementedError
+ 
+diff --git a/vllm_ascend/distributed/kv_transfer/kv_p2p/mooncake/connector.py b/vllm_ascend/distributed/kv_transfer/kv_p2p/mooncake/connector.py
+index 5486bb737..2b66c40c7 100644
+--- a/vllm_ascend/distributed/kv_transfer/kv_p2p/mooncake/connector.py
++++ b/vllm_ascend/distributed/kv_transfer/kv_p2p/mooncake/connector.py
+@@ -85,6 +85,10 @@ class MooncakeBaseConnector(KVConnectorBase_V1, SupportsHMA):
+         self.connector_scheduler: MooncakeBaseConnectorScheduler | None = None
+         self.connector_worker: MooncakeBaseConnectorWorker | None = None
+ 
++    def shutdown(self) -> None:
++        if self.connector_scheduler is not None:
++            self.connector_scheduler.shutdown()
++
+     @classmethod
+     def get_required_kvcache_layout(cls, vllm_config: VllmConfig) -> str | None:
+         """Use HND to avoid reformatting KV cache before D2D transfer."""
+diff --git a/vllm_ascend/distributed/kv_transfer/kv_p2p/mooncake/pull_scheduler.py b/vllm_ascend/distributed/kv_transfer/kv_p2p/mooncake/pull_scheduler.py
+index 83bd97d54..0667cc2cb 100644
+--- a/vllm_ascend/distributed/kv_transfer/kv_p2p/mooncake/pull_scheduler.py
++++ b/vllm_ascend/distributed/kv_transfer/kv_p2p/mooncake/pull_scheduler.py
+@@ -108,10 +108,9 @@ class MooncakeSchedulerSendingThread(threading.Thread):
+             self.use_kv_pp,
+         )
+         self.ready_event = ready_event
++        self.stop_event = threading.Event()
+         self.delayed_free_requests: OrderedDict[str, float] = OrderedDict()
+         self.finished_requests: queue.SimpleQueue[str] = queue.SimpleQueue()
+-        self.early_finished_requests: set[str] = set()
+-        self.finished_request_ids: set[str] = set()
+         self.state_lock = threading.Lock()
+ 
+     def _merge_metadata_by_pp_rank(
+@@ -314,9 +313,6 @@ class MooncakeSchedulerSendingThread(threading.Thread):
+     def add_delayed_request(self, request_id: str, delay_start_time: float) -> None:
+         with self.state_lock:
+             self.delayed_free_requests[request_id] = delay_start_time
+-            if request_id in self.early_finished_requests:
+-                self.early_finished_requests.remove(request_id)
+-                self._mark_finished_locked(request_id)
+ 
+     def get_and_clear_finished_requests(self) -> set[str]:
+         finished: set[str] = set()
+@@ -328,11 +324,21 @@ class MooncakeSchedulerSendingThread(threading.Thread):
+             except queue.Empty:
+                 return finished
+ 
++    def shutdown(self) -> None:
++        self.stop_event.set()
++        if self.ident is not None:
++            self.join()
++        with self.state_lock:
++            self.delayed_free_requests.clear()
++        while not self.finished_requests.empty():
++            self.finished_requests.get_nowait()
++
+     def run(self) -> None:
+         path = make_zmq_path("tcp", self.host, self.port)
+         try:
+             logger.info("Mooncake scheduler sending thread listening on %s", path)
+             with zmq_ctx(zmq.ROUTER, path) as sock:  # type: ignore[attr-defined]
++                sock.setsockopt(zmq.SNDTIMEO, 1000)  # type: ignore[attr-defined]
+                 sock.setsockopt(zmq.RCVTIMEO, 1000)  # type: ignore[attr-defined]
+                 self.ready_event.set()
+                 self._run_busy_loop(sock)
+@@ -342,7 +348,7 @@ class MooncakeSchedulerSendingThread(threading.Thread):
+ 
+     def _run_busy_loop(self, sock: Any) -> None:
+         decoder = msgspec.msgpack.Decoder(type=tuple)
+-        while True:
++        while not self.stop_event.is_set():
+             try:
+                 frames = sock.recv_multipart()
+             except zmq.Again:  # type: ignore[attr-defined]
+@@ -368,18 +374,19 @@ class MooncakeSchedulerSendingThread(threading.Thread):
+ 
+     def _handle_finished_request(self, request_id: str) -> None:
+         with self.state_lock:
+-            if request_id in self.finished_request_ids:
+-                return
+-            if request_id in self.delayed_free_requests:
+-                self._mark_finished_locked(request_id)
+-            else:
+-                self.early_finished_requests.add(request_id)
++            self._mark_finished_locked(request_id)
+ 
+     def _mark_finished_locked(self, request_id: str) -> None:
+-        if request_id in self.finished_request_ids:
++        # request_finished registers the request before exposing its transfer
++        # parameters to D. Unknown IDs are therefore stale or duplicate DONEs;
++        # the control loop still ACKs them so D can stop retrying.
++        if request_id not in self.delayed_free_requests:
++            logger.warning(
++                "Received Mooncake DONE for request %s with no pending delayed free; ignoring completion",
++                request_id,
++            )
+             return
+-        self.finished_request_ids.add(request_id)
+-        self.delayed_free_requests.pop(request_id, None)
++        del self.delayed_free_requests[request_id]
+         self.finished_requests.put(request_id)
+ 
+     def _retrieve_expired_requests_locked(self) -> None:
+@@ -404,7 +411,8 @@ class MooncakeSchedulerRecvingThread(threading.Thread):
+     def __init__(self, ready_event: threading.Event) -> None:
+         super().__init__(daemon=True, name="MooncakeSchedulerRecvingThread")
+         self.ready_event = ready_event
+-        self.request_queue: queue.Queue[tuple[str, int, str]] = queue.Queue()
++        self.stop_event = threading.Event()
++        self.request_queue: queue.Queue[tuple[str, int, str] | None] = queue.Queue()
+         self.encoder = msgspec.msgpack.Encoder()
+         self.remote_sockets: dict[str, deque[Any]] = defaultdict(deque)
+         self.remote_sockets_lock = threading.Lock()
+@@ -413,21 +421,55 @@ class MooncakeSchedulerRecvingThread(threading.Thread):
+     def add_request(self, remote_host: str, remote_port: int, request_id: str) -> None:
+         self.request_queue.put((remote_host, remote_port, request_id))
+ 
+-    def run(self) -> None:
+-        self.ready_event.set()
++    def shutdown(self) -> None:
++        if not self.stop_event.is_set():
++            self.stop_event.set()
++            self.request_queue.put(None)
++        if self.ident is not None:
++            self.join()
++        # Also handle shutdown before start and a sentinel enqueued while the
++        # thread was already completing its final cleanup.
++        self._clear_pending_requests()
++
++    def _clear_pending_requests(self) -> None:
+         while True:
+-            request = self.request_queue.get()
+-
+             try:
+-                self._send_done_recving(*request)
+-            except Exception:
+-                logger.exception(
+-                    "Failed to send Mooncake scheduler completion for request %s",
+-                    request[2],
+-                )
+-                self.request_queue.put(request)
+-            finally:
+-                self.request_queue.task_done()
++                self.request_queue.get_nowait()
++            except queue.Empty:
++                break
++            self.request_queue.task_done()
++
++    def run(self) -> None:
++        self.ready_event.set()
++        try:
++            while not self.stop_event.is_set():
++                request = self.request_queue.get()
++                try:
++                    if request is None or self.stop_event.is_set():
++                        break
++                    self._send_done_recving(*request)
++                except Exception:
++                    # The socket helpers already retry. Let P's delayed-free
++                    # timeout reclaim blocks if this notification cannot arrive.
++                    logger.exception(
++                        "Failed to send Mooncake scheduler completion for request %s; "
++                        "producer cleanup will rely on its delayed-free timeout",
++                        request[2] if request is not None else None,
++                    )
++                finally:
++                    self.request_queue.task_done()
++        finally:
++            self.stop_event.set()
++            # Close sockets in their owning thread, after the last send ends.
++            with self.remote_sockets_lock:
++                for sockets in self.remote_sockets.values():
++                    for sock in sockets:
++                        sock.close(linger=0)
++                self.remote_sockets.clear()
++                if self.zmq_context is not None:
++                    self.zmq_context.destroy(linger=0)
++                    self.zmq_context = None
++            self._clear_pending_requests()
+ 
+     def _send_done_recving(self, remote_host: str, remote_port: int, request_id: str) -> None:
+         path = make_zmq_path("tcp", remote_host, remote_port)
+@@ -498,6 +540,16 @@ class MooncakePullConnectorScheduler(MooncakeBaseConnectorScheduler):
+             self._recving_thread.start()
+             recving_ready_event.wait()
+ 
++    def shutdown(self) -> None:
++        if self._sending_thread is not None:
++            self._sending_thread.shutdown()
++        if self._recving_thread is not None:
++            self._recving_thread.shutdown()
++        self._reqs_need_recv.clear()
++        self._reqs_need_send.clear()
++        self._reqs_in_batch.clear()
++        self._reqs_recv_info.clear()
++
+     def set_xfer_handshake_metadata_from_workers(
+         self,
+         metadata: Mapping[int | tuple[int, ...], KVConnectorHandshakeMetadata],

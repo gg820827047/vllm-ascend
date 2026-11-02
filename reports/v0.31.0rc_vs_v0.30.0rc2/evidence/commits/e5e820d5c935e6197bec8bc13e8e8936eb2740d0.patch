@@ -1,0 +1,212 @@
+commit e5e820d5c935e6197bec8bc13e8e8936eb2740d0
+Author:     Zhaocen <zhaocen309@163.com>
+AuthorDate: Wed Oct 21 15:44:51 2026 +0800
+Commit:     GitHub <noreply@github.com>
+CommitDate: Wed Oct 21 15:44:51 2026 +0800
+
+    [BugFix] Recognize KPool main attention as SFA (#19079)
+    
+    ### What this PR does / why we need it?
+    
+    GLM-5.3-Flash with a KPool indexer still uses SFA for its main
+    attention. Previously `enable_sfa()` returned `False` whenever
+    `index_kpool` was present. On V2, this made cache planning use a
+    512-byte KV slot even though SFA C8 writes 528 bytes (512 bytes of KV
+    data plus 16 bytes of scales), causing a reshape failure during graph
+    capture.
+    
+    Remove the KPool exclusion from `enable_sfa()`. The existing SFA guards
+    now select the packed cache spec, allocation, and reshape consistently.
+    Keep `model_uses_sfa_sparse()` separate: it still excludes KPool because
+    Lightning Indexer cache layout, LI C8/C4, and replicated-indexer logic
+    are specific to non-KPool indexers.
+    
+    Impact review for KPool models with `index_topk` and no
+    `compress_ratios`:
+    
+    - V2 selects the SFA C8/TurboQuant main-cache geometry when enabled and
+    follows the existing packed allocation and reshape paths. It also treats
+    these caches as SFA in the KV placement and component-major MLA checks.
+    - V1 sets `use_sparse=True`, selecting the SFA backend and its sparse
+    cache / graph paths. This is broader than the V2 cache fix and needs NPU
+    regression validation for V1 configurations.
+    - Regular MLA FA quantization and the PROLOG_V3 writer path are skipped
+    for SFA main attention. KPool-specific indexer detection and LI-only
+    quantization/DCP/transfer gates remain unchanged.
+    - Sparse KV offload together with a packed SFA main cache is already
+    rejected by AscendConfig; that combination remains unsupported.
+    
+    ### Does this PR introduce _any_ user-facing change?
+    
+    Yes. GLM-5.3-Flash KPool with SFA C8 can plan its 528-byte main KV slot
+    correctly instead of failing during V2 graph capture. V1 KPool routing
+    now also follows the SFA path.
+    
+    ### How was this patch tested?
+    
+    - Added/updated `tests/ut/models/test_glm5next_sfa_routing.py` to cover
+    KPool and non-KPool SFA detection, backend selection, and KPool
+    configurations without sparse main attention.
+    - Added `test_kpool_sfa_c8_main_cache_spec` in
+    `tests/ut/worker/test_attn_utils_v2.py`, checking the real
+    `enable_sfa()` predicate and the 528-byte int8 packed cache spec.
+    - Synced upstream main through `ffb33d798` to fix CPU UT collection: the
+    old PR head selected vLLM `c4df37df` before the test job rebased onto
+    newer Ascend code, whose speculative decoder imports
+    `target_dependent_ar`. The synchronized head selects the verified vLLM
+    main pin `a98247ab`, matching that code. The v0.31.0 release lane
+    remains configured.
+    - Local `bash format.sh ci` passed all hooks, including Markdown
+    linting. Focused Ruff lint/format checks, Python compilation, and `git
+    diff --check` also passed.
+    - Focused local pytest could not collect because this macOS validation
+    environment lacks PyTorch/vLLM; Docker is unavailable. The CPU UT lanes
+    on the updated PR commit must provide runtime validation.
+    - The earlier 222 unit tests and successful 16-NPU GLM-5.3-Flash serve
+    run validated the previous cache-site workaround, **not this revised
+    predicate change**. Revised V1/V2 hardware startup, request validation,
+    and the V1 performance comparison remain required before merge.
+    
+    ---
+    
+    ### Checklist
+    
+    #### Testing
+    
+    - [x] **Boundary / edge-case coverage**: Covered absent `index_topk` and
+    present `compress_ratios` for KPool.
+    - [x] **Regression test**: The new KPool SFA predicate and 528-byte
+    cache spec assertions fail without this fix.
+    - [ ] **Error / failure path coverage**: The change adds no new
+    exception path.
+    - [x] **Meaningful & reliable tests**: Tests assert backend routing and
+    cache geometry using the real predicate.
+    - [ ] **Performance impact**: The V1 SFA route and packed cache need an
+    NPU performance comparison before merge.
+    
+    - vLLM main:
+    https://github.com/vllm-project/vllm/commit/a98247ab4db686ee03c66d5feb3c761e52a2f8ab
+    
+    Signed-off-by: Zhaocen <zhaocen309@163.com>
+
+diff --git a/tests/ut/models/test_glm5next_sfa_routing.py b/tests/ut/models/test_glm5next_sfa_routing.py
+index a6a9933ab..93db7a429 100644
+--- a/tests/ut/models/test_glm5next_sfa_routing.py
++++ b/tests/ut/models/test_glm5next_sfa_routing.py
+@@ -11,6 +11,7 @@ import vllm_ascend.attention.indexer_kpool as backend_module
+ import vllm_ascend.platform as platform
+ from vllm_ascend.attention.indexer_kpool import Glm5NextKPoolIndexerBackend
+ from vllm_ascend.device.hardware_profile import AttentionBackendFamily, DeviceAdaptorFamily
++from vllm_ascend.utils import enable_sfa, model_uses_sfa_sparse
+ 
+ 
+ @pytest.mark.parametrize("kpool", [False, True])
+@@ -19,10 +20,11 @@ def test_sparse_models_select_shared_sfa(monkeypatch, kpool, fp8_device):
+     config = SimpleNamespace(index_topk=2048)
+     if kpool:
+         config.index_kpool = 4
++    vllm_config = SimpleNamespace(model_config=SimpleNamespace(hf_text_config=config))
+     monkeypatch.setattr(
+         vllm_config_module,
+         "get_current_vllm_config",
+-        lambda: SimpleNamespace(model_config=SimpleNamespace(hf_text_config=config)),
++        lambda: vllm_config,
+     )
+     monkeypatch.setattr(
+         platform,
+@@ -33,10 +35,24 @@ def test_sparse_models_select_shared_sfa(monkeypatch, kpool, fp8_device):
+         ),
+     )
+     monkeypatch.setattr(platform, "_validate_fa3_backend", lambda *args: False)
+-    selector = SimpleNamespace(use_mla=True, use_sparse=True, use_pcp=False)
++    selector = SimpleNamespace(use_mla=True, use_sparse=enable_sfa(vllm_config), use_pcp=False)
++    assert enable_sfa(vllm_config)
++    assert model_uses_sfa_sparse(vllm_config.model_config) == (not kpool)
+     assert platform.NPUPlatform.get_attn_backend_cls(None, selector) == "vllm_ascend.attention.sfa_v1.AscendSFABackend"
+ 
+ 
++@pytest.mark.parametrize("has_index_topk, has_compress_ratios", [(False, False), (True, True)])
++def test_kpool_without_sparse_main_attention_is_not_sfa(has_index_topk, has_compress_ratios):
++    config = SimpleNamespace(index_kpool=4)
++    if has_index_topk:
++        config.index_topk = 2048
++    if has_compress_ratios:
++        config.compress_ratios = [4]
++    vllm_config = SimpleNamespace(model_config=SimpleNamespace(hf_text_config=config))
++
++    assert not enable_sfa(vllm_config)
++
++
+ @pytest.mark.parametrize("mode", ["310p", "pcp", "dcp"])
+ def test_kpool_unsupported_routes_fail_explicitly(monkeypatch, mode):
+     monkeypatch.setattr(
+diff --git a/tests/ut/worker/test_attn_utils_v2.py b/tests/ut/worker/test_attn_utils_v2.py
+index 49a48c035..4ab22fd1b 100644
+--- a/tests/ut/worker/test_attn_utils_v2.py
++++ b/tests/ut/worker/test_attn_utils_v2.py
+@@ -2292,6 +2292,45 @@ def _make_mla_layer(*, fa_quant: bool = False, sparse_c8: bool = False):
+     return layer
+ 
+ 
++def test_kpool_sfa_c8_main_cache_spec(monkeypatch):
++    layer_name = "language_model.model.layers.3.self_attn.attn"
++    layer = _make_mla_layer(sparse_c8=True)
++    layer.kv_lora_rank = 512
++    layer.qk_rope_head_dim = 0
++    source_spec = layer.get_kv_cache_spec(None)
++    layer.get_kv_cache_spec = lambda _cfg: SimpleNamespace(**{**vars(source_spec), "head_size": 512})
++    vllm_config = SimpleNamespace(
++        additional_config={},
++        attention_config=SimpleNamespace(indexer_kv_dtype="int8"),
++        cache_config=SimpleNamespace(block_size=16, cache_dtype="int8"),
++        kv_transfer_config=None,
++        model_config=SimpleNamespace(
++            dtype=torch.bfloat16,
++            hf_config=SimpleNamespace(),
++            hf_text_config=SimpleNamespace(index_topk=2048, index_kpool=4, kv_lora_rank=512, qk_rope_head_dim=0),
++        ),
++        parallel_config=SimpleNamespace(decode_context_parallel_size=2),
++        quant_config=None,
++    )
++    monkeypatch.setattr(attn_utils, "get_layers_from_vllm_config", lambda *_args, **_kwargs: {layer_name: layer})
++    monkeypatch.setattr(attn_utils, "get_current_vllm_config", lambda: vllm_config)
++    monkeypatch.setattr(attn_utils, "enable_sfa_dcp_replicated_indexer", lambda _cfg: False)
++    monkeypatch.setattr(attn_utils, "enable_fa_quant", lambda _cfg: False)
++    monkeypatch.setattr(attn_utils, "get_current_hardware_profile", lambda: get_hardware_profile(AscendDeviceType.A3))
++    monkeypatch.setattr(
++        attn_utils,
++        "get_ascend_config",
++        lambda: SimpleNamespace(sparse_kv_offload_config=SimpleNamespace(enabled=False)),
++    )
++
++    assert attn_utils.enable_sfa(vllm_config)
++    spec = attn_utils.get_kv_cache_spec(vllm_config)[layer_name]
++    assert isinstance(spec, AscendMLAAttentionSpec)
++    assert spec.cache_sparse_sfa_c8
++    assert spec.head_size == 528
++    assert spec.dtype == torch.int8
++
++
+ def test_v2_sparse_offload_marks_main_mla_cache_host_resident(monkeypatch):
+     layer_name = "model.layers.0.self_attn.attn"
+     vllm_config = SimpleNamespace(
+diff --git a/vllm_ascend/utils.py b/vllm_ascend/utils.py
+index db0515b7f..de1fd0ddc 100644
+--- a/vllm_ascend/utils.py
++++ b/vllm_ascend/utils.py
+@@ -1873,14 +1873,13 @@ def is_rot_weight_used(vllm_config: VllmConfig = None):
+ 
+ 
+ def enable_sfa(vllm_config) -> bool:
++    """Whether the model uses SFA for its main attention cache."""
+     model_config = getattr(vllm_config, "model_config", None)
+     if model_config is None:
+         return False
+     hf_text_config = getattr(model_config, "hf_text_config", None)
+     if hf_text_config is None:
+         return False
+-    if model_uses_kpool_indexer(model_config):
+-        return False
+     return hasattr(hf_text_config, "index_topk") and not hasattr(hf_text_config, "compress_ratios")
+ 
+ 

@@ -1,0 +1,171 @@
+commit 527a1bb2aa737875018ef3a469eca84bc16d8518
+Author:     danziheng <1024xiaoheng@gmail.com>
+AuthorDate: Sun Oct 11 20:51:13 2026 +0800
+Commit:     GitHub <noreply@github.com>
+CommitDate: Sun Oct 11 20:51:13 2026 +0800
+
+    [BugFix][Model] Avoid false buffer mutation guard in DeepSeek forward (#18257)
+    
+    ### What this PR does / why we need it?
+    
+    Fix a false positive in vLLM's CUDA/NPU graph buffer-mutation guard when
+    compiling the patched DeepSeek V2 forward. This prevents affected
+    DeepSeek/GLM-family services from failing during the startup profiling
+    pass with graph mode enabled, including PP=1.
+    
+    The Top-K PP transport change in
+    fe85f2bc4a652a0323b53c7cc4a22376f5c9d65e (#15614) added
+    `pp_output.tensors.update(...)` in the non-last-stage native
+    auxiliary-state relay branch. vLLM's
+    `TorchCompileWithNoGuardsWrapper.bytecode_hook` rejects a compiled
+    forward when `cudagraph_mode != NONE` and `"update" in
+    new_code.co_names`. Dynamo retains this name even when the branch is
+    traced out. With PP=1, disassembly contains no instruction loading
+    `update`, but the name remains and triggers the guard.
+    
+    Builds compared:
+    
+    | Component | Working build | Failing build |
+    | --- | --- | --- |
+    | vllm-ascend | `0.19.1rc2.dev2602+geee24e2e6.d20261007` |
+    `0.19.1rc2.dev2644+g27c0024a9.d20261009` |
+    | vLLM | `0.30.0+empty` | `0.30.0+empty` |
+    | torch / torch_npu | `2.10.0` / `2.10.0.post7` | `2.10.0` /
+    `2.10.0.post7` |
+    
+    Both installations have identical `vllm/compilation/wrapper.py`
+    contents. The affected model source in each installation matches its
+    wheel RECORD hash. The failing launch used PP=1, Model Runner V1,
+    `FULL_DECODE_ONLY`, and `enable_npugraph_ex=true`.
+    
+    Relevant original error (the repetitive generated forward and absolute
+    installation prefixes are omitted):
+    
+    ```text
+    File "vllm_ascend/worker/worker.py", line 595, in determine_available_memory
+        self.model_runner.profile_run()
+    File "vllm_ascend/worker/model_runner_v1.py", line 4344, in profile_run
+        super().profile_run()
+    File "vllm/v1/worker/gpu_model_runner.py", line 6524, in profile_run
+        hidden_states, last_hidden_states = self._dummy_run(
+    ...
+    File "vllm/compilation/wrapper.py", line 264, in bytecode_hook
+        raise RuntimeError(msg)
+    torch._dynamo.exc.InternalTorchDynamoError: RuntimeError: Assigning / modifying buffers of nn.Module during forward pass is not allowed when using cudagraph inside the compiler because it will cause silent errors. Please use eager mode or fix the code. The following code contains clues about which buffer is being modified (please search for the usage of the function `update`):
+    def _patched_forward(self, input_ids, positions, intermediate_tensors, inputs_embeds):
+        ...
+    ```
+    
+    The fix constructs the auxiliary PP payload with dictionary unpacking
+    instead of calling `dict.update`. It preserves hidden states, residuals,
+    auxiliary relay entries, and the subsequent Top-K transport logic
+    without disabling graph execution or weakening vLLM's guard.
+    
+    ### Does this PR introduce _any_ user-facing change?
+    
+    Affected services can get past this erroneous startup compilation check
+    while keeping graph mode enabled. There are no new flags or API changes.
+    
+    ### How was this patch tested?
+    
+    - Added a CPU Dynamo regression test covering first-and-last PP rank
+    versus a non-last PP rank, and native versus legacy auxiliary relay. It
+    checks the compiled bytecode against the same `co_names` condition used
+    by vLLM and compares compiled/eager outputs.
+    - Executed all tests from
+    `tests/ut/patch/worker/test_patch_deepseek_v2.py` against the affected
+    container's installed dependencies, replacing only the forward function
+    in the test process: **38 passed**. No installed package files were
+    modified.
+    - Verified the regression test against the unmodified affected
+    installation: **all 4 parameter combinations fail at the `co_names`
+    assertion**, as expected.
+    - Independently reproduced the original exception using the installed
+    forward and the installed vLLM bytecode hook with tiny CPU tensors: the
+    old build passes, the new build fails with the same
+    `InternalTorchDynamoError`, and the candidate fix passes with equal
+    outputs. Eager non-last PP payload keys and values are unchanged.
+    - `git diff --check` passes. The full `bash format.sh ci` check could
+    not run in the local Windows environment because `pre-commit` is not
+    installed.
+    
+    - vLLM main:
+    https://github.com/vllm-project/vllm/commit/ced6857afa0ea7b2e3f0846a62e1394e90f15607
+    
+    ---------
+    
+    Signed-off-by: danziheng <1024xiaoheng@gmail.com>
+
+diff --git a/tests/ut/patch/worker/test_patch_deepseek_v2.py b/tests/ut/patch/worker/test_patch_deepseek_v2.py
+index 9bddaec23..b08b63c1c 100644
+--- a/tests/ut/patch/worker/test_patch_deepseek_v2.py
++++ b/tests/ut/patch/worker/test_patch_deepseek_v2.py
+@@ -82,6 +82,51 @@ def test_mtp_layer_keeps_indexer():
+     )
+ 
+ 
++@pytest.mark.parametrize("last_rank", [False, True])
++@pytest.mark.parametrize("native", [False, True])
++def test_forward_compilation_does_not_trigger_buffer_mutation_guard(monkeypatch, last_rank, native):
++    # CPU UTs mock the NPU backend, but Dynamo's stream tracking calls the
++    # real accelerator API. This test only compiles CPU tensor operations.
++    monkeypatch.setattr(torch.accelerator, "is_available", lambda: False)
++    group = SimpleNamespace(is_first_rank=True, is_last_rank=last_rank)
++    monkeypatch.setattr(patch_deepseek_v2, "get_pp_group", lambda: group)
++    model = SimpleNamespace(
++        config=SimpleNamespace(llama_4_scaling=None),
++        layers=[lambda positions, hidden, residual, scaling: (hidden + 1, hidden)],
++        start_layer=0,
++        end_layer=1,
++        aux_hidden_state_layers=(0,),
++        _use_upstream_aux_relay=native,
++        send_pp_topk_indices=False,
++        embed_input_ids=lambda ids: ids.float().unsqueeze(-1),
++        norm=lambda hidden, residual: (hidden + residual, None),
++        pack_local_aux_hidden_states=lambda states: {"aux_hidden_states_0": states[0]},
++    )
++    ids = torch.arange(4)
++    compiled_codes = []
++
++    def capture_bytecode(old_code, new_code):
++        if old_code is _patched_forward.__code__:
++            compiled_codes.append(new_code)
++
++    torch._dynamo.reset()
++    handle = torch._dynamo.convert_frame.register_bytecode_hook(capture_bytecode)
++    try:
++        with torch.inference_mode():
++            expected = _patched_forward(model, ids, ids, None)
++            actual = torch.compile(_patched_forward, backend="eager", fullgraph=True)(model, ids, ids, None)
++        assert compiled_codes
++        # vLLM checks co_names, including names retained from traced-out branches.
++        assert all("update" not in code.co_names for code in compiled_codes)
++        if last_rank:
++            torch.testing.assert_close(actual, expected)
++        else:
++            torch.testing.assert_close(actual.tensors, expected.tensors)
++    finally:
++        handle.remove()
++        torch._dynamo.reset()
++
++
+ @pytest.mark.parametrize("native", [False, True])
+ @pytest.mark.parametrize("boundaries", [(0, 78), (0, 38, 78), (0, 42, 78), (0, 20, 40, 59, 78)])
+ @pytest.mark.parametrize("aux_layers", [(0, 2, 20, 39, 58, 75, 78), (2, 22, 38, 58, 74)])
+diff --git a/vllm_ascend/patch/worker/patch_deepseek_v2.py b/vllm_ascend/patch/worker/patch_deepseek_v2.py
+index 94b97b0b6..229eeaabc 100644
+--- a/vllm_ascend/patch/worker/patch_deepseek_v2.py
++++ b/vllm_ascend/patch/worker/patch_deepseek_v2.py
+@@ -411,7 +411,11 @@ def _patched_forward(
+     if not pp_group.is_last_rank:
+         pp_output = IntermediateTensors({"hidden_states": hidden_states, "residual": residual})
+         if self._use_upstream_aux_relay:
+-            pp_output.tensors.update(self.pack_local_aux_hidden_states(aux_hidden_states))
++            # vLLM's buffer-mutation check also sees names in traced-out branches.
++            # Avoid leaving "update" in the forward's co_names for PP=1.
++            pp_output = IntermediateTensors(
++                {**pp_output.tensors, **self.pack_local_aux_hidden_states(aux_hidden_states)}
++            )
+         else:
+             pp_transport.add_pp_transport_tensors(
+                 pp_output,

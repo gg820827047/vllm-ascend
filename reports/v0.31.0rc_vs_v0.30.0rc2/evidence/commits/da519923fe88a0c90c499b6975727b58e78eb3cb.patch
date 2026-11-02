@@ -1,0 +1,1258 @@
+commit da519923fe88a0c90c499b6975727b58e78eb3cb
+Author:     Akine-Ko <2923601304@qq.com>
+AuthorDate: Tue Oct 13 16:36:18 2026 +0800
+Commit:     GitHub <noreply@github.com>
+CommitDate: Tue Oct 13 16:36:18 2026 +0800
+
+    [Feature][EC Connector] Support encoder cache CPU offloading on Ascend (#13894)
+    
+    ### What this PR does / why we need it
+    
+    Depends on vllm-project/vllm#54033.
+    
+    This PR adds Ascend support for the upstream `ECCPUConnector`, enabling
+    multimodal encoder-cache offloading to CPU shared memory.
+    
+    #### Architecture
+    
+    The implementation keeps the common ECCPU design in upstream vLLM:
+    
+    - `ECCPUConnector` metadata and role handling;
+    - `ECCPUScheduler`, `EmbeddingCache`, and `ECSharedRegion`;
+    - descriptor construction and contiguous-block coalescing;
+    - common save/load batching, stream and Event lifetime, completion
+    polling, and worker metadata;
+    - common shared-mmap cleanup.
+    
+    `AscendECCPUConnector` registers an Ascend implementation under the
+    standard `ECCPUConnector` name. `AscendECCPUWorker` inherits the
+    upstream worker and supplies the Ascend backend through the three
+    extension points introduced by vLLM PR #54033:
+    
+    - `_pin_shared_region()` registers the shared mmap as pinned Host memory
+    through CANN;
+    - `_submit_transfer()` submits batched D2H and H2D copies through CANN;
+    - `_shutdown_transfer_backend()` synchronizes the NPU and unregisters
+    the pinned mmap.
+    
+    The Ascend worker also creates NPU timing Events, releases transfer
+    resources safely after asynchronous completion, and restores its save
+    state after submission failures. Availability of the required CANN
+    Host-registration and batched-copy APIs is validated before enabling
+    offload.
+    
+    Worker Event completion reports drive the scheduler-side cache state: a
+    completed D2H save marks an entry ready, while completed H2D loads
+    release its scheduler pin.
+    
+    #### Model Runner support
+    
+    ECCPU supports Model Runner V2 only.
+    
+    Refs #13057.
+    
+    ### Does this PR introduce any user-facing change?
+    
+    Yes. Users running Model Runner V2 can enable encoder-cache CPU
+    offloading on Ascend with:
+    
+    ```python
+    ECTransferConfig(
+        ec_connector="ECCPUConnector",
+        ec_role="ec_both",
+        ec_connector_extra_config={
+            "ec_cpu_bytes": 4294967296,
+        },
+    )
+    ```
+    
+    The same configuration can be passed to the server CLI:
+    
+    ```bash
+    --ec-transfer-config \
+    '{"ec_connector":"ECCPUConnector","ec_role":"ec_both","ec_connector_extra_config":{"ec_cpu_bytes":4294967296}}'
+    ```
+    
+    ### How was this patch tested?
+    
+    #### Model Runner V2 E2E validation
+    
+    The single-NPU ECCPU E2E test passed with Model Runner V2, covering the
+    cold encoder path, D2H cache save, and subsequent H2D cache load.
+    
+    #### Model Runner V2 performance comparison
+    
+    A same-device baseline/ECCPU comparison was performed with Model Runner
+    V2:
+    
+    - dataset: 500 images from the Open Images V7 validation set;
+    - compressed image size: approximately 450–550 KiB per image;
+    - access pattern: the same 500 unique images repeated for 5 sequential
+    passes;
+    - 2,500 requests per run;
+    - maximum concurrency: 10;
+    - output length: 100 tokens;
+    - temperature: 0;
+    - prefix caching: disabled;
+    - multimodal processor cache: 0.3 GiB;
+    - ECCPU Host cache: 32 GiB;
+    - Graph: enabled.
+    
+    Both runs completed all 2,500 requests with zero failures.
+    
+    | Metric | Baseline | ECCPU | Change |
+    |---|---:|---:|---:|
+    | Completed requests | 2,500 | 2,500 | — |
+    | Failed requests | 0 | 0 | — |
+    | Request throughput | 3.16 req/s | 3.74 req/s | +18.35% |
+    | Output token throughput | 315.65 tok/s | 373.70 tok/s | +18.39% |
+    | Total token throughput | 3,402.79 tok/s | 4,028.86 tok/s | +18.40% |
+    | Cold/save pass 1 mean TTFT | 1,058.98 ms | 1,088.64 ms | +2.80% |
+    | Cold/save pass 1 P95 TTFT | 1,483.59 ms | 1,517.09 ms | +2.26% |
+    | Resident passes 2–5 mean TTFT | 1,011.38 ms | 470.81 ms | -53.45% |
+    | Resident passes 2–5 per-pass P95 average | 1,453.66 ms | 686.85 ms |
+    -52.75% |
+    | All-five-pass mean TTFT | 1,020.90 ms | 594.37 ms | -41.78% |
+    | All-five-pass per-pass P95 average | 1,459.65 ms | 852.90 ms | -41.57%
+    |
+    | Aggregate P50 TTFT | 1,088.07 ms | 503.54 ms | -53.72% |
+    | Aggregate P95 TTFT | 1,462.66 ms | 1,415.47 ms | -3.23% |
+    | Aggregate P99 TTFT | 1,515.89 ms | 1,517.03 ms | +0.08% |
+    | P50 TPOT | 20.90 ms | 20.79 ms | -0.53% |
+    | P95 TPOT | 27.42 ms | 24.14 ms | -11.96% |
+    | P99 TPOT | 28.35 ms | 27.10 ms | -4.41% |
+    | Mean E2EL | 3,159.37 ms | 2,671.79 ms | -15.43% |
+    | P50 E2EL | 3,155.99 ms | 2,561.01 ms | -18.85% |
+    | P95 E2EL | 3,266.71 ms | 3,233.46 ms | -1.02% |
+    | P99 E2EL | 3,316.34 ms | 3,297.04 ms | -0.58% |
+    
+    The first pass populates the ECCPU Host cache through the cold encoder
+    and D2H save path. Its TTFT remains close to the baseline because it
+    still executes the encoder and performs the initial D2H save.
+    
+    Passes 2–5 reuse encoder outputs resident in the ECCPU Host cache.
+    Across these resident passes, mean TTFT decreased by 53.45% and the
+    average per-pass P95 TTFT decreased by 52.75%.
+    
+    - vLLM main:
+    https://github.com/vllm-project/vllm/commit/ced6857afa0ea7b2e3f0846a62e1394e90f15607
+    
+    ---------
+    
+    Signed-off-by: Akine-Ko <2923601304@qq.com>
+    Signed-off-by: Akine-Ko <173271196+Akine-Ko@users.noreply.github.com>
+    Co-authored-by: Akine-Ko <173271196+Akine-Ko@users.noreply.github.com>
+
+diff --git a/.github/workflows/scripts/estimated_times.yaml b/.github/workflows/scripts/estimated_times.yaml
+index bbdbbcb8d..d1fb8ce24 100644
+--- a/.github/workflows/scripts/estimated_times.yaml
++++ b/.github/workflows/scripts/estimated_times.yaml
+@@ -60,6 +60,7 @@ estimated_times:
+   tests/e2e/pull_request/one_card/rlhf/test_trace_replay.py: 30
+   tests/e2e/pull_request/one_card/test_completion_with_prompt_embeds.py: 200
+   tests/e2e/pull_request/one_card/test_cpu_offloading.py: 250
++  tests/e2e/pull_request/one_card/test_ec_cpu_offload.py: 1200
+   tests/e2e/pull_request/one_card/test_cpu_weight_offload.py: 530
+   tests/e2e/pull_request/one_card/test_gdn_stable_argsort.py: 60
+   tests/e2e/pull_request/one_card/test_guided_decoding.py: 690
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 76fae7ffd..1393308c5 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -161,6 +161,27 @@ else()
+   endif()
+ endif()
+ 
++# ECCPUConnector stores encoder-cache data in a shared mmap. Newer CANN releases
++# expose aclrtHostRegisterV2(..., ACL_HOST_REG_PINNED), which turns those mmap
++# pages into real page-locked host memory. Keep the custom op available on older
++# CANN releases as well, but make it fail with an actionable error at runtime
++# instead of silently claiming that pageable memory is pinned.
++check_cxx_source_compiles("
++  #include <acl/acl_rt.h>
++  int main() {
++    void* ptr = nullptr;
++    (void)aclrtHostRegisterV2(ptr, 0, ACL_HOST_REG_PINNED);
++    (void)aclrtHostUnregister;
++    return 0;
++  }
++" HAVE_ACLRT_HOST_REGISTER_V2_PINNED)
++if(HAVE_ACLRT_HOST_REGISTER_V2_PINNED)
++  message(STATUS "aclrtHostRegisterV2: pinned host registration available")
++  target_compile_definitions(vllm_ascend_C PRIVATE CANN_HOST_REGISTER_V2_PINNED)
++else()
++  message(STATUS "aclrtHostRegisterV2: pinned host registration unavailable; ECCPUConnector will be rejected")
++endif()
++
+ if(SOC_VERSION MATCHES "ascend310p.*")
+     target_compile_definitions(vllm_ascend_C PRIVATE -DASCEND_PLATFORM_310P)
+ endif()
+diff --git a/csrc/torch_binding.cpp b/csrc/torch_binding.cpp
+index 62c433a01..c86ec94e5 100644
+--- a/csrc/torch_binding.cpp
++++ b/csrc/torch_binding.cpp
+@@ -157,6 +157,18 @@ std::mutex& get_device_print_mutex()
+     return device_print_mutex;
+ }
+ 
++std::mutex& get_pinned_host_mmap_mutex()
++{
++    static std::mutex mutex;
++    return mutex;
++}
++
++std::unordered_map<void*, uint64_t>& get_pinned_host_mmaps()
++{
++    static std::unordered_map<void*, uint64_t> regions;
++    return regions;
++}
++
+ void device_print_callback(void* args)
+ {
+     // device_print is a debug-only helper. We intentionally do not reclaim the
+@@ -260,7 +272,10 @@ void swap_blocks_batch(const torch::Tensor& src_ptrs,
+         // aclrtMemcpyBatchAttr uses srcLoc/dstLoc (aclrtMemLocation)
+         // to specify memory locations, not aclrtMemcpyKind.
+         int32_t device_id = 0;
+-        aclrtGetDevice(&device_id);
++        const aclError get_device_result = aclrtGetDevice(&device_id);
++        TORCH_CHECK(get_device_result == ACL_SUCCESS,
++                    "aclrtGetDevice failed with error code ",
++                    get_device_result);
+ 
+         aclrtMemLocation host_loc = {};
+         host_loc.type = ACL_MEM_LOCATION_TYPE_HOST;
+@@ -320,6 +335,85 @@ void swap_blocks_batch(const torch::Tensor& src_ptrs,
+     }
+ }
+ 
++bool supports_eccpu_offload()
++{
++#if defined(CANN_MEMCPY_BATCH_ASYNC) && defined(CANN_HOST_REGISTER_V2_PINNED)
++    return true;
++#else
++    return false;
++#endif
++}
++
++void register_pinned_host_mmap(const torch::Tensor& host_tensor)
++{
++    // mmap is pageable by default; request page locking explicitly.
++    TORCH_CHECK(host_tensor.device().is_cpu(),
++                "register_pinned_host_mmap expects a CPU tensor");
++    TORCH_CHECK(host_tensor.is_contiguous(),
++                "register_pinned_host_mmap expects a contiguous tensor");
++
++    void* ptr = host_tensor.data_ptr();
++    const uint64_t size = static_cast<uint64_t>(
++        host_tensor.numel() * host_tensor.element_size());
++    TORCH_CHECK(size > 0, "register_pinned_host_mmap expects a non-empty tensor");
++    TORCH_CHECK(reinterpret_cast<std::uintptr_t>(ptr) % 4096 == 0,
++                "register_pinned_host_mmap requires a 4 KiB-aligned mmap address, got ",
++                reinterpret_cast<std::uintptr_t>(ptr));
++
++#if defined(CANN_HOST_REGISTER_V2_PINNED)
++    std::lock_guard<std::mutex> lock(get_pinned_host_mmap_mutex());
++    auto& regions = get_pinned_host_mmaps();
++    // Track the address and size to reject duplicate or mismatched operations.
++    TORCH_CHECK(regions.find(ptr) == regions.end(),
++                "Host mmap address is already registered as pinned memory: ",
++                reinterpret_cast<std::uintptr_t>(ptr));
++
++    const aclError ret = aclrtHostRegisterV2(ptr, size, ACL_HOST_REG_PINNED);
++    TORCH_CHECK(ret == ACL_SUCCESS,
++                "aclrtHostRegisterV2(ACL_HOST_REG_PINNED) failed with error code ",
++                ret, ", address=", reinterpret_cast<std::uintptr_t>(ptr),
++                ", size=", size);
++    regions.emplace(ptr, size);
++#else
++    TORCH_CHECK(false,
++                "Pinned shared mmap requires aclrtHostRegisterV2 with "
++                "ACL_HOST_REG_PINNED in the CANN headers/runtime");
++#endif
++}
++
++void unregister_pinned_host_mmap(const torch::Tensor& host_tensor)
++{
++    TORCH_CHECK(host_tensor.device().is_cpu(),
++                "unregister_pinned_host_mmap expects a CPU tensor");
++    TORCH_CHECK(host_tensor.is_contiguous(),
++                "unregister_pinned_host_mmap expects a contiguous tensor");
++
++#if defined(CANN_HOST_REGISTER_V2_PINNED)
++    void* ptr = host_tensor.data_ptr();
++    std::lock_guard<std::mutex> lock(get_pinned_host_mmap_mutex());
++    auto& regions = get_pinned_host_mmaps();
++    const auto it = regions.find(ptr);
++    TORCH_CHECK(it != regions.end(),
++                "Host mmap address is not registered as pinned memory: ",
++                reinterpret_cast<std::uintptr_t>(ptr));
++    const uint64_t size = static_cast<uint64_t>(
++        host_tensor.numel() * host_tensor.element_size());
++    TORCH_CHECK(it->second == size,
++                "Pinned host mmap size changed before unregister: registered=",
++                it->second, ", current=", size);
++
++    const aclError ret = aclrtHostUnregister(ptr);
++    TORCH_CHECK(ret == ACL_SUCCESS,
++                "aclrtHostUnregister failed with error code ", ret,
++                ", address=", reinterpret_cast<std::uintptr_t>(ptr));
++    regions.erase(it);
++#else
++    TORCH_CHECK(false,
++                "Pinned shared mmap unregister is unavailable because this "
++                "extension was built without aclrtHostRegisterV2 support");
++#endif
++}
++
+ #ifdef VLLM_ENABLE_ATB_AND_DIRECT_KERNELS
+ // Direct kernel wrappers depend on vllm_ascend_kernels, which is skipped on
+ // 310P and A5 builds.
+@@ -2929,6 +3023,15 @@ TORCH_LIBRARY_EXPAND(CONCAT(_C, _ascend), ops)
+              });
+ #endif
+ 
++    ops.def("supports_eccpu_offload() -> bool");
++    ops.impl("supports_eccpu_offload", c10::DispatchKey::CompositeExplicitAutograd,
++             &vllm_ascend::supports_eccpu_offload);
++    ops.def("register_pinned_host_mmap(Tensor x) -> ()");
++    ops.impl("register_pinned_host_mmap", torch::kCPU,
++             &vllm_ascend::register_pinned_host_mmap);
++    ops.def("unregister_pinned_host_mmap(Tensor x) -> ()");
++    ops.impl("unregister_pinned_host_mmap", torch::kCPU,
++             &vllm_ascend::unregister_pinned_host_mmap);
+     ops.def("device_print(str msg) -> ()");
+     ops.impl("device_print", c10::DispatchKey::CompositeExplicitAutograd,
+              static_cast<void (*)(c10::string_view)>(&vllm_ascend::device_print));
+diff --git a/docs/hooks/nav_titles.py b/docs/hooks/nav_titles.py
+index e71a1f2a3..133aa0857 100644
+--- a/docs/hooks/nav_titles.py
++++ b/docs/hooks/nav_titles.py
+@@ -210,6 +210,10 @@ TITLES = {
+         "zh": "动态分块流水线并行",
+     },
+     "user_guide/feature_guide/epd_disaggregation.md": {"en": "EPD Disaggregation", "zh": "EPD 分离"},
++    "user_guide/feature_guide/encoder_cache_cpu_offload.md": {
++        "en": "Encoder Cache CPU Offload",
++        "zh": "编码器缓存 CPU 卸载",
++    },
+     "user_guide/feature_guide/expert_parallelism_load_balancer.md": {
+         "en": "Expert Parallelism Load Balancer",
+         "zh": "专家并行负载均衡",
+diff --git a/docs/source/user_guide/feature_guide/encoder_cache_cpu_offload.md b/docs/source/user_guide/feature_guide/encoder_cache_cpu_offload.md
+new file mode 100644
+index 000000000..3876158ef
+--- /dev/null
++++ b/docs/source/user_guide/feature_guide/encoder_cache_cpu_offload.md
+@@ -0,0 +1,60 @@
++# Encoder Cache CPU Offload
++
++`ECCPUConnector` stores multimodal encoder outputs in a shared CPU mmap. A
++repeated image, audio item, or other multimodal input can be restored from CPU
++memory instead of running the encoder again.
++
++## Support scope
++
++- vLLM Model Runner V2
++- An Ascend device with a CANN build that provides both `aclrtMemcpyBatchAsync` and
++  `aclrtHostRegisterV2(..., ACL_HOST_REG_PINNED)`
++- Linux kernel newer than 5.10, as required by CANN when converting an mmap
++  allocation into page-locked Host memory
++- A single host using `/dev/shm`
++- `ec_both` role
++
++Cross-node encoder-cache transfer and NIXL/P2P transfer are not supported by
++this connector.
++
++The Ascend worker registers its shared mmap as real page-locked Host memory.
++If pinned mmap registration or batch memcpy is unavailable, initialization
++fails with an explicit error. It does not silently use pageable memory or the
++per-copy `aclrtMemcpyAsync` fallback.
++
++## Configuration
++
++The following example allocates 1 GiB for encoder-cache entries:
++
++```bash
++vllm serve <model-path> \
++  --ec-transfer-config '{
++    "ec_connector": "ECCPUConnector",
++    "ec_role": "ec_both",
++    "ec_connector_extra_config": {
++      "ec_cpu_bytes": 1073741824
++    }
++  }'
++```
++
++`ec_cpu_bytes` must be a positive integer large enough for at least one
++encoder-cache block. The corresponding mmap is created under `/dev/shm`, so
++the host must also have enough tmpfs capacity. Tensor-parallel workers map the
++same file; each worker process registers its own virtual mapping with CANN.
++
++## Transfer behavior
++
++On a cache miss, the encoder output is copied from NPU to the pinned mmap with
++one batched D2H operation. On a hit, the blocks are copied back with one
++batched H2D operation. Only TP rank 0 and PCP rank 0 write duplicate encoder
++outputs, while every consumer worker can load its local NPU tensor.
++
++The encoder output and D2H save are submitted to the current compute stream,
++so normal stream ordering guarantees that the encoder output is ready before
++the copy starts. Loads use a dedicated stream, and the current compute stream
++waits for that load stream before the restored tensor is consumed.
++
++During shutdown, the NPU device is synchronized before the Host mmap is
++unregistered from CANN, closed, and removed. If device synchronization fails,
++the mapping is deliberately left intact for process-exit cleanup rather than
++being unmapped while an asynchronous DMA may still reference it.
+diff --git a/mkdocs.yml b/mkdocs.yml
+index 7c9c99030..9bbaa0abf 100644
+--- a/mkdocs.yml
++++ b/mkdocs.yml
+@@ -303,6 +303,7 @@ nav:
+         - user_guide/feature_guide/layerwise_and_sparse_kv_cache_offloading.md
+         - user_guide/feature_guide/kvpp.md
+         - user_guide/feature_guide/kv_cache_cpu_offload.md
++        - user_guide/feature_guide/encoder_cache_cpu_offload.md
+         - user_guide/feature_guide/preempt_offload_connector.md
+         - user_guide/feature_guide/large_scale_ep.md
+         - user_guide/feature_guide/ucm_deployment.md
+diff --git a/tests/e2e/pull_request/one_card/test_ec_cpu_offload.py b/tests/e2e/pull_request/one_card/test_ec_cpu_offload.py
+new file mode 100644
+index 000000000..27abea230
+--- /dev/null
++++ b/tests/e2e/pull_request/one_card/test_ec_cpu_offload.py
+@@ -0,0 +1,117 @@
++# Copyright (c) 2026 Huawei Technologies Co., Ltd. All Rights Reserved.
++# This file is a part of the vllm-ascend project.
++# SPDX-License-Identifier: Apache-2.0
++"""Single-NPU ECCPUConnector correctness test."""
++
++import os
++import time
++from pathlib import Path
++from unittest.mock import patch
++
++import pytest
++from vllm import SamplingParams
++from vllm.assets.image import ImageAsset
++from vllm.config import ECTransferConfig
++
++from tests.e2e.conftest import (
++    VllmRunner,
++    qwen_prompt,
++    wait_until_npu_memory_free,
++)
++
++MODEL = "Qwen/Qwen2.5-VL-7B-Instruct"
++EC_CPU_BYTES = 500 << 20
++MMAP_GLOB = "vllm_ec_*.mmap"
++MMAP_CLEANUP_TIMEOUT = 10.0
++
++
++def _ec_mmap_paths() -> set[Path]:
++    return set(Path("/dev/shm").glob(MMAP_GLOB))
++
++
++def _wait_for_ec_ready(runner: VllmRunner) -> None:
++    """Advance one scheduler step so the completed save becomes ready."""
++    runner.generate_greedy(["hi"], max_tokens=1, use_tqdm=False)
++
++
++def _reset_device_encoder_cache(runner: VllmRunner) -> None:
++    runner.model.llm_engine.reset_encoder_cache()
++
++
++def _assert_ec_round_trip(runner: VllmRunner, image, prompt: str) -> None:
++    sampling_params = SamplingParams(max_tokens=8, temperature=0)
++
++    _reset_device_encoder_cache(runner)
++    cold_output = runner.generate(
++        prompts=[prompt],
++        images=[image],
++        sampling_params=sampling_params,
++        use_tqdm=False,
++    )
++
++    _wait_for_ec_ready(runner)
++    _reset_device_encoder_cache(runner)
++    loaded_output = runner.generate(
++        prompts=[prompt],
++        images=[image],
++        sampling_params=sampling_params,
++        use_tqdm=False,
++    )
++
++    assert loaded_output == cold_output
++
++
++def _assert_mmaps_removed(paths: set[Path]) -> None:
++    deadline = time.monotonic() + MMAP_CLEANUP_TIMEOUT
++    while remaining := {path for path in paths if path.exists()}:
++        if time.monotonic() >= deadline:
++            pytest.fail(f"EC mmap files were not removed at shutdown: {remaining}")
++        time.sleep(0.1)
++
++
++def _run_ec_cpu_offloading() -> None:
++    image = ImageAsset("cherry_blossom").pil_image.convert("RGB")
++    prompt = qwen_prompt(["Describe this image briefly."])[0]
++    ec_transfer_config = ECTransferConfig(
++        ec_connector="ECCPUConnector",
++        ec_role="ec_both",
++        ec_connector_extra_config={"ec_cpu_bytes": EC_CPU_BYTES},
++    )
++
++    existing_mmaps = _ec_mmap_paths()
++    created_mmaps: set[Path]
++    with VllmRunner(
++        MODEL,
++        max_model_len=4096,
++        gpu_memory_utilization=0.5,
++        enforce_eager=True,
++        limit_mm_per_prompt={"image": 1},
++        mm_processor_cache_gb=0.3,
++        enable_prefix_caching=False,
++        ec_transfer_config=ec_transfer_config,
++    ) as runner:
++        _assert_ec_round_trip(runner, image, prompt)
++        created_mmaps = _ec_mmap_paths() - existing_mmaps
++        assert created_mmaps, "ECCPUConnector did not create an EC mmap file"
++
++    _assert_mmaps_removed(created_mmaps)
++
++
++@pytest.mark.e2e_model("Qwen/Qwen2.5-VL-7B-Instruct")
++@pytest.mark.e2e_coverage(
++    arch="multimodal",
++    feature="cpu_offloading",
++    parallel="TP",
++    deploy="pd_mix",
++    hardware="A2",
++    quantization="BF16",
++    graph_mode="eager",
++)
++@wait_until_npu_memory_free()
++def test_ec_cpu_offloading() -> None:
++    env = {
++        "VLLM_USE_V2_MODEL_RUNNER": "1",
++        "VLLM_WORKER_MULTIPROC_METHOD": "spawn",
++    }
++    with patch.dict(os.environ, env):
++        _run_ec_cpu_offloading()
+diff --git a/tests/ut/distributed/ec_transfer/test_connector.py b/tests/ut/distributed/ec_transfer/test_connector.py
+new file mode 100644
+index 000000000..9a32547f4
+--- /dev/null
++++ b/tests/ut/distributed/ec_transfer/test_connector.py
+@@ -0,0 +1,18 @@
++# Copyright (c) 2026 Huawei Technologies Co., Ltd. All Rights Reserved.
++# This file is a part of the vllm-ascend project.
++# SPDX-License-Identifier: Apache-2.0
++
++from vllm_ascend.distributed.ec_transfer.ec_connector.cpu.connector import (
++    AscendECCPUConnector,
++)
++
++
++def test_make_worker_uses_ascend_backend(monkeypatch):
++    import vllm_ascend.distributed.ec_transfer.ec_connector.cpu.worker as worker_mod
++
++    config = object()
++    expected = object()
++    monkeypatch.setattr(worker_mod, "AscendECCPUWorker", lambda cfg: expected)
++    connector = AscendECCPUConnector.__new__(AscendECCPUConnector)
++
++    assert connector._make_worker(config) is expected
+diff --git a/tests/ut/distributed/ec_transfer/test_registration.py b/tests/ut/distributed/ec_transfer/test_registration.py
+new file mode 100644
+index 000000000..1e5869cf0
+--- /dev/null
++++ b/tests/ut/distributed/ec_transfer/test_registration.py
+@@ -0,0 +1,63 @@
++# Copyright (c) 2026 Huawei Technologies Co., Ltd. All Rights Reserved.
++# This file is a part of the vllm-ascend project.
++# SPDX-License-Identifier: Apache-2.0
++
++import importlib
++
++import pytest
++from vllm.distributed.ec_transfer.ec_connector.factory import ECConnectorFactory
++
++import vllm_ascend.distributed.ec_transfer as ec_registration
++
++
++@pytest.fixture
++def isolated_registry(monkeypatch):
++    registry = dict(ECConnectorFactory._registry)
++    monkeypatch.setattr(ECConnectorFactory, "_registry", registry)
++    return registry
++
++
++def test_registers_ascend_eccpu_connector(isolated_registry):
++    ec_registration.register_connector()
++
++    connector_cls = isolated_registry["ECCPUConnector"]()
++    assert connector_cls.__module__ == ("vllm_ascend.distributed.ec_transfer.ec_connector.cpu.connector")
++    assert connector_cls.__name__ == "AscendECCPUConnector"
++
++
++def test_missing_upstream_connector_is_skipped(monkeypatch, isolated_registry):
++    before = dict(isolated_registry)
++    upstream_module = "vllm.distributed.ec_transfer.ec_connector.cpu.connector"
++    real_import_module = importlib.import_module
++
++    def missing_upstream(name, package=None):
++        if name == upstream_module:
++            raise ModuleNotFoundError(
++                "upstream EC CPU connector is unavailable",
++                name="vllm.distributed.ec_transfer.ec_connector.cpu",
++            )
++        return real_import_module(name, package)
++
++    monkeypatch.setattr(ec_registration.importlib, "import_module", missing_upstream)
++    ec_registration.register_connector()
++
++    assert isolated_registry == before
++
++
++def test_nested_import_error_is_not_swallowed(monkeypatch, isolated_registry):
++    del isolated_registry
++    upstream_module = "vllm.distributed.ec_transfer.ec_connector.cpu.connector"
++
++    real_import_module = importlib.import_module
++
++    def broken_upstream(name, package=None):
++        if name == upstream_module:
++            raise ModuleNotFoundError(
++                "unexpected_nested_dependency is missing",
++                name="unexpected_nested_dependency",
++            )
++        return real_import_module(name, package)
++
++    monkeypatch.setattr(ec_registration.importlib, "import_module", broken_upstream)
++    with pytest.raises(ModuleNotFoundError, match="unexpected_nested_dependency"):
++        ec_registration.register_connector()
+diff --git a/tests/ut/distributed/ec_transfer/test_worker_mock.py b/tests/ut/distributed/ec_transfer/test_worker_mock.py
+new file mode 100644
+index 000000000..7b361631f
+--- /dev/null
++++ b/tests/ut/distributed/ec_transfer/test_worker_mock.py
+@@ -0,0 +1,345 @@
++# Copyright (c) 2026 Huawei Technologies Co., Ltd. All Rights Reserved.
++# This file is a part of the vllm-ascend project.
++# SPDX-License-Identifier: Apache-2.0
++
++from collections import deque
++from contextlib import nullcontext
++from types import SimpleNamespace
++
++import pytest
++import torch
++import vllm.distributed.ec_transfer.ec_connector.cpu.worker as upstream_worker_mod
++from vllm.distributed.ec_transfer.ec_connector.cpu.worker import (
++    ECCPUTransferDirection,
++    Transfer,
++)
++from vllm.distributed.ec_transfer.ec_connector.cpu.worker.descriptor_buffers import (
++    DescriptorBufferPool,
++)
++
++import vllm_ascend.distributed.ec_transfer.ec_connector.cpu.worker as worker_mod
++from vllm_ascend.distributed.ec_transfer.ec_connector.cpu.worker import (
++    AscendECCPUWorker,
++)
++
++
++class FakeStream:
++    def __init__(self, order=None):
++        self.order = order
++        self.synchronize_calls = 0
++
++    def synchronize(self):
++        self.synchronize_calls += 1
++        if self.order is not None:
++            self.order.append("stream_synchronize")
++
++    def wait_stream(self, stream):
++        del stream
++
++
++class FakeEvent:
++    def __init__(self, *, completed=False, order=None):
++        self.completed = completed
++        self.order = order
++        self.recorded_stream = None
++        self.synchronize_calls = 0
++
++    def record(self, stream):
++        self.recorded_stream = stream
++
++    def query(self):
++        return self.completed
++
++    def synchronize(self):
++        self.synchronize_calls += 1
++        if self.order is not None:
++            self.order.append("event_synchronize")
++
++    def elapsed_time(self, end_event):
++        del end_event
++        return 0.0
++
++
++class FakeNPU:
++    def __init__(self, order=None):
++        self.events = []
++        self.enable_timing = []
++        self.order = order
++        self.synchronize_calls = 0
++
++    def Event(self, *, enable_timing=False):
++        event = FakeEvent()
++        self.events.append(event)
++        self.enable_timing.append(enable_timing)
++        return event
++
++    def synchronize(self):
++        self.synchronize_calls += 1
++        if self.order is not None:
++            self.order.append("npu_synchronize")
++
++
++class FakePlatform:
++    device_type = "cpu"
++
++    def __init__(self):
++        self.compute_stream = FakeStream()
++        self.created_streams = []
++
++    def Stream(self):
++        stream = FakeStream()
++        self.created_streams.append(stream)
++        return stream
++
++    def stream(self, stream):
++        del stream
++        return nullcontext()
++
++    def current_stream(self):
++        return self.compute_stream
++
++
++class FakeRegion:
++    def __init__(self):
++        self.blocks = torch.empty((8, 16), dtype=torch.int8)
++        self.block_size_bytes = 16
++        self.num_blocks = 8
++        self.cleanup_calls = 0
++
++    def cleanup(self):
++        self.cleanup_calls += 1
++
++
++def raises(message):
++    def raise_error(*args, **kwargs):
++        del args, kwargs
++        raise RuntimeError(message)
++
++    return raise_error
++
++
++def make_worker():
++    worker = AscendECCPUWorker.__new__(AscendECCPUWorker)
++    worker._region = FakeRegion()
++    worker._buf_pool = DescriptorBufferPool()
++    worker._event_pool = []
++    worker._mmap_pinned = True
++    return worker
++
++
++def patch_init_dependencies(
++    monkeypatch,
++    *,
++    supported=True,
++    register_error=None,
++):
++    region = FakeRegion()
++    platform = FakePlatform()
++    npu = FakeNPU()
++    register_calls = []
++    pcp_group = SimpleNamespace(rank_in_group=0)
++
++    monkeypatch.setattr(upstream_worker_mod, "create_ec_shared_region", lambda cfg: region)
++    monkeypatch.setattr(upstream_worker_mod, "get_tensor_model_parallel_rank", lambda: 0)
++    monkeypatch.setattr(upstream_worker_mod, "get_pcp_group", lambda: pcp_group)
++    monkeypatch.setattr(worker_mod, "_supports_eccpu_offload", lambda: supported)
++    monkeypatch.setattr(worker_mod.torch, "npu", npu, raising=False)
++    monkeypatch.setattr(upstream_worker_mod, "current_platform", platform)
++
++    def register(blocks):
++        register_calls.append(blocks)
++        if register_error is not None:
++            raise register_error
++
++    monkeypatch.setattr(worker_mod, "_register_pinned_host_mmap", register)
++    return region, platform, npu, register_calls
++
++
++def test_init_registers_mmap_and_uses_upstream_lifecycle(monkeypatch):
++    region, platform, _, register_calls = patch_init_dependencies(monkeypatch)
++    config = SimpleNamespace(model_config=SimpleNamespace(dtype=torch.bfloat16))
++
++    worker = AscendECCPUWorker(config)
++
++    assert worker._region is region
++    assert register_calls == [region.blocks]
++    assert worker._mmap_pinned is True
++    assert worker._is_save_rank is True
++    assert worker._inflight_saves == deque()
++    assert worker._inflight_loads == deque()
++    assert platform.created_streams == []
++    assert region.cleanup_calls == 0
++
++
++def test_init_rejects_unsupported_runtime_and_cleans_region(monkeypatch):
++    region, _, _, register_calls = patch_init_dependencies(monkeypatch, supported=False)
++    config = SimpleNamespace(model_config=SimpleNamespace(dtype=torch.bfloat16))
++
++    with pytest.raises(RuntimeError, match="aclrtMemcpyBatchAsync"):
++        AscendECCPUWorker(config)
++
++    assert register_calls == []
++    assert region.cleanup_calls == 1
++
++
++def test_init_registration_failure_cleans_region(monkeypatch):
++    region, _, _, register_calls = patch_init_dependencies(
++        monkeypatch, register_error=RuntimeError("registration failed")
++    )
++    config = SimpleNamespace(model_config=SimpleNamespace(dtype=torch.bfloat16))
++
++    with pytest.raises(RuntimeError, match="registration failed"):
++        AscendECCPUWorker(config)
++
++    assert register_calls == [region.blocks]
++    assert region.cleanup_calls == 1
++
++
++def test_acquire_event_uses_npu_event_and_recycles(monkeypatch):
++    worker = make_worker()
++    npu = FakeNPU()
++    monkeypatch.setattr(worker_mod.torch, "npu", npu, raising=False)
++
++    created = worker._acquire_event()
++    worker._event_pool.append(created)
++    recycled = worker._acquire_event()
++
++    assert recycled is created
++    assert npu.enable_timing == [True]
++
++
++@pytest.mark.parametrize(
++    ("direction", "expected"),
++    [
++        (ECCPUTransferDirection.HOST_TO_DEVICE, worker_mod._DIRECTION_H2D),
++        (ECCPUTransferDirection.DEVICE_TO_HOST, worker_mod._DIRECTION_D2H),
++    ],
++)
++def test_submit_transfer_maps_cann_direction_without_releasing(monkeypatch, direction, expected):
++    worker = make_worker()
++    bufs = worker._buf_pool.acquire(2)
++    calls = []
++    monkeypatch.setattr(worker_mod, "_swap_blocks_batch", lambda *args: calls.append(args))
++
++    worker._submit_transfer(bufs, 1, direction)
++
++    src, dst, sizes, cann_direction = calls[0]
++    assert src.data_ptr() == bufs.src_ptrs.data_ptr()
++    assert dst.data_ptr() == bufs.dst_ptrs.data_ptr()
++    assert sizes.data_ptr() == bufs.sizes.data_ptr()
++    assert cann_direction == expected
++    assert worker._buf_pool._pool == []
++
++
++def test_submit_failure_propagates_without_releasing_descriptors(monkeypatch):
++    worker = make_worker()
++    bufs = worker._buf_pool.acquire(1)
++    monkeypatch.setattr(worker_mod, "_swap_blocks_batch", raises("copy failed"))
++
++    with pytest.raises(RuntimeError, match="copy failed"):
++        worker._submit_transfer(
++            bufs,
++            1,
++            ECCPUTransferDirection.DEVICE_TO_HOST,
++        )
++
++    assert worker._buf_pool._pool == []
++
++
++def test_upstream_completion_recycles_npu_transfer_resources():
++    worker = make_worker()
++    worker._stream_pool = []
++    bufs = worker._buf_pool.acquire(1)
++    stream = FakeStream()
++    start_event = FakeEvent()
++    end_event = FakeEvent(completed=True)
++    inflight = deque(
++        [
++            Transfer(
++                start_event=start_event,
++                end_event=end_event,
++                completions=["hash"],
++                bufs=bufs,
++                stream=stream,
++                num_bytes=16,
++            )
++        ]
++    )
++
++    completed = worker._collect_finished(inflight, "save")
++
++    assert completed == ["hash"]
++    assert inflight == deque()
++    assert worker._buf_pool._pool == [bufs]
++    assert worker._stream_pool == [stream]
++    assert worker._event_pool == [start_event, end_event]
++
++
++def test_shutdown_waits_for_transfer_then_unregisters_and_cleans_up(monkeypatch):
++    worker = make_worker()
++    order: list[str] = []
++    monkeypatch.setattr(worker_mod.torch, "npu", FakeNPU(order), raising=False)
++    worker._dtype = torch.float32
++    worker._is_save_rank = True
++    worker._save_bufs = None
++    worker._save_stream = None
++    worker._save_count = 0
++    worker._save_bytes = 0
++    worker._save_mm_hashes = []
++    worker._stream_pool = []
++    worker._inflight_loads = deque()
++    bufs = worker._buf_pool.acquire(1)
++    end_event = FakeEvent(order=order)
++    worker._inflight_saves = deque(
++        [
++            Transfer(
++                start_event=FakeEvent(),
++                end_event=end_event,
++                completions=["hash"],
++                bufs=bufs,
++                stream=FakeStream(),
++                num_bytes=16,
++            )
++        ]
++    )
++    worker._region.cleanup = lambda: order.append("cleanup")
++    monkeypatch.setattr(
++        worker_mod,
++        "_unregister_pinned_host_mmap",
++        lambda blocks: order.append("unregister"),
++    )
++
++    worker.shutdown()
++
++    assert order == [
++        "event_synchronize",
++        "npu_synchronize",
++        "unregister",
++        "cleanup",
++    ]
++    assert worker._mmap_pinned is False
++
++
++def test_unregister_failure_preserves_registration_for_retry(monkeypatch):
++    worker = make_worker()
++    fake_npu = FakeNPU()
++    monkeypatch.setattr(worker_mod.torch, "npu", fake_npu, raising=False)
++    calls = 0
++
++    def fail_once(blocks):
++        del blocks
++        nonlocal calls
++        calls += 1
++        if calls == 1:
++            raise RuntimeError("unregister failed")
++
++    monkeypatch.setattr(worker_mod, "_unregister_pinned_host_mmap", fail_once)
++
++    with pytest.raises(RuntimeError, match="unregister failed"):
++        worker._shutdown_transfer_backend()
++
++    assert worker._mmap_pinned is True
++    worker._shutdown_transfer_backend()
++    assert calls == 2
++    assert fake_npu.synchronize_calls == 2
++    assert worker._mmap_pinned is False
+diff --git a/tests/ut/worker/test_worker_v1.py b/tests/ut/worker/test_worker_v1.py
+index 14b5cd0ab..a76efd244 100644
+--- a/tests/ut/worker/test_worker_v1.py
++++ b/tests/ut/worker/test_worker_v1.py
+@@ -2302,14 +2302,17 @@ class TestNPUWorkerWeightUpdate(TestBase):
+         with self.assertRaises(RuntimeError):
+             worker.update_weights({"names": [], "dtype_names": [], "shapes": []})
+ 
+-    @patch("vllm.distributed.kv_transfer.ensure_kv_transfer_shutdown", create=True)
+-    def test_shutdown_releases_engine(self, _mock_kv_shutdown):
++    @patch("vllm_ascend.worker.worker.ensure_ec_transfer_shutdown")
++    @patch("vllm_ascend.worker.worker.ensure_kv_transfer_shutdown")
++    def test_shutdown_releases_engine(self, mock_kv_shutdown, mock_ec_shutdown):
+         engine = MagicMock()
+         worker = self._make_worker(engine=engine)
+         worker.profiler = None
+ 
+         worker.shutdown()
+ 
++        mock_kv_shutdown.assert_called_once_with()
++        mock_ec_shutdown.assert_called_once_with()
+         engine.shutdown.assert_called_once()
+ 
+     @patch("vllm_ascend.worker.worker.ensure_kv_transfer_shutdown")
+diff --git a/vllm_ascend/__init__.py b/vllm_ascend/__init__.py
+index 97de8d8a4..ed0fa8874 100644
+--- a/vllm_ascend/__init__.py
++++ b/vllm_ascend/__init__.py
+@@ -78,10 +78,16 @@ def register():
+ def register_connector():
+     _ensure_global_patch()
+ 
+-    from vllm_ascend.distributed.kv_transfer import register_connector
++    from vllm_ascend.distributed.ec_transfer import (
++        register_connector as register_ec_connector,
++    )
++    from vllm_ascend.distributed.kv_transfer import (
++        register_connector as register_kv_connector,
++    )
+     from vllm_ascend.distributed.weight_transfer import register_engine
+ 
+-    register_connector()
++    register_kv_connector()
++    register_ec_connector()
+     register_engine()
+ 
+ 
+diff --git a/vllm_ascend/distributed/ec_transfer/__init__.py b/vllm_ascend/distributed/ec_transfer/__init__.py
+index e69de29bb..2c77911a0 100644
+--- a/vllm_ascend/distributed/ec_transfer/__init__.py
++++ b/vllm_ascend/distributed/ec_transfer/__init__.py
+@@ -0,0 +1,34 @@
++# Copyright (c) 2026 Huawei Technologies Co., Ltd. All Rights Reserved.
++# This file is a part of the vllm-ascend project.
++# SPDX-License-Identifier: Apache-2.0
++"""Ascend overrides for vLLM encoder-cache transfer connectors."""
++
++import importlib
++
++
++def register_connector() -> None:
++    """Replace upstream ECCPUConnector with the Ascend worker adaptation.
++
++    Scheduler-side cache allocation and metadata remain upstream-owned. The
++    override is installed only when the upstream CPU connector exists; import
++    errors inside an available upstream module are deliberately propagated.
++    """
++    upstream_module = "vllm.distributed.ec_transfer.ec_connector.cpu.connector"
++    try:
++        importlib.import_module(upstream_module)
++    except ModuleNotFoundError as exc:
++        if exc.name and (exc.name == upstream_module or upstream_module.startswith(f"{exc.name}.")):
++            return
++        raise
++
++    from vllm.distributed.ec_transfer.ec_connector.factory import (
++        ECConnectorFactory,
++    )
++
++    # replace worker
++    ECConnectorFactory._registry.pop("ECCPUConnector", None)
++    ECConnectorFactory.register_connector(
++        "ECCPUConnector",
++        "vllm_ascend.distributed.ec_transfer.ec_connector.cpu.connector",
++        "AscendECCPUConnector",
++    )
+diff --git a/vllm_ascend/distributed/ec_transfer/ec_connector/__init__.py b/vllm_ascend/distributed/ec_transfer/ec_connector/__init__.py
+new file mode 100644
+index 000000000..d9b8a96ff
+--- /dev/null
++++ b/vllm_ascend/distributed/ec_transfer/ec_connector/__init__.py
+@@ -0,0 +1,4 @@
++# Copyright (c) 2026 Huawei Technologies Co., Ltd. All Rights Reserved.
++# This file is a part of the vllm-ascend project.
++# SPDX-License-Identifier: Apache-2.0
++"""Ascend encoder-cache connector implementations."""
+diff --git a/vllm_ascend/distributed/ec_transfer/ec_connector/cpu/__init__.py b/vllm_ascend/distributed/ec_transfer/ec_connector/cpu/__init__.py
+new file mode 100644
+index 000000000..c88cc0f41
+--- /dev/null
++++ b/vllm_ascend/distributed/ec_transfer/ec_connector/cpu/__init__.py
+@@ -0,0 +1,10 @@
++# Copyright (c) 2026 Huawei Technologies Co., Ltd. All Rights Reserved.
++# This file is a part of the vllm-ascend project.
++# SPDX-License-Identifier: Apache-2.0
++"""Ascend adaptation of vLLM's CPU encoder-cache connector."""
++
++from vllm_ascend.distributed.ec_transfer.ec_connector.cpu.connector import (
++    AscendECCPUConnector,
++)
++
++__all__ = ["AscendECCPUConnector"]
+diff --git a/vllm_ascend/distributed/ec_transfer/ec_connector/cpu/connector.py b/vllm_ascend/distributed/ec_transfer/ec_connector/cpu/connector.py
+new file mode 100644
+index 000000000..653702ad8
+--- /dev/null
++++ b/vllm_ascend/distributed/ec_transfer/ec_connector/cpu/connector.py
+@@ -0,0 +1,22 @@
++# Copyright (c) 2026 Huawei Technologies Co., Ltd. All Rights Reserved.
++# This file is a part of the vllm-ascend project.
++# SPDX-License-Identifier: Apache-2.0
++"""Role shell for the Ascend CPU encoder-cache offload connector."""
++
++from typing import TYPE_CHECKING
++
++from vllm.distributed.ec_transfer.ec_connector.cpu.connector import ECCPUConnector
++
++if TYPE_CHECKING:
++    from vllm.config import VllmConfig
++
++
++class AscendECCPUConnector(ECCPUConnector):
++    """Adapt upstream ECCPU scheduling and transfer plumbing for Ascend."""
++
++    def _make_worker(self, vllm_config: "VllmConfig"):
++        from vllm_ascend.distributed.ec_transfer.ec_connector.cpu.worker import (
++            AscendECCPUWorker,
++        )
++
++        return AscendECCPUWorker(vllm_config)
+diff --git a/vllm_ascend/distributed/ec_transfer/ec_connector/cpu/worker.py b/vllm_ascend/distributed/ec_transfer/ec_connector/cpu/worker.py
+new file mode 100644
+index 000000000..0daa54a47
+--- /dev/null
++++ b/vllm_ascend/distributed/ec_transfer/ec_connector/cpu/worker.py
+@@ -0,0 +1,101 @@
++# Copyright (c) 2026 Huawei Technologies Co., Ltd. All Rights Reserved.
++# This file is a part of the vllm-ascend project.
++# SPDX-License-Identifier: Apache-2.0
++"""NPU worker for vLLM's mmap-backed CPU encoder-cache connector."""
++
++from __future__ import annotations
++
++from typing import TYPE_CHECKING
++
++import torch
++from vllm.distributed.ec_transfer.ec_connector.cpu.worker import (
++    ECCPUTransferDirection,
++    ECCPUWorker,
++)
++from vllm.distributed.ec_transfer.ec_connector.cpu.worker.descriptor_buffers import DescriptorBuffers
++
++if TYPE_CHECKING:
++    from vllm.config import VllmConfig
++
++
++_DIRECTION_H2D = 0
++_DIRECTION_D2H = 1
++
++
++def _supports_eccpu_offload() -> bool:
++    return bool(torch.ops._C_ascend.supports_eccpu_offload())
++
++
++def _register_pinned_host_mmap(blocks: torch.Tensor) -> None:
++    torch.ops._C_ascend.register_pinned_host_mmap(blocks)
++
++
++def _unregister_pinned_host_mmap(blocks: torch.Tensor) -> None:
++    torch.ops._C_ascend.unregister_pinned_host_mmap(blocks)
++
++
++def _swap_blocks_batch(
++    src_ptrs: torch.Tensor,
++    dst_ptrs: torch.Tensor,
++    sizes: torch.Tensor,
++    direction: int,
++) -> None:
++    torch.ops._C_ascend.swap_blocks_batch(src_ptrs, dst_ptrs, sizes, direction)
++
++
++class AscendECCPUWorker(ECCPUWorker):
++    """Use pinned shared mmap and CANN batched DMA for encoder caches.
++
++    Shared-region lifecycle, scheduling and cache bookkeeping stay upstream;
++    only host registration, NPU event creation and CANN DMA are replaced.
++    """
++
++    def __init__(self, vllm_config: VllmConfig) -> None:
++        self._mmap_pinned = False
++        try:
++            super().__init__(vllm_config)
++        except Exception:
++            try:
++                self._shutdown_transfer_backend()
++            finally:
++                region = getattr(self, "_region", None)
++                if region is not None:
++                    region.cleanup()
++            raise
++
++    def _pin_shared_region(self) -> None:
++        if not _supports_eccpu_offload():
++            raise RuntimeError(
++                "Ascend ECCPUConnector requires both "
++                "aclrtMemcpyBatchAsync and "
++                "aclrtHostRegisterV2(ACL_HOST_REG_PINNED). Rebuild "
++                "vllm-ascend against a CANN stack that provides both APIs."
++            )
++        _register_pinned_host_mmap(self._region.blocks)
++        self._mmap_pinned = True
++
++    def _acquire_event(self) -> torch.npu.Event:
++        if self._event_pool:
++            return self._event_pool.pop()
++        return torch.npu.Event(enable_timing=True)
++
++    def _submit_transfer(
++        self,
++        bufs: DescriptorBuffers,
++        count: int,
++        direction: ECCPUTransferDirection,
++    ) -> None:
++        cann_direction = _DIRECTION_H2D if direction == ECCPUTransferDirection.HOST_TO_DEVICE else _DIRECTION_D2H
++        _swap_blocks_batch(
++            bufs.src_ptrs[:count],
++            bufs.dst_ptrs[:count],
++            bufs.sizes[:count],
++            cann_direction,
++        )
++
++    def _shutdown_transfer_backend(self) -> None:
++        if not self._mmap_pinned:
++            return
++        torch.npu.synchronize()
++        _unregister_pinned_host_mmap(self._region.blocks)
++        self._mmap_pinned = False
+diff --git a/vllm_ascend/worker/worker.py b/vllm_ascend/worker/worker.py
+index 94552d3e8..2331bea44 100644
+--- a/vllm_ascend/worker/worker.py
++++ b/vllm_ascend/worker/worker.py
+@@ -32,7 +32,10 @@ from torch_npu.op_plugin.atb._atb_ops import _register_atb_extensions
+ from torch_npu.profiler import dynamic_profile as dp
+ from vllm.config import CUDAGraphMode, VllmConfig, set_current_vllm_config
+ from vllm.distributed import ensure_model_parallel_initialized, get_pcp_group, init_distributed_environment
+-from vllm.distributed.ec_transfer import ensure_ec_transfer_initialized
++from vllm.distributed.ec_transfer import (
++    ensure_ec_transfer_initialized,
++    ensure_ec_transfer_shutdown,
++)
+ from vllm.distributed.kv_transfer import (
+     ensure_kv_transfer_initialized,
+     ensure_kv_transfer_shutdown,
+@@ -370,6 +373,8 @@ class NPUWorker(WorkerBase):
+             state.close()
+         if ensure_kv_transfer_shutdown is not None:
+             ensure_kv_transfer_shutdown()
++        if ensure_ec_transfer_shutdown is not None:
++            ensure_ec_transfer_shutdown()
+ 
+         if self.profiler is not None:
+             self.profiler.shutdown()

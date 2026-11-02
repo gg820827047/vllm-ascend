@@ -1,0 +1,137 @@
+commit 19c2f7a7cb1504d4624620ea59d6c7fa9eadc422
+Author:     LXX1122 <126799050+LXX1122@users.noreply.github.com>
+AuthorDate: Mon Oct 19 20:23:57 2026 +0800
+Commit:     GitHub <noreply@github.com>
+CommitDate: Mon Oct 19 20:23:57 2026 +0800
+
+    [BugFix][MoE] Fix CANN MegaMoE weight preparation for DeepSeekV4 W4A8 MXFP (#18684)
+    
+    Refs #17452
+    
+    ## What this PR does / why?
+    
+    When CANN MegaMoE is enabled for DeepSeek W4A8 MXFP MoE, startup fails
+    because `AscendW4A8MXFPDSDynamicFusedMoEMethod` overrides the common
+    `process_weights_after_loading()` implementation.
+    
+    The DeepSeek-specific override only performs the non-MegaMoE weight
+    format conversion and transpose. Because it takes precedence over the
+    parent method, the parent CANN MegaMoE preparation is not executed and
+    the following required per-expert lists are not created:
+    
+    - `cann_mega_moe_w13_weight_list`
+    - `cann_mega_moe_w2_weight_list`
+    - `cann_mega_moe_w13_weight_scale_list`
+    - `cann_mega_moe_w2_weight_scale_list`
+    
+    Startup therefore fails during profile run or warmup with:
+    
+    ```text
+    AttributeError: 'AscendRoutedExperts' object has no attribute
+    'cann_mega_moe_w13_weight_list'
+    ```
+    
+    DeepSeek W4A8 MXFP checkpoints store packed FP4 expert weights in
+    `torch.int8` tensors, while the inherited `get_weight()` creates the
+    destination expert parameters with `torch.uint8` storage.
+    
+    During checkpoint loading, vLLM writes the checkpoint tensors into the
+    destination parameters through:
+    
+    ```python
+    expert_data.copy_(loaded_weight)
+    ```
+    
+    Therefore, the expert weights are already stored as `torch.uint8` before
+    `process_weights_after_loading()` is called. The removed
+    `view(torch.uint8)` operations do not perform the checkpoint `int8` to
+    parameter `uint8` conversion; they only reinterpret the existing
+    storage.
+    
+    This PR removes the duplicated DeepSeek-specific
+    `process_weights_after_loading()` override. DeepSeek W4A8 MXFP now
+    reuses the common parent implementation, which:
+    
+    - performs the backend-specific packed FP4 weight and E8M0 scale layout
+    processing;
+    - creates the per-expert weight and scale lists required by CANN
+    MegaMoE;
+    - handles the common non-MegaMoE post-load path;
+    - prevents duplicate weight transformation.
+    
+    The DeepSeek-specific `get_dynamic_quant_param()` implementation and its
+    `torch.float8_e8m0fnu` scale parameters remain unchanged.
+    
+    Because the entire child override is removed, both MegaMoE and
+    non-MegaMoE post-load processing now use the common parent
+    implementation. Non-MegaMoE compatibility is covered by regression
+    testing.
+    
+    ## Does this PR introduce any user-facing change?
+    
+    Yes.
+    
+    This fixes DeepSeek W4A8 MXFP startup when CANN MegaMoE is enabled with:
+    
+    ```bash
+    --enable-expert-parallel \
+    --additional-config '{"enable_fused_mc2":2}'
+    ```
+    
+    There is no API, CLI, configuration, or checkpoint-format change.
+    
+    ## How was this patch tested?
+    
+    - [x] W4A8 MXFP unit tests
+    - [x] Verified that `torch.int8` checkpoint weights are loaded into
+    `torch.uint8` expert parameters correctly
+    - [x] Verified that all four `cann_mega_moe_*` lists are created and
+    non-empty
+    - [x] A5 / Ascend 950 startup with `enable_fused_mc2=2`
+    - [x] Real generation request with non-empty `choices`
+    - [x] Non-MegaMoE service startup and real generation request without
+    specifying `enable_fused_mc2` (effective default: `0`)
+    - [x] DSpark/speculative decoding compatibility
+    - [x] Observed an approximately 6% improvement in single-card E2E
+    throughput in the tested configuration.
+    
+    
+    - vLLM main:
+    https://github.com/vllm-project/vllm/commit/c4df37dfcc7f72ca41cd43801a468526ecf99a2b
+    
+    ---------
+    
+    Signed-off-by: LXX1122 <126799050+LXX1122@users.noreply.github.com>
+
+diff --git a/vllm_ascend/quantization/methods/w4a8/w4a8_mxfp4.py b/vllm_ascend/quantization/methods/w4a8/w4a8_mxfp4.py
+index 1696d3ef1..c8d2cfd85 100644
+--- a/vllm_ascend/quantization/methods/w4a8/w4a8_mxfp4.py
++++ b/vllm_ascend/quantization/methods/w4a8/w4a8_mxfp4.py
+@@ -516,27 +516,3 @@ class AscendW4A8MXFPDSDynamicFusedMoEMethod(AscendW4A8MXFPDynamicFusedMoEMethod)
+             num_experts, hidden_sizes, intermediate_size_per_partition // self.group_size, dtype=torch.float8_e8m0fnu
+         )
+         return param_dict
+-
+-    def process_weights_after_loading(self, layer):
+-        layer.w13_weight.data = torch_npu.npu_format_cast(
+-            layer.w13_weight.data.view(torch.uint8),
+-            ACL_FORMAT_FRACTAL_NZ,
+-            customize_dtype=torch.float8_e4m3fn,
+-            input_dtype=torch_npu.float4_e2m1fn_x2,
+-        )
+-        layer.w2_weight.data = torch_npu.npu_format_cast(
+-            layer.w2_weight.data.view(torch.uint8),
+-            ACL_FORMAT_FRACTAL_NZ,
+-            customize_dtype=torch.float8_e4m3fn,
+-            input_dtype=torch_npu.float4_e2m1fn_x2,
+-        )
+-        layer.w13_weight.data = layer.w13_weight.data.transpose(1, 2)
+-        layer.w2_weight.data = layer.w2_weight.data.transpose(1, 2)
+-        g, n, k = layer.w13_weight_scale.shape
+-        layer.w13_weight_scale.data = (
+-            layer.w13_weight_scale.data.reshape(g, n, k // 2, 2).view(torch.uint8).transpose(-3, -2)
+-        )
+-        g, n, k = layer.w2_weight_scale.shape
+-        layer.w2_weight_scale.data = (
+-            layer.w2_weight_scale.data.reshape(g, n, k // 2, 2).view(torch.uint8).transpose(-3, -2)
+-        )

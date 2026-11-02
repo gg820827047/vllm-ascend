@@ -1,0 +1,320 @@
+commit 55ae17c271e6666dd4b3065570c905c02c955cae
+Author:     caozq <zcao9910@gmail.com>
+AuthorDate: Thu Oct 22 18:49:23 2026 +0800
+Commit:     GitHub <noreply@github.com>
+CommitDate: Thu Oct 22 18:49:23 2026 +0800
+
+    [BugFix][KVTransfer] Sync physical layer count for layerwise PP pooling (#19480)
+    
+    ### What this PR does / why we need it?
+    
+    Layerwise GVA pooling can skip trailing physical KV layers under
+    pipeline parallelism. `layerwise_key_layers` is initialized from the
+    logical layer count, but cache registration can subsequently expand
+    `num_layers`. In a multi-group PP configuration, the existing
+    synchronization guard does not update the transfer-loop bound. For
+    example, a worker with 32 registered physical layers can continue
+    saving/loading only 29 layers.
+    
+    Extend the existing synchronization condition to cover layerwise GVA
+    transfers with PP > 1, retaining a single assignment. Add regression
+    coverage that uses the real group-builder, request-task and
+    transfer-address construction paths for both PP ranks and save/load
+    directions. The tests also exercise final-layer save submission and
+    preserve the existing PP=1 and non-layerwise branches.
+    
+    Release-branch counterpart: #19421 (`releases/v0.30.0`).
+    
+    ### Does this PR introduce _any_ user-facing change?
+    
+    Yes. It fixes incomplete KV transfers that can corrupt the beginning of
+    generated output with layerwise PP pooling, including SSD-backed
+    pooling. The public API and configuration are unchanged.
+    
+    A release note fragment is included in this PR.
+    
+    ### How was this patch tested?
+    
+    - Exact main-branch source under repository CPU mocks: `pytest -q
+    tests/ut/kv_offload/test_pool_worker_pp_layer_count.py` — **16 passed**;
+    withdraw only the production guard change: **4 expected expanded-layout
+    failures, 12 passed**; restore it: **16 passed**, no errors/skips.
+    Tested with Python 3.12, Torch 2.10.0+cpu and the branch's CI-verified
+    vLLM source `a98247ab4db686ee03c66d5feb3c761e52a2f8ab`. The initial
+    Python 3.11/image-vLLM attempt failed during dependency import before
+    collection; it is not counted as a regression-test failure.
+    - An equivalent three-line synchronization fix was tested on
+    `56debc194a42d473f8c456d4850369442d694c8f` with four Ascend A3 hosts,
+    DeepSeek-V4-Pro W4A8/MTP, P PCP8 × TP2 × PP2 and D DP16 × TP2. With SSD
+    pooling enabled throughout: two independent cold 32-request rounds had 0
+    opening-collapse cases; withdrawing only the fix reproduced the ID0
+    opening failure; restoring it and expanding to the frozen original 128
+    requests produced 0/128 opening-collapse cases. Concurrency 32, output
+    limit 1024, temperature 0, seed 1024. Native SSD rewarm and
+    current-request KV load/copy evidence were retained.
+    - This hardware evidence is for the historical revision plus the
+    equivalent fix, **not an end-to-end run of this current main branch**.
+    Current-branch NPU integration validation remains for CI/review before
+    merge. Existing post-answer repetition and prolonged reasoning were
+    recorded separately; no overall output-quality or GSM8K accuracy claim
+    is made.
+    - Ruff check/format, codespell, Python package/import/context-manager
+    checks and `git diff --check` pass. Full local `bash format.sh ci` is
+    **not green**: Windows path handling prevents typos/bash-based hooks,
+    ShellCheck is unavailable, and the Go download for actionlint failed
+    (that hook was explicitly skipped on the later attempt). These checks
+    remain for Linux CI; no repository check configuration was changed. No
+    performance-regression claim is made.
+    
+    ### Checklist
+    
+    #### Testing
+    
+    - [x] **Boundary / edge-case coverage**: covers expanded/unexpanded
+    physical layouts, PP ranks 0/1, PP=1, save/load and non-layerwise
+    controls.
+    - [x] **Regression test**: expanded-layout tests fail when the
+    production fix is withdrawn.
+    - [ ] **Error / failure path coverage**: backend failures and real DMA
+    are outside this focused layer-count test.
+    - [x] **Meaningful & reliable tests**: asserts actual trailing-layer
+    task coverage, addresses and final save submission.
+    - [ ] **Performance impact**: no paired performance experiment; this
+    changes initialization-time count synchronization.
+    
+    - vLLM main:
+    https://github.com/vllm-project/vllm/commit/a98247ab4db686ee03c66d5feb3c761e52a2f8ab
+    
+    ---------
+    
+    Signed-off-by: zouyida2052 <zouyida2002@gmail.com>
+    Co-authored-by: zouyida2052 <zouyida2002@gmail.com>
+
+diff --git a/release_notes/fragments/19422.yaml b/release_notes/fragments/19422.yaml
+new file mode 100644
+index 000000000..b78b60b63
+--- /dev/null
++++ b/release_notes/fragments/19422.yaml
+@@ -0,0 +1,7 @@
++pr: 19422
++entries:
++  - category: bugfix
++    text: >-
++      Fixed incomplete layerwise KV transfers under pipeline parallelism when
++      physical cache registration expands the local layer count, including
++      SSD-backed pooling.
+diff --git a/tests/ut/kv_offload/test_pool_worker_pp_layer_count.py b/tests/ut/kv_offload/test_pool_worker_pp_layer_count.py
+index fd8f2a1a2..9a579c6e5 100644
+--- a/tests/ut/kv_offload/test_pool_worker_pp_layer_count.py
++++ b/tests/ut/kv_offload/test_pool_worker_pp_layer_count.py
+@@ -16,7 +16,6 @@ import pytest
+ import torch
+ from vllm.v1.kv_cache_interface import FullAttentionSpec, KVCacheConfig, KVCacheGroupSpec
+ 
+-from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.kv_transfer import LayerBatchBuilder
+ from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.metadata import LoadSpec, ReqMeta
+ from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.pool_worker import (
+     KVPoolWorker,
+@@ -35,13 +34,11 @@ def test_reuse_layout_remap_to_stage_local():
+     assert KVPoolWorker._remap_layout_to_stage_local({3: 0, 4: 1}, [0], list(range(38))) == ({3: 0, 4: 1}, [0])
+ 
+ 
+-@pytest.mark.parametrize("pp_rank", [0, 1])
+-@pytest.mark.parametrize("is_save", [True, False])
+-def test_pp_stage_maps_multiple_cache_groups_to_local_layers(pp_rank, is_save):
++def _make_pp_layer_count_worker(pp_rank, pp_size=2, initial_num_layers=4, use_layerwise_transfer=False, num_groups=2):
+     layer_offset = pp_rank * 4
+     group_layer_names = [
+-        [f"model.layers.{layer_offset + i}.attn" for i in [0, 2]],
+-        [f"model.layers.{layer_offset + i}.attn" for i in [1, 3]],
++        [f"model.layers.{layer_offset + i}.attn" for i in range(group_id, 4, num_groups)]
++        for group_id in range(num_groups)
+     ]
+     worker = KVPoolWorker.__new__(KVPoolWorker)
+     attention_spec = FullAttentionSpec(block_size=16, num_kv_heads=1, head_size=1, dtype=torch.uint8)
+@@ -53,29 +50,23 @@ def test_pp_stage_maps_multiple_cache_groups_to_local_layers(pp_rank, is_save):
+         ],
+     )
+     worker.hf_config = SimpleNamespace(num_hidden_layers=8)
+-    worker.pp_size = 2
++    worker.pp_size = pp_size
+     worker.pp_rank = pp_rank
+     worker.pp_layer_offset = layer_offset
+     worker.total_layers = 8
+-    worker.num_layers = 4
+-    worker.num_kv_cache_groups = 2
++    worker.num_layers = initial_num_layers
++    worker.num_kv_cache_groups = num_groups
+     # _init_layerwise_config skips non-cacheable groups; both attention
+     # groups here are prefix-cacheable.
+-    worker.cacheable_group_ids = [0, 1]
+-    worker.use_layerwise_transfer = False
++    worker.cacheable_group_ids = list(range(num_groups))
++    worker.use_layerwise_transfer = use_layerwise_transfer
+     worker.use_layerwise = False
+     worker._extra_config = {}
+ 
+     worker._init_layerwise_config()
+ 
+-    assert worker.num_layers == worker.layerwise_key_layers == 4
+-    assert worker.physical_layer_to_group_layers == {
+-        0: [(0, 0)],
+-        1: [(1, 0)],
+-        2: [(0, 1)],
+-        3: [(1, 1)],
+-    }
+-
++    assert worker.num_layers == 4
++    assert worker.layerwise_key_layers == initial_num_layers
+     worker.num_blocks = 2
+     worker.kv_caches = {
+         layer_name: torch.empty((2, 16, 2, 1, 1), dtype=torch.uint8)
+@@ -91,9 +82,12 @@ def test_pp_stage_maps_multiple_cache_groups_to_local_layers(pp_rank, is_save):
+     for group_id, names in enumerate(group_layer_names):
+         worker._infer_cache_group_metadata(group_id, names)
+ 
+-    assert worker.group_num_layers == {0: 2, 1: 2}
+-    assert all(len(addresses) == 2 for addresses in worker.group_kv_caches_base_addr.values())
+-    assert worker.group_layer_cache_entry_offsets == {0: [0, 1, 2], 1: [0, 1, 2]}
++    layers_per_group = 4 // num_groups
++    assert worker.group_num_layers == dict.fromkeys(range(num_groups), layers_per_group)
++    assert all(len(addresses) == layers_per_group for addresses in worker.group_kv_caches_base_addr.values())
++    assert worker.group_layer_cache_entry_offsets == {
++        group_id: list(range(layers_per_group + 1)) for group_id in range(num_groups)
++    }
+ 
+     worker.tp_rank = 0
+     worker.dcp_size = 1
+@@ -102,8 +96,8 @@ def test_pp_stage_maps_multiple_cache_groups_to_local_layers(pp_rank, is_save):
+     # align state, and a bare producer owns every save.
+     worker.kv_role = "kv_producer"
+     worker.consumer_is_to_put = False
+-    worker.group_uses_align_state = [False, False]
+-    worker.grouped_block_size = [16, 16]
++    worker.group_uses_align_state = [False] * num_groups
++    worker.grouped_block_size = [16] * num_groups
+     worker.hash_block_size = 16
+     worker.cache_coordinator = None
+     worker.use_block_key_layerwise = False
+@@ -112,9 +106,31 @@ def test_pp_stage_maps_multiple_cache_groups_to_local_layers(pp_rank, is_save):
+     # Supply backend allocation results; keep task and address construction real.
+     worker._prepare_load_gvas = Mock()
+     worker._alloc_gvas_for_save = Mock()
+-    # The worker is built via __new__ (no __init__), so the per-step memo
+-    # cache that process_layer_data clears must be seeded manually.
+     worker._masked_runs_cache = {}
++    # Builders only need the registered geometry; no real backend client.
++    worker.token_database = worker
++    return worker, layer_offset
++
++
++@pytest.mark.parametrize("pp_rank", [0, 1])
++@pytest.mark.parametrize("is_save", [True, False])
++@pytest.mark.parametrize(
++    ("initial_num_layers", "use_layerwise_transfer"),
++    [(4, False), (4, True), (2, True)],
++    ids=["existing-non-layerwise", "gva-no-expansion", "gva-physical-expansion"],
++)
++def test_pp_stage_maps_multiple_cache_groups_to_local_layers(
++    pp_rank, is_save, initial_num_layers, use_layerwise_transfer, monkeypatch
++):
++    worker, layer_offset = _make_pp_layer_count_worker(
++        pp_rank, initial_num_layers=initial_num_layers, use_layerwise_transfer=use_layerwise_transfer
++    )
++    assert worker.physical_layer_to_group_layers == {
++        0: [(0, 0)],
++        1: [(1, 0)],
++        2: [(0, 1)],
++        3: [(1, 1)],
++    }
+     request = ReqMeta(
+         req_id="pp-layer",
+         token_len_chunk=16,
+@@ -126,11 +142,9 @@ def test_pp_stage_maps_multiple_cache_groups_to_local_layers(pp_rank, is_save):
+         block_gvas_by_group_np=[np.array([4096]), np.array([8192])],
+         load_block_gvas_by_group_np=[np.array([4096]), np.array([8192])],
+     )
++    # This is the real production builder entry point, before request binding.
++    builders = worker._build_group_layer_builders()
+     worker.process_layer_data([request])
+-    builders = [
+-        LayerBatchBuilder(worker, sum(worker.group_block_len[group]), worker.group_num_layers[group], group_id=group)
+-        for group in range(2)
+-    ]
+     tasks_by_layer = worker.layer_save_tasks if is_save else worker.layer_load_tasks
+     assert len(tasks_by_layer) == 4
+     assert all(len(tasks) == 1 for tasks in tasks_by_layer)
+@@ -139,3 +153,56 @@ def test_pp_stage_maps_multiple_cache_groups_to_local_layers(pp_rank, is_save):
+         cache = worker.kv_caches[f"model.layers.{layer_offset + local_layer}.attn"]
+         assert meta is not None
+         assert meta.addr_array.tolist() == [cache[1].data_ptr()]
++
++    # Both trailing physical layers must have real tasks and correctly selected
++    # cache addresses, even when the original logical extent stopped at layer 2.
++    assert worker.layerwise_key_layers == worker.num_layers == 4
++    assert tasks_by_layer[-1][0].layer_id == 3
++    assert tasks_by_layer[-1][0].layer_idx_in_group == 1
++    assert tasks_by_layer[-1][0].final_group_layer
++    if is_save:
++        # Exercise the real final-layer submission; only device events and the
++        # blocking sender drain are stubbed, as no transfer thread is started.
++        worker.current_layer = worker.num_layers - 1
++        worker.sync_save_events = [Mock() for _ in range(worker.num_layers)]
++        worker.layer_save_finished_events = [Mock() for _ in range(worker.num_layers)]
++        worker.kv_send_thread = Mock()
++        worker._attention_saved_layers = set()
++        worker.block_key_hybrid = False
++        worker._wait_for_final_layer_save = Mock()
++        monkeypatch.setitem(KVPoolWorker.save_kv_layer.__globals__, "_LW_DEFER_LAST_SAVE", False)
++
++        worker.save_kv_layer(None)
++
++        worker.sync_save_events[-1].record.assert_called_once_with()
++        worker.kv_send_thread.add_stored_request.assert_called_once_with(request.req_id)
++        worker.kv_send_thread.add_request.assert_called_once_with(tasks_by_layer[-1])
++        worker._wait_for_final_layer_save.assert_called_once_with(worker.num_layers, worker.kv_send_thread)
++        assert worker.current_layer == worker.num_layers
++
++
++@pytest.mark.parametrize(
++    ("pp_size", "use_layerwise_transfer", "num_groups", "expected_key_layers"),
++    [(1, True, 2, 2), (2, False, 2, 2), (1, True, 1, 4)],
++    ids=["pp1-multigroup-unchanged", "non-layerwise-pp-unchanged", "pp1-single-group-existing-sync"],
++)
++def test_group_builders_preserve_other_layer_count_branches(
++    pp_size, use_layerwise_transfer, num_groups, expected_key_layers
++):
++    worker, _ = _make_pp_layer_count_worker(
++        pp_rank=0,
++        pp_size=pp_size,
++        initial_num_layers=2,
++        use_layerwise_transfer=use_layerwise_transfer,
++        num_groups=num_groups,
++    )
++    original_key_offset = worker.layerwise_key_layer_offset
++    original_group_bytes = {group_id: tuple(lengths) for group_id, lengths in worker.group_block_len.items()}
++
++    builders = worker._build_group_layer_builders()
++
++    assert worker.num_layers == 4
++    assert worker.layerwise_key_layers == expected_key_layers
++    assert worker.layerwise_key_layer_offset == original_key_offset
++    assert {group_id: tuple(lengths) for group_id, lengths in worker.group_block_len.items()} == original_group_bytes
++    assert len(builders) == num_groups
+diff --git a/vllm_ascend/distributed/kv_transfer/kv_pool/ascend_store/pool_worker.py b/vllm_ascend/distributed/kv_transfer/kv_pool/ascend_store/pool_worker.py
+index aa9976259..5ce4936a5 100644
+--- a/vllm_ascend/distributed/kv_transfer/kv_pool/ascend_store/pool_worker.py
++++ b/vllm_ascend/distributed/kv_transfer/kv_pool/ascend_store/pool_worker.py
+@@ -686,7 +686,11 @@ class KVPoolWorker:
+         # or those extra layers are skipped during the save/load lifecycle. A
+         # block-key store owns a stage-local object, so its count stays local
+         # under PP. A GVA store retains the global PP layout and offset below.
+-        if self.use_block_key_layerwise or (self.num_kv_cache_groups == 1 and getattr(self, "pp_size", 1) == 1):
++        if (
++            self.use_block_key_layerwise
++            or (self.num_kv_cache_groups == 1 and getattr(self, "pp_size", 1) == 1)
++            or (self.use_layerwise_transfer and getattr(self, "pp_size", 1) > 1)
++        ):
+             self.layerwise_key_layers = self.num_layers
+         for group_id in range(self.num_kv_cache_groups):
+             group_num_layers = self.group_num_layers.get(group_id, self.num_layers)

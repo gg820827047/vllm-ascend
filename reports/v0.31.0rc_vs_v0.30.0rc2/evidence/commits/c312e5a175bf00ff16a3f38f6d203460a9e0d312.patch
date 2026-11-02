@@ -1,0 +1,378 @@
+commit c312e5a175bf00ff16a3f38f6d203460a9e0d312
+Author:     chenweiqiang11 <1436404370@qq.com>
+AuthorDate: Fri Oct 9 00:44:02 2026 -0700
+Commit:     GitHub <noreply@github.com>
+CommitDate: Fri Oct 9 15:44:02 2026 +0800
+
+    [v0.30.0][Feature][Worker] Support the TurboQuant packed KV cache in the V1 runner (#18048)
+    
+    ### What this PR does / why we need it?
+    
+    Adds the **Model Runner V1** half of the TurboQuant 4-bit packed KV
+    cache, for the `releases/v0.30.0` branch.
+    
+    This is the **`releases/v0.30.0` counterpart of #18026** — same change,
+    cherry-picked onto the release branch, so the two stay identical for the
+    dual merge. The branch already carries the V2 side (`#17726` is in
+    `releases/v0.30.0`), so only the V1 half is added here.
+    
+    The packed SFA main cache (`--kv-cache-dtype turboquant_4bit_nc`) is
+    wired through the V2 spec builder only, and a TurboQuant configuration
+    is rejected outright unless `VLLM_USE_V2_MODEL_RUNNER=1`. That leaves
+    deployments still running the V1 runner unable to use the cache at all.
+    This builds the same spec on the V1 side:
+    
+    - `worker/model_runner_v1.py`: recognise the attention impl's
+    `enable_sparse_sfa_turboquant` flag next to the existing C8 one, and
+    build the 386-byte fused slot (`kv_lora_rank/2` int4 nope bytes + bf16
+    rope + fp16 scale) with int8 storage. That is the same shape
+    `worker/v2/attn_utils.py` produces, so the attention implementation
+    itself stays shared between the two runners.
+    - Generalise the V1 allocation and unpacking from the C8-only predicate
+    to `kv_cache_spec_uses_packed_sfa_main_cache`, so a TQ4 spec allocates
+    and unpacks one packed tensor rather than a K/V pair. The cache dtype
+    stays on the C8 predicate: `self.c8_cache_dtype` is only bound when C8
+    is enabled, while TQ4 uses the spec dtype.
+    - Move the V2-runner requirement out of the shared validation and into
+    the compressed-cache path, which is the half that is V2-only: the packed
+    SFA cache is built by both runners, while DeepSeek V4 TurboQuant remains
+    V2-only.
+    
+    ### How was this patch tested?
+    
+    Unit tests, in the same commit (identical to #18026):
+    
+    -
+    `tests/ut/worker/test_model_runner_v1.py::test_sparse_layer_packs_the_turboquant_main_cache`
+    — the V1 spec builder produces a packed spec with
+    `cache_sparse_sfa_turboquant=True`,
+    `head_size=get_tq_fused_slot_bytes(512, 64)` and `dtype=torch.int8`,
+    mirroring the C8 spec test next to it.
+    -
+    `tests/ut/worker/test_model_runner_v1.py::test_sparse_layer_allocates_one_packed_turboquant_tensor`
+    — the allocation returns a single packed tensor (unpacking it as a K/V
+    pair would raise), which is what the generalised predicate buys.
+    - `tests/ut/quantization/methods/kv_cache/turboquant/test_config.py` —
+    an SFA configuration validates without the V2 runner, while the
+    parametrised case for the DeepSeek V4 path still asserts the
+    `VLLM_USE_V2_MODEL_RUNNER` requirement.
+    
+    Neither of these is an end-to-end run: PR CI has no TurboQuant e2e,
+    because it needs a CANN with `cann_ops_nn.turbo_quant` and the
+    `key_quant_mode=3` sparse attention operator.
+    
+    ### Does this PR introduce _any_ user-facing change?
+    
+    Yes, for SFA models only: `--kv-cache-dtype turboquant_4bit_nc` is no
+    longer refused when `VLLM_USE_V2_MODEL_RUNNER` is unset. DeepSeek V4
+    TurboQuant keeps requiring the V2 runner, and every other constraint
+    (BF16, `kv_lora_rank=512`, `qk_rope_head_dim=64`, A2/A3, SFA sparse
+    models, no xLite, no C8) applies unchanged on both paths.
+    
+    - vLLM main:
+    https://github.com/vllm-project/vllm/commit/ced6857afa0ea7b2e3f0846a62e1394e90f15607
+    
+    Signed-off-by: chenweiqiang11 <chenweiqiang11@users.noreply.github.com>
+    Co-authored-by: chenweiqiang11 <chenweiqiang11@users.noreply.github.com>
+    Co-authored-by: Claude <noreply@anthropic.com>
+
+diff --git a/tests/ut/quantization/methods/kv_cache/turboquant/test_config.py b/tests/ut/quantization/methods/kv_cache/turboquant/test_config.py
+index 512cdaf9c..781cd93c9 100644
+--- a/tests/ut/quantization/methods/kv_cache/turboquant/test_config.py
++++ b/tests/ut/quantization/methods/kv_cache/turboquant/test_config.py
+@@ -141,3 +141,11 @@ def test_sfa_model_allows_context_parallelism(runtime):
+     _as_sfa_model(runtime).parallel_config.decode_context_parallel_size = 2
+ 
+     config.validate_turboquant(runtime)
++
++
++def test_sfa_cache_accepts_the_v1_model_runner(runtime):
++    # The V1 runner builds the same packed SFA main cache spec; the compressed
++    # cache of the DeepSeek V4 path stays V2-only, as the case above asserts.
++    _as_sfa_model(runtime).use_v2_model_runner = False
++
++    config.validate_turboquant(runtime)
+diff --git a/tests/ut/worker/test_model_runner_v1.py b/tests/ut/worker/test_model_runner_v1.py
+index ce1f10a2e..c3545462d 100644
+--- a/tests/ut/worker/test_model_runner_v1.py
++++ b/tests/ut/worker/test_model_runner_v1.py
+@@ -37,7 +37,7 @@ from vllm_ascend.attention.attention_c8_mxfp import (
+ )
+ from vllm_ascend.attention.attention_v1 import AscendAttentionBackend
+ from vllm_ascend.attention.mla_v1 import AscendMLABackend
+-from vllm_ascend.attention.utils import get_sfa_qsfa_packed_head_dim
++from vllm_ascend.attention.utils import get_sfa_qsfa_packed_head_dim, get_tq_fused_slot_bytes
+ from vllm_ascend.core.kv_cache_interface import (
+     AscendIndexerKPoolTailSpec,
+     AscendMLAAttentionSpec,
+@@ -2436,6 +2436,103 @@ class TestNPUModelRunnerKVCache(unittest.TestCase):
+         self.assertEqual(raw_k_cache.numel(), 2 * 16 * 512 * 2)
+         self.assertEqual(raw_v_cache.numel(), 2 * 16 * 64 * 2)
+ 
++    @patch("vllm_ascend.worker.model_runner_v1.get_layers_from_vllm_config")
++    def test_sparse_layer_packs_the_turboquant_main_cache(
++        self,
++        mock_get_layers,
++    ):
++        runner = self._build_runner()
++        runner.use_sparse = True
++        runner.block_size = 16
++        runner.kv_cache_dtype = torch.bfloat16
++        runner.shared_kv_cache_layers = {}
++        runner.ascend_config = MagicMock()
++        runner.ascend_config.kvpp_config.size = 1
++        runner.model_config.hf_text_config = SimpleNamespace(
++            kv_lora_rank=512,
++            qk_rope_head_dim=64,
++        )
++        runner.vllm_config.cache_config.cache_dtype = "turboquant_4bit_nc"
++        runner.sparse_kv_offload_enabled = False
++
++        attn_module = MLAAttention.__new__(MLAAttention)
++        torch.nn.Module.__init__(attn_module)
++        attn_module.impl = SimpleNamespace(
++            has_indexer=False,
++            enable_sparse_sfa_c8=False,
++            enable_sparse_li_c8=False,
++            enable_sparse_sfa_turboquant=True,
++        )
++        attn_module.kv_lora_rank = 512
++        attn_module.qk_rope_head_dim = 64
++        layer_name = "model.layers.1.self_attn.attn"
++        mock_get_layers.return_value = {layer_name: attn_module}
++
++        spec = runner.get_kv_cache_spec()[layer_name]
++
++        self.assertTrue(spec.cache_sparse_sfa_turboquant)
++        self.assertFalse(spec.cache_sparse_sfa_c8)
++        self.assertEqual(spec.head_size, get_tq_fused_slot_bytes(512, 64))
++        self.assertEqual(spec.dtype, torch.int8)
++
++    @patch("vllm_ascend.worker.model_runner_v1.has_ec_transfer", return_value=False)
++    @patch("vllm_ascend.worker.model_runner_v1.get_layers_from_vllm_config")
++    def test_sparse_layer_allocates_one_packed_turboquant_tensor(
++        self,
++        mock_get_layers,
++        _mock_has_ec_transfer,
++    ):
++        runner = self._build_runner()
++        runner.use_sparse = True
++        runner.block_size = 16
++        runner.kv_cache_dtype = torch.bfloat16
++        runner.shared_kv_cache_layers = {}
++        runner.ascend_config = MagicMock()
++        runner.ascend_config.kvpp_config.size = 1
++        runner.model_config.hf_text_config = SimpleNamespace(
++            kv_lora_rank=512,
++            qk_rope_head_dim=64,
++        )
++        runner.vllm_config.cache_config.cache_dtype = "turboquant_4bit_nc"
++        runner.sparse_kv_offload_enabled = False
++
++        attn_module = MLAAttention.__new__(MLAAttention)
++        torch.nn.Module.__init__(attn_module)
++        attn_module.impl = SimpleNamespace(
++            has_indexer=False,
++            enable_sparse_sfa_c8=False,
++            enable_sparse_li_c8=False,
++            enable_sparse_sfa_turboquant=True,
++        )
++        attn_module.kv_lora_rank = 512
++        attn_module.qk_rope_head_dim = 64
++        layer_name = "model.layers.1.self_attn.attn"
++        mock_get_layers.return_value = {layer_name: attn_module}
++
++        spec = runner.get_kv_cache_spec()[layer_name]
++        kv_cache_config = KVCacheConfig(
++            num_blocks=2,
++            kv_cache_tensors=[
++                _make_kv_cache_tensor(
++                    per_layer_size=2 * spec.page_size_bytes,
++                    layer_names=[layer_name],
++                    page_size=spec.page_size_bytes,
++                )
++            ],
++            kv_cache_groups=[
++                KVCacheGroupSpec(
++                    layer_names=[layer_name],
++                    kv_cache_spec=spec,
++                )
++            ],
++        )
++
++        raw_caches = runner._allocate_kv_cache_tensors(kv_cache_config)
++
++        # Unpacking into one tensor is the assertion: a K/V pair would raise.
++        (raw_cache,) = raw_caches[layer_name]
++        self.assertEqual(raw_cache.numel(), 2 * 16 * spec.head_size)
++
+     @patch("vllm_ascend.worker.model_runner_v1.has_ec_transfer", return_value=False)
+     @patch("vllm_ascend.worker.model_runner_v1.get_layers_from_vllm_config")
+     def test_sparse_indexer_allocates_separate_replicated_cache_tensor(
+diff --git a/vllm_ascend/quantization/methods/kv_cache/turboquant/config.py b/vllm_ascend/quantization/methods/kv_cache/turboquant/config.py
+index ed52aeae0..0f122b090 100644
+--- a/vllm_ascend/quantization/methods/kv_cache/turboquant/config.py
++++ b/vllm_ascend/quantization/methods/kv_cache/turboquant/config.py
+@@ -14,8 +14,6 @@ from . import TURBOQUANT_CACHE_DTYPE, is_turboquant
+ 
+ def _validate_turboquant_common(vllm_config) -> None:
+     """Constraints that hold for every TurboQuant entry point."""
+-    if not vllm_config.use_v2_model_runner:
+-        raise ValueError(f"Ascend {TURBOQUANT_CACHE_DTYPE} requires VLLM_USE_V2_MODEL_RUNNER=1")
+     model = vllm_config.model_config
+     if model.dtype != torch.bfloat16:
+         raise ValueError(f"Ascend {TURBOQUANT_CACHE_DTYPE} requires a BF16 (bfloat16) model dtype, got {model.dtype}")
+@@ -63,6 +61,8 @@ def _validate_turboquant_dsa(vllm_config) -> None:
+         hf = getattr(model, "hf_config", None)
+     if hf is None or getattr(hf, "model_type", None) != "deepseek_v4":
+         raise ValueError(f"Ascend {TURBOQUANT_CACHE_DTYPE} currently requires DeepSeek V4")
++    if not vllm_config.use_v2_model_runner:
++        raise ValueError("DeepSeek V4 TurboQuant requires VLLM_USE_V2_MODEL_RUNNER=1")
+     head_dims = (getattr(hf, "head_dim", None), getattr(hf, "qk_rope_head_dim", None))
+     if head_dims != (512, 64):
+         raise ValueError("DeepSeek V4 TurboQuant requires head_dim=512 and qk_rope_head_dim=64")
+diff --git a/vllm_ascend/worker/model_runner_v1.py b/vllm_ascend/worker/model_runner_v1.py
+index 24116d169..986f9d6e6 100644
+--- a/vllm_ascend/worker/model_runner_v1.py
++++ b/vllm_ascend/worker/model_runner_v1.py
+@@ -136,6 +136,7 @@ from vllm_ascend.attention.mla_v1 import AscendMLABackend
+ from vllm_ascend.attention.utils import (
+     AscendCommonAttentionMetadata,
+     get_sfa_qsfa_packed_head_dim,
++    get_tq_fused_slot_bytes,
+     requires_contiguous_pa_kv_cache,
+     using_paged_attention,
+ )
+@@ -213,6 +214,7 @@ from vllm_ascend.utils import (
+     is_c8_mxfp_kv_quant,
+     is_hidden_state_cache_spec,
+     is_score_encoder_cache_manager,
++    kv_cache_spec_uses_packed_sfa_main_cache,
+     kv_cache_spec_uses_sparse_sfa_c8,
+     lmhead_tp_enable,
+     model_uses_kpool_indexer,
+@@ -5234,7 +5236,7 @@ class NPUModelRunner(GPUModelRunner):
+                     # and rope head dim.
+                     current_kv_cache_spec = layer_kv_cache_spec[layer_name]
+                     assert isinstance(current_kv_cache_spec, AttentionSpec)
+-                    current_sparse_sfa_c8 = kv_cache_spec_uses_sparse_sfa_c8(current_kv_cache_spec)
++                    current_packed_sfa_main_cache = kv_cache_spec_uses_packed_sfa_main_cache(current_kv_cache_spec)
+ 
+                     # vLLM #51718 packs every layer of a group into a single
+                     # KVCacheTensor on main; the per-layer size is the block
+@@ -5244,7 +5246,7 @@ class NPUModelRunner(GPUModelRunner):
+                     kv_cache_tensor_size = (
+                         kv_cache_config.num_blocks * current_kv_cache_spec.page_size_bytes
+                     )
+-                    if current_sparse_sfa_c8:
++                    if current_packed_sfa_main_cache:
+                         k_tensor_size = kv_cache_tensor_size
+                         v_tensor_size = None
+                     else:
+@@ -5264,7 +5266,9 @@ class NPUModelRunner(GPUModelRunner):
+                         v_tensor_size = int(kv_cache_tensor_size // v_tensor_split_factor)
+                     if self.sparse_kv_offload_enabled:
+                         assert self.use_sparse, "Sparse KV offload only support sparse attention."
+-                        assert not current_sparse_sfa_c8, "Sparse KV offload do not support sparse SFA C8."
++                        assert not current_packed_sfa_main_cache, (
++                            "Sparse KV offload do not support a packed SFA main cache."
++                        )
+                         assert v_tensor_size is not None
+                         for layer_name_inner in allocation_layers:
+                             if "attn" in layer_name_inner and "linear_attn" not in layer_name_inner:
+@@ -5298,7 +5302,7 @@ class NPUModelRunner(GPUModelRunner):
+                                     v_tensor_size,
+                                     alignment,
+                                 )
+-                            if current_sparse_sfa_c8:
++                            if current_packed_sfa_main_cache:
+                                 kv_cache_raw_tensors[layer_name_inner] = (k_tensor,)
+                             else:
+                                 assert v_tensor is not None
+@@ -5581,9 +5585,12 @@ class NPUModelRunner(GPUModelRunner):
+                     # elif branch below before the sparse branch tries to
+                     # unpack them as a K/V tuple.
+                     current_sparse_sfa_c8 = kv_cache_spec_uses_sparse_sfa_c8(current_kv_cache_spec)
++                    current_packed_sfa_main_cache = kv_cache_spec_uses_packed_sfa_main_cache(current_kv_cache_spec)
+                     if self.sparse_kv_offload_enabled:
+                         assert self.use_sparse, "Sparse KV offload only support sparse attention."
+-                        assert not current_sparse_sfa_c8, "Sparse KV offload do not support sparse SFA C8."
++                        assert not current_packed_sfa_main_cache, (
++                            "Sparse KV offload do not support a packed SFA main cache."
++                        )
+                         reshaped_tensors = reshape_kv_cache_tensors_for_sparse_kv_offload(
+                             kv_cache_raw_tensors[layer_name],
+                             current_kv_cache_spec,
+@@ -5595,12 +5602,12 @@ class NPUModelRunner(GPUModelRunner):
+                         kv_caches[layer_name] = reshaped_tensors
+                         continue
+                     raw_kv_is_combined = False
+-                    if (self.use_sparse or current_sparse_sfa_c8) and "cache_only_layers" not in layer_name:
++                    if (self.use_sparse or current_packed_sfa_main_cache) and "cache_only_layers" not in layer_name:
+                         raw_cache = kv_cache_raw_tensors[layer_name]
+                         if not isinstance(raw_cache, tuple):
+                             raw_k_tensor = raw_v_tensor = raw_cache
+                             sum_page_size_bytes = raw_k_tensor.numel()
+-                        elif current_sparse_sfa_c8:
++                        elif current_packed_sfa_main_cache:
+                             (raw_k_tensor,) = raw_cache
+                             raw_v_tensor = None
+                             sum_page_size_bytes = raw_k_tensor.numel()
+@@ -5809,7 +5816,7 @@ class NPUModelRunner(GPUModelRunner):
+                             num_kv_heads,
+                             k_dim,
+                         )
+-                        if current_sparse_sfa_c8:
++                        if current_packed_sfa_main_cache:
+                             k_shape = (
+                                 mla_num_blocks,
+                                 mla_block_size,
+@@ -5833,13 +5840,13 @@ class NPUModelRunner(GPUModelRunner):
+                         )
+ 
+                     k_cache = raw_k_tensor.view(k_cache_dtype).view(k_shape)
+-                    if current_sparse_sfa_c8:
++                    if current_packed_sfa_main_cache:
+                         v_cache = None
+                     else:
+                         assert raw_v_tensor is not None
+                         v_cache = raw_v_tensor.view(v_cache_dtype).view(v_shape)
+ 
+-                    if current_sparse_sfa_c8:
++                    if current_packed_sfa_main_cache:
+                         kv_caches[layer_name] = (k_cache,)
+                     else:
+                         assert v_cache is not None
+@@ -6168,12 +6175,23 @@ class NPUModelRunner(GPUModelRunner):
+             elif isinstance(attn_module, MLAAttention):
+                 if self.use_sparse or getattr(
+                     getattr(attn_module, "impl", None), "enable_sparse_sfa_c8", False
++                ) or getattr(
++                    getattr(attn_module, "impl", None), "enable_sparse_sfa_turboquant", False
+                 ):
+                     impl = attn_module.impl
+                     cache_sparse_sfa_c8 = bool(
+                         getattr(impl, "enable_sparse_sfa_c8", False)
+                     )
+-                    if cache_sparse_sfa_c8:
++                    cache_sparse_sfa_turboquant = bool(
++                        getattr(impl, "enable_sparse_sfa_turboquant", False)
++                    )
++                    if cache_sparse_sfa_turboquant:
++                        head_size = get_tq_fused_slot_bytes(
++                            self.model_config.hf_text_config.kv_lora_rank,
++                            self.model_config.hf_text_config.qk_rope_head_dim,
++                        )
++                        dtype = torch.int8
++                    elif cache_sparse_sfa_c8:
+                         head_size = get_sfa_qsfa_packed_head_dim(
+                             self.model_config.hf_text_config.kv_lora_rank,
+                             self.model_config.hf_text_config.qk_rope_head_dim,
+@@ -6198,6 +6216,7 @@ class NPUModelRunner(GPUModelRunner):
+                         dtype=dtype,
+                         cache_dtype_str=self.vllm_config.cache_config.cache_dtype,
+                         cache_sparse_sfa_c8=cache_sparse_sfa_c8,
++                        cache_sparse_sfa_turboquant=cache_sparse_sfa_turboquant,
+                         store_on_host=self.sparse_kv_offload_enabled,
+                         model_version=model_version,
+                         indexes_kv_by_block_stride=indexes_kv_by_block_stride,

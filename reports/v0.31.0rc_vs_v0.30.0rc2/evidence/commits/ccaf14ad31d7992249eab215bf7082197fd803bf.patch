@@ -1,0 +1,161 @@
+commit ccaf14ad31d7992249eab215bf7082197fd803bf
+Author:     SparrowMu <52023119+SparrowMu@users.noreply.github.com>
+AuthorDate: Tue Oct 20 11:41:33 2026 +0800
+Commit:     GitHub <noreply@github.com>
+CommitDate: Tue Oct 20 11:41:33 2026 +0800
+
+    [BugFix][Attention] Fix MLA PROLOG_V3 tile size for non-128 KV pages (#19213)
+    
+    ### What this PR does / why we need it?
+    
+    The MLA PROLOG_V3 call derives `tile_size` from the PA cache page
+    length. With a 768-token DCP current-KV workspace, this passes
+    `tile_size=768` and startup fails with `TileSize 768 should be128`.
+    
+    Pass `tile_size=128` for the KV quantization modes used here (0/1),
+    independently of KV cache page length. The [PROLOG_V3 API
+    contract](https://github.com/Ascend/op-plugin/blob/master/docs/zh/custom_APIs/torch_npu/torch_npu-npu_mla_prolog_v3.md)
+    defines this as a quantization tile attribute; it is separate from the
+    PA cache block size. Cache shapes, slot mappings and attention masks are
+    unchanged.
+    
+    Add a CPU regression that executes the real `_run_prolog_v3` method
+    extracted from the source, with the NPU operator mocked. Covers
+    128/768-token pages and KV quantization modes 0/1.
+    
+    ### Does this PR introduce _any_ user-facing change?
+    
+    Fixes the invalid PROLOG_V3 tile argument used during startup in
+    affected DCP configurations with non-128-token cache pages. No CLI or
+    configuration changes.
+    
+    ### How was this patch tested?
+    
+    ```bash
+    PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 python -m pytest -q --confcutdir=tests/ut/attention tests/ut/attention/test_mla_prolog_v3_tile_size_cpu.py
+    ```
+    
+    - Fixed code: **4 passed**.
+    - Negative control using the unmodified `main` source: **2 failed, 2
+    passed**; both failures are the 768-page cases (`768 != 128`).
+    - Changed-file Ruff 0.14.0 lint/format checks, Python syntax checks and
+    `git diff --check`: passed.
+    - Attempted `bash format.sh ci`; it stopped while installing the
+    actionlint Go environment with `RemoteDisconnected` on Windows, before
+    running the full hooks.
+    - The full torch/vLLM UT suite was not run locally; those dependencies
+    are unavailable in this lightweight environment.
+    - These are CPU API-contract checks. NPU startup, numerical correctness
+    and multi-node P/D validation have not been run.
+    
+    ---
+    
+    ### Checklist
+    
+    #### Testing
+    
+    - [x] **Boundary / edge-case coverage**: covered both 128-token and
+    non-128 (768-token) pages, with KV quantization modes 0/1.
+    - [x] **Regression test**: the non-128 cases fail against the original
+    source.
+    - [ ] **Error / failure path coverage**: the NPU operator rejection
+    itself is not executed by the CPU test.
+    - [x] **Meaningful & reliable tests**: executes the actual production
+    method and checks operator arguments, cache identity/shape and slot
+    conversion.
+    - [ ] **Performance impact**: no NPU benchmark has been run.
+    
+    - vLLM main:
+    https://github.com/vllm-project/vllm/commit/c4df37dfcc7f72ca41cd43801a468526ecf99a2b
+    
+    Signed-off-by: SparrowMu <52023119+SparrowMu@users.noreply.github.com>
+
+diff --git a/tests/ut/attention/test_mla_prolog_v3_tile_size_cpu.py b/tests/ut/attention/test_mla_prolog_v3_tile_size_cpu.py
+new file mode 100644
+index 000000000..c6e8bd10a
+--- /dev/null
++++ b/tests/ut/attention/test_mla_prolog_v3_tile_size_cpu.py
+@@ -0,0 +1,69 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""Check PROLOG call arguments without importing torch or executing NPU kernels."""
++
++import ast
++from pathlib import Path
++from types import SimpleNamespace
++from unittest.mock import MagicMock
++
++import pytest
++
++
++def _load_run_prolog_v3(torch, torch_npu):
++    source = Path(__file__).resolve().parents[3] / "vllm_ascend/attention/mla_v1.py"
++    tree = ast.parse(source.read_text(encoding="utf-8"))
++    impl = next(node for node in tree.body if isinstance(node, ast.ClassDef) and node.name == "AscendMLAImpl")
++    method = next(node for node in impl.body if isinstance(node, ast.FunctionDef) and node.name == "_run_prolog_v3")
++    method.decorator_list = []
++    future = ast.ImportFrom(module="__future__", names=[ast.alias(name="annotations")], level=0)
++    module = ast.fix_missing_locations(ast.Module(body=[future, method], type_ignores=[]))
++    scope = {"torch": torch, "torch_npu": torch_npu}
++    exec(compile(module, str(source), "exec"), scope)
++    return scope[method.name]
++
++
++@pytest.mark.parametrize("page_size", [128, 768])
++@pytest.mark.parametrize("quant_mode", [0, 1])
++def test_prolog_tile_size_is_independent_of_cache_pages(page_size, quant_mode):
++    torch = SimpleNamespace(int64=object())
++    outputs = object()
++    operator = MagicMock(return_value=outputs)
++    run = _load_run_prolog_v3(torch, SimpleNamespace(npu_mla_prolog_v3=operator))
++    hidden_states = SimpleNamespace(shape=(3, 7168))
++    cache = (
++        SimpleNamespace(shape=(1, page_size, 1, 512)),
++        SimpleNamespace(shape=(1, page_size, 1, 64)),
++    )
++    slots = MagicMock()
++    slots.view.return_value = slots
++    slots.to.return_value = slots
++    slots.contiguous.return_value = slots
++    norm = SimpleNamespace(weight=SimpleNamespace(data=object()), variance_epsilon=1e-6)
++    weights = dict.fromkeys(["weight_dq", "weight_uq_qr", "weight_uk", "weight_dkv_kr"], object())
++    impl = SimpleNamespace(
++        q_a_layernorm=norm,
++        kv_a_layernorm=norm,
++        fa_quant_layer=bool(quant_mode),
++        support_fp8_attention=False,
++        quant_kscale=MagicMock(),
++        _prepare_prolog_v3_token=MagicMock(return_value=(hidden_states, {}, weights)),
++        _flatten_prolog_rope_table=lambda table, _: table,
++    )
++
++    assert run(impl, hidden_states, object(), object(), cache, slots, quantize_query=True) is outputs
++
++    operator.assert_called_once()
++    passed = operator.call_args.kwargs
++    assert passed["tile_size"] == 128
++    assert passed["kv_cache_quant_mode"] == quant_mode
++    assert passed["query_quant_mode"] == quant_mode
++    assert passed["cache_mode"] == "PA_BSND"
++    assert passed["kv_cache"] is cache[0]
++    assert passed["kr_cache"] is cache[1]
++    assert cache[0].shape == (1, page_size, 1, 512)
++    assert cache[1].shape == (1, page_size, 1, 64)
++    assert passed["cache_index"] is slots
++    slots.view.assert_called_once_with(-1)
++    slots.to.assert_called_once_with(torch.int64)
++    slots.contiguous.assert_called_once_with()
+diff --git a/vllm_ascend/attention/mla_v1.py b/vllm_ascend/attention/mla_v1.py
+index 458a791ce..b70bc6740 100644
+--- a/vllm_ascend/attention/mla_v1.py
++++ b/vllm_ascend/attention/mla_v1.py
+@@ -2161,7 +2161,8 @@ class AscendMLAImpl(MLAAttentionImpl):
+             kv_cache_quant_mode=1 if self.fa_quant_layer else 0,
+             ckvkr_repo_mode=0,
+             quant_scale_repo_mode=0,
+-            tile_size=kv_cache[0].shape[1],
++            # PROLOG quantization tiles are independent of KV cache page size.
++            tile_size=128,
+             quant_scale_ckv=(
+                 (self.fak_descale_reciprocal if self.support_fp8_attention else self.quant_kscale[:, :1])
+                 if self.fa_quant_layer

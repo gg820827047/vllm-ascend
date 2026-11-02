@@ -1,0 +1,926 @@
+commit 7e081f466da1b07ac6e5b757d8610fe774cdf0e9
+Author:     LifeOfCoffee <63617742+LifeOfCoffee@users.noreply.github.com>
+AuthorDate: Tue Oct 20 15:59:36 2026 +0800
+Commit:     GitHub <noreply@github.com>
+CommitDate: Tue Oct 20 15:59:36 2026 +0800
+
+    [BugFix][KVPool] Preserve physical blocks in bulk and layerwise cache transfers (#19070)
+    
+    ### What this PR does / why we need it?
+    
+    This PR fixes the AscendStore KVPool save/restore regression introduced
+    by #18256. For the affected MLA path, #18256 changed the cache
+    allocation to place NoPE and RoPE payloads together within each physical
+    kernel block. The existing KVPool copy logic still assumed that each
+    component was contiguous across all kernel blocks belonging to one
+    scheduler block, making it incompatible with the new layout when a
+    scheduler block spans multiple kernel blocks.
+    
+    AscendStore KVPool can corrupt scaled, block-strided MLA caches by
+    copying each component as one contiguous range across multiple physical
+    blocks. NoPE/RoPE payloads are separated by the other component or
+    padding, so the old ranges overlap and omit trailing KV.
+    
+    This affects both bulk and layerwise transfers. For 5760-token scheduler
+    blocks / 128-token kernel blocks with 512/64 NoPE/RoPE dimensions, the
+    old layerwise descriptors omit the final five physical blocks (640
+    tokens).
+    
+    This change:
+    - Emits per-physical-block descriptors for affected bulk and layerwise
+    transfers, retaining the logical-block stride.
+    - Coalesces same-storage adjacent MLA components for complete
+    non-layerwise blocks: one descriptor per physical page with padding, or
+    one per logical block without padding. Layerwise, partial-chunk,
+    align-state, TP mismatch, DCP and KVPP paths retain segmented
+    descriptors; the existing bulk address generator and backend interfaces
+    are unchanged.
+    - Carries each descriptor's physical-block index/count into the token
+    database so legacy partial-layer transfers intersect the requested token
+    interval with each segment.
+    - Uses recorded layer descriptor boundaries instead of assuming every
+    layer has the same descriptor count.
+    - Registers the complete physical storage span and rejects unsupported
+    noncontiguous inner payloads.
+    - Keeps compact descriptors for contiguous or ratio-one layouts and
+    preserves existing KVPP mapping.
+    - Adds byte-level regression coverage for GVA, block-key and legacy
+    per-layer addresses, partial intervals and mixed layer layouts.
+    
+    ### Does this PR introduce _any_ user-facing change?
+    
+    Correctly saves/restores affected pooled caches in bulk and layerwise
+    modes. Dense layouts retain their existing representation.
+    
+    **Upgrade all writers and readers together and invalidate affected old
+    pool entries or use a fresh namespace/`cache_salt`.** Old packed
+    contents are incompatible even though the total byte size is unchanged.
+    Restarting workers alone does not invalidate persisted objects; no
+    automatic migration is provided. The deployment guide includes this
+    requirement. The coalesced bulk representation is physical-page major
+    and also requires a fresh namespace when upgrading from the earlier
+    component-major segmented implementation. Writers/readers must agree on
+    transfer mode and component layout.
+    
+    ### How was this patch tested?
+    
+    Rebased on main (`70451936818f21482c298fe8946d5460bd188568`); original
+    segmented-transfer commit: `e01bd3c8d338a1e113146ced10ee7afa107dcd29`;
+    bulk-coalescing follow-up: `3373e0695bcab04f902b0aaddca1e3ac54db5a7f`.
+    
+    The original segmented-transfer implementation passed **344 selected
+    related CPU unit tests**: 339 across the segmented-transfer,
+    layerwise-roundtrip, metadata, worker, hybrid and pipeline tests, plus 5
+    PP stage-local numbering tests.
+    
+    - The 94 added roundtrip cases cover GVA, block-key and legacy per-layer
+    addressing; ratios 1/3/45; BF16/FP32; padding and nonzero storage
+    offsets; guard/unselected data; partial prefixes and nonzero token
+    intervals; and layers with different descriptor counts in either order.
+    - The full-size 5760/128-token, 512/64-dimension BF16 case now restores
+    all 45 physical blocks on every tested path.
+    - The earlier unpatched-head regression reproduced missing historical KV
+    on both PR branches; the corresponding cases pass after the fix.
+    - The existing shared NumPy CPU mock implements `stride()`,
+    `stride(dim)` and `numel()`.
+    - Ruff 0.14.0 check/format, codespell with repository word exceptions,
+    and `git diff --check` passed.
+    - Python 3.11.10, PyTorch 2.10.0+cpu, pytest 8.4.2, NumPy 1.26.4. Real
+    CPU tensor storage and `ctypes` byte copies were used; unrelated
+    vLLM/NPU/backend dependencies were mocked in an isolated test bootstrap.
+    Production source was imported without runtime patches.
+    - Full `bash format.sh ci` was attempted, but hook dependency
+    installation could not complete against the remote package mirrors. Full
+    upstream CI remains required.
+    
+    Rebased onto the latest target branch on 2026-10-20 without conflicts;
+    `git range-diff` confirms both patch commits are unchanged. The selected
+    tests below and PP numbering tests were rerun after rebasing.
+    
+    **Bulk coalescing validation (2026-10-20):** **377 selected CPU tests
+    passed**, including 33 new coalescing tests and 5 PP stage-local
+    numbering tests. The new tests cover 384/128 and 5760/128 token layouts,
+    512/64 components, BF16/FP32, nonzero storage offsets, padding/guard
+    preservation, cross-padding-layout round trips, mixed layers, and
+    unsupported-layout/mode fallback. Eligible registration is tested with
+    the fallback made to fail, proving that the fast path executes:
+    descriptor counts drop from 6 to 1 or 3, and from 90 to 1 or 45. Startup
+    logs identify coalesced layers and descriptor counts.
+    
+    Two existing KVPP test methods were excluded because the isolated CPU
+    dependency mock rejects the `block_size` constructor argument; the same
+    six subtest failures were reproduced on the unmodified main baseline.
+    Python 3.14.7, PyTorch 2.14.1+cpu, NumPy 2.5.4, pytest 9.1.1; real CPU
+    tensors and raw byte copies were used with unrelated NPU/vLLM
+    dependencies mocked.
+    
+    A CPU-only address-construction microbenchmark with 25 layers reduced
+    the scale-3 no-padding descriptor count from 150 to 25 and median
+    construction time from about 22 to 4 microseconds. This is not a backend
+    transfer or model-throughput measurement. Ruff 0.14.0 check/format,
+    codespell and diff whitespace checks passed. The full manual pre-commit
+    suite was attempted locally but did not complete hook-environment
+    bootstrapping; full CI remains required.
+    
+    The CPU validation above covers address generation and byte
+    preservation; it does not cover NPU model inference, actual
+    backend/network integration, or performance.
+    
+    **Additional GPQA accuracy evaluation (2026-10-20):** Kimi K3 with
+    KVPool enabled was evaluated in three runs. The tester reported no
+    accuracy issue in these runs. These runs preceded the bulk-coalescing
+    follow-up and are not accuracy validation of that optimization:
+    
+    | Run | GPQA accuracy |
+    | --- | ---: |
+    | 1 | 93.94% |
+    | 2 | 91.92% |
+    | 3 | 93.43% |
+    
+    These are shared hardware accuracy results for the tested deployment,
+    not three independent evaluations of each PR branch. The aggregate
+    scores alone do not establish cold/warm output equivalence or prove that
+    the affected KVPool restore path was exercised in every run.
+    
+    **NPU bulk-path check and segmented A/B control (2026-10-20):** The
+    production hunks were backported onto the installed v0.30.0 daily image
+    on two idle A3 hosts (80.5.9.133/135), using the 5-layer/32-expert
+    pruned Kimi K3 weights, MRV2, TP16/DP2/EP, eager mode, synchronous
+    non-layerwise AscendStoreConnector with Mooncake v0.3.14-rc1, and HBM
+    prefix caching disabled. Both hosts logged 48 coalesced-layer
+    registrations (3 MLA layers across 16 TP ranks), each reducing 6
+    descriptors to 1. This proves the fast path executes with actual NPU
+    tensor storage; it is not an end-to-end throughput benchmark.
+    
+    Three GPQA prompts (IDs 131, 14, 78; 1983/1988/1968 input tokens) were
+    tested with fixed prompt token IDs, temperature 0, seed 1024,
+    concurrency 1 and 32 output tokens. Each case used cold, warm,
+    repeated-warm and fresh-salt cold-control requests. Fresh model
+    namespaces and fresh Mooncake masters isolated the two transfer
+    representations. Every warm request reported 1920 external-hit tokens,
+    176 worker GET keys and 16 load operations, corroborated by master GET
+    metrics.
+    
+    The segmented-only baseline was constructed by removing only the
+    coalescing follow-up while retaining the physical-block fix and all
+    inference settings. **All 12 corresponding output-token sequences
+    matched exactly between optimized and segmented-only runs.** Within each
+    version, however, all three cold/warm pairs differed (first divergence
+    at zero-based output positions 4, 18 and 4); cold controls matched cold
+    requests and repeated warm requests matched warm requests. This limited
+    A/B check found no new output difference attributable to coalescing, but
+    cold/warm equivalence did not pass and the underlying cause remains
+    unresolved. The pruned model and fixed plain-text prompts are a
+    cache-path probe, not a GPQA accuracy evaluation. Startup master
+    ping/lease timeouts occurred before readiness; the probe GET/PUT
+    operations completed without transfer failures.
+    
+    Full-model NPU accuracy, layerwise NPU E2E, other backend integrations
+    and end-to-end performance measurements for the coalescing follow-up
+    remain pending. The earlier GPQA aggregate scores do not establish
+    hardware correctness of every transfer path.
+    
+    AI assistance was used to diagnose and prepare this change.
+    
+    - vLLM main:
+    https://github.com/vllm-project/vllm/commit/c4df37dfcc7f72ca41cd43801a468526ecf99a2b
+    
+    ---------
+    
+    Signed-off-by: LifeOfCoffee <lcyzhyx@163.com>
+
+diff --git a/docs/source/user_guide/feature_guide/kv_cache_pool_ascend_store.md b/docs/source/user_guide/feature_guide/kv_cache_pool_ascend_store.md
+index 908c19314..6daa43d82 100644
+--- a/docs/source/user_guide/feature_guide/kv_cache_pool_ascend_store.md
++++ b/docs/source/user_guide/feature_guide/kv_cache_pool_ascend_store.md
+@@ -52,6 +52,16 @@ KV Cache supports the following three external storage backends, choose the stor
+     | Software Dependencies | Requires `openyuanrong-datasystem` |
+     | Feature Mutex | • Worker cannot configure both Coordinator and etcd discovery backends simultaneously.<br>• Under `P2P_TRANSFER` or FabricMem mode, client-side device memory pre-registration is always skipped regardless of `enable_dev_mem_pregister` value. |
+ 
++### Upgrading Pools with Strided MLA Caches
++
++Bulk and layerwise pooling transfer MLA components in separate physical-block segments when a scheduler block contains multiple kernel blocks with gaps between their payloads. The components must be contiguous inside each physical block. Partial layerwise transfers copy only the token interval covered by each segment. Dense cache layouts retain their existing packed representation.
++
++Pool objects written by the older contiguous-range implementation are incompatible with the corrected representation for affected layouts, even though their total byte size is unchanged. Upgrade all writers and readers together, and invalidate the affected pool entries or use a fresh cache namespace. For request-level isolation, use a new `cache_salt` consistently for requests that should share cached prefixes. Restarting vLLM workers alone does not invalidate persisted pool objects.
++
++For non-layerwise complete-block transfers, adjacent MLA components sharing one backing storage are coalesced into one descriptor per physical page, or one descriptor per logical block when the pages have no gaps. Padding is never copied. Layerwise transfers, partial-chunk configurations, align-state groups, decode-cache saving, TP mismatch, DCP and KVPP retain the component-segment fallback. Registration logs report each coalesced layer and its descriptor count.
++
++This bulk fast path uses physical-page-major object contents instead of the previous component-major segmented contents. A fresh namespace is required even when upgrading from the earlier segmented version of this fix. Writers and readers must agree on transfer mode and cache layout; do not share these objects with layerwise readers or workers using a different component layout.
++
+ ## Scenario 1: Mooncake Backend
+ 
+ ### Configuration Examples
+diff --git a/tests/ut/distributed/ascend_store/test_coalesced_cache_transfer.py b/tests/ut/distributed/ascend_store/test_coalesced_cache_transfer.py
+new file mode 100644
+index 000000000..838b12f25
+--- /dev/null
++++ b/tests/ut/distributed/ascend_store/test_coalesced_cache_transfer.py
+@@ -0,0 +1,128 @@
++# SPDX-License-Identifier: Apache-2.0
++"""Bulk coalescing must reduce descriptors without touching adjacent bytes."""
++
++import ctypes
++
++import pytest
++import torch
++
++import tests.ut.distributed.ascend_store._mock_deps  # noqa: F401
++from tests.ut.distributed.ascend_store.test_layerwise_strided_roundtrip import components
++from tests.ut.distributed.ascend_store.test_segmented_cache_transfer import make_database, make_worker
++
++
++def bulk_worker(views, scale, tokens, **overrides):
++    caches = {"model.layers.0.attn": views}
++    worker = make_worker(caches)
++    worker._extra_config = {}
++    worker.grouped_block_size = [scale * tokens]
++    worker.cache_transfer_granularity = scale * tokens
++    worker.physical_layer_to_group_layers = {}
++    for key, value in overrides.items():
++        setattr(worker, key, value)
++    worker._infer_cache_group_metadata(0, list(caches))
++    return worker
++
++
++@pytest.mark.parametrize("scale", [3, 45])
++@pytest.mark.parametrize("source_padding,dest_padding", [(0, 0), (3, 3), (0, 3), (3, 0)])
++@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32])
++def test_combined_bulk_roundtrip(scale, source_padding, dest_padding, dtype, monkeypatch):
++    tokens, nope, rope = 128, 512, 64
++    source, source_views = components(scale, source_padding, dtype, tokens, nope, rope)
++    dest, dest_views = components(scale, dest_padding, dtype, tokens, nope, rope)
++    expected, expected_views = components(scale, dest_padding, dtype, tokens, nope, rope)
++    for index, view in enumerate(source_views):
++        view.copy_(torch.arange(view.numel()).reshape(view.shape).remainder(97) + index * 100)
++    for src, exp in zip(source_views, expected_views):
++        exp[scale : 2 * scale].copy_(src[scale : 2 * scale])
++
++    databases = []
++    for views, padding in [(source_views, source_padding), (dest_views, dest_padding)]:
++        worker = bulk_worker(views, scale, tokens)
++        expected_count = scale if padding else 1
++        assert len(worker.group_block_len[0]) == expected_count
++        assert sum(worker.group_block_len[0]) == scale * tokens * (nope + rope) * views[0].element_size()
++        # Prove that the combined branch, rather than the segmented fallback,
++        # constructs the descriptors during normal metadata registration.
++        monkeypatch.setattr(worker, "_get_cache_transfer_segments", lambda _: pytest.fail("unexpected fallback"))
++        worker._infer_cache_group_metadata(0, list(worker.kv_caches))
++        db = make_database(worker, scale)
++        db.block_size = [scale * tokens]
++        databases.append(db)
++
++    src_addr, src_size, _ = databases[0].prepare_value(scale * tokens, 2 * scale * tokens, [0, 1])
++    dst_addr, dst_size, _ = databases[1].prepare_value(scale * tokens, 2 * scale * tokens, [0, 1])
++    payload = b"".join(ctypes.string_at(address, size) for address, size in zip(src_addr, src_size))
++    cursor = 0
++    for address, size in zip(dst_addr, dst_size):
++        ctypes.memmove(address, payload[cursor : cursor + size], size)
++        cursor += size
++    assert cursor == len(payload)
++    assert torch.equal(dest, expected), "copied padding, guards, or an unselected block"
++    assert torch.equal(source_views[0][scale : 2 * scale], dest_views[0][scale : 2 * scale])
++    assert torch.equal(source_views[1][scale : 2 * scale], dest_views[1][scale : 2 * scale])
++
++
++@pytest.mark.parametrize(
++    "overrides",
++    [
++        {"use_layerwise": True},
++        {"_extra_config": {"discard_partial_chunks": False}},
++        {"_extra_config": {"save_decode_cache": True}},
++        {"tp_mismatch": True},
++        {"dcp_size": 2},
++        {"use_kvpp": True},
++        {"cache_transfer_granularity": 5},
++        {"group_uses_align_state": [True]},
++        {"_extra_config": None},
++    ],
++)
++def test_unsupported_transfer_modes_keep_segmented_layout(overrides):
++    _, views = components(3, 3, torch.bfloat16)
++    worker = bulk_worker(views, 3, 2, **overrides)
++    expected = [segment for cache in views for segment in worker._get_cache_transfer_segments(cache)]
++    actual = list(zip(worker.group_kv_caches_base_addr[0], worker.group_block_len[0], worker.group_block_stride[0]))
++    assert actual == expected
++    assert worker.group_cache_entry_segments[0] == [(0, 3), (1, 3), (2, 3)] * 2
++
++
++@pytest.mark.parametrize("layout", ["separate_storage", "reversed", "gap", "different_shape", "different_dtype"])
++def test_incompatible_components_do_not_coalesce(layout):
++    _, views = components(3, 3, torch.float32)
++    first, second = views
++    if layout == "separate_storage":
++        _, other = components(3, 3, torch.float32)
++        second = other[1]
++    elif layout == "reversed":
++        first, second = second, first
++    elif layout == "gap":
++        second = torch.as_strided(second, second.shape, second.stride(), second.storage_offset() + 1)
++    elif layout == "different_shape":
++        second = second[:, :1]
++    else:
++        second = second.to(torch.bfloat16)
++    worker = bulk_worker((first, second), 3, 2)
++    assert worker._get_combined_cache_transfer_segments((first, second), 0) is None
++
++
++def test_dense_or_single_component_retains_existing_descriptors():
++    dense = torch.zeros(9, 2, 8)
++    worker = bulk_worker((dense,), 3, 2)
++    assert worker.group_kv_caches_base_addr[0] == [dense.data_ptr()]
++    assert worker.group_block_len[0] == [3 * dense[0].numel() * dense.element_size()]
++
++
++def test_ratio_one_retains_existing_descriptors():
++    _, views = components(1, 0, torch.bfloat16)
++    worker = bulk_worker(views, 1, 2)
++    assert len(worker.group_block_len[0]) == 2
++
++
++def test_mixed_layer_descriptor_offsets():
++    _, views = components(3, 0, torch.bfloat16)
++    worker = bulk_worker(views, 3, 2)
++    worker.kv_caches["model.layers.1.attn"] = (torch.zeros(9, 2, 8),)
++    worker._infer_cache_group_metadata(0, list(worker.kv_caches))
++    assert worker.group_layer_cache_entry_offsets[0] == [0, 1, 2]
++    assert worker.group_num_layers[0] == 2
+diff --git a/tests/ut/distributed/ascend_store/test_layerwise_strided_roundtrip.py b/tests/ut/distributed/ascend_store/test_layerwise_strided_roundtrip.py
+new file mode 100644
+index 000000000..1dcb0a909
+--- /dev/null
++++ b/tests/ut/distributed/ascend_store/test_layerwise_strided_roundtrip.py
+@@ -0,0 +1,158 @@
++# SPDX-License-Identifier: Apache-2.0
++"""Regression tests: the selected logical block must survive a raw-byte round trip."""
++
++import ctypes
++
++import numpy as np
++import pytest
++import torch
++
++import tests.ut.distributed.ascend_store._mock_deps  # noqa: F401
++from tests.ut.distributed.ascend_store.test_segmented_cache_transfer import make_database, make_worker
++from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.kv_transfer import LayerBatchBuilder
++from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.metadata import SharedBlockData
++
++
++def components(scale, padding, dtype, tokens=2, nope=8, rope=1):
++    slot = tokens * (nope + rope) + padding
++    backing = torch.full(((3 * scale + 2) * slot,), -1, dtype=dtype)
++    views = tuple(
++        torch.as_strided(backing, (3 * scale, tokens, 1, width), (slot, width, width, 1), storage_offset=slot + offset)
++        for width, offset in [(nope, 0), (rope, tokens * nope)]
++    )
++    return backing, views
++
++
++def addresses(database, mode, scale, tokens, token_count=None, layer_id=0, token_offset=0):
++    start = scale * tokens
++    start += token_offset
++    end = start + (scale * tokens if token_count is None else token_count)
++    if mode == "bulk":
++        addr, size, _ = database.prepare_value(start, end, [0, 1])
++        return addr, size, None
++    if mode == "legacy":
++        addr, size, _ = database.prepare_value_layer(start, end, [0, 1], layer_id)
++        return addr, size, None
++    builder = LayerBatchBuilder(database, sum(database.group_block_len[0]), database.group_num_layers["kv"][0])
++    shared = SharedBlockData(
++        block_ids_arr=np.array([1], dtype=np.int64),
++        block_gvas_arr=np.array([4096], dtype=np.int64) if mode == "gva" else None,
++        req_ids=["regression"],
++        is_last_chunks=[True],
++        block_keys=["regression-key"] if mode == "block_key" else None,
++    )
++    result = builder.build_addrs(shared, layer_id)
++    if mode == "gva":
++        return result.addr_array.tolist(), result.size_array.tolist(), result.gvas_array.tolist()
++    return result.all_buffers[0], result.all_sizes[0], result.all_offsets[0]
++
++
++def roundtrip(mode, scale, padding, dtype, tokens=2, nope=8, rope=1, token_count=None, token_offset=0):
++    source, source_views = components(scale, padding, dtype, tokens, nope, rope)
++    dest, dest_views = components(scale, padding, dtype, tokens, nope, rope)
++    expected, expected_views = components(scale, padding, dtype, tokens, nope, rope)
++    for i, view in enumerate(source_views):
++        view.copy_(torch.arange(view.numel()).reshape(view.shape).remainder(97) + i * 100)
++
++    def database(views):
++        worker = make_worker({"model.layers.0.self_attn.attn": views}, layerwise=mode != "bulk")
++        # The helper uses 2 tokens/physical block. Here the database's logical
++        # block size is explicit, including the 5760/128 hardware-shaped case.
++        db = make_database(worker, scale)
++        db.block_size = [scale * tokens]
++        return db
++
++    src_db, dst_db = database(source_views), database(dest_views)
++    addr, sizes, offsets = addresses(src_db, mode, scale, tokens, token_count, token_offset=token_offset)
++    dst_addr, dst_sizes, dst_offsets = addresses(dst_db, mode, scale, tokens, token_count, token_offset=token_offset)
++    assert sizes == dst_sizes
++    assert offsets == dst_offsets
++    # Serialize every segment before restoring, just as a pool PUT then GET.
++    payload = [ctypes.string_at(a, n) for a, n in zip(addr, sizes)]
++    for a, data in zip(dst_addr, payload):
++        ctypes.memmove(a, data, len(data))
++    count = scale * tokens if token_count is None else token_count
++    for sv, ev in zip(source_views, expected_views):
++        for token in range(token_offset, token_offset + count):
++            slot, offset = divmod(token, tokens)
++            ev[scale + slot, offset].copy_(sv[scale + slot, offset])
++    # Compare restored payload first, then guards, padding and unselected blocks.
++    bad_slots = [
++        i
++        for i in range(scale)
++        if any(not torch.equal(d[scale + i], e[scale + i]) for d, e in zip(dest_views, expected_views))
++    ]
++    assert not bad_slots, f"{mode}: incorrect physical slots {bad_slots}; descriptors={len(sizes)}"
++    assert torch.equal(dest, expected), f"{mode}: modified padding/guards/unselected data"
++
++
++@pytest.mark.parametrize("mode", ["bulk", "gva", "block_key", "legacy"])
++@pytest.mark.parametrize("scale", [1, 3, 45])
++@pytest.mark.parametrize("padding", [0, 3])
++@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32])
++def test_interleaved_full_block(mode, scale, padding, dtype):
++    roundtrip(mode, scale, padding, dtype)
++
++
++@pytest.mark.parametrize("mode", ["bulk", "gva", "block_key", "legacy"])
++def test_5760_token_block_128_token_kernel_bf16(mode):
++    roundtrip(mode, 45, 0, torch.bfloat16, tokens=128, nope=512, rope=64)
++
++
++@pytest.mark.parametrize("count", [1, 2, 3, 5, 6])
++@pytest.mark.parametrize("padding", [0, 3])
++@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32])
++def test_legacy_partial_block(count, padding, dtype):
++    roundtrip("legacy", 3, padding, dtype, token_count=count)
++
++
++@pytest.mark.parametrize("offset,count", [(1, 1), (1, 3), (2, 3), (3, 3), (5, 1), (0, 0)])
++def test_legacy_token_interval(offset, count):
++    roundtrip("legacy", 3, 3, torch.bfloat16, token_count=count, token_offset=offset)
++
++
++@pytest.mark.parametrize("mode", ["gva", "block_key", "legacy"])
++@pytest.mark.parametrize("segmented_layer", [0, 1])
++@pytest.mark.parametrize("layer_id", [0, 1])
++def test_mixed_layer_descriptor_counts(mode, segmented_layer, layer_id):
++    def make(fill):
++        backing, views = components(3, 3, torch.bfloat16)
++        dense = torch.full((9, 2, 8), fill, dtype=torch.bfloat16)
++        if fill != -1:
++            for i, view in enumerate(views):
++                view.copy_(torch.arange(view.numel()).reshape(view.shape).remainder(97) + i * 100)
++        caches = {f"model.layers.{i}.attn": views if i == segmented_layer else (dense,) for i in range(2)}
++        worker = make_worker(caches, layerwise=True)
++        return (backing, dense), caches, make_database(worker, 3)
++
++    src_storage, src_views, src_db = make(7)
++    dst_storage, dst_views, dst_db = make(-1)
++    expected_storage, expected_views, _ = make(-1)
++    src_addr, sizes, offsets = addresses(src_db, mode, 3, 2, layer_id=layer_id)
++    dst_addr, dst_sizes, dst_offsets = addresses(dst_db, mode, 3, 2, layer_id=layer_id)
++    assert sizes == dst_sizes
++    assert offsets == dst_offsets
++    for addr, data in zip(dst_addr, [ctypes.string_at(a, n) for a, n in zip(src_addr, sizes)]):
++        ctypes.memmove(addr, data, len(data))
++    layer = f"model.layers.{layer_id}.attn"
++    for original, expected in zip(src_views[layer], expected_views[layer]):
++        expected[3:6].copy_(original[3:6])
++    assert all(torch.equal(actual, expected) for actual, expected in zip(dst_storage, expected_storage))
++
++
++@pytest.mark.parametrize("mode", ["bulk", "gva", "block_key", "legacy"])
++def test_dense_scaled_control(mode):
++    source = torch.arange(3 * 45 * 2 * 8, dtype=torch.float32).reshape(3 * 45, 2, 8)
++    dest = torch.full_like(source, -1)
++
++    def db(tensor):
++        return make_database(make_worker({"model.layers.0.attn": (tensor,)}, layerwise=mode != "bulk"), 45)
++
++    a, n, _ = addresses(db(source), mode, 45, 2)
++    b, m, _ = addresses(db(dest), mode, 45, 2)
++    assert n == m
++    for dst, data in zip(b, [ctypes.string_at(p, s) for p, s in zip(a, n)]):
++        ctypes.memmove(dst, data, len(data))
++    expected = torch.full_like(source, -1)
++    expected[45:90].copy_(source[45:90])
++    assert torch.equal(dest, expected)
+diff --git a/tests/ut/distributed/ascend_store/test_mooncake_hybrid.py b/tests/ut/distributed/ascend_store/test_mooncake_hybrid.py
+index cd9e4265f..2104d3894 100644
+--- a/tests/ut/distributed/ascend_store/test_mooncake_hybrid.py
++++ b/tests/ut/distributed/ascend_store/test_mooncake_hybrid.py
+@@ -103,7 +103,9 @@ def cpu_cache(array):
+     cache = MagicMock()
+     cache.shape = array.shape
+     cache.element_size.return_value = array.itemsize
+-    cache.stride.return_value = array.strides[0] // array.itemsize
++    strides = tuple(stride // array.itemsize for stride in array.strides)
++    cache.stride.side_effect = lambda dim=None: strides if dim is None else strides[dim]
++    cache.numel.return_value = array.size
+     cache.data_ptr.return_value = array.ctypes.data
+     cache.untyped_storage.return_value.data_ptr.return_value = array.ctypes.data
+     cache.__getitem__.return_value.numel.return_value = array[0].size
+diff --git a/tests/ut/distributed/ascend_store/test_pool_worker.py b/tests/ut/distributed/ascend_store/test_pool_worker.py
+index 8b855d699..632fc7423 100644
+--- a/tests/ut/distributed/ascend_store/test_pool_worker.py
++++ b/tests/ut/distributed/ascend_store/test_pool_worker.py
+@@ -2876,7 +2876,8 @@ class TestKVPoolWorkerTpMismatch(unittest.TestCase):
+         fake_cache.shape = [100, 16, 4, 64]
+         fake_cache.__getitem__.return_value.numel.return_value = 16 * 4 * 64
+         fake_cache.element_size.return_value = 2
+-        fake_cache.stride.return_value = 16 * 4 * 64
++        strides = (16 * 4 * 64, 4 * 64, 64, 1)
++        fake_cache.stride.side_effect = lambda dim=None: strides if dim is None else strides[dim]
+         fake_cache.data_ptr.return_value = 10000
+         fake_cache.untyped_storage.return_value.data_ptr.return_value = 10000
+         worker._transfer_threads_started = True
+diff --git a/tests/ut/distributed/ascend_store/test_segmented_cache_transfer.py b/tests/ut/distributed/ascend_store/test_segmented_cache_transfer.py
+new file mode 100644
+index 000000000..a5c008405
+--- /dev/null
++++ b/tests/ut/distributed/ascend_store/test_segmented_cache_transfer.py
+@@ -0,0 +1,148 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++
++"""Exercise actual pool address generation against interleaved CPU storage."""
++
++import ctypes
++from types import SimpleNamespace
++
++import pytest
++
++import tests.ut.distributed.ascend_store._mock_deps  # noqa: F401, E402
++
++# isort: split
++import torch
++
++from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.metadata import ChunkedTokenDatabase
++from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.pool_worker import KVPoolWorker
++
++NUM_BLOCKS = 3
++TOKENS_PER_PHYSICAL_BLOCK = 2
++
++
++def make_worker(caches, *, layerwise=False):
++    worker = object.__new__(KVPoolWorker)
++    worker.num_blocks = NUM_BLOCKS
++    worker.use_layerwise = layerwise
++    worker.kv_caches = caches
++    worker.hf_config = SimpleNamespace(num_hidden_layers=2)
++    worker.num_layers = 2
++    worker._global_to_local_layer = {}
++    for name in (
++        "group_kv_caches_base_addr",
++        "group_block_len",
++        "group_block_stride",
++        "group_layer_cache_entry_offsets",
++        "group_cache_entry_segments",
++        "group_num_layers",
++    ):
++        setattr(worker, name, {})
++    worker._infer_cache_group_metadata(0, list(caches))
++    return worker
++
++
++def make_database(worker, scale):
++    database = ChunkedTokenDatabase([], [scale * TOKENS_PER_PHYSICAL_BLOCK], None)
++    database.set_group_buffers(
++        worker.group_kv_caches_base_addr,
++        worker.group_block_len,
++        worker.group_block_stride,
++        group_num_layers=worker.group_num_layers,
++        group_layer_cache_entry_offsets=worker.group_layer_cache_entry_offsets,
++        group_cache_entry_segments=worker.group_cache_entry_segments,
++    )
++    return database
++
++
++def make_components(scale, padding, dtype):
++    # Each physical slot contains [NoPE][RoPE][padding]. Use a nonzero
++    # storage offset and guard slots to catch out-of-region writes as well.
++    nope_width, rope_width = 4, 2
++    nope_elements = TOKENS_PER_PHYSICAL_BLOCK * nope_width
++    rope_elements = TOKENS_PER_PHYSICAL_BLOCK * rope_width
++    slot_elements = nope_elements + rope_elements + padding
++    slots = NUM_BLOCKS * scale
++    backing = torch.full(((slots + 2) * slot_elements,), -1, dtype=dtype)
++    components = tuple(
++        torch.as_strided(
++            backing,
++            (slots, TOKENS_PER_PHYSICAL_BLOCK, 1, width),
++            (slot_elements, width, width, 1),
++            storage_offset=slot_elements + component_offset,
++        )
++        for width, component_offset in ((nope_width, 0), (rope_width, nope_elements))
++    )
++    return backing, components
++
++
++@pytest.mark.parametrize("scale", [1, 3, 45])
++@pytest.mark.parametrize("padding", [0, 3])
++@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
++def test_pool_roundtrip_preserves_components_and_guards(scale, padding, dtype):
++    source, source_components = make_components(scale, padding, dtype)
++    destination, destination_components = make_components(scale, padding, dtype)
++    for component, view in enumerate(source_components):
++        view.copy_(torch.arange(view.numel()).reshape(view.shape).remainder(97) + component * 100)
++    layer = "model.layers.0.self_attn.attn"
++    source_worker = make_worker({layer: source_components})
++    destination_worker = make_worker({layer: destination_components})
++    source_db = make_database(source_worker, scale)
++    destination_db = make_database(destination_worker, scale)
++    selected_block = 1
++    start = selected_block * scale * TOKENS_PER_PHYSICAL_BLOCK
++    end = start + scale * TOKENS_PER_PHYSICAL_BLOCK
++    addresses, sizes, _ = source_db.prepare_value(start, end, [0, selected_block])
++    restored_addresses, restored_sizes, _ = destination_db.prepare_value(start, end, [0, selected_block])
++    assert sizes == restored_sizes
++    # Model a backend PUT followed by GET, rather than tensor indexing, so a
++    # wrong contiguous byte span reproduces the production corruption.
++    payload = [ctypes.string_at(address, size) for address, size in zip(addresses, sizes)]
++    for address, data in zip(restored_addresses, payload):
++        ctypes.memmove(address, data, len(data))
++    expected, expected_components = make_components(scale, padding, dtype)
++    selected = slice(selected_block * scale, (selected_block + 1) * scale)
++    for original, restored, reference in zip(source_components, destination_components, expected_components):
++        assert torch.equal(restored[selected], original[selected])
++        reference[selected].copy_(original[selected])
++    assert torch.equal(destination, expected), "Padding, guard slots and unselected blocks must remain untouched"
++    assert source_worker.group_num_layers[0] == 1
++    assert source_worker.group_layer_cache_entry_offsets[0] == [0, len(addresses)]
++    assert sum(sizes) == sum(view[selected].numel() * view.element_size() for view in source_components)
++
++
++def test_dense_scaled_cache_keeps_one_descriptor():
++    cache = torch.zeros(NUM_BLOCKS * 3, 2, 4)
++    worker = make_worker({"model.layers.0.attn": (cache,)})
++    assert worker.group_kv_caches_base_addr[0] == [cache.data_ptr()]
++    assert worker.group_block_len[0] == [cache[0].numel() * cache.element_size() * 3]
++
++
++def test_registration_covers_last_physical_payload():
++    _, components = make_components(45, 3, torch.float32)
++    worker = make_worker({"model.layers.0.attn": components})
++    for cache in components:
++        _, _, span, _ = worker._get_cache_block_metadata(cache)
++        expected = ((cache.shape[0] - 1) * cache.stride(0) + cache[0].numel()) * cache.element_size()
++        assert span == expected
++
++
++def test_layer_offsets_cover_different_segment_counts():
++    _, components = make_components(3, 3, torch.float32)
++    dense = torch.zeros(NUM_BLOCKS * 3, 2, 4)
++    worker = make_worker({"model.layers.1.attn": components, "model.layers.0.attn": (dense,)})
++    assert worker.group_num_layers[0] == 2
++    assert worker.group_layer_cache_entry_offsets[0] == [0, 1, 7]
++
++
++def test_layerwise_descriptors_preserve_physical_blocks():
++    _, components = make_components(3, 3, torch.float32)
++    worker = make_worker({"model.layers.0.attn": components}, layerwise=True)
++    assert worker.group_layer_cache_entry_offsets[0] == [0, 6]
++    assert worker.group_cache_entry_segments[0] == [(0, 3), (1, 3), (2, 3)] * 2
++
++
++@pytest.mark.parametrize("layerwise", [False, True])
++def test_segmented_transfer_rejects_noncontiguous_inner_block(layerwise):
++    cache = torch.zeros(NUM_BLOCKS * 3, 2, 8)[..., ::2]
++    with pytest.raises(ValueError, match="contiguous data inside each physical block"):
++        make_worker({"model.layers.0.attn": (cache,)}, layerwise=layerwise)
+diff --git a/tests/ut/kv_offload/test_pool_worker_pp_layer_count.py b/tests/ut/kv_offload/test_pool_worker_pp_layer_count.py
+index a4d8c0e05..fd8f2a1a2 100644
+--- a/tests/ut/kv_offload/test_pool_worker_pp_layer_count.py
++++ b/tests/ut/kv_offload/test_pool_worker_pp_layer_count.py
+@@ -86,6 +86,7 @@ def test_pp_stage_maps_multiple_cache_groups_to_local_layers(pp_rank, is_save):
+     worker.group_block_len = {}
+     worker.group_block_stride = {}
+     worker.group_layer_cache_entry_offsets = {}
++    worker.group_cache_entry_segments = {}
+     worker.group_num_layers = {}
+     for group_id, names in enumerate(group_layer_names):
+         worker._infer_cache_group_metadata(group_id, names)
+diff --git a/vllm_ascend/distributed/kv_transfer/kv_pool/ascend_store/metadata.py b/vllm_ascend/distributed/kv_transfer/kv_pool/ascend_store/metadata.py
+index 4b963e178..b738b951b 100644
+--- a/vllm_ascend/distributed/kv_transfer/kv_pool/ascend_store/metadata.py
++++ b/vllm_ascend/distributed/kv_transfer/kv_pool/ascend_store/metadata.py
+@@ -347,6 +347,9 @@ class ChunkedTokenDatabase:
+         self.group_block_len: dict[int, list[int]] = {}
+         self.group_block_stride: dict[int, list[int]] = {}
+         self.group_layer_cache_entry_offsets: dict[int, list[int]] = {}
++        # Per descriptor: physical-block index and count within a logical block.
++        # Compact contiguous descriptors cover the whole block as (0, 1).
++        self.group_cache_entry_segments: dict[int, list[tuple[int, int]]] = {}
+         self.group_cache_families: dict[str, dict[int, str]] = {
+             "kv": {},
+             "state": {},
+@@ -453,6 +456,7 @@ class ChunkedTokenDatabase:
+         group_cache_families: dict[int, str] | None = None,
+         group_num_layers: dict[int, int] | None = None,
+         group_layer_cache_entry_offsets: dict[int, list[int]] | None = None,
++        group_cache_entry_segments: dict[int, list[tuple[int, int]]] | None = None,
+     ) -> None:
+         if cache_role == "state":
+             # Keep the interface for future explicit state groups, but this
+@@ -463,6 +467,7 @@ class ChunkedTokenDatabase:
+             self.group_block_len = group_block_len
+             self.group_block_stride = group_block_stride or {}
+             self.group_layer_cache_entry_offsets = group_layer_cache_entry_offsets or {}
++            self.group_cache_entry_segments = group_cache_entry_segments or {}
+         if group_cache_families is not None:
+             self.group_cache_families[cache_role] = group_cache_families.copy()
+             self._key_prefix_cache.clear()
+@@ -520,17 +525,32 @@ class ChunkedTokenDatabase:
+         size_list: list[int] = []
+         group_addrs, group_block_len, group_block_stride = self._get_group_buffers(0)
+         num_layers = self.group_num_layers.get("kv", {}).get(0, 1)
+-        entries_per_layer = len(group_addrs) // num_layers if num_layers else 0
+-        if layer_id >= num_layers or entries_per_layer == 0:
++        if layer_id < 0 or layer_id >= num_layers:
+             return [], [], 0
+-        start_idx = layer_id * entries_per_layer
+-        for i in range(entries_per_layer):
+-            idx = start_idx + i
++        layer_offsets = self.group_layer_cache_entry_offsets.get(0)
++        if layer_offsets is None:
++            entries_per_layer = len(group_addrs) // num_layers if num_layers else 0
++            start_idx = layer_id * entries_per_layer
++            end_idx = start_idx + entries_per_layer
++        else:
++            start_idx, end_idx = layer_offsets[layer_id : layer_id + 2]
++        segments = self.group_cache_entry_segments.get(0)
++        start_in_block = start - block_idx * group_block_size
++        end_in_block = end - block_idx * group_block_size
++        for idx in range(start_idx, end_idx):
++            segment_index, segment_count = segments[idx] if segments else (0, 1)
++            segment_tokens = group_block_size // segment_count
++            segment_start = segment_index * segment_tokens
++            copy_start = max(start_in_block, segment_start)
++            copy_end = min(end_in_block, segment_start + segment_tokens)
++            if copy_start >= copy_end:
++                continue
+             block_stride = group_block_stride[idx] if group_block_stride else group_block_len[idx]
+-            addr = group_addrs[idx] + block_id * block_stride
+-            size = int(group_block_len[idx] / group_block_size * (end - start))
++            byte_start = group_block_len[idx] * (copy_start - segment_start) // segment_tokens
++            byte_end = group_block_len[idx] * (copy_end - segment_start) // segment_tokens
++            addr = group_addrs[idx] + block_id * block_stride + byte_start
+             addr_list.append(addr)
+-            size_list.append(size)
++            size_list.append(byte_end - byte_start)
+         return addr_list, size_list, block_id
+ 
+     def _iter_token_chunks(
+diff --git a/vllm_ascend/distributed/kv_transfer/kv_pool/ascend_store/pool_worker.py b/vllm_ascend/distributed/kv_transfer/kv_pool/ascend_store/pool_worker.py
+index 8b704f8c1..aa9976259 100644
+--- a/vllm_ascend/distributed/kv_transfer/kv_pool/ascend_store/pool_worker.py
++++ b/vllm_ascend/distributed/kv_transfer/kv_pool/ascend_store/pool_worker.py
+@@ -975,9 +975,80 @@ class KVPoolWorker:
+         block_size_scale = tensor_num_blocks // self.num_blocks
+         block_len = cache[0].numel() * cache.element_size() * block_size_scale
+         block_stride = cache.stride(0) * cache.element_size() * block_size_scale
+-        region_len = (self.num_blocks - 1) * block_stride + block_len if self.num_blocks else 0
++        # Registration covers the physical span, including gaps between kernel
++        # blocks inside one scheduler block and non-contiguous inner views.
++        region_len = (
++            (1 + sum((size - 1) * stride for size, stride in zip(cache.shape, cache.stride()))) * cache.element_size()
++            if cache.numel()
++            else 0
++        )
+         return block_len, block_stride, region_len, block_size_scale
+ 
++    def _get_cache_transfer_segments(self, cache: torch.Tensor) -> list[tuple[int, int, int]]:
++        """Describe full-block pool transfers without crossing kernel-page gaps.
++
++        Both bulk and layerwise transfers must preserve physical-block gaps.
++        Partial layerwise transfers also retain each segment's token interval.
++        """
++        block_len, block_stride, _, scale = self._get_cache_block_metadata(cache)
++        physical_bytes = block_len // scale
++        physical_stride = block_stride // scale
++        if scale == 1 or physical_stride == physical_bytes:
++            return [(cache.data_ptr(), block_len, block_stride)]
++        if not cache[0].is_contiguous():
++            raise ValueError("Segmented KV pool transfer requires contiguous data inside each physical block.")
++        return [(cache.data_ptr() + index * physical_stride, physical_bytes, block_stride) for index in range(scale)]
++
++    def _get_combined_cache_transfer_segments(
++        self, caches: tuple[torch.Tensor, ...], group_id: int
++    ) -> list[tuple[int, int, int]] | None:
++        """Coalesce adjacent MLA components for complete bulk pages only.
++
++        The packed object becomes physical-page major. All readers and writers
++        must use this layout and a fresh namespace when upgrading an old pool.
++        Layerwise/partial transfers retain component-major segment metadata.
++        """
++        if self.use_layerwise or len(caches) != 2:
++            return None
++        extra_config = getattr(self, "_extra_config", None)
++        if not isinstance(extra_config, dict) or extra_config.get("discard_partial_chunks", True) is not True:
++            return None
++        if extra_config.get("save_decode_cache", False) or getattr(self, "tp_mismatch", False):
++            return None
++        if getattr(self, "dcp_size", 1) != 1 or getattr(self, "use_kvpp", False):
++            return None
++        block_sizes = getattr(self, "grouped_block_size", ())
++        granularity = getattr(self, "cache_transfer_granularity", 0)
++        if group_id >= len(block_sizes) or not granularity or granularity % block_sizes[group_id]:
++            return None
++        align_state = getattr(self, "group_uses_align_state", ())
++        if group_id < len(align_state) and align_state[group_id]:
++            return None
++        first, second = caches
++        if (
++            first.ndim != 4
++            or second.ndim != 4
++            or first.shape[:-1] != second.shape[:-1]
++            or first.dtype != second.dtype
++            or first.device != second.device
++            or self._get_storage_key(first) != self._get_storage_key(second)
++            or not first[0].is_contiguous()
++            or not second[0].is_contiguous()
++        ):
++            return None
++        first_len, block_stride, _, scale = self._get_cache_block_metadata(first)
++        second_len, second_stride, _, second_scale = self._get_cache_block_metadata(second)
++        if scale <= 1 or scale != second_scale or block_stride != second_stride:
++            return None
++        first_bytes = first_len // scale
++        page_bytes = (first_len + second_len) // scale
++        page_stride = block_stride // scale
++        if second.data_ptr() != first.data_ptr() + first_bytes or page_stride < page_bytes:
++            return None
++        if page_stride == page_bytes:
++            return [(first.data_ptr(), first_len + second_len, block_stride)]
++        return [(first.data_ptr() + index * page_stride, page_bytes, block_stride) for index in range(scale)]
++
+     @staticmethod
+     def _get_storage_key(cache: torch.Tensor) -> int:
+         try:
+@@ -1031,6 +1102,7 @@ class KVPoolWorker:
+         group_addrs: list[int] = []
+         group_block_lens: list[int] = []
+         group_block_strides: list[int] = []
++        group_cache_entry_segments: list[tuple[int, int]] = []
+         layer_names_by_physical: dict[int, list[str]] = {}
+         for layer_name in layer_names:
+             phys = self._extract_physical_layer_index(layer_name)
+@@ -1045,17 +1117,33 @@ class KVPoolWorker:
+                 )
+             for layer_name in sorted(layer_names_by_physical[phys]):
+                 cache_or_caches = self.kv_caches[layer_name]
+-                for cache in self._as_cache_tuple(cache_or_caches):
+-                    base_addr = cache.data_ptr()
+-                    block_len, block_stride, _, _ = self._get_cache_block_metadata(cache)
+-                    group_addrs.append(base_addr)
+-                    group_block_lens.append(block_len)
+-                    group_block_strides.append(block_stride)
++                caches = self._as_cache_tuple(cache_or_caches)
++                combined = self._get_combined_cache_transfer_segments(caches, group_id)
++                cache_segments = (
++                    [combined]
++                    if combined is not None
++                    else [self._get_cache_transfer_segments(cache) for cache in caches]
++                )
++                for segments in cache_segments:
++                    for segment_index, (base_addr, block_len, block_stride) in enumerate(segments):
++                        group_cache_entry_segments.append((segment_index, len(segments)))
++                        group_addrs.append(base_addr)
++                        group_block_lens.append(block_len)
++                        group_block_strides.append(block_stride)
++                if combined is not None:
++                    logger.info(
++                        "KVPool coalesced bulk cache layer=%s group=%d descriptors=%d->%d",
++                        layer_name,
++                        group_id,
++                        2 * (caches[0].shape[0] // self.num_blocks),
++                        len(combined),
++                    )
+             layer_cache_entry_offsets.append(len(group_addrs))
+         self.group_kv_caches_base_addr[group_id] = group_addrs
+         self.group_block_len[group_id] = group_block_lens
+         self.group_block_stride[group_id] = group_block_strides
+         self.group_layer_cache_entry_offsets[group_id] = layer_cache_entry_offsets
++        self.group_cache_entry_segments[group_id] = group_cache_entry_segments
+         self.group_num_layers[group_id] = len(layer_names_by_physical)
+ 
+     def _align_kv_ptrs(self, registered_regions: dict[int, tuple[int, int]]):
+@@ -1157,6 +1245,7 @@ class KVPoolWorker:
+         self.group_block_len: dict[int, list[int]] = {}
+         self.group_block_stride: dict[int, list[int]] = {}
+         self.group_layer_cache_entry_offsets: dict[int, list[int]] = {}
++        self.group_cache_entry_segments: dict[int, list[tuple[int, int]]] = {}
+         self.kv_caches = kv_caches
+         if self.use_kvpp:
+             self.physical_layer_to_group_layers.clear()
+@@ -1240,6 +1329,7 @@ class KVPoolWorker:
+             group_cache_families=self.group_kv_cache_families,
+             group_num_layers=self.group_num_layers,
+             group_layer_cache_entry_offsets=self.group_layer_cache_entry_offsets,
++            group_cache_entry_segments=self.group_cache_entry_segments,
+         )
+ 
+         if self.tp_mismatch:

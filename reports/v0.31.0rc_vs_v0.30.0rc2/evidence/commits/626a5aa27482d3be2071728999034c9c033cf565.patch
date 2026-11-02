@@ -1,0 +1,264 @@
+commit 626a5aa27482d3be2071728999034c9c033cf565
+Author:     SHUAI YANG <shuaiyang047@163.com>
+AuthorDate: Fri Oct 9 12:00:43 2026 +0800
+Commit:     GitHub <noreply@github.com>
+CommitDate: Fri Oct 9 12:00:43 2026 +0800
+
+    [BugFix][310P] Select kernel block sizes compatible with physical KV cache blocks (#17964)
+    
+    ### What this PR does / why we need it?
+    Fix 310P KV cache initialization and input handling for MRV1 and MRV2.
+    
+    - Select attention kernel block sizes that satisfy the hardware limit
+    and evenly divide the physical KV cache block size. This fixes startup
+    failures when a 64-token physical block is paired with a 128-token
+    kernel block.
+    - Raise `NotImplementedError` when no compatible kernel block size
+    exists instead of falling back to an unchecked block size.
+    - Compare MRV1 cache sizes against the initial input batch block size so
+    the batch is rebuilt when backend selection changes the cache block
+    size, preventing incorrect KV cache addressing.
+    - Clear padded input token IDs after the MRV2 decode copy to prevent
+    stale or out-of-vocabulary IDs from entering FULL decode graphs.
+    
+    ### Does this PR introduce _any_ user-facing change?
+    None
+    ### How was this patch tested?
+    
+    
+    - vLLM main:
+    https://github.com/vllm-project/vllm/commit/ced6857afa0ea7b2e3f0846a62e1394e90f15607
+    
+    ---------
+    
+    Signed-off-by: YangShuai52 <shuaiyang047@163.com>
+
+diff --git a/tests/ut/_310p/test_model_runner_310p.py b/tests/ut/_310p/test_model_runner_310p.py
+index b7c98b234..83337d765 100644
+--- a/tests/ut/_310p/test_model_runner_310p.py
++++ b/tests/ut/_310p/test_model_runner_310p.py
+@@ -18,6 +18,7 @@ from types import SimpleNamespace
+ from unittest.mock import MagicMock, patch
+ 
+ import numpy as np
++import pytest
+ import torch
+ from vllm.config import CUDAGraphMode
+ from vllm.v1.kv_cache_interface import AttentionSpec, MambaSpec
+@@ -134,6 +135,7 @@ class TestNPUModelRunner310(TestBase):
+         runner.pin_memory = False
+         runner.is_pooling_model = False
+         runner.model_config = SimpleNamespace(max_model_len=512, get_vocab_size=lambda: 32000)
++        runner.block_size = 128
+         runner.cache_config = SimpleNamespace(block_size=128, enable_prefix_caching=True)
+         runner.parallel_config = SimpleNamespace(cp_kv_cache_interleave_size=4)
+         runner.vllm_config = SimpleNamespace(speculative_config=None)
+@@ -177,3 +179,67 @@ class TestNPUModelRunner310(TestBase):
+         self.assertEqual(kwargs["max_num_blocks_per_req"], [4, 6])
+         self.assertIs(kwargs["kv_cache_groups"], kv_cache_config.kv_cache_groups)
+         self.assertEqual(kwargs["cp_kv_cache_interleave_size"], 4)
++
++
++@pytest.mark.parametrize(
++    ("physical_block_size", "head_size", "expected_kernel_sizes"),
++    [(64, 128, [64]), (128, 128, [128, 64]), (128, 256, [64]), (256, 128, [128, 64])],
++)
++def test_attention_kernel_blocks_match_input_batch_and_cache_shape(
++    physical_block_size, head_size, expected_kernel_sizes
++) -> None:
++    runner = object.__new__(NPUModelRunner310)
++    runner.max_num_reqs = 8
++    runner.max_model_len = 512
++    runner.max_encoder_len = 0
++    runner.max_num_tokens = 1024
++    runner.device = torch.device("cpu")
++    runner.pin_memory = False
++    runner.is_pooling_model = False
++    runner.model_config = SimpleNamespace(get_vocab_size=lambda: 32000)
++    runner.block_size = 128
++    runner.cache_config = SimpleNamespace(block_size=128, enable_prefix_caching=False)
++    runner.parallel_config = SimpleNamespace(cp_kv_cache_interleave_size=1)
++    runner.vllm_config = SimpleNamespace(speculative_config=None)
++    runner.offload_config = SimpleNamespace(uva=SimpleNamespace(cpu_offload_gb=0))
++    runner.input_batch = SimpleNamespace(logitsprocs=MagicMock())
++    runner.attn_backend = MagicMock()
++    runner.attn_backend.get_supported_kernel_block_sizes.return_value = [128, 64]
++    runner.attn_backend.get_kv_cache_shape.side_effect = lambda n, b, h, d: (2, n, h * d // 16, b, 16)
++    runner.attn_groups = [[SimpleNamespace(backend=runner.attn_backend)]]
++    runner.runner_only_attn_layers = set()
++    runner._acl_format = 0
++    spec = AttentionSpec(block_size=physical_block_size, num_kv_heads=2, head_size=head_size, dtype=torch.float16)
++    cache_tensor = SimpleNamespace(size=4 * spec.page_size_bytes)
++    cache_config = SimpleNamespace(
++        num_blocks=4,
++        kv_cache_groups=[SimpleNamespace(kv_cache_spec=spec, layer_names=["model.attn"])],
++        kv_cache_tensors=[cache_tensor],
++    )
++    with (
++        patch("vllm_ascend._310p.model_runner_310p.NPUInputBatch") as input_batch,
++        patch("vllm_ascend._310p.model_runner_310p.get_decode_context_model_parallel_world_size", return_value=1),
++    ):
++        runner.may_reinitialize_input_batch(cache_config)
++    assert input_batch.call_args.kwargs["kernel_block_sizes"] == [expected_kernel_sizes]
++    assert input_batch.call_args.kwargs["block_sizes"] == [physical_block_size]
++    # The parent input batch now takes only the first candidate for each group.
++    assert physical_block_size % expected_kernel_sizes[0] == 0
++
++    with (
++        patch("vllm_ascend._310p.model_runner_310p.get_kv_cache_tensor_layers", return_value=["model.attn"]),
++        patch("vllm_ascend._310p.model_runner_310p.torch_npu.empty_with_format", create=True) as allocate,
++    ):
++        caches = runner._allocate_kv_cache_tensors(cache_config)
++    kernel_size = expected_kernel_sizes[0]
++    runner.attn_backend.get_kv_cache_shape.assert_called_once_with(
++        4 * physical_block_size // kernel_size, kernel_size, 2, head_size
++    )
++    assert allocate.call_count == 2
++    assert allocate.call_args.kwargs["size"] == (
++        4 * physical_block_size // kernel_size,
++        2 * head_size // 16,
++        kernel_size,
++        16,
++    )
++    assert set(caches) == {"model.attn"}
+diff --git a/tests/ut/_310p/test_model_runner_v2_310p.py b/tests/ut/_310p/test_model_runner_v2_310p.py
+index 1877ab1d8..211a6b1b3 100644
+--- a/tests/ut/_310p/test_model_runner_v2_310p.py
++++ b/tests/ut/_310p/test_model_runner_v2_310p.py
+@@ -951,3 +951,52 @@ def test_worker_selects_v2_runner_on_310p() -> None:
+     with patch("vllm_ascend._310p.worker.v2.model_runner.NPUModelRunner310V2") as runner_cls:
+         worker.model_runner = worker._create_model_runner()
+     runner_cls.assert_called_once_with(worker.vllm_config, worker.device)
++
++
++@pytest.mark.parametrize(
++    ("block_sizes", "head_sizes", "expected_kernel_size"),
++    [([64], [128], 64), ([128], [128], 128), ([128], [256], 64), ([256], [128], 128), ([128, 64], [128, 128], 64)],
++)
++def test_adjust_kernel_block_sizes_respects_physical_blocks(block_sizes, head_sizes, expected_kernel_size):
++    class FakeAttentionSpec:
++        def __init__(self, block_size, head_size):
++            self.block_size = block_size
++            self.head_size = head_size
++
++    class FakeUniformTypeKVCacheSpecs:
++        def __init__(self, specs):
++            self.kv_cache_specs = dict(enumerate(specs))
++
++    specs = [FakeAttentionSpec(b, h) for b, h in zip(block_sizes, head_sizes)]
++    group_spec = specs[0] if len(specs) == 1 else FakeUniformTypeKVCacheSpecs(specs)
++    runner = object.__new__(NPUModelRunner310V2)
++    runner.kernel_block_sizes = [128]
++    runner.attn_groups = [
++        [SimpleNamespace(backend=SimpleNamespace(get_supported_kernel_block_sizes=lambda: [128, 64]))]
++    ]
++    config = SimpleNamespace(kv_cache_groups=[SimpleNamespace(kv_cache_spec=group_spec)])
++    with (
++        patch.object(model_runner_module, "AttentionSpec", FakeAttentionSpec),
++        patch.object(model_runner_module, "UniformTypeKVCacheSpecs", FakeUniformTypeKVCacheSpecs),
++    ):
++        runner._adjust_kernel_block_sizes(config)
++    assert runner.kernel_block_sizes == [expected_kernel_size]
++    assert all(b % expected_kernel_size == 0 for b in block_sizes)
++
++
++def test_adjust_kernel_block_sizes_rejects_incompatible_physical_blocks():
++    class FakeAttentionSpec:
++        block_size = 96
++        head_size = 128
++
++    runner = object.__new__(NPUModelRunner310V2)
++    runner.kernel_block_sizes = [128]
++    runner.attn_groups = [
++        [SimpleNamespace(backend=SimpleNamespace(get_supported_kernel_block_sizes=lambda: [128, 64]))]
++    ]
++    config = SimpleNamespace(kv_cache_groups=[SimpleNamespace(kv_cache_spec=FakeAttentionSpec())])
++    with (
++        patch.object(model_runner_module, "AttentionSpec", FakeAttentionSpec),
++        pytest.raises(NotImplementedError, match="divides every attention cache block size"),
++    ):
++        runner._adjust_kernel_block_sizes(config)
+diff --git a/vllm_ascend/_310p/attention/attention_v1.py b/vllm_ascend/_310p/attention/attention_v1.py
+index c791781c1..29b395691 100644
+--- a/vllm_ascend/_310p/attention/attention_v1.py
++++ b/vllm_ascend/_310p/attention/attention_v1.py
+@@ -98,6 +98,14 @@ class AscendAttentionBackend310(AscendAttentionBackend):
+     def get_supported_kernel_block_sizes() -> list[int]:
+         return [128, 64]
+ 
++    @classmethod
++    def get_preferred_block_size(cls, default_block_size: int) -> int:
++        # Keep the 310P default at 128 rather than selecting the smallest
++        # supported size (64), which regresses paged decode performance.
++        if cls.supports_block_size(default_block_size):
++            return default_block_size
++        return 128
++
+ 
+ class AscendAttentionBackendImpl310(AscendAttentionBackendImpl):
+     """
+diff --git a/vllm_ascend/_310p/model_runner_310p.py b/vllm_ascend/_310p/model_runner_310p.py
+index e7745051a..198a8a686 100644
+--- a/vllm_ascend/_310p/model_runner_310p.py
++++ b/vllm_ascend/_310p/model_runner_310p.py
+@@ -802,6 +802,7 @@ class NPUModelRunner310(NPUModelRunner):
+                         support_size
+                         for support_size in self.attn_backend.get_supported_kernel_block_sizes()
+                         if support_size * kv_cache_spec.head_size <= _ATTENTION_BLOCK_SIZE_LIMIT
++                        and kv_cache_spec.block_size % support_size == 0
+                     ]
+                     if supported_sizes:
+                         block_size = supported_sizes[0]
+@@ -972,6 +973,7 @@ class NPUModelRunner310(NPUModelRunner):
+                         support_size
+                         for support_size in backend.get_supported_kernel_block_sizes()
+                         if support_size * kv_cache_spec.head_size <= _ATTENTION_BLOCK_SIZE_LIMIT
++                        and kv_cache_spec.block_size % support_size == 0
+                     ]
+                     kernel_block_size_list = supported_sizes if supported_sizes else [self.cache_config.block_size]
+                 except IndexError:
+@@ -992,9 +994,12 @@ class NPUModelRunner310(NPUModelRunner):
+                 max_num_blocks_per_req = max(max_num_blocks_per_req, mamba_blocks_per_req)
+             max_num_blocks.append(max_num_blocks_per_req)
+ 
++        # Backend selection may update cache_config.block_size after the
++        # initial input batch is created. Compare against its original size,
++        # otherwise a 128-token table can survive a switch to 64-token caches.
+         if (
+-            block_sizes != [self.cache_config.block_size]
+-            or self.kernel_block_sizes != [[self.cache_config.block_size]]
++            block_sizes != [self.block_size]
++            or self.kernel_block_sizes != [[self.block_size]]
+             or len(kv_cache_config.kv_cache_groups) > 1
+         ):
+             assert self.offload_config.uva.cpu_offload_gb == 0, (
+diff --git a/vllm_ascend/_310p/worker/v2/model_runner.py b/vllm_ascend/_310p/worker/v2/model_runner.py
+index 3375d468a..f072cb73e 100644
+--- a/vllm_ascend/_310p/worker/v2/model_runner.py
++++ b/vllm_ascend/_310p/worker/v2/model_runner.py
+@@ -827,10 +827,12 @@ class NPUModelRunner310V2(NPUModelRunner):
+                 block_size
+                 for block_size in backend.get_supported_kernel_block_sizes()
+                 if block_size * max_head_size <= _ATTENTION_BLOCK_SIZE_LIMIT
++                and all(spec.block_size % block_size == 0 for spec in attention_specs)
+             ]
+             if not supported_sizes:
+                 raise NotImplementedError(
+-                    f"310P paged attention requires block_size * head_size <= {_ATTENTION_BLOCK_SIZE_LIMIT}."
++                    f"310P paged attention requires block_size * head_size <= {_ATTENTION_BLOCK_SIZE_LIMIT} "
++                    "and a kernel block size that divides every attention cache block size in the group."
+                 )
+             self.kernel_block_sizes[group_id] = supported_sizes[0]
+ 
+@@ -1114,6 +1116,11 @@ class NPUModelRunner310V2(NPUModelRunner):
+                 self.input_buffers.input_ids[:num_decode_reqs].copy_(
+                     decode_tokens.to(self.input_buffers.input_ids.dtype)
+                 )
++                # FULL decode graphs embed padded rows as well. Clear them
++                # after the partial copy: reused buffers may contain stale
++                # out-of-vocabulary IDs, and 310P slice writes can affect the
++                # adjacent tail element.
++                self.input_buffers.input_ids[num_decode_reqs:num_tokens_after_padding].zero_()
+                 return
+             self._decode_req_indices.np[:num_decode_reqs] = decode_req_indices
+             self._decode_input_indices.np[:num_decode_reqs] = decode_input_indices

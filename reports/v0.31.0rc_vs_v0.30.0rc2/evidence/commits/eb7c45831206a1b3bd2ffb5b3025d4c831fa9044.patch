@@ -1,0 +1,166 @@
+commit eb7c45831206a1b3bd2ffb5b3025d4c831fa9044
+Author:     lijiahang226 <216526138+lijiahang226@users.noreply.github.com>
+AuthorDate: Sun Oct 18 14:47:10 2026 +0800
+Commit:     GitHub <noreply@github.com>
+CommitDate: Sun Oct 18 14:47:10 2026 +0800
+
+    [BugFix] Preserve GLM-5.3-Flash MRV2 MTP capture lifecycle (#16936)
+    
+    ### What this PR does / why we need it?
+    
+    When `index_share_for_mtp_iteration` is enabled, MTP runtime computes
+    top-k in the first draft step and reuses those indices in later steps.
+    The Ascend MRV2 capture override omitted the existing lifecycle hooks
+    and captured decode with `skip_topk=False`, while runtime uses `True`.
+    
+    Call the existing prefill/decode hooks around graph capture and clear
+    the request mapping before capture. This records the runtime branch and
+    restores ordinary mode afterwards. Extend the existing capture tests to
+    verify the single-step and multi-step lifecycle.
+    
+    Refs #15665. Related MRV2 work: #16755.
+    
+    ### Does this PR introduce _any_ user-facing change?
+    
+    Corrects shared-index MTP graph capture for GLM-5.3-Flash on MRV2. No
+    new option is introduced.
+    
+    ### How was this patch tested?
+    
+    - Isolated CPU execution of existing metadata regression cases and
+    actual capture/MTP hook methods: **16 passed**. Framework and kernel
+    boundaries are isolated; these are not full-module or NPU tests.
+    - A counterfactual using the base capture method records draft decode
+    with `skip_topk=False`; the updated method records `True`, matching
+    runtime.
+    - Current-head [pre-commit, including Linux hooks and
+    mypy](https://github.com/vllm-project/vllm-ascend/actions/runs/39021249056/job/117363337242):
+    **passed**. CPU/device CI is pending in [the same
+    run](https://github.com/vllm-project/vllm-ascend/actions/runs/39021249056).
+    Current-head Nightly has not run; direct workflow dispatch was rejected
+    with HTTP 403.
+    - Current-head NPU graph/MTP accuracy and complete GSM8K remain
+    unverified. Existing `glm-5.2-w4a8-mtp-v2` nightly enables eager draft
+    execution, so it can check compatibility but cannot establish draft
+    graph replay correctness.
+    
+    ---
+    
+    
+    - vLLM main:
+    https://github.com/vllm-project/vllm/commit/c4df37dfcc7f72ca41cd43801a468526ecf99a2b
+    
+    Signed-off-by: Li Jiahang <216526138+lijiahang226@users.noreply.github.com>
+
+diff --git a/tests/ut/worker/test_mtp_pcp_speculator_v2.py b/tests/ut/worker/test_mtp_pcp_speculator_v2.py
+index c2281afcc..5fb3cb0f9 100644
+--- a/tests/ut/worker/test_mtp_pcp_speculator_v2.py
++++ b/tests/ut/worker/test_mtp_pcp_speculator_v2.py
+@@ -850,15 +850,21 @@ def test_graph_prefill_uses_local_dummy_metadata(attn_architecture: str) -> None
+         assert kwargs["seq_lens_cpu_upper_bound"] is speculator.input_batch.seq_lens_cpu_upper_bound
+ 
+ 
+-@pytest.mark.parametrize("replicated", [False, True])
+-def test_capture_preserves_prepared_prefill_inputs(replicated: bool) -> None:
++@pytest.mark.parametrize(("replicated", "num_steps"), [(False, 1), (True, 1), (False, 3)])
++def test_capture_preserves_prepared_prefill_inputs(replicated: bool, num_steps: int) -> None:
+     speculator = object.__new__(AscendMTPSpeculator)
+     speculator.replicated_pcp = replicated
+     speculator.pcp_manager = object()
+     speculator.model_state = SimpleNamespace(pcp_manager=speculator.pcp_manager)
+     speculator.last_token_indices = torch.ones(2, dtype=torch.int32)
+-    speculator.num_speculative_steps = 1
++    speculator.idx_mapping = torch.ones(2, dtype=torch.int32)
++    speculator.max_num_reqs = 2
++    speculator.num_speculative_steps = num_steps
++    speculator.share_mtp_topk_indices = True
++    speculator.model = SimpleNamespace(model=MagicMock())
+     speculator.prefill_cudagraph_manager = MagicMock(use_breakable_cg=False)
++    speculator.decode_cudagraph_manager = MagicMock()
++    speculator.input_buffers = object()
+     speculator.target_input_buffers = object()
+     speculator.block_tables = object()
+     speculator.attn_groups = []
+@@ -884,8 +890,16 @@ def test_capture_preserves_prepared_prefill_inputs(replicated: bool) -> None:
+         chosen.assert_called_once_with(metadata, slots)
+         unused = speculator._prefill if replicated else upstream_prefill
+         unused.assert_not_called()
+-    metadata_context.__exit__.assert_called_once()
++    assert metadata_context.__exit__.call_count == (2 if num_steps > 1 else 1)
+     assert speculator.model_state.pcp_manager is speculator.pcp_manager
++    assert speculator.last_token_indices.tolist() == speculator.idx_mapping.tolist() == [0, 0]
++    assert [c.args[0] for c in speculator.model.model.set_skip_topk.call_args_list] == (
++        [False, True, False] if num_steps > 1 else [False]
++    )
++    compact = speculator.model.model.compact_topk_indices
++    assert compact.call_count == (1 if num_steps > 1 else 0)
++    if num_steps > 1:
++        assert compact.call_args.args[0].tolist() == [0, 0]
+ 
+ 
+ @pytest.mark.parametrize(
+diff --git a/tests/ut/worker/v2/test_speculator.py b/tests/ut/worker/v2/test_speculator.py
+index dc9d75b01..6460a31da 100644
+--- a/tests/ut/worker/v2/test_speculator.py
++++ b/tests/ut/worker/v2/test_speculator.py
+@@ -543,6 +543,8 @@ def test_capture_single_step_only_captures_prefill():
+     """Test single-step capture only captures the prefill graph."""
+     speculator = AscendAutoRegressiveSpeculator.__new__(AscendAutoRegressiveSpeculator)
+     speculator.last_token_indices = MagicMock()
++    speculator.idx_mapping = torch.ones(2, dtype=torch.int32)
++    speculator.max_num_reqs = 2
+     speculator.prefill_cudagraph_manager = MagicMock()
+     speculator.prefill_cudagraph_manager.use_breakable_cg = True
+     speculator.decode_cudagraph_manager = MagicMock()
+@@ -569,6 +571,8 @@ def test_capture_multi_step_captures_decode():
+     """Test multi-step capture includes the decode graph."""
+     speculator = AscendAutoRegressiveSpeculator.__new__(AscendAutoRegressiveSpeculator)
+     speculator.last_token_indices = MagicMock()
++    speculator.idx_mapping = torch.ones(2, dtype=torch.int32)
++    speculator.max_num_reqs = 2
+     speculator.prefill_cudagraph_manager = MagicMock()
+     speculator.prefill_cudagraph_manager.use_breakable_cg = False
+     speculator.decode_cudagraph_manager = MagicMock()
+diff --git a/vllm_ascend/worker/v2/spec_decode/autoregressive/speculator.py b/vllm_ascend/worker/v2/spec_decode/autoregressive/speculator.py
+index 9d1630901..bc37abbb8 100644
+--- a/vllm_ascend/worker/v2/spec_decode/autoregressive/speculator.py
++++ b/vllm_ascend/worker/v2/spec_decode/autoregressive/speculator.py
+@@ -398,6 +398,7 @@ class AscendAutoRegressiveSpeculator(LmheadTPDraftSamplingMixin, AutoRegressiveS
+         # Reset indices to zeros to prevent stale values from prior
+         # dummy runs to cause out-of-bounds indexing during capture.
+         self.last_token_indices.zero_()
++        self.idx_mapping.zero_()
+ 
+         # Capture the prefill routine (model forward + compute_logits +
+         # sample).
+@@ -407,6 +408,7 @@ class AscendAutoRegressiveSpeculator(LmheadTPDraftSamplingMixin, AutoRegressiveS
+         assert self.prefill_cudagraph_manager is not None
+         if self.prefill_cudagraph_manager.use_breakable_cg:
+             self.prefill_cudagraph_manager.init_breakable_cg_runner(self.model)
++        self.on_prefill_begin(self.max_num_reqs)
+         with (
+             disable_target_pcp_for_replicated_draft(self),
+             build_attn_metadata_wrapper(),
+@@ -423,12 +425,14 @@ class AscendAutoRegressiveSpeculator(LmheadTPDraftSamplingMixin, AutoRegressiveS
+                 self.kv_cache_config,
+                 progress_bar_desc="Capturing prefill CUDA graphs",
+             )
++        self.on_prefill_end(self.max_num_reqs)
+ 
+         if self.num_speculative_steps == 1:
+             return
+ 
+         # Capture all decode draft generation steps as a single graph.
+         assert self.decode_cudagraph_manager is not None
++        self.on_multi_step_decode_begin(self.max_num_reqs)
+         with (
+             disable_target_pcp_for_replicated_draft(self),
+             build_attn_metadata_wrapper(),
+@@ -442,6 +446,7 @@ class AscendAutoRegressiveSpeculator(LmheadTPDraftSamplingMixin, AutoRegressiveS
+                 self.kv_cache_config,
+                 progress_bar_desc="Capturing decode CUDA graphs",
+             )
++        self.on_multi_step_decode_end(self.max_num_reqs)
+ 
+     @torch.inference_mode()
+     def _run_model(

@@ -1,0 +1,2699 @@
+commit 846116e14a2b6ae1e8fbcb2dbe2d6e4ddadf1755
+Author:     freyfwt <110148731+freyfwt@users.noreply.github.com>
+AuthorDate: Mon Oct 12 21:23:53 2026 +0800
+Commit:     GitHub <noreply@github.com>
+CommitDate: Mon Oct 12 21:23:53 2026 +0800
+
+    [BugFix][EPLB] Fix HIXL registration ranges and resource cleanup (#18217)
+    
+    ### What this PR does / why we need it?
+    
+    HIXL EPLB currently registers whole allocator snapshot segments.
+    Expandable segments can grow at the same address or release unused
+    physical pages while their registrations remain active. Main-model and
+    MoE-draft communicators can also register overlapping aligned ranges
+    independently.
+    
+    Give each EPLB state one private HIXL session. After all loading-time
+    `add_model()` calls, initialize it before starting the existing async
+    worker. Register the union of the actual expert-weight and
+    receive-buffer spans across every participating model: align outward to
+    2 MiB and merge overlapping or adjacent ranges without bridging gaps.
+    This includes identical starts with different lengths and distinct model
+    allocations sharing aligned coverage. Pin the original storage until
+    deregistration succeeds. Each model retains its own layers, slots,
+    addresses, strides, and READ descriptors. Transfers still access the
+    original weights and existing expert buffers directly, with no
+    additional D2D copies or changes to allocation methods.
+    
+    Validate the ordered model manifest and metadata across ranks before
+    registration and connection, and reject additions after initialization.
+    Limit each rank's shared session to 4000 aligned, merged registration
+    ranges across all participating models. Exceeding the limit fails before
+    the first local backend registration and uses the existing
+    initialization rollback. Keep one owner for connections, registered
+    handles, and submitted requests. Terminal status queries consume backend
+    request handles, so never query those handles again. Failures anywhere
+    in the HIXL background migration, including context restoration and the
+    final stream synchronization, make the entire session unusable.
+    Foreground checks terminate the worker through the existing RPC
+    process-death path while preserving registered resources. Unexpected
+    thread setup failure is fatal too.
+    
+    Normal shutdown drains the background worker, stops and joins it,
+    confirms all-rank transfer completion, disconnects peers, deregisters
+    memory, and finalizes HIXL once. Failed cleanup retains resources and
+    terminates the worker, including initialization rollback failures
+    through worker RPC. Cross-thread calls restore the initialization ACL
+    context, rank confirmations use CPU tensors, and the ctypes MemDesc
+    matches the CANN reserved-byte layout.
+    
+    Shared registration ownership stays in `eplb_communicator.py` and
+    `eplb_state.py`; the existing async-worker wrapper propagates failures
+    to that owner. A small ctypes destructor guard handles cleared globals
+    at interpreter shutdown. Setup remains in model loading, before
+    profiling. Moving registration after profiling/warmup, sleep/wake,
+    weight reload, model/state replacement, and elastic-EP lifecycle
+    integration remain outside this PR.
+    
+    ### Does this PR introduce _any_ user-facing change?
+    
+    - EPLB rejects weight offload/prefetch (`cpu_offload_gb > 0` or
+    `offload_group_size > 0`).
+    - Failed HIXL transfers or cleanup terminate the worker before
+    registered resources are released.
+    - HIXL model registration is sealed before the async worker starts.
+    - Sessions requiring more than 4000 merged registration ranges fail
+    initialization.
+    
+    ### How was this patch tested?
+    
+    Final source commit: `00d4d12434f5edf3823e037202170e36d2ad7b3c`.
+    
+    - Related CPU tests using repository NPU mocks: **498 passed, 1
+    skipped**. Covers shared main/draft registration and separate READ
+    metadata, range union, storage retention, terminal-handle consumption,
+    failure propagation, ordered model manifests, partial
+    registration/submission, rollback, basic shutdown, and
+    worker/controller/config regressions. Tests cover the 4000/4001
+    registration boundaries, counting merged ranges, and registration-limit
+    rollback. Context restoration, post-transfer synchronization and thread
+    setup failures exercise the actual verified upstream RPC handler and
+    retain both models' shared resources. These tests do not validate NPU
+    execution.
+    - `bash format.sh ci`: passed.
+    - Full `tools/mypy.sh 1` for Python 3.10, 3.11, and 3.12: passed for
+    source, examples, and tests against the verified vLLM commit. The local
+    static environment uses NumPy 1.26 and Triton wheel Python source for
+    import discovery.
+    - Expanded real two-device regression:
+    
+      ```bash
+    python -m pytest --confcutdir=tests/e2e/pull_request/two_card -q
+    tests/e2e/pull_request/two_card/test_hixl_eplb_registration.py -s
+      ```
+    
+    Includes distinct main/draft storages with overlapping 2 MiB coverage,
+    one engine/connection set, alternating direct READs after
+    `empty_cache()` with `expandable_segments=True`, untouched neighboring
+    bytes, repeat close, same-base 84/86 MiB spans, allocator growth,
+    background ACL context, the native 4000-registration boundary, and fatal
+    cleanup/rollback failure injection after real registration.
+    
+    These standalone HIXL component tests use real torch_npu, ACL and HIXL.
+    The command avoids the global model-adapter conftest, whose optional
+    model dependency is unavailable in the test runtime. No NPU or HIXL
+    stubs were used.
+    
+    | Hardware | CANN | Binding | Result | Tested commit |
+    | --- | --- | --- | --- | --- |
+    | Ascend A2, earlier 321-region regression | 9.1.0 | ctypes | **4
+    passed, 2 skipped** (official binding unavailable) | `a0e035c330c8` |
+    | Ascend A2, earlier 321-region regression | 9.2.0, 2026-09-28 CI image
+    | official Python and ctypes | **6 passed** | `dd4656b5c8e9` |
+    | Ascend A3, 4000-region boundary | 9.1.0 | ctypes | **4 passed, 2
+    skipped** (official binding unavailable) | `00d4d12434f5` |
+    | Ascend A3, 4000-region boundary | 9.2.0 CI image | official Python and
+    ctypes | **6 passed** | `00d4d12434f5` |
+    
+    The A2 rows describe the earlier 321-region implementation. The final
+    4000-region limit is validated on A3. Independent review of the final
+    source and worker-RPC failure boundary found no remaining P1/P2 source
+    blockers. The CI duration entry for this new test is also present; the
+    local workflow coverage check passes.
+    
+    **A5 hardware coverage, full-model acceptance, and steady-state
+    performance acceptance remain outstanding.** Component transfer timings
+    are diagnostics, not end-to-end performance evidence. Ready for review;
+    the outstanding acceptance items above remain documented for merge
+    assessment.
+    
+    - vLLM main:
+    https://github.com/vllm-project/vllm/commit/8cc9aa5ad350f6f80cf3bebb298d410803ff75a9
+    
+    ---------
+    
+    Signed-off-by: freyfwt <freytian1996@gmail.com>
+
+diff --git a/.github/workflows/scripts/estimated_times.yaml b/.github/workflows/scripts/estimated_times.yaml
+index edf6d1507..bbdbbcb8d 100644
+--- a/.github/workflows/scripts/estimated_times.yaml
++++ b/.github/workflows/scripts/estimated_times.yaml
+@@ -100,6 +100,7 @@ estimated_times:
+   tests/e2e/pull_request/two_card/test_deepseek_multistream_moe.py: 270
+   tests/e2e/pull_request/two_card/test_disaggregated_encoder.py: 170
+   tests/e2e/pull_request/two_card/test_gpt_oss_distributed.py: 290
++  tests/e2e/pull_request/two_card/test_hixl_eplb_registration.py: 300
+   tests/e2e/pull_request/two_card/rlhf/consistency/test_moe_routing_replay.py: 650
+   tests/e2e/pull_request/two_card/test_pipeline_parallel.py: 280
+   tests/e2e/pull_request/two_card/test_prefix_caching.py: 470
+diff --git a/docs/source/developer_guide/Design_Documents/model_runner_v2_eplb.md b/docs/source/developer_guide/Design_Documents/model_runner_v2_eplb.md
+index 3f18319fb..66ed368d5 100644
+--- a/docs/source/developer_guide/Design_Documents/model_runner_v2_eplb.md
++++ b/docs/source/developer_guide/Design_Documents/model_runner_v2_eplb.md
+@@ -129,8 +129,11 @@ asynchronous communicator interface:
+ 
+ - `AscendHixlEplbCommunicator` (default): receiver-initiated one-sided reads
+   between NPU memory regions registered with the HIXL engine. Participating
+-  expert weights and receive buffers are registered once per engine at
+-  startup, whole allocator segments at a time.
++  expert weights and receive buffers from all models are registered as aligned,
++  merged live tensor ranges. One state-owned HIXL session holds their underlying
++  storage until deregistration succeeds. Unrelated allocator growth does not
++  change these registrations. Each session supports up to 4000 merged regions
++  across all participating models; larger sets fail before backend registration.
+ - `AscendGlooEplbCommunicator` (fallback): CPU-staged P2P over Gloo with
+   pinned staging buffers.
+ 
+@@ -147,6 +150,8 @@ falling back mid-flight: ranks may disagree on transfer progress and live
+ slots may already be in transition (see
+ [RFC #17572](https://github.com/vllm-project/vllm-ascend/issues/17572)).
+ 
++Initialization confirms engine creation, registration, metadata exchange, and connection across ranks. Explicit shutdown drains every submitted request, disconnects peers, confirms that incoming connections are gone, deregisters memory, and finalizes the engine. Failed cleanup, including initialization rollback, retains the remaining handles and storage on a fatal exception chain and terminates the worker before registered memory is released.
++
+ Only asynchronous EPLB is supported. The upstream worker publishes one layer
+ at a time and waits for the model-runner thread to acknowledge consumption
+ before reusing the receive workspace. The Ascend commit adapter delays that
+diff --git a/docs/source/user_guide/feature_guide/expert_parallelism_load_balancer.md b/docs/source/user_guide/feature_guide/expert_parallelism_load_balancer.md
+index 620b7320e..892082733 100644
+--- a/docs/source/user_guide/feature_guide/expert_parallelism_load_balancer.md
++++ b/docs/source/user_guide/feature_guide/expert_parallelism_load_balancer.md
+@@ -138,6 +138,8 @@ transfers; explicitly configured values are kept (for example
+ warning is logged. Explicitly setting `torch_gloo` or `hixl` also keeps
+ your configured limits untouched.
+ 
++Weight offload and prefetch are incompatible with upstream EPLB on Ascend. Enabling EPLB with `cpu_offload_gb > 0` or `offload_group_size > 0` raises a configuration error.
++
+ Ascend extends the upstream `policy` field without adding a second selector.
+ For example, use `--eplb-config.policy default` to run the upstream policy;
+ omit it or set it to `stair` to run STAIR.
+diff --git a/tests/e2e/pull_request/two_card/test_hixl_eplb_registration.py b/tests/e2e/pull_request/two_card/test_hixl_eplb_registration.py
+new file mode 100644
+index 000000000..2e9ab8f16
+--- /dev/null
++++ b/tests/e2e/pull_request/two_card/test_hixl_eplb_registration.py
+@@ -0,0 +1,344 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM Ascend project
++
++"""Real HIXL registration/READ regression; no model weights are required."""
++
++import importlib.util
++import statistics
++from concurrent.futures import ThreadPoolExecutor
++from datetime import timedelta
++from types import SimpleNamespace
++from typing import Any
++
++import numpy as np
++import pytest
++import torch
++import torch.distributed as dist
++import torch.multiprocessing as mp
++import torch_npu  # noqa: F401
++from torch.multiprocessing.spawn import ProcessExitedException
++from vllm.utils.network_utils import get_open_port
++from vllm.v1.executor.multiproc_executor import WorkerProc
++
++from vllm_ascend.distributed.eplb import eplb_communicator, hixl_compat
++from vllm_ascend.distributed.eplb.eplb_state import AscendEplbState
++
++_MIB = 1024 * 1024
++
++
++def _migrate(communicator, buffers, rank: int) -> None:
++    communicator.set_stream(None)
++    communicator.set_transfer_context(np.arange(4), layer_idx=0)
++    communicator.add_recv([tensor[0] for tensor in buffers], src_rank=1 - rank, expert_id=3 - 2 * rank)
++    communicator.execute()
++
++
++def _registration_worker(rank: int, port: int, binding: str) -> None:
++    torch.npu.set_device(rank)
++    if binding == "ctypes":
++        eplb_communicator._resolve_hixl_module = lambda: hixl_compat
++    dist.init_process_group(
++        "gloo",
++        init_method=f"tcp://127.0.0.1:{port}",
++        rank=rank,
++        world_size=2,
++        timeout=timedelta(seconds=300),
++    )
++    timings = []
++    for _ in range(3):
++        # Same start, different lengths: the failing log registered 84 MiB
++        # and then 86 MiB at the same address. Both views share live storage.
++        allocation = torch.full((86 * _MIB // 4,), rank + 1, dtype=torch.float32, device=f"npu:{rank}")
++        weights = [allocation[: 84 * _MIB // 4].view(2, -1), allocation.view(2, -1)]
++        buffers = [torch.empty_like(tensor) for tensor in weights]
++        communicator = eplb_communicator.AscendHixlEplbCommunicator(dist.group.WORLD, [weights], buffers)
++        session = eplb_communicator._HixlSession(dist.group.WORLD)
++        session.initialize({"model": communicator})
++        registered = tuple(session._registered_handles)
++        # Grow the allocator, then let it reclaim unused mapped pages while
++        # the original expert registrations and connections remain alive.
++        extra = torch.empty(128 * _MIB, dtype=torch.uint8, device=f"npu:{rank}")
++        del extra
++        torch.npu.empty_cache()
++        assert tuple(session._registered_handles) == registered
++
++        with ThreadPoolExecutor(max_workers=1) as executor:
++            for _ in range(4):
++                executor.submit(_migrate, communicator, buffers, rank).result(timeout=300)
++                for tensor in buffers:
++                    assert torch.all(tensor[0] == 2 - rank).item()
++        timings.extend(communicator._eplb_hixl_phase_timings)
++        session.close()
++        session.close()
++        assert not session._storage_refs
++        del session, communicator, buffers, weights, allocation
++        torch.npu.empty_cache()
++    # Exercise the 4000-region boundary on the real backend, including one
++    # additional region for the receive buffer.
++    region_count = 3999
++    # A small allocator prefix can make a 2 MiB view cover two aligned
++    # pages; leave another page between views so merging keeps them apart.
++    region_spacing = 6 * _MIB
++    allocation = torch.empty(region_count * region_spacing // 4, dtype=torch.float32, device=f"npu:{rank}")
++    weights = [
++        [allocation[offset : offset + 2 * _MIB // 4].view(2, -1)]
++        for offset in range(0, allocation.numel(), region_spacing // 4)
++    ]
++    buffers = [torch.empty_like(weights[0][0])]
++    communicator = eplb_communicator.AscendHixlEplbCommunicator(dist.group.WORLD, weights, buffers)
++    session = eplb_communicator._HixlSession(dist.group.WORLD)
++    session.initialize({"model": communicator})
++    assert len(session._registered_handles) == 4000
++    session.close()
++    del session, communicator, buffers, weights, allocation
++    torch.npu.empty_cache()
++    if rank == 0:
++        print(
++            {
++                "binding": binding,
++                "requests_per_migration": 1,
++                "mean_transfer_ms": statistics.mean(t.transfer_ms for t in timings),
++            }
++        )
++    dist.destroy_process_group()
++
++
++@pytest.mark.parametrize("binding", ["ctypes", "official"])
++def test_expandable_registration_growth_reclaim_and_rebuild(monkeypatch, binding):
++    if torch.npu.device_count() < 2:
++        pytest.skip("requires two NPU devices")
++    if binding == "official" and importlib.util.find_spec("hixl") is None:
++        pytest.skip("CANN does not provide the official Python binding")
++    monkeypatch.setenv("PYTORCH_NPU_ALLOC_CONF", "expandable_segments:True")
++    mp.spawn(_registration_worker, args=(get_open_port(), binding), nprocs=2, join=True)
++
++
++class _FailedDeregistration:
++    def __init__(self, engine, rank):
++        self.engine = engine
++        self.rank = rank
++
++    def __getattr__(self, name):
++        return getattr(self.engine, name)
++
++    def deregister_mem(self, handle):
++        return hixl_compat.PARAM_INVALID if self.rank == 0 else self.engine.deregister_mem(handle)
++
++
++def _failed_close_worker(rank: int, port: int) -> None:
++    torch.npu.set_device(rank)
++    eplb_communicator._resolve_hixl_module = lambda: hixl_compat
++    dist.init_process_group(
++        "gloo",
++        init_method=f"tcp://127.0.0.1:{port}",
++        rank=rank,
++        world_size=2,
++        timeout=timedelta(seconds=300),
++    )
++    weights = torch.full((2, 1024), rank + 1, dtype=torch.float32, device=f"npu:{rank}")
++    buffers = [torch.empty_like(weights)]
++    communicator = eplb_communicator.AscendHixlEplbCommunicator(dist.group.WORLD, [[weights]], buffers)
++    session = eplb_communicator._HixlSession(dist.group.WORLD)
++    session.initialize({"model": communicator})
++    _migrate(communicator, buffers, rank)
++    session._engine = _FailedDeregistration(session._engine, rank)
++    state: Any = AscendEplbState.__new__(AscendEplbState)
++    state._close_error = None
++    state._hixl_session = session
++    state.async_worker = None
++    state.model_states = {"model": SimpleNamespace(communicator=communicator)}
++    try:
++        state.close()
++    except SystemExit:
++        # The owner remains intact until the actual subprocess exits. This
++        # failure must bypass the upstream RPC loop's `except Exception`.
++        assert session._engine is not None
++        assert session._storage_refs
++        assert state._close_error is not None
++        raise
++    raise AssertionError("failed deregistration must terminate the worker")
++
++
++def test_failed_deregistration_terminates_workers(monkeypatch):
++    if torch.npu.device_count() < 2:
++        pytest.skip("requires two NPU devices")
++    monkeypatch.setenv("PYTORCH_NPU_ALLOC_CONF", "expandable_segments:True")
++    with pytest.raises(ProcessExitedException) as error:
++        mp.spawn(_failed_close_worker, args=(get_open_port(),), nprocs=2, join=True)
++    assert error.value.exit_code == 1
++
++
++def _failed_initialization_worker(rank: int, port: int) -> None:
++    torch.npu.set_device(rank)
++    eplb_communicator._resolve_hixl_module = lambda: hixl_compat
++    dist.init_process_group("gloo", init_method=f"tcp://127.0.0.1:{port}", rank=rank, world_size=2)
++    weights = torch.full((2, 1024), rank + 1, dtype=torch.float32, device=f"npu:{rank}")
++    buffers = [torch.empty_like(weights)]
++    register = eplb_communicator._HixlSession._register_tensor_segments
++
++    def fail_after_registration(communicator, tensors):
++        register(communicator, tensors)
++        if rank == 0:
++            communicator._engine = _FailedDeregistration(communicator._engine, rank)
++            raise RuntimeError("injected initialization failure after real registration")
++
++    eplb_communicator._HixlSession._register_tensor_segments = fail_after_registration
++
++    def rebuild():
++        communicator = eplb_communicator.AscendHixlEplbCommunicator(dist.group.WORLD, [[weights]], buffers)
++        session = eplb_communicator._HixlSession(dist.group.WORLD)
++        session.initialize({"model": communicator})
++
++    def unexpected_response(_output):
++        raise AssertionError("failed rollback must bypass ordinary RPC error handling")
++
++    rpc = SimpleNamespace(worker=SimpleNamespace(rebuild=rebuild), rank=rank, handle_output=unexpected_response)
++    try:
++        WorkerProc._execute_worker_rpc(rpc, ("rebuild", (), {}, None))
++    except SystemExit as error:
++        cause = error.__cause__
++        assert cause is not None and hasattr(cause, "hixl_session")
++        owner = cause.hixl_session
++        assert owner._engine is not None
++        assert owner._storage_refs
++        if rank == 0:
++            assert owner._registered_handles
++        raise
++    raise AssertionError("failed initialization rollback must terminate the worker")
++
++
++def test_failed_initialization_rollback_terminates_workers_through_rpc(monkeypatch):
++    if torch.npu.device_count() < 2:
++        pytest.skip("requires two NPU devices")
++    monkeypatch.setenv("PYTORCH_NPU_ALLOC_CONF", "expandable_segments:True")
++    with pytest.raises(ProcessExitedException) as error:
++        mp.spawn(_failed_initialization_worker, args=(get_open_port(),), nprocs=2, join=True)
++    assert error.value.exit_code == 1
++
++
++class _TrackingEngine:
++    def __init__(self, engine):
++        self.engine = engine
++        self.regions = []
++        self.connections = 0
++        self.finalizations = 0
++
++    def __getattr__(self, name):
++        return getattr(self.engine, name)
++
++    def register_mem(self, descriptor, mem_type):
++        address, size = descriptor.addr, descriptor.len
++        assert all(address + size <= start or start + length <= address for start, length in self.regions)
++        status, handle = self.engine.register_mem(descriptor, mem_type)
++        if status == 0:
++            self.regions.append((address, size))
++        return status, handle
++
++    def connect(self, *args):
++        self.connections += 1
++        return self.engine.connect(*args)
++
++    def finalize(self):
++        self.finalizations += 1
++        return self.engine.finalize()
++
++
++class _TrackingBinding:
++    def __init__(self, binding):
++        self.binding = binding
++        self.engines = []
++
++    def __getattr__(self, name):
++        return getattr(self.binding, name)
++
++    def Hixl(self):
++        engine = _TrackingEngine(self.binding.Hixl())
++        self.engines.append(engine)
++        return engine
++
++
++def _shared_registration_worker(rank: int, port: int, binding: str) -> None:
++    torch.npu.set_device(rank)
++    tracked = _TrackingBinding(hixl_compat if binding == "ctypes" else eplb_communicator._resolve_hixl_module())
++    eplb_communicator._resolve_hixl_module = lambda: tracked
++    dist.init_process_group(
++        "gloo", init_method=f"tcp://127.0.0.1:{port}", rank=rank, world_size=2, timeout=timedelta(seconds=300)
++    )
++    # Use distinct ordinary allocator storages and select two whose outward
++    # registration ranges overlap. Neither tensor must start on a 2 MiB boundary.
++    candidates = [torch.full((2, 16 * 1024), rank + 1, device=f"npu:{rank}") for _ in range(32)]
++    alignment = 2 * _MIB
++    pairs = [
++        (left, right)
++        for index, left in enumerate(candidates)
++        for right in candidates[index + 1 :]
++        if left.data_ptr() // alignment == right.data_ptr() // alignment
++        and left.data_ptr() % alignment
++        and right.data_ptr() % alignment
++    ]
++    assert pairs, "allocator did not produce the overlapping aligned ranges required by this regression"
++    main_weight, draft_weight = pairs[0]
++    assert main_weight.untyped_storage().data_ptr() != draft_weight.untyped_storage().data_ptr()
++    draft_weight.fill_(rank + 11)
++    buffers = {
++        model: [torch.full_like(weight, -7)] for model, weight in (("draft", draft_weight), ("main", main_weight))
++    }
++    communicators = {
++        model: eplb_communicator.AscendHixlEplbCommunicator(dist.group.WORLD, [[weight]], buffers[model])
++        for model, weight in (("draft", draft_weight), ("main", main_weight))
++    }
++    session = eplb_communicator._HixlSession(dist.group.WORLD)
++    state: Any = AscendEplbState.__new__(AscendEplbState)
++    state._hixl_session = session
++    state._close_error = None
++    state.async_worker = None
++    state.model_states = {key: SimpleNamespace(communicator=value) for key, value in communicators.items()}
++    session.initialize(communicators)
++    assert len(tracked.engines) == 1
++    engine = tracked.engines[0]
++    assert engine.connections == 1
++    shared_page = main_weight.data_ptr() // alignment * alignment
++    assert sum(start <= shared_page < start + length for start, length in engine.regions) == 1
++    handles = tuple(session._registered_handles)
++    with ThreadPoolExecutor(max_workers=1) as executor:
++        for _ in range(8):
++            extra = torch.empty(128 * _MIB, dtype=torch.uint8, device=f"npu:{rank}")
++            del extra
++            torch.npu.empty_cache()
++            for model in ("draft", "main"):
++                executor.submit(_migrate, communicators[model], buffers[model], rank).result(timeout=300)
++                expected = (12 if model == "draft" else 2) - rank
++                assert torch.all(buffers[model][0][0] == expected).item()
++                assert torch.all(buffers[model][0][1] == -7).item()
++            assert tuple(session._registered_handles) == handles
++            assert torch.all(main_weight == rank + 1).item()
++            assert torch.all(draft_weight == rank + 11).item()
++    for tensor in candidates:
++        if tensor is not draft_weight:
++            assert torch.all(tensor == rank + 1).item()
++    timings = [timing for c in communicators.values() for timing in c._eplb_hixl_phase_timings]
++    state.close()
++    state.close()
++    assert engine.finalizations == 1
++    assert not session._storage_refs
++    if rank == 0:
++        print(
++            {
++                "binding": binding,
++                "models": 2,
++                "registered_regions": len(engine.regions),
++                "registered_bytes": sum(size for _, size in engine.regions),
++                "mean_transfer_ms": statistics.mean(t.transfer_ms for t in timings),
++            }
++        )
++    dist.destroy_process_group()
++
++
++@pytest.mark.parametrize("binding", ["ctypes", "official"])
++def test_main_and_draft_share_aligned_registration_after_empty_cache(monkeypatch, binding):
++    if torch.npu.device_count() < 2:
++        pytest.skip("requires two NPU devices")
++    if binding == "official" and importlib.util.find_spec("hixl") is None:
++        pytest.skip("CANN does not provide the official Python binding")
++    monkeypatch.setenv("PYTORCH_NPU_ALLOC_CONF", "expandable_segments:True")
++    mp.spawn(_shared_registration_worker, args=(get_open_port(), binding), nprocs=2, join=True)
+diff --git a/tests/ut/distributed/eplb/test_hixl_communicator.py b/tests/ut/distributed/eplb/test_hixl_communicator.py
+index b745ab44b..04e03d7eb 100644
+--- a/tests/ut/distributed/eplb/test_hixl_communicator.py
++++ b/tests/ut/distributed/eplb/test_hixl_communicator.py
+@@ -1,13 +1,16 @@
+ # SPDX-License-Identifier: Apache-2.0
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM Ascend project
+ 
++import gc
+ import sys
++import weakref
+ from types import SimpleNamespace
+ from unittest.mock import MagicMock
+ 
+ import numpy as np
+ import pytest
+ import torch
++from vllm.v1.executor.multiproc_executor import WorkerProc
+ 
+ from vllm_ascend.distributed.eplb import eplb_communicator
+ 
+@@ -23,6 +26,9 @@ class _Tensor:
+     def data_ptr(self):
+         return self._address
+ 
++    def untyped_storage(self):
++        return SimpleNamespace(data_ptr=self.data_ptr, nbytes=lambda: self.nbytes)
++
+     def is_contiguous(self):
+         return True
+ 
+@@ -34,13 +40,21 @@ class _Engine:
+         self.transfers = []
+         self.deregistered = []
+         self.finalized = False
++        self.initializations = 0
++        self.finalizations = 0
++        self.pending = set()
+ 
+     def initialize(self, local_engine, options):
++        self.initializations += 1
+         self.local_engine = local_engine
+         self.options = options
+         return 0
+ 
+     def register_mem(self, descriptor, _mem_type):
++        assert all(
++            descriptor.addr + descriptor.len <= old.addr or old.addr + old.len <= descriptor.addr
++            for old in self.registered
++        ), "overlapping HIXL registration"
+         self.registered.append(descriptor)
+         return 0, len(self.registered)
+ 
+@@ -50,9 +64,13 @@ class _Engine:
+ 
+     def transfer_async(self, remote_engine, operation, descriptors):
+         self.transfers.append((remote_engine, operation, descriptors))
+-        return 0, 100 + len(self.transfers)
++        request = 100 + len(self.transfers)
++        self.pending.add(request)
++        return 0, request
+ 
+-    def get_transfer_status(self, _request):
++    def get_transfer_status(self, request):
++        assert request in self.pending, "terminal request queried twice"
++        self.pending.remove(request)
+         return 0, 1
+ 
+     def disconnect(self, _remote_engine):
+@@ -64,6 +82,7 @@ class _Engine:
+ 
+     def finalize(self):
+         self.finalized = True
++        self.finalizations += 1
+ 
+ 
+ def _fake_hixl(engine):
+@@ -85,13 +104,20 @@ def _fake_hixl(engine):
+         MemType=SimpleNamespace(MEM_DEVICE=0),
+         TransferOp=SimpleNamespace(READ=0),
+         TransferOpDesc=TransferOpDesc,
+-        TransferStatus=SimpleNamespace(WAITING=0, COMPLETED=1),
++        TransferStatus=SimpleNamespace(WAITING=0, COMPLETED=1, FAILED=2),
+     )
+ 
+ 
+ def test_hixl_reads_registered_remote_expert(monkeypatch):
+     engine = _Engine()
+     monkeypatch.setitem(sys.modules, "hixl", _fake_hixl(engine))
++    context = object()
++    set_context = MagicMock(return_value=0)
++    monkeypatch.setitem(
++        sys.modules,
++        "acl",
++        SimpleNamespace(rt=SimpleNamespace(get_context=lambda: (context, 0), set_context=set_context)),
++    )
+     monkeypatch.setattr(eplb_communicator, "is_weak_contiguous", lambda _tensor: True)
+     set_device = MagicMock()
+     memory_snapshot = MagicMock(
+@@ -121,8 +147,11 @@ def test_hixl_reads_registered_remote_expert(monkeypatch):
+         gathered[1] = (
+             "192.0.2.2:12346",
+             {
+-                key: (tuple(address + 10_000 for address in addresses), stride)
+-                for key, (addresses, stride) in local_state[1].items()
++                model: {
++                    key: (tuple(address + 10_000 for address in addresses), stride)
++                    for key, (addresses, stride) in meta.items()
++                }
++                for model, meta in local_state[1].items()
+             },
+         )
+ 
+@@ -147,7 +176,11 @@ def test_hixl_reads_registered_remote_expert(monkeypatch):
+     ]
+     communicator = eplb_communicator.AscendHixlEplbCommunicator(group, weights, buffers)
+ 
++    session = eplb_communicator._HixlSession(group)
++    assert engine.initializations == 0
++    session.initialize({"main": communicator})
+     communicator.set_stream(None)
++    set_context.assert_called_once_with(context)
+     communicator.set_transfer_context(np.array([0, 1, 2, 3]), layer_idx=1)
+     communicator.add_send([weights[1][0]], dst_rank=1, expert_id=0)
+     with pytest.raises(RuntimeError, match="receive size"):
+@@ -167,7 +200,7 @@ def test_hixl_reads_registered_remote_expert(monkeypatch):
+     assert engine.options == {}
+     assert engine.connected == [("192.0.2.2:12346", 300_000)]
+     assert len(engine.registered) == 1
+-    assert (engine.registered[0].addr, engine.registered[0].len) == (0, 8_388_608)
++    assert (engine.registered[0].addr, engine.registered[0].len) == (0, 2_097_152)
+     assert len(engine.transfers) == 1
+     remote_engine, operation, descriptors = engine.transfers[0]
+     assert remote_engine == "192.0.2.2:12346"
+@@ -176,12 +209,12 @@ def test_hixl_reads_registered_remote_expert(monkeypatch):
+         (5000, 13016, 16),
+         (6100, 14200, 16),
+     ]
+-    assert memory_snapshot.call_count == 1
+-    assert work.wait.call_count == 2
++    assert memory_snapshot.call_count == 0
++    assert work.wait.call_count == 6
+     timing = communicator._eplb_hixl_phase_timings[0]
+     assert (timing.request_count, timing.transfer_bytes) == (1, 32)
+ 
+-    communicator._close()
++    session.close()
+     assert engine.deregistered == [1]
+     assert engine.finalized
+ 
+@@ -204,24 +237,432 @@ def test_hixl_rejects_interleaved_expert_rows():
+     communicator._validate_view(stacked.contiguous())
+ 
+ 
+-def test_hixl_destructor_cleans_up_when_modules_are_unavailable(monkeypatch):
+-    communicator = object.__new__(eplb_communicator.AscendHixlEplbCommunicator)
+-    engine = MagicMock()
+-    engine.disconnect.side_effect = RuntimeError("disconnect failed")
+-    engine.deregister_mem.side_effect = RuntimeError("deregister failed")
+-    communicator._engine = engine
+-    communicator._device = SimpleNamespace(type="npu", index=0)
++def test_single_per_expert_tensor_keeps_its_full_transfer_range(monkeypatch):
++    session = _bare_session(monkeypatch)
++    view = [_Tensor(1000, session._device, shape=(8,), nbytes=32)]
++    communicator = eplb_communicator.AscendHixlEplbCommunicator(session._cpu_group, [[view]], [view])
++    communicator._prepare()
++    assert communicator._num_local_experts == 1
++    assert communicator._local_send_meta() == {(0, 0): ((1000,), 32)}
++
++
++def test_hixl_close_retains_resources_on_disconnect_failure(monkeypatch):
++    communicator = _bare_session(monkeypatch)
+     communicator._remote_engines = {1: "peer"}
++    communicator._engine.disconnect = MagicMock(return_value=103900)
++    communicator._registered_handles = [1]
++    storage = object()
++    communicator._storage_refs = [storage]
++
++    with pytest.raises(RuntimeError, match="disconnect"):
++        communicator.close()
++
++    assert communicator._engine is not None
++    assert communicator._registered_handles == [1]
++    assert communicator._storage_refs == [storage]
++    assert communicator._engine.deregistered == []
++    assert not communicator._engine.finalized
++
++
++def _bare_session(monkeypatch):
++    group = MagicMock()
++    group.rank.return_value = 0
++    group.size.return_value = 2
++    session = eplb_communicator._HixlSession(group)
++    session._engine = _Engine()
++    session._hixl = _fake_hixl(session._engine)
++    session._device = SimpleNamespace(type="npu", index=0)
++    session._usable = True
++    session._confirm_all_ranks = lambda error, _operation: (_ for _ in ()).throw(error) if error else None
++    monkeypatch.setattr(torch, "npu", SimpleNamespace(set_device=lambda _device: None), raising=False)
++    return session
++
++
++@pytest.mark.parametrize(
++    "ranges, expected",
++    [
++        ([(0, 84), (0, 86)], [(0, 86)]),
++        ([(0, 4), (2, 4)], [(0, 6)]),
++        ([(0, 2), (2, 2)], [(0, 4)]),
++        ([(0, 2), (4, 2)], [(0, 2), (4, 2)]),
++        ([(1, 1), (1, 1)], [(0, 2)]),
++    ],
++)
++def test_registration_merges_live_ranges_without_bridging_holes(monkeypatch, ranges, expected):
++    communicator = _bare_session(monkeypatch)
++    monkeypatch.setattr(eplb_communicator, "_HIXL_MEMORY_ALIGNMENT", 2)
++    tensors = [_Tensor(start, communicator._device, nbytes=size) for start, size in ranges]
++    communicator._register_tensor_segments(tensors)
++    assert [(d.addr, d.len) for d in communicator._engine.registered] == expected
++    assert len(communicator._storage_refs) == len(tensors)
++    communicator.close()
++    assert communicator._storage_refs == []
++
++
++@pytest.mark.parametrize("region_count", [4000, 4001])
++def test_registration_region_limit_is_checked_before_any_backend_call(monkeypatch, region_count):
++    session = _bare_session(monkeypatch)
++    register = MagicMock(side_effect=[(0, handle) for handle in range(1, 4001)])
++    session._engine.register_mem = register
++    alignment = eplb_communicator._HIXL_MEMORY_ALIGNMENT
++    tensors = [_Tensor((2 * index + 1) * alignment, session._device) for index in range(region_count)]
++    if region_count == 4001:
++        with pytest.raises(ValueError, match="4001.*maximum is 4000"):
++            session._register_tensor_segments(tensors)
++        register.assert_not_called()
++        assert session._registered_handles == []
++    else:
++        session._register_tensor_segments(tensors)
++        assert register.call_count == 4000
++        assert len(session._registered_handles) == 4000
++    session.close()
++    assert session._storage_refs == []
++
++
++def test_registration_limit_counts_merged_regions_instead_of_input_tensors(monkeypatch):
++    session = _bare_session(monkeypatch)
++    session._register_tensor_segments([_Tensor(1000, session._device) for _ in range(4001)])
++    assert len(session._registered_handles) == 1
++    session.close()
++
++
++def test_registration_limit_failure_rolls_back_before_registering_either_model(monkeypatch):
++    session, models, engine = _shared_models(monkeypatch)
++    models["main"]._all_expert_weights[1][0]._address = 3 * eplb_communicator._HIXL_MEMORY_ALIGNMENT
++    monkeypatch.setattr(eplb_communicator, "_HIXL_MAX_REGISTERED_REGIONS", 1)
++    with pytest.raises(ValueError, match="2.*maximum is 1"):
++        session.initialize(models)
++    assert engine.registered == []
++    assert engine.connected == []
++    assert engine.finalized
++    assert session._engine is None
++    assert session._storage_refs == []
++
++
++def test_registration_keeps_old_storage_alive_after_tensor_rebinding(monkeypatch):
++    communicator = _bare_session(monkeypatch)
++    tensor = torch.empty(8)
++    communicator._register_tensor_segments([tensor])
++    old_storage = weakref.ref(communicator._storage_refs[0])
++    old_address = tensor.data_ptr()
++    tensor.data = torch.empty(8)
++    del tensor
++    storage = old_storage()
++    assert storage is not None
++    assert storage.data_ptr() == old_address
++    del storage
++    communicator.close()
++    assert old_storage() is None
++
++
++def test_partial_submission_is_drained_before_reporting_failure(monkeypatch):
++    session = _bare_session(monkeypatch)
++    communicator = eplb_communicator.AscendHixlEplbCommunicator(session._cpu_group, [], [])
++    communicator._session = session
++    session._remote_engines = {1: "one", 2: "two"}
++    communicator._pending_reads = {1: [(0, 0, 8)], 2: [(8, 8, 8)]}
++    session._engine.transfer_async = MagicMock(side_effect=[(0, 11), (103900, 0)])
++    session._engine.get_transfer_status = MagicMock(return_value=(0, 1))
++    communicator._pending_bytes = 16
++    communicator._layer_idx = 0
++    with pytest.raises(RuntimeError, match="read from rank 2"):
++        communicator.execute()
++    session._engine.get_transfer_status.assert_called_once_with(11)
++    assert communicator._eplb_hixl_phase_timings[0].request_count == 1
++    assert session._requests == []
++    assert not session._usable
++    assert session._error is not None
++
++
++def test_close_preserves_failed_deregistration_handle(monkeypatch):
++    communicator = _bare_session(monkeypatch)
+     communicator._registered_handles = [1, 2]
+-    communicator._remote_send_meta = {1: {}}
++    communicator._storage_refs = [object()]
++    communicator._engine.deregister_mem = MagicMock(side_effect=[0, 103900])
++    with pytest.raises(RuntimeError, match="deregister"):
++        communicator.close()
++    assert communicator._registered_handles == [1]
++    assert communicator._storage_refs
++    assert not communicator._engine.finalized
++
++
++def test_close_is_idempotent(monkeypatch):
++    communicator = _bare_session(monkeypatch)
++    engine = communicator._engine
++    communicator.close()
++    communicator.close()
++    assert engine.finalized
++    assert communicator._engine is None
++
++
++def test_initialization_rollback_participates_without_local_engine(monkeypatch):
++    communicator = _bare_session(monkeypatch)
++    communicator._engine = None
++    communicator._initializing = True
++    communicator._confirm_all_ranks = MagicMock()
++    communicator.close()
++    assert [call.args[1] for call in communicator._confirm_all_ranks.call_args_list] == [
++        "drain",
++        "disconnect",
++        "deregistration",
++        "finalization",
++    ]
++    communicator.close()
++    assert communicator._confirm_all_ranks.call_count == 4
++
++
++def test_failed_cpu_group_is_not_reused_for_cleanup(monkeypatch):
++    communicator = _bare_session(monkeypatch)
++    communicator._group_error = None
++    communicator._world_size = 2
++    communicator._cpu_group = object()
++    del communicator._confirm_all_ranks
++    collective = MagicMock(side_effect=TimeoutError("collective timeout"))
++    monkeypatch.setattr(torch.distributed, "all_reduce", collective)
++    with pytest.raises(TimeoutError, match="collective timeout"):
++        communicator._confirm_all_ranks(None, "initialization")
++    with pytest.raises(RuntimeError, match="CPU group failed"):
++        communicator.close()
++    assert collective.call_count == 1
++    assert communicator._engine is not None
++
++
++def test_rank_confirmation_uses_cpu_under_a_device_context(monkeypatch):
++    communicator = _bare_session(monkeypatch)
++    communicator._group_error = None
++    communicator._world_size = 2
++    communicator._cpu_group = object()
++    del communicator._confirm_all_ranks
++
++    def all_reduce(tensor, **_kwargs):
++        assert tensor.device.type == "cpu"
++        tensor.fill_(2)
++        return MagicMock()
++
++    monkeypatch.setattr(torch.distributed, "all_reduce", all_reduce)
++    with torch.device("meta"):
++        communicator._confirm_all_ranks(None, "initialization")
++
++
++@pytest.mark.parametrize("rollback_fails", [False, True])
++def test_initialization_rollback_failure_bypasses_rpc_and_retains_storage(monkeypatch, rollback_fails):
++    communicator = _bare_session(monkeypatch)
++    monkeypatch.setitem(sys.modules, "hixl", communicator._hixl)
++    monkeypatch.setitem(
++        sys.modules,
++        "acl",
++        SimpleNamespace(rt=SimpleNamespace(get_context=lambda: (None, 0), set_context=lambda _context: 0)),
++    )
++    monkeypatch.setattr(eplb_communicator, "get_ip", lambda: "192.0.2.1")
++    monkeypatch.setattr(eplb_communicator, "get_open_port", lambda: 12345)
++    device = communicator._device
++    model_communicator = eplb_communicator.AscendHixlEplbCommunicator(
++        communicator._cpu_group, [[_Tensor(1000, device)]], [_Tensor(2000, device)]
++    )
++    monkeypatch.setattr(eplb_communicator, "is_weak_contiguous", lambda _tensor: True)
+     monkeypatch.setattr(
+-        torch, "npu", SimpleNamespace(set_device=MagicMock(side_effect=RuntimeError("no device"))), raising=False
++        torch.distributed, "all_gather_object", lambda gathered, state, **_: gathered.__setitem__(0, state)
++    )
++    communicator._world_size = 1
++    storage_ref = None
++
++    def fail_registration(_tensors):
++        nonlocal storage_ref
++        storage = torch.empty(4).untyped_storage()
++        storage_ref = weakref.ref(storage)
++        communicator._storage_refs = [storage]
++        communicator._registered_handles = [1]
++        raise RuntimeError("registration failed")
++
++    communicator._register_tensor_segments = fail_registration
++    if rollback_fails:
++        communicator._engine.deregister_mem = MagicMock(return_value=103900)
++    rpc = SimpleNamespace(
++        rank=0,
++        worker=SimpleNamespace(rebuild=lambda: communicator.initialize({"main": model_communicator})),
++        handle_output=MagicMock(),
+     )
+-    monkeypatch.setattr(eplb_communicator, "contextlib", None)
++    if rollback_fails:
++        with pytest.raises(SystemExit, match="worker must terminate") as fatal:
++            WorkerProc._execute_worker_rpc(rpc, ("rebuild", (), {}, None))
++        rpc.handle_output.assert_not_called()
++        cause = fatal.value.__cause__
++        assert cause is not None and hasattr(cause, "hixl_session")
++        owner = cause.hixl_session
++        assert owner._engine is not None
++        assert owner._registered_handles == [1]
++        del rpc, communicator, owner
++        gc.collect()
++        assert storage_ref is not None
++        assert storage_ref() is not None
++    else:
++        WorkerProc._execute_worker_rpc(rpc, ("rebuild", (), {}, None))
++        assert isinstance(rpc.handle_output.call_args.args[0], RuntimeError)
++        assert communicator._engine is None
++        assert communicator._storage_refs == []
++
++
++def _shared_models(monkeypatch, *, peer_metadata=None):
++    session = _bare_session(monkeypatch)
++    engine = session._engine
++    monkeypatch.setitem(sys.modules, "hixl", session._hixl)
++    monkeypatch.setitem(
++        sys.modules,
++        "acl",
++        SimpleNamespace(rt=SimpleNamespace(get_context=lambda: (None, 0), set_context=lambda _context: 0)),
++    )
++    monkeypatch.setattr(eplb_communicator, "is_weak_contiguous", lambda _tensor: True)
++    monkeypatch.setattr(eplb_communicator, "get_ip", lambda: "192.0.2.1")
++    monkeypatch.setattr(eplb_communicator, "get_open_port", lambda: 12345)
+ 
+-    communicator.__del__()
++    def gather(gathered, state, **_kwargs):
++        gathered[0] = state
++        metadata = {
++            model: {
++                key: (tuple(address + 10_000 for address in addresses), stride)
++                for key, (addresses, stride) in meta.items()
++            }
++            for model, meta in state[1].items()
++        }
++        if peer_metadata is not None:
++            metadata = peer_metadata(metadata)
++        gathered[1] = ("192.0.2.2:12346", metadata)
++
++    monkeypatch.setattr(torch.distributed, "all_gather_object", gather)
++    device = session._device
++    models = {
++        "draft": eplb_communicator.AscendHixlEplbCommunicator(
++            session._cpu_group, [[_Tensor(1100, device, (2, 8), 64)]], [_Tensor(2100, device, (2, 8), 64)]
++        ),
++        "main": eplb_communicator.AscendHixlEplbCommunicator(
++            session._cpu_group, [[_Tensor(1000, device)], [_Tensor(3000, device)]], [_Tensor(2000, device)]
++        ),
++    }
++    return session, models, engine
++
++
++def test_main_and_draft_share_registration_but_keep_transfer_metadata(monkeypatch):
++    session, models, engine = _shared_models(monkeypatch)
++    assert engine.initializations == 0
++    with pytest.raises(RuntimeError, match="initialized before migration"):
++        models["draft"].set_stream(None)
++    session.initialize(models)
++    assert engine.initializations == 1
++    assert len(engine.registered) == 1
++    assert (engine.registered[0].addr, engine.registered[0].len) == (0, 2_097_152)
++    assert len(session._storage_refs) == 5
++    assert engine.connected == [("192.0.2.2:12346", 300_000)]
+ 
+-    engine.disconnect.assert_called_once_with("peer")
+-    assert engine.deregister_mem.call_count == 2
+-    engine.finalize.assert_called_once_with()
+-    assert communicator._engine is None
++    for model, layer, destination in (("draft", 0, 2100), ("main", 1, 2000), ("draft", 0, 2100)):
++        communicator = models[model]
++        communicator.set_transfer_context(np.arange(4), layer_idx=layer)
++        stride = communicator._remote_send_meta[1][(layer, 0)][1]
++        communicator.add_recv([_Tensor(destination, session._device, (stride // 4,), stride)], 1, 3)
++        communicator.execute()
++    assert [
++        (operations[0].local_addr, operations[0].remote_addr, operations[0].len)
++        for _, _, operations in engine.transfers
++    ] == [(2100, 11132, 32), (2000, 13016, 16), (2100, 11132, 32)]
++    assert not session._requests
++
++    del models["draft"]
++    gc.collect()
++    assert session._usable
++    assert not engine.deregistered
++    assert session._storage_refs
++    session.close()
++    session.close()
++    assert engine.deregistered == [1]
++    assert engine.finalizations == 1
++    assert not session._storage_refs
++    with pytest.raises(RuntimeError, match="closed or failed"):
++        models["main"].set_stream(None)
++
++
++@pytest.mark.parametrize("failure", ["terminal", "query", "timeout"])
++def test_transfer_failure_poisoning_is_shared_and_does_not_requery_consumed_handles(monkeypatch, failure):
++    session, models, engine = _shared_models(monkeypatch)
++    session.initialize(models)
++    calls = []
++
++    def status(request):
++        assert request in engine.pending
++        calls.append(request)
++        if failure == "timeout":
++            return 0, 0
++        engine.pending.remove(request)
++        return (0, 2) if failure == "terminal" else (103900, 2)
++
++    monkeypatch.setattr(engine, "get_transfer_status", status)
++    monkeypatch.setattr(eplb_communicator, "_TRANSFER_TIMEOUT_SECONDS", 0)
++    main = models["main"]
++    main.set_transfer_context(np.arange(4), layer_idx=0)
++    main.add_recv([_Tensor(2000, session._device, (4,), 16)], 1, 3)
++    with pytest.raises((RuntimeError, TimeoutError)):
++        main.execute()
++    assert session._error is not None
++    assert not session._usable
++    assert session._requests == ([101] if failure == "timeout" else [])
++    with pytest.raises(RuntimeError, match="closed or failed"):
++        models["draft"].set_transfer_context(np.arange(4), 0)
++    with pytest.raises(RuntimeError, match="worker must terminate"):
++        session.close()
++    assert calls == [101]
++    assert session._storage_refs
++    assert not engine.deregistered
++    assert not engine.finalized
++
++
++@pytest.mark.parametrize("mismatch", ["order", "models", "stride", "count"])
++def test_model_manifest_and_metadata_mismatch_rolls_back_before_registration(monkeypatch, mismatch):
++    def change(metadata):
++        if mismatch == "order":
++            return dict(reversed(list(metadata.items())))
++        if mismatch == "models":
++            return {"main": metadata["main"]}
++        addresses, stride = metadata["draft"][(0, 0)]
++        metadata["draft"][(0, 0)] = (addresses[:1], stride) if mismatch == "count" else (addresses, stride + 4)
++        return metadata
++
++    session, models, engine = _shared_models(monkeypatch, peer_metadata=change)
++    with pytest.raises(RuntimeError, match="mismatch"):
++        session.initialize(models)
++    assert not engine.registered
++    assert not engine.connected
++    assert engine.finalizations == 1
++    assert session._engine is None
++
++
++@pytest.mark.parametrize("mismatch", ["group", "device"])
++def test_models_cannot_share_a_session_across_groups_or_devices(monkeypatch, mismatch):
++    session, models, engine = _shared_models(monkeypatch)
++    if mismatch == "group":
++        models["draft"]._cpu_group = object()
++    else:
++        models["draft"]._all_expert_weights[0][0].device = SimpleNamespace(type="npu", index=1)
++        models["draft"]._expert_buffer[0].device = SimpleNamespace(type="npu", index=1)
++    with pytest.raises(ValueError, match="share one"):
++        session.initialize(models)
++    assert engine.initializations == 0
++    assert not session._storage_refs
++
++
++def test_partial_registration_rolls_back_only_successful_handles(monkeypatch):
++    session, models, engine = _shared_models(monkeypatch)
++    monkeypatch.setattr(eplb_communicator, "_HIXL_MEMORY_ALIGNMENT", 128)
++    register = engine.register_mem
++    calls = 0
++
++    def fail_second(descriptor, mem_type):
++        nonlocal calls
++        calls += 1
++        return (103900, 0) if calls == 2 else register(descriptor, mem_type)
++
++    monkeypatch.setattr(engine, "register_mem", fail_second)
++    with pytest.raises(RuntimeError, match="register memory"):
++        session.initialize(models)
++    assert calls == 2
++    assert engine.deregistered == [1]
++    assert engine.finalizations == 1
++    assert not session._registered_handles
++    assert not session._storage_refs
+diff --git a/tests/ut/distributed/eplb/test_hixl_compat.py b/tests/ut/distributed/eplb/test_hixl_compat.py
+index 038bdc282..ed16a196a 100644
+--- a/tests/ut/distributed/eplb/test_hixl_compat.py
++++ b/tests/ut/distributed/eplb/test_hixl_compat.py
+@@ -16,6 +16,23 @@ from tests.ut.distributed.eplb.test_hixl_communicator import _Engine, _Tensor
+ from vllm_ascend.distributed.eplb import eplb_communicator, hixl_compat
+ 
+ 
++@pytest.mark.parametrize("finalizing", [False, True])
++def test_destructors_do_not_call_hixl_after_interpreter_shutdown(monkeypatch, finalizing):
++    monkeypatch.setattr(sys, "is_finalizing", lambda: finalizing)
++    engine = hixl_compat.Hixl.__new__(hixl_compat.Hixl)
++    engine._close = MagicMock()
++    engine.__del__()
++    assert engine._close.call_count == (0 if finalizing else 1)
++
++
++def test_destructor_ignores_cleared_module_globals(monkeypatch):
++    engine = hixl_compat.Hixl.__new__(hixl_compat.Hixl)
++    engine._close = MagicMock()
++    monkeypatch.setattr(hixl_compat, "sys", None)
++    engine.__del__()
++    engine._close.assert_not_called()
++
++
+ def test_compat_layout_matches_probed_cann_abi():
+     assert ctypes.sizeof(hixl_compat.MemDesc) == 144
+     assert ctypes.sizeof(hixl_compat.TransferOpDesc) == 24
+@@ -34,7 +51,8 @@ def test_compat_layout_matches_probed_cann_abi():
+     desc = hixl_compat.TransferOpDesc(local_addr=1, remote_addr=2, len=3)
+     assert (desc.local_addr, desc.remote_addr, desc.len) == (1, 2, 3)
+     mem_desc = hixl_compat.MemDesc(4096, 8192)
+-    assert (mem_desc.addr, mem_desc.len, mem_desc.remote_accessible) == (4096, 8192, True)
++    assert (mem_desc.addr, mem_desc.len) == (4096, 8192)
++    assert bytes(mem_desc.reserved) == bytes(128)
+ 
+ 
+ def test_compat_empty_options_map_self_points_at_header():
+@@ -74,6 +92,11 @@ def test_resolve_raises_when_both_hixl_paths_are_unavailable(monkeypatch):
+ 
+ def test_hixl_communicator_reads_through_hixl_compat(monkeypatch):
+     engine = _Engine()
++    monkeypatch.setitem(
++        sys.modules,
++        "acl",
++        SimpleNamespace(rt=SimpleNamespace(get_context=lambda: (1, 0), set_context=lambda _context: 0)),
++    )
+     monkeypatch.setitem(sys.modules, "hixl", None)
+     monkeypatch.setattr(hixl_compat, "ensure_available", MagicMock())
+     monkeypatch.setattr(hixl_compat, "Hixl", lambda: engine)
+@@ -99,8 +122,11 @@ def test_hixl_communicator_reads_through_hixl_compat(monkeypatch):
+         gathered[1] = (
+             "192.0.2.2:12346",
+             {
+-                key: (tuple(address + 10_000 for address in addresses), stride)
+-                for key, (addresses, stride) in local_state[1].items()
++                model: {
++                    key: (tuple(address + 10_000 for address in addresses), stride)
++                    for key, (addresses, stride) in meta.items()
++                }
++                for model, meta in local_state[1].items()
+             },
+         )
+ 
+@@ -125,7 +151,9 @@ def test_hixl_communicator_reads_through_hixl_compat(monkeypatch):
+     ]
+     communicator = eplb_communicator.AscendHixlEplbCommunicator(group, weights, buffers)
+ 
+-    assert communicator._hixl is hixl_compat
++    session = eplb_communicator._HixlSession(group)
++    session.initialize({"main": communicator})
++    assert session._hixl is hixl_compat
+     assert engine.options == {}
+     assert len(engine.registered) == 1
+     assert isinstance(engine.registered[0], hixl_compat.MemDesc)
+@@ -143,5 +171,5 @@ def test_hixl_communicator_reads_through_hixl_compat(monkeypatch):
+     assert operation == hixl_compat.TransferOp.READ
+     assert all(isinstance(desc, hixl_compat.TransferOpDesc) for desc in descriptors)
+ 
+-    communicator._close()
++    session.close()
+     assert engine.finalized
+diff --git a/tests/ut/distributed/eplb/test_policy_load_stats.py b/tests/ut/distributed/eplb/test_policy_load_stats.py
+index 2a9d5e63c..1e65314dc 100644
+--- a/tests/ut/distributed/eplb/test_policy_load_stats.py
++++ b/tests/ut/distributed/eplb/test_policy_load_stats.py
+@@ -30,6 +30,8 @@ def test_step_keeps_skipped_samples_on_shared_time_axis(monkeypatch):
+     upstream_step = MagicMock()
+     monkeypatch.setattr(upstream_eplb_state.EplbState, "step", upstream_step)
+     state = AscendEplbState.__new__(AscendEplbState)
++    state._hixl_session = None
++    state._close_error = None
+     state.policy = _custom_policy()
+     state.model_states = {"model": _model_state()}
+     state.expert_load_window_size = 2
+diff --git a/tests/ut/distributed/eplb/test_state.py b/tests/ut/distributed/eplb/test_state.py
+index 526787fbe..67b3c2161 100644
+--- a/tests/ut/distributed/eplb/test_state.py
++++ b/tests/ut/distributed/eplb/test_state.py
+@@ -1,8 +1,9 @@
+ # SPDX-License-Identifier: Apache-2.0
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM Ascend project
+ 
++import threading
+ from types import SimpleNamespace
+-from unittest.mock import MagicMock
++from unittest.mock import MagicMock, patch
+ 
+ import pytest
+ import torch
+@@ -10,6 +11,7 @@ from vllm.distributed.eplb import eplb_state as upstream_eplb_state
+ 
+ from vllm_ascend.ascend_config import StairConfig
+ from vllm_ascend.distributed.eplb import eplb_state
++from vllm_ascend.distributed.eplb.eplb_communicator import AscendHixlEplbCommunicator, _HixlSession
+ from vllm_ascend.distributed.eplb.eplb_state import (
+     AscendEplbLayerState,
+     AscendEplbState,
+@@ -19,7 +21,14 @@ from vllm_ascend.utils import vllm_version_is
+ 
+ 
+ def test_uses_upstream_policy_and_async_worker_lifecycle():
+-    assert AscendEplbState.start_async_loop is upstream_eplb_state.EplbState.start_async_loop
++    state = AscendEplbState.__new__(AscendEplbState)
++    state._hixl_session = None
++    state._close_error = None
++    state._suspended = False
++    state.model_states = {}
++    with patch.object(upstream_eplb_state.EplbState, "start_async_loop") as start:
++        state.start_async_loop()
++    start.assert_called_once_with()
+ 
+ 
+ def test_result_readiness_defers_incomplete_transfer(monkeypatch):
+@@ -41,6 +50,8 @@ def test_result_readiness_defers_incomplete_transfer(monkeypatch):
+ 
+     monkeypatch.setattr(torch.distributed, "all_reduce", all_reduce)
+     state = AscendEplbState.__new__(AscendEplbState)
++    state._hixl_session = None
++    state._close_error = None
+     state.async_worker = None
+     model_state = SimpleNamespace(pending_result=None)
+ 
+@@ -151,6 +162,9 @@ def test_sync_rearrange_refreshes_all_model_routing_tables(monkeypatch):
+     )
+     monkeypatch.setattr(eplb_state, "refresh_model_routing_tables", refresh)
+     state = AscendEplbState.__new__(AscendEplbState)
++    state._hixl_session = None
++    state._close_error = None
++    state._suspended = False
+     state.is_async = False
+     state.model_states = model_states
+ 
+@@ -169,6 +183,9 @@ def test_async_rearrange_defers_routing_refresh_to_workspace_hook(monkeypatch):
+     refresh = MagicMock()
+     monkeypatch.setattr(eplb_state, "refresh_model_routing_tables", refresh)
+     state = AscendEplbState.__new__(AscendEplbState)
++    state._hixl_session = None
++    state._close_error = None
++    state._suspended = False
+     state.is_async = True
+     state.model_states = {"model": object()}
+ 
+@@ -286,3 +303,145 @@ def test_init_sets_cuda_device_index_for_npu(monkeypatch):
+         assert state.cuda_device_index == 5
+     else:
+         assert state.device_index == 5
++
++
++def _shutdown_state():
++    state = AscendEplbState.__new__(AscendEplbState)
++    state._hixl_session = None
++    state._close_error = None
++    state._suspended = False
++    state._stop_async = threading.Event()
++    state._close_error = None
++    state.is_async = True
++    state.async_worker = None
++    state.model_states = {}
++    return state
++
++
++def test_close_wakes_idle_worker_without_fake_device_event():
++    state = _shutdown_state()
++    recorded = threading.Event()
++    event_wait = MagicMock()
++    state.rearrange_event = SimpleNamespace(_recorded=recorded, wait=event_wait)
++    state.async_worker = threading.Thread(target=state.wait_for_rearrangement, args=(None,))
++    state.async_worker.start()
++    state.close()
++    assert state.async_worker is None
++    assert state._suspended
++    assert not recorded.is_set()
++    event_wait.assert_not_called()
++
++
++def test_close_failure_keeps_communicator_owner():
++    state = _shutdown_state()
++    communicator = MagicMock(spec=AscendHixlEplbCommunicator)
++    session = MagicMock(spec=_HixlSession)
++    session._error = None
++    session.close.side_effect = RuntimeError("still bound")
++    state._hixl_session = session
++    state.model_states = {"model": SimpleNamespace(communicator=communicator)}
++    with pytest.raises(SystemExit, match="worker must terminate"):
++        state.close()
++    assert state.model_states["model"].communicator is communicator
++    assert state._suspended
++
++
++def test_failed_close_is_fatal_without_retrying_cleanup():
++    state = _shutdown_state()
++    error = RuntimeError("still bound")
++    state._close_error = error
++    communicator = MagicMock(spec=AscendHixlEplbCommunicator)
++    state.model_states = {"model": SimpleNamespace(communicator=communicator)}
++    with pytest.raises(SystemExit, match="worker must terminate") as exc:
++        state.close()
++    assert exc.value.__cause__ is error
++    assert state._hixl_session is None
++
++
++def test_hixl_initializes_all_models_before_starting_the_async_worker(monkeypatch):
++    state = _shutdown_state()
++    group = object()
++    draft = AscendHixlEplbCommunicator.__new__(AscendHixlEplbCommunicator)
++    main = AscendHixlEplbCommunicator.__new__(AscendHixlEplbCommunicator)
++    draft._cpu_group = main._cpu_group = group
++    state.model_states = {"draft": SimpleNamespace(communicator=draft), "main": SimpleNamespace(communicator=main)}
++    session = MagicMock(spec=_HixlSession)
++    session._error = None
++    factory = MagicMock(return_value=session)
++    monkeypatch.setattr(eplb_state, "_HixlSession", factory)
++    calls: list[tuple[str, list[str] | None]] = []
++    session.initialize.side_effect = lambda models: calls.append(("initialize", list(models)))
++    monkeypatch.setattr(upstream_eplb_state.EplbState, "start_async_loop", lambda *_args: calls.append(("start", None)))
++    state.start_async_loop()
++    state.start_async_loop()
++    assert calls == [("initialize", ["draft", "main"]), ("start", None), ("start", None)]
++    factory.assert_called_once_with(group)
++    assert state._hixl_session is session
++    with (
++        patch.object(upstream_eplb_state.EplbState, "add_model") as add,
++        pytest.raises(RuntimeError, match="Cannot add"),
++    ):
++        state.add_model(object(), object())
++    add.assert_not_called()
++    state.close()
++    state.close()
++    # Actual sessions perform teardown only once, even on repeated state close.
++    assert session.close.call_count == 2
++
++
++def test_hixl_initialization_failure_never_starts_the_async_worker(monkeypatch):
++    state = _shutdown_state()
++    main = AscendHixlEplbCommunicator.__new__(AscendHixlEplbCommunicator)
++    main._cpu_group = object()
++    state.model_states = {"main": SimpleNamespace(communicator=main)}
++    session = MagicMock(spec=_HixlSession)
++    session.initialize.side_effect = RuntimeError("registration failed")
++    monkeypatch.setattr(eplb_state, "_HixlSession", MagicMock(return_value=session))
++    with (
++        patch.object(upstream_eplb_state.EplbState, "start_async_loop") as start,
++        pytest.raises(RuntimeError, match="registration failed"),
++    ):
++        state.start_async_loop()
++    start.assert_not_called()
++    assert state._hixl_session is session
++
++
++@pytest.mark.parametrize("entry", ["step", "ready", "close"])
++def test_hixl_worker_setup_failure_exits_before_releasing_storage(entry):
++    state = _shutdown_state()
++    session = MagicMock(spec=_HixlSession)
++    session._error = None
++    session._usable = True
++    state._hixl_session = session
++    state.async_worker = SimpleNamespace(is_alive=lambda: False)
++    state.model_states = {"main": SimpleNamespace(rebalanced=False, pending_result=None)}
++    with pytest.raises(SystemExit, match="worker must terminate") as fatal:
++        if entry == "step":
++            state.step()
++        elif entry == "ready":
++            state._all_ranks_result_ready(object())
++        else:
++            state.close()
++    assert "background worker terminated" in str(fatal.value.__cause__)
++    assert session._error is fatal.value.__cause__
++    assert not session._usable
++    session.close.assert_not_called()
++
++
++@pytest.mark.parametrize("entry", ["step", "ready", "close"])
++def test_failed_shared_session_exits_from_foreground_before_reusing_resources(entry):
++    state = _shutdown_state()
++    error = RuntimeError("HIXL transfer failed")
++    session = MagicMock(spec=_HixlSession)
++    session._error = error
++    state._hixl_session = session
++    with pytest.raises(SystemExit, match="worker must terminate") as fatal:
++        if entry == "step":
++            state.step()
++        elif entry == "ready":
++            state._all_ranks_result_ready(object())
++        else:
++            state.close()
++    assert fatal.value.__cause__ is error
++    assert state._hixl_session is session
++    session.close.assert_not_called()
+diff --git a/tests/ut/patch/platform/test_patch_eplb.py b/tests/ut/patch/platform/test_patch_eplb.py
+index 6ad8abd23..71931796d 100644
+--- a/tests/ut/patch/platform/test_patch_eplb.py
++++ b/tests/ut/patch/platform/test_patch_eplb.py
+@@ -1,6 +1,7 @@
+ # SPDX-License-Identifier: Apache-2.0
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM Ascend project
+ 
++import sys
+ from contextlib import contextmanager
+ from types import SimpleNamespace
+ from unittest.mock import MagicMock, patch
+@@ -11,8 +12,11 @@ import torch
+ from vllm.config import EPLBConfig, ParallelConfig, VllmConfig
+ from vllm.config import parallel as parallel_module
+ from vllm.platforms import current_platform
++from vllm.v1.executor.multiproc_executor import WorkerProc
+ 
++from tests.ut.distributed.eplb.test_hixl_communicator import _shared_models
+ from vllm_ascend.ascend_config import EplbConfig
++from vllm_ascend.distributed.eplb.eplb_state import AscendEplbState
+ from vllm_ascend.patch.platform import patch_eplb
+ 
+ 
+@@ -516,8 +520,9 @@ def test_async_worker_only_publishes_changed_layers(monkeypatch, changed_layer):
+     monkeypatch.setattr(patch_eplb._async_worker, "transfer_layer", MagicMock(return_value=object()))
+     monkeypatch.setattr(patch_eplb.torch.distributed, "all_reduce", MagicMock())
+     state = SimpleNamespace(
+-        rearrange_event=SimpleNamespace(wait=wait_for_cycle),
++        wait_for_rearrangement=lambda stream: (wait_for_cycle(stream=stream), True)[1],
+         model_states={"model": model_state},
++        _hixl_session=None,
+     )
+ 
+     def original_worker(state, cuda_stream, is_profile=False):
+@@ -534,6 +539,68 @@ def test_async_worker_only_publishes_changed_layers(monkeypatch, changed_layer):
+     assert patch_eplb._async_worker.transfer_layer.call_count == int(changed_layer is not None)
+ 
+ 
++@pytest.mark.parametrize("failure_stage", ["context", "synchronize"])
++def test_hixl_async_failure_outside_execute_exits_rpc_and_retains_shared_storage(monkeypatch, failure_stage):
++    session, communicators, engine = _shared_models(monkeypatch)
++    session.initialize(communicators)
++    storage_refs = list(session._storage_refs)
++    handles = list(session._registered_handles)
++    stream = MagicMock()
++    if failure_stage == "context":
++        session._acl_context = object()
++        monkeypatch.setattr(sys.modules["acl"].rt, "set_context", lambda _context: 1)
++    else:
++        stream.synchronize.side_effect = RuntimeError("NPU synchronization failed")
++    old_mapping = torch.tensor([[0, 1], [0, 1]])
++    new_mapping = torch.tensor([[1, 0], [0, 1]])
++    model_state = SimpleNamespace(
++        communicator=communicators["main"],
++        physical_to_logical_map=old_mapping,
++        logical_to_physical_map=torch.empty((2, 2, 1), dtype=torch.int32),
++        model=SimpleNamespace(expert_weights=[[object()], [object()]]),
++        expert_buffer=[object()],
++        rebalanced=True,
++        pending_result=None,
++    )
++    state = AscendEplbState.__new__(AscendEplbState)
++    state._hixl_session = session
++    state._close_error = None
++    state.model_states = {"main": model_state}
++    state.wait_for_rearrangement = lambda _stream: True
++    monkeypatch.setattr(
++        patch_eplb._async_worker,
++        "get_eplb_group",
++        lambda: SimpleNamespace(device_group=MagicMock(), cpu_group=MagicMock(size=lambda: 1)),
++    )
++    monkeypatch.setattr(patch_eplb._async_worker, "run_rebalance_experts", lambda *_args: new_mapping)
++    transfer = MagicMock(return_value=object())
++    monkeypatch.setattr(patch_eplb._async_worker, "transfer_layer", transfer)
++    monkeypatch.setattr(torch.distributed, "all_reduce", MagicMock())
++
++    def original_worker(state, cuda_stream, is_profile=False):
++        raise AssertionError("Ascend state must use the patched worker")
++
++    worker = patch_eplb._wrap_async_worker(original_worker)
++    message = "restore ACL context" if failure_stage == "context" else "NPU synchronization failed"
++    with pytest.raises(RuntimeError, match=message) as failure:
++        worker(state, stream)
++    assert session._error is failure.value
++    assert not session._usable
++    assert model_state.pending_result is None
++    assert transfer.call_count == int(failure_stage == "synchronize")
++    for communicator in communicators.values():
++        with pytest.raises(RuntimeError, match="HIXL EPLB session is closed or failed"):
++            communicator.set_stream(stream)
++    rpc = SimpleNamespace(rank=0, worker=SimpleNamespace(step=state.step), handle_output=MagicMock())
++    with pytest.raises(SystemExit, match="worker must terminate") as fatal:
++        WorkerProc._execute_worker_rpc(rpc, ("step", (), {}, None))
++    assert fatal.value.__cause__ is failure.value
++    rpc.handle_output.assert_not_called()
++    assert session._storage_refs == storage_refs
++    assert session._registered_handles == handles
++    assert not engine.deregistered and not engine.finalized
++
++
+ def test_async_noop_result_finishes_without_moving_weights(monkeypatch):
+     move_from_buffer = MagicMock()
+     monkeypatch.setattr(patch_eplb._eplb_state, "move_from_buffer", move_from_buffer)
+diff --git a/tests/ut/test_platform.py b/tests/ut/test_platform.py
+index 13c4288dc..dc800af2a 100644
+--- a/tests/ut/test_platform.py
++++ b/tests/ut/test_platform.py
+@@ -356,6 +356,8 @@ class TestNPUPlatform(TestBase):
+         # vLLM main exposes aux_output_config; the release has no such field.
+         mock_vllm_config.aux_output_config = None if vllm_version_is("0.30.0") else MagicMock(enabled=False)
+         mock_vllm_config.parallel_config.enable_eplb = False
++        mock_vllm_config.offload_config.uva.cpu_offload_gb = 0
++        mock_vllm_config.offload_config.prefetch.offload_group_size = 0
+         mock_vllm_config.parallel_config.enable_elastic_ep = False
+         mock_vllm_config.parallel_config.eplb_config = MagicMock(
+             use_async=True,
+@@ -439,6 +441,26 @@ class TestNPUPlatform(TestBase):
+             mock_warning.call_args.args[0],
+         )
+ 
++    def test_validate_eplb_config_rejects_weight_offload(self):
++        for cpu_gb, group_size in ((1, 0), (0, 2)):
++            with self.subTest(cpu_gb=cpu_gb, group_size=group_size):
++                config = self.mock_vllm_config()
++                config.use_v2_model_runner = True
++                config.parallel_config.enable_eplb = True
++                config.offload_config.uva.cpu_offload_gb = cpu_gb
++                config.offload_config.prefetch.offload_group_size = group_size
++                with self.assertRaisesRegex(ValueError, "incompatible with weight offload/prefetch"):
++                    _validate_eplb_config(config)
++
++    def test_weight_offload_allowed_without_eplb(self):
++        config = self.mock_vllm_config()
++        config.use_v2_model_runner = True
++        config.parallel_config.enable_eplb = False
++        config.offload_config.uva.cpu_offload_gb = 1
++        config.offload_config.prefetch.offload_group_size = 2
++        with patch.dict("os.environ", {}, clear=True):
++            _validate_eplb_config(config)
++
+     def test_validate_eplb_config_allows_v2_load_collection_phase(self):
+         vllm_config = self.mock_vllm_config()
+         vllm_config.use_v2_model_runner = True
+@@ -535,10 +557,7 @@ class TestNPUPlatform(TestBase):
+             communicator=None,
+         )
+ 
+-        with (
+-            patch.dict("os.environ", {}, clear=True),
+-            self.assertRaisesRegex(ValueError, "elastic EP"),
+-        ):
++        with patch.dict("os.environ", {}, clear=True), self.assertRaisesRegex(ValueError, "elastic EP"):
+             _validate_eplb_config(vllm_config)
+ 
+     def test_validate_eplb_config_async_rejects_nccl_communicator(self):
+diff --git a/tests/ut/worker/test_worker_v1.py b/tests/ut/worker/test_worker_v1.py
+index 20e40854a..14b5cd0ab 100644
+--- a/tests/ut/worker/test_worker_v1.py
++++ b/tests/ut/worker/test_worker_v1.py
+@@ -16,6 +16,7 @@ from vllm.v1.kv_cache_interface import (
+ from tests.ut.base import TestBase
+ from vllm_ascend.device.hardware import AscendDeviceType
+ from vllm_ascend.device.hardware_profile import HardwareCapability, get_hardware_profile
++from vllm_ascend.distributed.eplb.eplb_state import AscendEplbState
+ 
+ init_cached_hf_modules_path = "vllm.utils.import_utils.init_cached_hf_modules"
+ kw_module = importlib.import_module("vllm_ascend.model_executor.warmup.kernel_warmup")
+@@ -2311,6 +2312,39 @@ class TestNPUWorkerWeightUpdate(TestBase):
+ 
+         engine.shutdown.assert_called_once()
+ 
++    @patch("vllm_ascend.worker.worker.ensure_kv_transfer_shutdown")
++    def test_shutdown_closes_eplb_before_releasing_resources(self, _mock_kv_shutdown):
++        engine = MagicMock()
++        worker = self._make_worker(engine=engine)
++        worker.profiler = None
++        state = MagicMock(spec=AscendEplbState)
++        worker.model_runner.eplb_state = state
++        cleanup = MagicMock()
++        cleanup.attach_mock(state.close, "close_eplb")
++        cleanup.attach_mock(engine.shutdown, "shutdown_engine")
++        cleanup.attach_mock(worker.model_runner.shutdown, "shutdown_runner")
++
++        worker.shutdown()
++
++        self.assertEqual([call[0] for call in cleanup.mock_calls], ["close_eplb", "shutdown_engine", "shutdown_runner"])
++
++    @patch("vllm_ascend.worker.worker.ensure_kv_transfer_shutdown")
++    def test_failed_eplb_close_blocks_resource_release(self, mock_kv_shutdown):
++        engine = MagicMock()
++        worker = self._make_worker(engine=engine)
++        worker.profiler = MagicMock()
++        state = MagicMock(spec=AscendEplbState)
++        state.close.side_effect = SystemExit("EPLB cleanup failed")
++        worker.model_runner.eplb_state = state
++
++        with self.assertRaises(SystemExit):
++            worker.shutdown()
++
++        mock_kv_shutdown.assert_not_called()
++        worker.profiler.shutdown.assert_not_called()
++        engine.shutdown.assert_not_called()
++        worker.model_runner.shutdown.assert_not_called()
++
+ 
+ class TestKVPPWorkerBudget(TestBase):
+     def test_complete_spec_and_logical_planner_budget(self):
+diff --git a/tests/ut/worker/v2/test_eplb_load_collection_phase.py b/tests/ut/worker/v2/test_eplb_load_collection_phase.py
+index d079b72bc..f983ea42f 100644
+--- a/tests/ut/worker/v2/test_eplb_load_collection_phase.py
++++ b/tests/ut/worker/v2/test_eplb_load_collection_phase.py
+@@ -155,6 +155,9 @@ class TestAscendEplbFreshLoadGate(unittest.TestCase):
+     @staticmethod
+     def _make_state(*, rearrangement_step=1):
+         state = object.__new__(AscendEplbState)
++        state._hixl_session = None
++        state._close_error = None
++        state._suspended = False
+         state.parallel_config = SimpleNamespace(
+             enable_elastic_ep=False,
+             eplb_config=SimpleNamespace(log_balancedness_interval=1),
+diff --git a/vllm_ascend/distributed/eplb/eplb_communicator.py b/vllm_ascend/distributed/eplb/eplb_communicator.py
+index 30b336423..3aa1384cb 100644
+--- a/vllm_ascend/distributed/eplb/eplb_communicator.py
++++ b/vllm_ascend/distributed/eplb/eplb_communicator.py
+@@ -5,7 +5,7 @@
+ 
+ import contextlib
+ import time
+-from collections.abc import Iterator, Sequence
++from collections.abc import Callable, Iterator, Sequence
+ from dataclasses import dataclass
+ from datetime import timedelta
+ from typing import Any
+@@ -24,10 +24,12 @@ from vllm.utils.gpu_sync_debug import gpu_sync_allowed
+ from vllm.utils.network_utils import get_ip, get_open_port, join_host_port
+ 
+ _HIXL_MEMORY_ALIGNMENT = 2 * 1024 * 1024
+-_HIXL_MAX_REGISTERED_REGIONS = 256
++_HIXL_MAX_REGISTERED_REGIONS = 4000
+ _TRANSFER_TIMEOUT_SECONDS = 300
+ _STATUS_POLL_SECONDS = 0.0005
+ 
++_ExpertMetadata = dict[tuple[int, int], tuple[tuple[int, ...], int]]
++
+ 
+ @dataclass(frozen=True)
+ class _HixlTransferTiming:
+@@ -147,8 +149,314 @@ class AscendGlooEplbCommunicator(TorchDistGlooStagedEplbCommunicator):
+         return False
+ 
+ 
++class _HixlSession:
++    """Own registrations and connections for every model in one EPLB state."""
++
++    def __init__(self, cpu_group: ProcessGroup) -> None:
++        self._cpu_group = cpu_group
++        self._rank = cpu_group.rank()
++        self._world_size = cpu_group.size()
++        self._group_error: Exception | None = None
++        self._error: Exception | None = None
++        self._engine: Any | None = None
++        self._acl_context: Any = None
++        self._registered_handles: list[int] = []
++        self._storage_refs: list[Any] = []
++        self._requests: list[int] = []
++        self._remote_engines: dict[int, str] = {}
++        self._usable = False
++        self._initializing = False
++
++    def initialize(self, communicators: dict[str, "AscendHixlEplbCommunicator"]) -> None:
++        local_engine = ""
++        local_meta: dict[str, _ExpertMetadata] = {}
++
++        def preflight() -> None:
++            self._hixl = _resolve_hixl_module()
++            for key, communicator in communicators.items():
++                if communicator._cpu_group is not self._cpu_group:
++                    raise ValueError("HIXL EPLB models must share one CPU group")
++                communicator._prepare()
++                local_meta[key] = communicator._local_send_meta()
++            self._device = next(iter(communicators.values()))._device
++            if any(c._device != self._device for c in communicators.values()):
++                raise ValueError("HIXL EPLB models must share one NPU device")
++
++        def initialize_engine() -> None:
++            import acl  # type: ignore[import-not-found, import-untyped]  # NPU worker runtime.
++
++            nonlocal local_engine
++            torch.npu.set_device(self._device)
++            self._acl_context, status = acl.rt.get_context()
++            self._check_status(status, "get ACL context")
++            self._engine = self._hixl.Hixl()
++            local_engine = join_host_port(get_ip(), get_open_port())
++            self._check_status(self._engine.initialize(local_engine, {}), "initialize")
++
++        self._initializing = True
++        for communicator in communicators.values():
++            communicator._session = self
++        try:
++            self._initialize_phase(preflight, "preflight")
++            self._initialize_phase(initialize_engine, "initialization")
++            self._initialize_phase(
++                lambda: self._exchange_remote_state(local_engine, communicators, local_meta), "metadata exchange"
++            )
++            tensors = [
++                tensor
++                for communicator in communicators.values()
++                for views in (*communicator._all_expert_weights, communicator._expert_buffer)
++                for tensor in communicator._iter_storage_tensors(views)
++            ]
++            self._initialize_phase(lambda: self._register_tensor_segments(tensors), "registration")
++            self._connect_peers()
++            self._usable = True
++            self._initializing = False
++            for communicator in communicators.values():
++                # The session now pins storage; model states own the tensors.
++                communicator._all_expert_weights = ()
++                communicator._expert_buffer = ()
++                communicator._log_initialized()
++        except Exception:
++            try:
++                self.close()
++            except Exception as cleanup_error:
++                # Keep the owner on the fatal exception chain until process exit.
++                # An ordinary RPC exception is serialized and then discarded.
++                cleanup_error.hixl_session = self  # type: ignore[attr-defined]
++                raise SystemExit("HIXL initialization rollback failed; worker must terminate") from cleanup_error
++            raise
++
++    def check_usable(self) -> None:
++        if not self._usable:
++            raise RuntimeError("HIXL EPLB session is closed or failed") from self._error
++
++    def _initialize_phase(self, operation: Callable[[], None], name: str) -> None:
++        local_error: Exception | None = None
++        try:
++            operation()
++        except Exception as error:
++            local_error = error
++        self._confirm_all_ranks(local_error, name)
++
++    def _register_tensor_segments(self, tensors: Sequence[torch.Tensor]) -> None:
++        """Register only aligned pages protected by live transferable storage.
++
++        Expandable allocator segments can grow or shed free physical pages.
++        Their snapshot size is therefore not a stable registration identity.
++        Holding the underlying storage keeps these pages allocated, including
++        when a tensor is rebound to another storage during model rebuilding.
++        """
++        regions: list[tuple[int, int]] = []
++        for tensor in tensors:
++            storage = tensor.untyped_storage()
++            start = tensor.data_ptr()
++            end = start + tensor.nbytes
++            if tensor.nbytes <= 0 or not storage.data_ptr() <= start < end <= storage.data_ptr() + storage.nbytes():
++                raise ValueError("HIXL EPLB tensor byte range must fit its underlying storage")
++            self._storage_refs.append(storage)
++            regions.append(
++                (
++                    start // _HIXL_MEMORY_ALIGNMENT * _HIXL_MEMORY_ALIGNMENT,
++                    (end + _HIXL_MEMORY_ALIGNMENT - 1) // _HIXL_MEMORY_ALIGNMENT * _HIXL_MEMORY_ALIGNMENT,
++                )
++            )
++        merged: list[tuple[int, int]] = []
++        for start, end in sorted(regions):
++            if merged and start <= merged[-1][1]:
++                merged[-1] = (merged[-1][0], max(merged[-1][1], end))
++            else:
++                merged.append((start, end))
++        ordered_regions = [(start, end - start) for start, end in merged]
++        if len(ordered_regions) > _HIXL_MAX_REGISTERED_REGIONS:
++            raise ValueError(
++                f"HIXL EPLB requires {len(ordered_regions)} registered memory regions after merging; "
++                f"the maximum is {_HIXL_MAX_REGISTERED_REGIONS}"
++            )
++        if self._rank == 0:
++            registered_bytes = sum(size for _, size in ordered_regions)
++            logger.info(
++                "Registering %d NPU memory regions (%.2f GiB) for HIXL EPLB.",
++                len(ordered_regions),
++                registered_bytes / 1024**3,
++            )
++        for start, size in ordered_regions:
++            self._register_region(start, size)
++
++    def _register_region(self, address: int, size: int) -> None:
++        assert self._engine is not None
++        status, handle = self._engine.register_mem(
++            self._hixl.MemDesc(address, size),
++            self._hixl.MemType.MEM_DEVICE,
++        )
++        self._check_status(status, f"register memory at {address:#x}, size={size}")
++        self._registered_handles.append(handle)
++
++    def _exchange_remote_state(
++        self,
++        local_engine: str,
++        communicators: dict[str, "AscendHixlEplbCommunicator"],
++        local_meta: dict[str, _ExpertMetadata],
++    ) -> None:
++        gathered: list[tuple[str, dict[str, _ExpertMetadata]] | None] = [None] * self._world_size
++        torch.distributed.all_gather_object(gathered, (local_engine, local_meta), group=self._cpu_group)
++        for peer_rank, peer_state in enumerate(gathered):
++            if peer_rank == self._rank:
++                continue
++            if peer_state is None or list(peer_state[1]) != list(local_meta):
++                raise RuntimeError(f"HIXL EPLB model order mismatch with rank {peer_rank}")
++            for model_key, communicator in communicators.items():
++                peer_meta = peer_state[1][model_key]
++                if peer_meta.keys() != local_meta[model_key].keys():
++                    raise RuntimeError(f"HIXL EPLB metadata mismatch with rank {peer_rank} for {model_key}")
++                for key, (addresses, stride) in peer_meta.items():
++                    if len(addresses) != communicator._num_local_experts:
++                        raise RuntimeError(
++                            f"HIXL EPLB expert count mismatch with rank {peer_rank} for {model_key}, {key}"
++                        )
++                    if stride != local_meta[model_key][key][1]:
++                        raise RuntimeError(
++                            f"HIXL EPLB tensor size mismatch with rank {peer_rank} for {model_key}, {key}"
++                        )
++                communicator._remote_send_meta[peer_rank] = peer_meta
++            self._remote_engines[peer_rank] = peer_state[0]
++
++    def _connect_peers(self) -> None:
++        assert self._engine is not None
++        local_error: Exception | None = None
++        for peer_rank, remote_engine in self._remote_engines.items():
++            try:
++                self._check_status(
++                    self._engine.connect(remote_engine, _TRANSFER_TIMEOUT_SECONDS * 1000),
++                    f"connect to rank {peer_rank}",
++                )
++            except Exception as error:
++                local_error = local_error or error
++        self._confirm_all_ranks(local_error, "connection")
++
++    def _check_status(self, status: int, operation: str) -> None:
++        if status != self._hixl.SUCCESS:
++            raise RuntimeError(f"HIXL EPLB {operation} failed with status {status}")
++
++    def _set_hixl_context(self) -> None:
++        torch.npu.set_device(self._device)
++        if self._acl_context is not None:
++            import acl  # Lazy NPU runtime import.
++
++            self._check_status(acl.rt.set_context(self._acl_context), "restore ACL context")
++
++    def _confirm_all_ranks(self, local_error: Exception | None, operation: str) -> None:
++        if self._group_error is not None:
++            raise RuntimeError("HIXL EPLB CPU group failed; worker must terminate") from self._group_error
++        completed = torch.tensor(int(local_error is None), dtype=torch.int32, device="cpu")
++        try:
++            work = torch.distributed.all_reduce(
++                completed,
++                group=self._cpu_group,
++                async_op=True,
++            )
++            work.wait(timeout=timedelta(seconds=_TRANSFER_TIMEOUT_SECONDS))
++        except Exception as error:
++            self._group_error = error
++            raise
++        if local_error is not None:
++            raise local_error
++        if completed.item() != self._world_size:
++            raise RuntimeError(f"HIXL EPLB {operation} failed on another rank")
++
++    def _start_transfers(self, reads: dict[int, list[tuple[int, int, int]]]) -> None:
++        assert self._engine is not None
++        for src_rank, descriptors in reads.items():
++            operations = [
++                self._hixl.TransferOpDesc(
++                    local_addr=local_addr,
++                    remote_addr=remote_addr,
++                    len=length,
++                )
++                for local_addr, remote_addr, length in descriptors
++            ]
++            status, request = self._engine.transfer_async(
++                self._remote_engines[src_rank],
++                self._hixl.TransferOp.READ,
++                operations,
++            )
++            self._check_status(status, f"read from rank {src_rank}")
++            self._requests.append(request)
++
++    def _wait_for_transfers(self, requests: list[int]) -> None:
++        assert self._engine is not None
++        pending = set(requests)
++        deadline = time.monotonic() + _TRANSFER_TIMEOUT_SECONDS
++        while pending:
++            for request in tuple(pending):
++                status, transfer_status = self._engine.get_transfer_status(request)
++                # CANN consumes terminal requests, including query failures.
++                # Never query an invalidated handle again during shutdown.
++                if status != self._hixl.SUCCESS or transfer_status != self._hixl.TransferStatus.WAITING:
++                    pending.remove(request)
++                    self._requests.remove(request)
++                self._check_status(status, "query transfer")
++                if transfer_status not in (self._hixl.TransferStatus.WAITING, self._hixl.TransferStatus.COMPLETED):
++                    raise RuntimeError(f"HIXL EPLB transfer failed with state {transfer_status}")
++            if pending:
++                if time.monotonic() >= deadline:
++                    raise TimeoutError("HIXL EPLB transfer timed out")
++                time.sleep(_STATUS_POLL_SECONDS)
++
++    def close(self) -> None:
++        """Release the shared registrations only after every rank has drained."""
++        if self._error is not None:
++            raise RuntimeError("HIXL EPLB session failed; worker must terminate") from self._error
++        if self._engine is None and not self._initializing:
++            return
++        self._usable = False
++        try:
++            local_error: Exception | None = None
++            try:
++                if self._engine is not None:
++                    self._set_hixl_context()
++                    self._wait_for_transfers(self._requests)
++            except Exception as error:
++                local_error = error
++            self._confirm_all_ranks(local_error, "drain")
++            for remote_engine in self._remote_engines.values():
++                try:
++                    assert self._engine is not None
++                    status = self._engine.disconnect(remote_engine)
++                    if status != getattr(self._hixl, "NOT_CONNECTED", None):
++                        self._check_status(status, "disconnect")
++                except Exception as error:
++                    local_error = local_error or error
++            # Outgoing completion alone does not prove incoming READs are done.
++            self._confirm_all_ranks(local_error, "disconnect")
++            try:
++                while self._registered_handles:
++                    assert self._engine is not None
++                    handle = self._registered_handles[-1]
++                    self._check_status(self._engine.deregister_mem(handle), f"deregister memory handle={handle}")
++                    self._registered_handles.pop()
++            except Exception as error:
++                local_error = error
++            self._confirm_all_ranks(local_error, "deregistration")
++            try:
++                if self._engine is not None:
++                    status = self._engine.finalize()
++                    if status is not None:
++                        self._check_status(status, "finalize")
++            except Exception as error:
++                local_error = error
++            self._confirm_all_ranks(local_error, "finalization")
++        except Exception as error:
++            self._error = error
++            raise
++        self._engine = None
++        self._initializing = False
++        self._storage_refs.clear()
++        self._remote_engines.clear()
++
++
+ class AscendHixlEplbCommunicator(EplbCommunicator):
+-    """Read expert weights directly between registered NPU allocations."""
++    """Keep model-specific READ metadata while the state owns HIXL resources."""
+ 
+     receiver_initiated = True
+ 
+@@ -158,34 +466,37 @@ class AscendHixlEplbCommunicator(EplbCommunicator):
+         all_expert_weights: Sequence[Sequence[Any]],
+         expert_buffer: Sequence[Any],
+     ) -> None:
+-        self._hixl = _resolve_hixl_module()
+-
+-        if not all_expert_weights or not all_expert_weights[0] or not expert_buffer:
+-            raise ValueError("HIXL EPLB requires expert weights and receive buffers")
+-
+-        first_view = all_expert_weights[0][0]
+-        first_tensors = self._storage_tensors(first_view)
+-        first_tensor = first_tensors[0]
+-        if first_tensor.device.type != "npu" or first_tensor.ndim == 0 or first_tensor.shape[0] == 0:
+-            raise ValueError("HIXL EPLB requires non-empty NPU expert tensors")
+-
+         self._cpu_group = cpu_group
+         self._rank = cpu_group.rank()
+         self._world_size = cpu_group.size()
+-        self._device = first_tensor.device
+-        self._num_local_experts = first_tensor.shape[0] if len(first_tensors) == 1 else len(first_tensors)
+-        self._engine: Any | None = None
+-        self._registered_handles: list[int] = []
+-        self._remote_engines: dict[int, str] = {}
+-        self._remote_send_meta: dict[int, dict[tuple[int, int], tuple[tuple[int, ...], int]]] = {}
++        self._all_expert_weights = all_expert_weights
++        self._expert_buffer = expert_buffer
++        self._session: _HixlSession | None = None
++        self._remote_send_meta: dict[int, _ExpertMetadata] = {}
+         self._expert_to_src_row: list[dict[int, int]] | None = None
+         self._layer_idx: int | None = None
+         self._pending_reads: dict[int, list[tuple[int, int, int]]] = {}
+         self._pending_bytes = 0
+ 
+-        self._validate_tensors(all_expert_weights, expert_buffer)
+-        self._initialize(all_expert_weights, expert_buffer)
+-        self._log_initialized()
++    def _prepare(self) -> None:
++        if not self._all_expert_weights or not self._all_expert_weights[0] or not self._expert_buffer:
++            raise ValueError("HIXL EPLB requires expert weights and receive buffers")
++        first_view = self._all_expert_weights[0][0]
++        first_tensors = self._storage_tensors(first_view)
++        if not first_tensors:
++            raise ValueError("HIXL EPLB requires non-empty NPU expert tensors")
++        first_tensor = first_tensors[0]
++        if first_tensor.device.type != "npu" or first_tensor.ndim == 0 or first_tensor.shape[0] == 0:
++            raise ValueError("HIXL EPLB requires non-empty NPU expert tensors")
++        self._device = first_tensor.device
++        self._num_local_experts = first_tensor.shape[0] if hasattr(first_view, "data_ptr") else len(first_tensors)
++        self._validate_tensors(self._all_expert_weights, self._expert_buffer)
++
++    def _require_session(self) -> _HixlSession:
++        if self._session is None:
++            raise RuntimeError("HIXL EPLB session must be initialized before migration")
++        self._session.check_usable()
++        return self._session
+ 
+     def _validate_tensors(
+         self,
+@@ -210,7 +521,7 @@ class AscendHixlEplbCommunicator(EplbCommunicator):
+             raise ValueError("HIXL EPLB weight views must contain one storage or one tensor per local expert")
+         for tensor in tensors:
+             self._validate_storage(tensor)
+-        if len(tensors) == 1:
++        if hasattr(view, "data_ptr"):
+             if tensors[0].shape[0] != self._num_local_experts:
+                 raise ValueError("HIXL EPLB weight views must align their first dimension with local experts")
+             if not tensors[0].is_contiguous():
+@@ -226,96 +537,12 @@ class AscendHixlEplbCommunicator(EplbCommunicator):
+         for view in views:
+             yield from self._storage_tensors(view)
+ 
+-    def _initialize(
+-        self,
+-        all_expert_weights: Sequence[Sequence[Any]],
+-        expert_buffer: Sequence[Any],
+-    ) -> None:
+-        torch.npu.set_device(self._device)
+-        self._engine = self._hixl.Hixl()
+-        local_engine = join_host_port(get_ip(), get_open_port())
+-        try:
+-            self._check_status(
+-                self._engine.initialize(local_engine, {}),
+-                "initialize",
+-            )
+-            tensors = [
+-                tensor for layer_views in all_expert_weights for tensor in self._iter_storage_tensors(layer_views)
+-            ]
+-            tensors.extend(self._iter_storage_tensors(expert_buffer))
+-            self._register_tensor_segments(tensors)
+-            self._exchange_remote_state(local_engine, all_expert_weights)
+-            self._connect_peers()
+-        except Exception:
+-            self._close()
+-            raise
+-
+-    def _register_tensor_segments(self, tensors: Sequence[torch.Tensor]) -> None:
+-        """Register the allocator segments holding the transferable tensors.
+-
+-        Per-tensor padded ranges fragment into one region per contiguous
+-        tensor run and exceed the engine's region limit on deep MoE models,
+-        so register whole segments instead: a segment is 2 MiB aligned, which
+-        is exactly the granularity a registration accepts, and transfers only
+-        ever touch expert slots named in the exchanged remote metadata.
+-        """
+-        segments = sorted(
+-            {
+-                (int(segment["address"]), int(segment["total_size"]))
+-                for segment in torch.npu.memory_snapshot()
+-                if segment.get("device") == self._device.index
+-            }
+-        )
+-        regions: set[tuple[int, int]] = set()
+-        for tensor in tensors:
+-            segment = next(
+-                (
+-                    (address, size)
+-                    for address, size in segments
+-                    if address <= tensor.data_ptr() and tensor.data_ptr() + tensor.nbytes <= address + size
+-                ),
+-                None,
+-            )
+-            if segment is None:
+-                raise RuntimeError("HIXL EPLB could not resolve an allocator segment for every expert tensor")
+-            if segment[0] % _HIXL_MEMORY_ALIGNMENT or segment[1] % _HIXL_MEMORY_ALIGNMENT:
+-                raise RuntimeError("HIXL EPLB allocator segments must be 2 MiB aligned")
+-            regions.add(segment)
+-        ordered_regions = sorted(regions)
+-        if len(ordered_regions) > _HIXL_MAX_REGISTERED_REGIONS:
+-            raise RuntimeError(
+-                f"HIXL EPLB requires {len(ordered_regions)} memory registrations; "
+-                f"the HIXL limit is {_HIXL_MAX_REGISTERED_REGIONS}"
+-            )
+-        if self._rank == 0:
+-            registered_bytes = sum(size for _, size in ordered_regions)
+-            logger.info(
+-                "Registering %d NPU memory regions (%.2f GiB) for HIXL EPLB.",
+-                len(ordered_regions),
+-                registered_bytes / 1024**3,
+-            )
+-        for start, size in ordered_regions:
+-            self._register_region(start, size)
+-
+-    def _register_region(self, address: int, size: int) -> None:
+-        assert self._engine is not None
+-        status, handle = self._engine.register_mem(
+-            self._hixl.MemDesc(address, size),
+-            self._hixl.MemType.MEM_DEVICE,
+-        )
+-        self._check_status(status, "register memory")
+-        self._registered_handles.append(handle)
+-
+-    def _exchange_remote_state(
+-        self,
+-        local_engine: str,
+-        all_expert_weights: Sequence[Sequence[Any]],
+-    ) -> None:
+-        local_meta: dict[tuple[int, int], tuple[tuple[int, ...], int]] = {}
+-        for layer_idx, layer_views in enumerate(all_expert_weights):
++    def _local_send_meta(self) -> _ExpertMetadata:
++        local_meta: _ExpertMetadata = {}
++        for layer_idx, layer_views in enumerate(self._all_expert_weights):
+             for tensor_idx, view in enumerate(layer_views):
+                 tensors = self._storage_tensors(view)
+-                if len(tensors) == 1:
++                if hasattr(view, "data_ptr"):
+                     tensor = tensors[0]
+                     stride = tensor.nbytes // self._num_local_experts
+                     addresses = tuple(tensor.data_ptr() + slot * stride for slot in range(self._num_local_experts))
+@@ -324,50 +551,14 @@ class AscendHixlEplbCommunicator(EplbCommunicator):
+                     addresses = tuple(tensor.data_ptr() for tensor in tensors)
+                 local_meta[(layer_idx, tensor_idx)] = addresses, stride
+ 
+-        gathered: list[tuple[str, dict[tuple[int, int], tuple[tuple[int, ...], int]]] | None] = [
+-            None
+-        ] * self._world_size
+-        torch.distributed.all_gather_object(
+-            gathered,
+-            (local_engine, local_meta),
+-            group=self._cpu_group,
+-        )
+-        for peer_rank, peer_state in enumerate(gathered):
+-            if peer_rank == self._rank:
+-                continue
+-            if peer_state is None or peer_state[1].keys() != local_meta.keys():
+-                raise RuntimeError(f"HIXL EPLB metadata mismatch with rank {peer_rank}")
+-            for key, (peer_addresses, peer_stride) in peer_state[1].items():
+-                if len(peer_addresses) != self._num_local_experts:
+-                    raise RuntimeError(f"HIXL EPLB expert count mismatch with rank {peer_rank} for {key}")
+-                if peer_stride != local_meta[key][1]:
+-                    raise RuntimeError(f"HIXL EPLB tensor size mismatch with rank {peer_rank} for {key}")
+-            self._remote_engines[peer_rank] = peer_state[0]
+-            self._remote_send_meta[peer_rank] = peer_state[1]
+-
+-    def _connect_peers(self) -> None:
+-        assert self._engine is not None
+-        local_error: Exception | None = None
+-        for peer_rank, remote_engine in self._remote_engines.items():
+-            try:
+-                self._check_status(
+-                    self._engine.connect(remote_engine, _TRANSFER_TIMEOUT_SECONDS * 1000),
+-                    f"connect to rank {peer_rank}",
+-                )
+-            except Exception as error:
+-                local_error = local_error or error
+-        self._confirm_all_ranks(local_error, "connection")
+-
+-    def _check_status(self, status: int, operation: str) -> None:
+-        if status != self._hixl.SUCCESS:
+-            raise RuntimeError(f"HIXL EPLB {operation} failed with status {status}")
++        return local_meta
+ 
+     def set_stream(self, stream: torch.Stream | None) -> None:
+-        # HIXL owns its transfer streams. Binding the worker thread to this
+-        # device supplies the ACL context required by HIXL APIs.
+-        torch.npu.set_device(self._device)
++        # HIXL owns its streams; restore the engine's initialization context.
++        self._require_session()._set_hixl_context()
+ 
+     def set_transfer_context(self, old_indices: np.ndarray, layer_idx: int) -> None:
++        self._require_session()
+         if self._pending_reads:
+             raise RuntimeError("HIXL EPLB started a layer with pending transfers")
+         placement = np.asarray(old_indices).reshape(
+@@ -408,27 +599,31 @@ class AscendHixlEplbCommunicator(EplbCommunicator):
+             self._pending_bytes += remote_stride
+ 
+     def execute(self) -> None:
++        session = self._require_session()
+         if self._layer_idx is None:
+             raise RuntimeError("set_transfer_context() must precede HIXL execution")
+         phase_started_at = time.perf_counter()
+-        requests: list[int] = []
+         local_error: Exception | None = None
+         try:
+-            requests = self._start_transfers()
++            session._start_transfers(self._pending_reads)
+         except Exception as error:
+             local_error = error
+         launch_finished_at = time.perf_counter()
++        request_count = len(session._requests)
+         try:
+-            if local_error is None:
+-                self._wait_for_transfers(requests)
++            session._wait_for_transfers(session._requests)
+         except Exception as error:
+-            local_error = error
++            local_error = local_error or error
+         transfer_finished_at = time.perf_counter()
+         try:
+             # Publish the layer only after every one-sided READ is complete.
+             # The foreground can then defer an unavailable result instead of
+             # waiting for transfer safety during workspace commit.
+-            self._confirm_all_ranks(local_error, "transfer")
++            session._confirm_all_ranks(local_error, "transfer")
++        except Exception as error:
++            session._error = error
++            session._usable = False
++            raise
+         finally:
+             confirmed_at = time.perf_counter()
+             self.__dict__.setdefault("_eplb_hixl_phase_timings", []).append(
+@@ -436,7 +631,7 @@ class AscendHixlEplbCommunicator(EplbCommunicator):
+                     launch_ms=(launch_finished_at - phase_started_at) * 1000,
+                     transfer_ms=(transfer_finished_at - launch_finished_at) * 1000,
+                     confirmation_ms=(confirmed_at - transfer_finished_at) * 1000,
+-                    request_count=len(requests),
++                    request_count=request_count,
+                     transfer_bytes=self._pending_bytes,
+                 )
+             )
+@@ -445,91 +640,6 @@ class AscendHixlEplbCommunicator(EplbCommunicator):
+             self._expert_to_src_row = None
+             self._layer_idx = None
+ 
+-    def _confirm_all_ranks(self, local_error: Exception | None, operation: str) -> None:
+-        completed = torch.tensor(int(local_error is None), dtype=torch.int32)
+-        work = torch.distributed.all_reduce(
+-            completed,
+-            group=self._cpu_group,
+-            async_op=True,
+-        )
+-        work.wait(timeout=timedelta(seconds=_TRANSFER_TIMEOUT_SECONDS))
+-        if local_error is not None:
+-            raise local_error
+-        if completed.item() != self._world_size:
+-            raise RuntimeError(f"HIXL EPLB {operation} failed on another rank")
+-
+-    def _start_transfers(self) -> list[int]:
+-        assert self._engine is not None
+-        requests = []
+-        for src_rank, descriptors in self._pending_reads.items():
+-            operations = [
+-                self._hixl.TransferOpDesc(
+-                    local_addr=local_addr,
+-                    remote_addr=remote_addr,
+-                    len=length,
+-                )
+-                for local_addr, remote_addr, length in descriptors
+-            ]
+-            status, request = self._engine.transfer_async(
+-                self._remote_engines[src_rank],
+-                self._hixl.TransferOp.READ,
+-                operations,
+-            )
+-            self._check_status(status, f"read from rank {src_rank}")
+-            requests.append(request)
+-        return requests
+-
+-    def _wait_for_transfers(self, requests: list[int]) -> None:
+-        assert self._engine is not None
+-        pending = set(requests)
+-        deadline = time.monotonic() + _TRANSFER_TIMEOUT_SECONDS
+-        while pending:
+-            for request in tuple(pending):
+-                status, transfer_status = self._engine.get_transfer_status(request)
+-                self._check_status(status, "query transfer")
+-                if transfer_status == self._hixl.TransferStatus.COMPLETED:
+-                    pending.remove(request)
+-                elif transfer_status != self._hixl.TransferStatus.WAITING:
+-                    raise RuntimeError(f"HIXL EPLB transfer failed with state {transfer_status}")
+-            if pending:
+-                if time.monotonic() >= deadline:
+-                    raise TimeoutError("HIXL EPLB transfer timed out")
+-                time.sleep(_STATUS_POLL_SECONDS)
+-
+     @property
+     def needs_profile_buffer_reservation(self) -> bool:
+         return False
+-
+-    def _close(self) -> None:
+-        engine = getattr(self, "_engine", None)
+-        if engine is None:
+-            return
+-        self._engine = None
+-        # contextlib may already be cleared during interpreter shutdown.
+-        try:  # noqa: SIM105
+-            torch.npu.set_device(self._device)
+-        except Exception:
+-            pass
+-        for remote_engine in getattr(self, "_remote_engines", {}).values():
+-            try:  # noqa: SIM105
+-                engine.disconnect(remote_engine)
+-            except Exception:
+-                pass
+-        for handle in reversed(getattr(self, "_registered_handles", [])):
+-            try:  # noqa: SIM105
+-                engine.deregister_mem(handle)
+-            except Exception:
+-                pass
+-        try:  # noqa: SIM105
+-            engine.finalize()
+-        except Exception:
+-            pass
+-        self._registered_handles.clear()
+-        self._remote_engines.clear()
+-        self._remote_send_meta.clear()
+-
+-    def __del__(self) -> None:
+-        try:  # noqa: SIM105
+-            self._close()
+-        except Exception:
+-            pass
+diff --git a/vllm_ascend/distributed/eplb/eplb_state.py b/vllm_ascend/distributed/eplb/eplb_state.py
+index cd0101839..6d3f37b4e 100644
+--- a/vllm_ascend/distributed/eplb/eplb_state.py
++++ b/vllm_ascend/distributed/eplb/eplb_state.py
+@@ -4,11 +4,13 @@
+ """Ascend-owned extensions for the upstream EPLB state."""
+ 
+ import inspect
++import threading
+ import time
+ from collections.abc import Iterator
+ from contextlib import contextmanager
+ from contextvars import ContextVar
+ from dataclasses import fields
++from datetime import timedelta
+ from typing import Any
+ 
+ import numpy as np
+@@ -18,12 +20,16 @@ from vllm.distributed import get_ep_group, get_eplb_group
+ from vllm.distributed.eplb import eplb_state as _eplb_state
+ from vllm.distributed.eplb.policy import AbstractEplbPolicy
+ from vllm.distributed.parallel_state import in_the_same_node_as
++from vllm.logger import logger
+ 
++from vllm_ascend.distributed.eplb.eplb_communicator import AscendHixlEplbCommunicator, _HixlSession
+ from vllm_ascend.distributed.eplb.policy import PreparedLoadStats
+ from vllm_ascend.ops.fused_moe import eplb as _eplb_ops
+ from vllm_ascend.utils import vllm_version_is
+ 
+ ASYNC_EPLB_CYCLE_COMMITTED_LOG = "Ascend async EPLB cycle committed"
++_EPLB_CLOSE_TIMEOUT_SECONDS = 300
++_EPLB_EVENT_POLL_SECONDS = 0.1
+ EXPERT_MAPPING_EP_SIZE: ContextVar[int] = ContextVar("vllm_ascend_expert_mapping_ep_size", default=1)
+ 
+ 
+@@ -130,7 +136,14 @@ def refresh_model_routing_tables(
+ def _raise_if_async_worker_stopped(state: Any) -> None:
+     worker = getattr(state, "async_worker", None)
+     if worker is not None and not worker.is_alive():
+-        raise RuntimeError("EPLB background worker terminated unexpectedly")
++        error = RuntimeError("EPLB background worker terminated unexpectedly")
++        session = getattr(state, "_hixl_session", None)
++        if session is not None:
++            # Device/stream setup can fail before the migration loop is entered.
++            session._error = session._error or error
++            session._usable = False
++            state.raise_if_close_failed()
++        raise error
+ 
+ 
+ class AscendEplbState(_eplb_state.EplbState):
+@@ -138,6 +151,7 @@ class AscendEplbState(_eplb_state.EplbState):
+ 
+     cuda_device_index: int | None
+     device_index: int | None
++    async_worker: threading.Thread | None
+ 
+     def __init__(
+         self,
+@@ -152,6 +166,10 @@ class AscendEplbState(_eplb_state.EplbState):
+         self._has_fresh_recorded_load = False
+         self._is_load_sampling_step = False
+         self._should_collect_local_load = False
++        self._stop_async = threading.Event()
++        self._suspended = False
++        self._close_error: Exception | None = None
++        self._hixl_session: _HixlSession | None = None
+         # vLLM main renamed ``EplbState.cuda_device_index`` to ``device_index``
+         # (and passes it to EplbModelState on add_model), so keep both lanes
+         # pointing at the attribute upstream actually reads.
+@@ -168,6 +186,8 @@ class AscendEplbState(_eplb_state.EplbState):
+ 
+     def add_model(self, model, model_config) -> None:
+         """Build the EP-aware layout and initialize custom load statistics."""
++        if self._hixl_session is not None:
++            raise RuntimeError("Cannot add EPLB models after HIXL initialization")
+         token = EXPERT_MAPPING_EP_SIZE.set(get_ep_group().world_size)
+         try:
+             with _configured_upstream_policy(
+@@ -180,6 +200,61 @@ class AscendEplbState(_eplb_state.EplbState):
+         if self.uses_custom_load_stats:
+             self._initialize_load_stats_state(self.model_states[model_config.compute_hash()])
+ 
++    def wait_for_rearrangement(self, stream) -> bool:
++        """Allow an idle worker to stop without recording a fake device event."""
++        while not self.rearrange_event._recorded.wait(_EPLB_EVENT_POLL_SECONDS):
++            if self._stop_async.is_set():
++                return False
++        self.rearrange_event.wait(stream=stream)
++        return True
++
++    def close(self) -> None:
++        """Close EPLB while its CPU groups and NPU mappings are still alive."""
++        self.raise_if_close_failed()
++        try:
++            self._suspended = True
++            worker = self.async_worker
++            if worker is not None:
++                _raise_if_async_worker_stopped(self)
++                # Acknowledge real completed results before stopping the idle loop.
++                # This also handles the worker waiting for consumed_event.
++                self.drain_async()
++                self._stop_async.set()
++                worker.join(timeout=_EPLB_CLOSE_TIMEOUT_SECONDS)
++                if worker.is_alive():
++                    raise TimeoutError("EPLB background worker could not be stopped; worker must terminate")
++                self.async_worker = None
++            if self._hixl_session is not None:
++                self._hixl_session.close()
++        except Exception as error:
++            self._close_error = error
++            self.raise_if_close_failed()
++
++    def raise_if_close_failed(self) -> None:
++        if self._hixl_session is not None and self._hixl_session._error is not None:
++            self._close_error = self._hixl_session._error
++        if self._close_error is not None:
++            logger.error("EPLB cleanup failed; terminating the worker: %s", self._close_error)
++            # Ordinary RPC exceptions are caught by the upstream worker loop.
++            # SystemExit reaches its process-death monitor and engine shutdown.
++            raise SystemExit(
++                "EPLB cleanup failed; worker must terminate before releasing registered memory"
++            ) from self._close_error
++
++    def start_async_loop(self, *args, **kwargs) -> None:
++        if not self._suspended:
++            communicators = {
++                key: model_state.communicator
++                for key, model_state in self.model_states.items()
++                if isinstance(model_state.communicator, AscendHixlEplbCommunicator)
++            }
++            if communicators and self._hixl_session is None:
++                self._hixl_session = _HixlSession(next(iter(communicators.values()))._cpu_group)
++                self._hixl_session.initialize(communicators)
++            if self._hixl_session is not None:
++                self._hixl_session.check_usable()
++            super().start_async_loop(*args, **kwargs)
++
+     def _initialize_load_stats_state(self, model_state: Any) -> None:
+         model_state._last_committed_mean_ratios = np.full(
+             model_state.model.num_moe_layers,
+@@ -277,6 +352,9 @@ class AscendEplbState(_eplb_state.EplbState):
+         log_stats: bool = False,
+     ) -> None:
+         """Advance the custom time axis alongside the upstream load window."""
++        self.raise_if_close_failed()
++        if self._hixl_session is not None:
++            _raise_if_async_worker_stopped(self)
+         is_sampling = getattr(self, "_is_load_sampling_step", False) and not is_dummy and not is_profile
+         should_collect = getattr(self, "_should_collect_local_load", False)
+         self._is_load_sampling_step = False
+@@ -402,6 +480,8 @@ class AscendEplbState(_eplb_state.EplbState):
+         is_profile: bool = False,
+         rank_mapping: dict[int, int] | None = None,
+     ) -> torch.Tensor | None:
++        if self._suspended:
++            return None
+         use_custom_async_stats = (
+             self.is_async and not is_profile and rank_mapping is None and self.uses_custom_load_stats
+         )
+@@ -435,9 +515,17 @@ class AscendEplbState(_eplb_state.EplbState):
+         """Acknowledge changed-layer and no-op results through one lifecycle."""
+         if not self.is_async:
+             return
++        deadline = time.monotonic() + _EPLB_CLOSE_TIMEOUT_SECONDS
+         for model_state in self.model_states.values():
++            work = getattr(model_state, "_eplb_ready_work", None)
++            if work is not None:
++                work.wait(timeout=timedelta(seconds=_EPLB_CLOSE_TIMEOUT_SECONDS))
++                del model_state._eplb_ready_work
++                del model_state._eplb_ready_flag
+             while model_state.rebalanced:
+                 _raise_if_async_worker_stopped(self)
++                if time.monotonic() >= deadline:
++                    raise TimeoutError("EPLB migration could not be drained; worker must terminate")
+                 result = model_state.pending_result
+                 if result is not None:
+                     if getattr(
+@@ -453,6 +541,7 @@ class AscendEplbState(_eplb_state.EplbState):
+ 
+     def _all_ranks_result_ready(self, model_state: Any) -> bool:
+         """Pipeline readiness reduction behind one foreground iteration."""
++        self.raise_if_close_failed()
+         _raise_if_async_worker_stopped(self)
+         model_state._eplb_migration_span_steps = getattr(model_state, "_eplb_migration_span_steps", 0) + 1
+         group = get_ep_group().cpu_group
+diff --git a/vllm_ascend/distributed/eplb/hixl_compat.py b/vllm_ascend/distributed/eplb/hixl_compat.py
+index 4cc732a92..98dd89512 100644
+--- a/vllm_ascend/distributed/eplb/hixl_compat.py
++++ b/vllm_ascend/distributed/eplb/hixl_compat.py
+@@ -31,6 +31,7 @@ import ctypes
+ import glob
+ import os
+ import struct
++import sys
+ import threading
+ from collections.abc import Callable
+ from enum import IntEnum
+@@ -85,20 +86,18 @@ class TransferStatus(IntEnum):
+ 
+ 
+ class MemDesc(ctypes.Structure):
+-    """Mirror of ``hixl::MemDesc``; ``remote_accessible`` defaults to true."""
++    """Mirror of CANN 9.1/9.2 ``hixl::MemDesc``, including zeroed reserved bytes."""
+ 
+     _fields_ = [
+         ("addr", ctypes.c_uint64),
+         ("len", ctypes.c_uint64),
+-        ("remote_accessible", ctypes.c_bool),
+-        ("reserved", ctypes.c_uint8 * 127),
++        ("reserved", ctypes.c_uint8 * 128),
+     ]
+ 
+-    def __init__(self, address: int, size: int, remote_accessible: bool = True) -> None:
++    def __init__(self, address: int, size: int) -> None:
+         super().__init__()
+         self.addr = address
+         self.len = size
+-        self.remote_accessible = remote_accessible
+ 
+ 
+ class TransferOpDesc(ctypes.Structure):
+@@ -463,8 +462,10 @@ class Hixl:
+             self._engine = None
+ 
+     def __del__(self) -> None:
+-        # contextlib may already be cleared during interpreter shutdown.
++        # Module globals may already be cleared during interpreter shutdown.
+         try:  # noqa: SIM105
++            if sys.is_finalizing():
++                return
+             self._close()
+         except Exception:
+             pass
+diff --git a/vllm_ascend/patch/platform/patch_eplb.py b/vllm_ascend/patch/platform/patch_eplb.py
+index e967218f7..ddfd120e5 100644
+--- a/vllm_ascend/patch/platform/patch_eplb.py
++++ b/vllm_ascend/patch/platform/patch_eplb.py
+@@ -573,17 +573,8 @@ def _wrap_async_worker(original_worker):
+     transfer_signature = signature(_async_worker.transfer_layer)
+     transfer_stream_parameter = "stream" if "stream" in transfer_signature.parameters else "cuda_stream"
+ 
+-    @wraps(original_worker)
+-    def _transfer_run_periodically(*args, **kwargs):
+-        bound = worker_signature.bind(*args, **kwargs)
+-        bound.apply_defaults()
+-        state = bound.arguments["state"]
+-        stream = bound.arguments[worker_stream_parameter]
+-        is_profile = bound.arguments["is_profile"]
+-        if not isinstance(state, AscendEplbState) or is_profile:
+-            return original_worker(*bound.args, **bound.kwargs)
+-        while True:
+-            state.rearrange_event.wait(stream=stream)
++    def _run(state, stream, is_profile):
++        while state.wait_for_rearrangement(stream):
+             eplb_group = _async_worker.get_eplb_group().device_group
+             eplb_cpu_group = _async_worker.get_eplb_group().cpu_group
+             for model_state in state.model_states.values():
+@@ -652,6 +643,27 @@ def _wrap_async_worker(original_worker):
+                     consumed_event.wait(stream=stream)
+                     assert model_state.pending_result is None
+ 
++    @wraps(original_worker)
++    def _transfer_run_periodically(*args, **kwargs):
++        bound = worker_signature.bind(*args, **kwargs)
++        bound.apply_defaults()
++        state = bound.arguments["state"]
++        stream = bound.arguments[worker_stream_parameter]
++        is_profile = bound.arguments["is_profile"]
++        if not isinstance(state, AscendEplbState) or is_profile:
++            return original_worker(*bound.args, **bound.kwargs)
++        try:
++            return _run(state, stream, is_profile)
++        except Exception as error:
++            if state._hixl_session is not None:
++                # Context restoration and the final stream synchronization also
++                # belong to the migration. Preserve ownership on any failure.
++                session = state._hixl_session
++                if session._error is None:
++                    session._error = error
++                session._usable = False
++            raise
++
+     setattr(_transfer_run_periodically, _PATCH_MARKER, True)
+     return _transfer_run_periodically
+ 
+diff --git a/vllm_ascend/platform.py b/vllm_ascend/platform.py
+index 094fb7fdb..d55c1b670 100644
+--- a/vllm_ascend/platform.py
++++ b/vllm_ascend/platform.py
+@@ -976,6 +976,13 @@ def _validate_model_runner_config(vllm_config: VllmConfig) -> None:
+ 
+ 
+ def _validate_eplb_config(vllm_config: VllmConfig) -> None:
++    if vllm_config.parallel_config.enable_eplb:
++        offload = vllm_config.offload_config
++        if offload.uva.cpu_offload_gb > 0 or offload.prefetch.offload_group_size > 0:
++            raise ValueError(
++                "EPLB is incompatible with weight offload/prefetch on Ascend. "
++                "Set cpu_offload_gb=0 and offload_group_size=0, or disable EPLB."
++            )
+     additional_config = vllm_config.additional_config or {}
+     eplb_config = additional_config.get("eplb_config", {})
+     if not isinstance(eplb_config, dict):
+diff --git a/vllm_ascend/worker/worker.py b/vllm_ascend/worker/worker.py
+index 8d175599f..90d179fff 100644
+--- a/vllm_ascend/worker/worker.py
++++ b/vllm_ascend/worker/worker.py
+@@ -84,6 +84,7 @@ from vllm_ascend.cpu_binding import bind_cpus
+ from vllm_ascend.device.hardware_profile import HardwareCapability, get_current_hardware_profile
+ from vllm_ascend.device_allocator.camem import CaMemAllocator
+ from vllm_ascend.device_allocator.sleep_mem_optimized import SleepWakeupManager
++from vllm_ascend.distributed.eplb.eplb_state import AscendEplbState
+ from vllm_ascend.distributed.kv_transfer.kv_p2p.sfa_pd_rd2h.dspark_context import uses_sfa_dspark_kv_transfer
+ from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.layerwise_cache_layout import (
+     build_layerwise_cache_layout,
+@@ -364,6 +365,9 @@ class NPUWorker(WorkerBase):
+         self._weight_update_active = False
+ 
+     def shutdown(self) -> None:
++        state = getattr(getattr(self, "model_runner", None), "eplb_state", None)
++        if isinstance(state, AscendEplbState):
++            state.close()
+         if ensure_kv_transfer_shutdown is not None:
+             ensure_kv_transfer_shutdown()
+ 

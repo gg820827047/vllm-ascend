@@ -1,0 +1,393 @@
+commit e101bec10ae04035faab881227232833b0706007
+Author:     zouzy <zouzongyu@huawei.com>
+AuthorDate: Thu Oct 22 16:29:10 2026 +0800
+Commit:     GitHub <noreply@github.com>
+CommitDate: Thu Oct 22 16:29:10 2026 +0800
+
+    [Ops][Feature][MRV2] Add early kernel and NZ warmup for Model Runner V2 (#19054)
+    
+    ### What this PR does / why we need it?
+    
+    This PR enables early kernel warmup and NZ format-cast warmup for Model
+    Runner V2 (MRv2).
+    Specifically:
+    - It integrates `start_early_kernel_warmup`, `join_early_kernel_warmup`,
+    `start_nz_warm_thread`, and `join_nz_warm_thread` into
+    `NPUModelRunner.load_model` in `vllm_ascend/worker/v2/model_runner.py`
+    to overlap Triton compilation and NZ format-cast lazy initialization
+    with weight loading.
+    - It updates `early_kernel_warmup.py` to skip v1-only rejection sampler
+    and penalty kernels when `use_v2_model_runner` is enabled, only warming
+    up the shared `rms` kernel.
+    - It adds unit tests to verify that only the required kernels are warmed
+    up for MRv2 and that warmup threads are properly joined even if weight
+    loading fails.
+    - It updates the documentation to clarify that rejection sampler and
+    penalty kernels are skipped by the v2 model runner.
+    
+    ### Does this PR introduce _any_ user-facing change?
+    
+    No.
+    
+    ### How was this patch tested?
+    
+    - Added unit tests in
+    `tests/ut/model_executor/warmup/test_early_kernel_warmup.py` to verify
+    that only the `rms` kernel is warmed up when `use_v2_model_runner` is
+    True.
+    - Added unit tests in `tests/ut/worker/test_model_runner_v2.py` to
+    verify that warmups are started and joined correctly during
+    `load_model`, including the failure path.
+    
+    ---
+    
+    ### Checklist
+    
+    #### Testing
+    
+    - [x] **Boundary / edge-case coverage**: I reviewed whether this change
+    involves
+    boundary conditions (e.g. empty input, single/zero element, min/max
+    values,
+    off-by-one, sequence-length limits, integer overflow). Where applicable,
+    I
+    added unit tests covering these edge cases in `tests/ut/` or
+    `tests/e2e/`.
+    - [x] **Regression test**: If this PR fixes a bug, I added a regression
+    test
+      that would fail without the fix.
+    - [x] **Error / failure path coverage**: I covered abnormal paths
+    (exceptions,
+    timeouts, out-of-range, division by zero) in addition to the happy path.
+    - [x] **Meaningful & reliable tests**: New tests assert real behavior
+    and are
+      not written merely to satisfy CI.
+    - [x] **Performance impact**: If this PR touches a performance-sensitive
+    path,
+      I attached benchmark results and added performance regression tests.
+    
+    
+    - vLLM main:
+    https://github.com/vllm-project/vllm/commit/a98247ab4db686ee03c66d5feb3c761e52a2f8ab
+    
+    Signed-off-by: zouzy <zouzongyu@huawei.com>
+
+diff --git a/docs/source/user_guide/configuration/additional_config.md b/docs/source/user_guide/configuration/additional_config.md
+index b7c970594..bc5f52f5a 100644
+--- a/docs/source/user_guide/configuration/additional_config.md
++++ b/docs/source/user_guide/configuration/additional_config.md
+@@ -153,7 +153,7 @@ Both warmups run on a background thread during weight loading. The worker waits
+ 
+ | Name | Type | Default | Description |
+ | ---- | ---- | ------- | ----------- |
+-| `enable_early_kernel_warmup` | bool | `False` | Compile the rejection sampler, penalty, and RMS norm Triton warmup kernels while weights load, so the regular kernel warmup hits the Triton cache. |
++| `enable_early_kernel_warmup` | bool | `False` | Compile the rejection sampler, penalty, and RMS norm Triton warmup kernels while weights load, so the regular kernel warmup hits the Triton cache. The rejection sampler and penalty kernels are v1-only and skipped by the v2 model runner. |
+ | `enable_early_nz_warmup` | bool | `False` | Pay the one-time lazy initialization of the first NZ format cast while weights load. Independent of the quantization scheme. |
+ 
+ **eplb_config**
+diff --git a/tests/ut/model_executor/warmup/test_early_kernel_warmup.py b/tests/ut/model_executor/warmup/test_early_kernel_warmup.py
+index 8030d4cb4..004a2f291 100644
+--- a/tests/ut/model_executor/warmup/test_early_kernel_warmup.py
++++ b/tests/ut/model_executor/warmup/test_early_kernel_warmup.py
+@@ -191,3 +191,45 @@ def test_join_warns_when_the_thread_outlives_the_timeout():
+         ek.join_early_kernel_warmup("load_model")
+ 
+     warning.assert_called_once()
++
++
++def _shim(use_v2_model_runner):
++    config = MagicMock(use_v2_model_runner=use_v2_model_runner)
++    return ek._WarmupShim(config, "npu:0")
++
++
++def _run_with_recorded_items(use_v2_model_runner):
++    calls: list[str] = []
++
++    def record(name):
++        return lambda *_args, **_kwargs: calls.append(name)
++
++    with (
++        patch.object(ek.torch.npu, "set_device"),
++        patch(
++            "vllm_ascend.model_executor.warmup.rms_triton_warmup.triton_rms_warmup",
++            record("rms"),
++        ),
++        patch(
++            "vllm_ascend.model_executor.warmup.penalties_triton_warmup.penalties_triton_warmup",
++            record("penalties"),
++        ),
++        patch(
++            "vllm_ascend.model_executor.warmup.rejection_sampler_triton_warmup.rejection_sampler_triton_warmup",
++            record("rejection_sampler"),
++        ),
++    ):
++        ek._run(_shim(use_v2_model_runner), 0)
++    return calls
++
++
++@pytest.mark.parametrize(
++    ("use_v2_model_runner", "expected"),
++    [
++        (False, ["rejection_sampler", "penalties", "rms"]),
++        # MRv2 samples through worker/v2 kernels, so only rms is shared.
++        (True, ["rms"]),
++    ],
++)
++def test_run_warms_only_the_kernels_the_model_runner_uses(use_v2_model_runner, expected):
++    assert _run_with_recorded_items(use_v2_model_runner) == expected
+diff --git a/tests/ut/worker/conftest.py b/tests/ut/worker/conftest.py
+index 3069975a7..9275e2452 100644
+--- a/tests/ut/worker/conftest.py
++++ b/tests/ut/worker/conftest.py
+@@ -20,5 +20,6 @@ def _stub_ascend_config(monkeypatch):
+             ascend_compilation_config=object(),
+             eplb_config=object(),
+             draft_window_size=None,
++            ascend_warmup_config=SimpleNamespace(enable_early_kernel_warmup=False, enable_early_nz_warmup=False),
+         ),
+     )
+diff --git a/tests/ut/worker/test_model_runner_v2.py b/tests/ut/worker/test_model_runner_v2.py
+index b29d416d5..56b2c1545 100644
+--- a/tests/ut/worker/test_model_runner_v2.py
++++ b/tests/ut/worker/test_model_runner_v2.py
+@@ -745,12 +745,35 @@ def test_load_model_starts_dump_before_capture_in_graph_mode(load_dummy_weights)
+     with (
+         patch.object(GPUModelRunner, "load_model") as parent_load_model,
+         patch("vllm_ascend.worker.v2.model_runner.get_pd_dspark_aux_layer_ids", return_value=aux_layers),
++        patch("vllm_ascend.model_executor.warmup.nz_warmup.start_nz_warm_thread") as start_nz,
++        patch("vllm_ascend.model_executor.warmup.nz_warmup.join_nz_warm_thread") as join_nz,
++        patch("vllm_ascend.model_executor.warmup.early_kernel_warmup.start_early_kernel_warmup") as start_early,
++        patch("vllm_ascend.model_executor.warmup.early_kernel_warmup.join_early_kernel_warmup") as join_early,
+     ):
++        order = Mock()
++        order.attach_mock(start_nz, "start_nz")
++        order.attach_mock(start_early, "start_early")
++        order.attach_mock(parent_load_model, "parent_load")
++        order.attach_mock(join_nz, "join_nz")
++        order.attach_mock(join_early, "join_early")
+         runner.load_model(load_dummy_weights, "load_arg", load_option=True)
+ 
+     parent_load_model.assert_called_once_with(load_dummy_weights, "load_arg", load_option=True)
+     assert runner.pd_dspark_aux_layer_ids == aux_layers
+     debugger.start.assert_called_once_with(runner.model)
++    # The warmups must be started before weight I/O and joined before the
++    # method returns, which is before memory profiling.
++    start_nz.assert_called_once_with("thread")
++    start_early.assert_called_once_with()
++    join_nz.assert_called_once_with()
++    join_early.assert_called_once_with("load_model")
++    assert [entry[0] for entry in order.mock_calls] == [
++        "start_nz",
++        "start_early",
++        "parent_load",
++        "join_nz",
++        "join_early",
++    ]
+ 
+ 
+ def test_load_model_skips_dump_in_eager_mode():
+@@ -764,6 +787,28 @@ def test_load_model_skips_dump_in_eager_mode():
+     debugger.start.assert_not_called()
+ 
+ 
++def test_load_model_joins_warmups_when_weight_loading_fails():
++    # The background warmup threads touch the NPU device, so a failed load must
++    # not leave them running.
++    runner = _make_runner(need_timing=False)
++
++    with (
++        patch.object(GPUModelRunner, "load_model", side_effect=RuntimeError("OOM")),
++        patch("vllm_ascend.worker.v2.model_runner.get_pd_dspark_aux_layer_ids", return_value=()),
++        patch("vllm_ascend.model_executor.warmup.nz_warmup.start_nz_warm_thread") as start_nz,
++        patch("vllm_ascend.model_executor.warmup.nz_warmup.join_nz_warm_thread") as join_nz,
++        patch("vllm_ascend.model_executor.warmup.early_kernel_warmup.start_early_kernel_warmup") as start_early,
++        patch("vllm_ascend.model_executor.warmup.early_kernel_warmup.join_early_kernel_warmup") as join_early,
++        pytest.raises(RuntimeError),
++    ):
++        runner.load_model()
++
++    start_nz.assert_called_once_with("thread")
++    start_early.assert_called_once_with()
++    join_nz.assert_called_once_with()
++    join_early.assert_called_once_with("load_model")
++
++
+ @pytest.mark.parametrize("with_draft", [False, True])
+ def test_load_model_original_profiler_counts_post_load_weights(monkeypatch, with_draft):
+     runner = _make_runner(need_timing=False)
+diff --git a/vllm_ascend/model_executor/warmup/early_kernel_warmup.py b/vllm_ascend/model_executor/warmup/early_kernel_warmup.py
+index ffe622241..a2eff11aa 100644
+--- a/vllm_ascend/model_executor/warmup/early_kernel_warmup.py
++++ b/vllm_ascend/model_executor/warmup/early_kernel_warmup.py
+@@ -5,6 +5,8 @@ Rejection-sampler / penalty / RMS JIT is host work. Starting it at the
+ beginning of ``NPUModelRunner.load_model`` overlaps the compile with
+ safetensors load. That method joins this thread before it returns, before
+ memory profiling, so the regular kernel_warmup hits the Triton cache.
++Both ``model_runner_v1`` and ``worker/v2`` start it; the v1-only
++rejection-sampler and penalty kernels are skipped by the v2 runner.
+ 
+ Enable with ``ascend_warmup_config.enable_early_kernel_warmup``. Imports
+ that the thread needs are done on the main thread first so a concurrent import
+@@ -14,6 +16,7 @@ cannot walk sys.modules mid-registration.
+ from __future__ import annotations
+ 
+ import threading
++import time
+ from typing import Any
+ 
+ import torch
+@@ -44,31 +47,27 @@ class _WarmupShim:
+         self.model_runner = None
+ 
+ 
+-def _preimport() -> None:
++def _preimport(use_v2_model_runner: bool) -> None:
+     import vllm.triton_utils  # noqa: F401
+ 
+-    import vllm_ascend.ops.triton.penalty  # noqa: F401
+-    import vllm_ascend.ops.triton.reject_sample  # noqa: F401
++    if not use_v2_model_runner:
++        import vllm_ascend.ops.triton.penalty  # noqa: F401
++        import vllm_ascend.ops.triton.reject_sample  # noqa: F401
++        from vllm_ascend.model_executor.warmup.penalties_triton_warmup import (  # noqa: F401
++            penalties_triton_warmup,
++        )
++        from vllm_ascend.model_executor.warmup.rejection_sampler_triton_warmup import (  # noqa: F401
++            rejection_sampler_triton_warmup,
++        )
++
+     import vllm_ascend.ops.triton.rms_norm  # noqa: F401
+     import vllm_ascend.ops.triton.spec_decode.utils  # noqa: F401
+-    from vllm_ascend.model_executor.warmup.penalties_triton_warmup import (  # noqa: F401
+-        penalties_triton_warmup,
+-    )
+-    from vllm_ascend.model_executor.warmup.rejection_sampler_triton_warmup import (  # noqa: F401
+-        rejection_sampler_triton_warmup,
+-    )
+     from vllm_ascend.model_executor.warmup.rms_triton_warmup import (  # noqa: F401
+         triton_rms_warmup,
+     )
+ 
+ 
+ def _run(shim: _WarmupShim, device_index: int) -> None:
+-    from vllm_ascend.model_executor.warmup.penalties_triton_warmup import (
+-        penalties_triton_warmup,
+-    )
+-    from vllm_ascend.model_executor.warmup.rejection_sampler_triton_warmup import (
+-        rejection_sampler_triton_warmup,
+-    )
+     from vllm_ascend.model_executor.warmup.rms_triton_warmup import triton_rms_warmup
+ 
+     try:
+@@ -77,14 +76,29 @@ def _run(shim: _WarmupShim, device_index: int) -> None:
+         logger.warning("Early kernel warmup set_device failed; regular warmup still runs", exc_info=True)
+         return
+ 
+-    items = (
+-        ("rejection_sampler", lambda: rejection_sampler_triton_warmup(shim)),
+-        ("penalties", lambda: penalties_triton_warmup(shim)),
+-        ("rms", lambda: triton_rms_warmup(shim, assume_used=True)),
+-    )
++    items: tuple[tuple[str, Any], ...] = ()
++    # MRv2 samples through worker/v2 kernels, so the v1-only rejection-sampler
++    # and penalty Triton kernels are never launched there (mirrors
++    # kernel_warmup, which skips them for use_v2_model_runner). Only rms is
++    # shared by both runners.
++    if not getattr(shim.vllm_config, "use_v2_model_runner", False):
++        from vllm_ascend.model_executor.warmup.penalties_triton_warmup import (
++            penalties_triton_warmup,
++        )
++        from vllm_ascend.model_executor.warmup.rejection_sampler_triton_warmup import (
++            rejection_sampler_triton_warmup,
++        )
++
++        items += (
++            ("rejection_sampler", lambda: rejection_sampler_triton_warmup(shim)),
++            ("penalties", lambda: penalties_triton_warmup(shim)),
++        )
++    items += (("rms", lambda: triton_rms_warmup(shim, assume_used=True)),)
+     for name, fn in items:
++        start = time.perf_counter()
+         try:
+             fn()
++            logger.info("Early kernel warmup %s complete in %.3fs.", name, time.perf_counter() - start)
+         except Exception:
+             logger.warning("Early kernel warmup item %s failed; regular warmup will compile it", name, exc_info=True)
+ 
+@@ -107,7 +121,7 @@ def start_early_kernel_warmup() -> None:
+ 
+         device_index = torch.npu.current_device()
+         shim = _WarmupShim(vllm_config, torch.device(f"npu:{device_index}"))
+-        _preimport()
++        _preimport(getattr(vllm_config, "use_v2_model_runner", False))
+ 
+         def _target() -> None:
+             try:
+diff --git a/vllm_ascend/model_executor/warmup/nz_warmup.py b/vllm_ascend/model_executor/warmup/nz_warmup.py
+index dc789a862..fccf542b3 100644
+--- a/vllm_ascend/model_executor/warmup/nz_warmup.py
++++ b/vllm_ascend/model_executor/warmup/nz_warmup.py
+@@ -12,6 +12,7 @@ Enable with ``ascend_warmup_config.enable_early_nz_warmup``.
+ from __future__ import annotations
+ 
+ import threading
++import time
+ from typing import Any
+ 
+ import torch
+@@ -29,15 +30,16 @@ _NZ_THREAD: Any = None
+ 
+ def warm_nz_format_cast(tag: str) -> None:
+     """Pay the first NZ format-cast lazy init on a tiny scratch tensor."""
+-    del tag
+     global _NZ_WARMED
+     if _NZ_WARMED:
+         return
+     _NZ_WARMED = True
++    start = time.perf_counter()
+     try:
+         scratch = maybe_trans_nz(torch.zeros((256, 256), dtype=torch.int8, device="npu"))
+         torch.npu.synchronize()
+         del scratch
++        logger.info("NZ format-cast %s warmup complete in %.3fs.", tag, time.perf_counter() - start)
+     except Exception:
+         logger.warning("NZ format-cast warmup skipped", exc_info=True)
+ 
+diff --git a/vllm_ascend/worker/v2/model_runner.py b/vllm_ascend/worker/v2/model_runner.py
+index 3bca10e2c..4b057334a 100644
+--- a/vllm_ascend/worker/v2/model_runner.py
++++ b/vllm_ascend/worker/v2/model_runner.py
+@@ -289,9 +289,30 @@ class NPUModelRunner(GPUModelRunner):
+         return AscendPCPManager
+ 
+     def load_model(self, load_dummy_weights: bool = False, *args, **kwargs) -> None:
+-        aux_layers = get_pd_dspark_aux_layer_ids(self.vllm_config)
+-        super().load_model(load_dummy_weights, *args, **kwargs)
+-        self.pd_dspark_aux_layer_ids = aux_layers
++        from vllm_ascend.model_executor.warmup.early_kernel_warmup import (
++            join_early_kernel_warmup,
++            start_early_kernel_warmup,
++        )
++        from vllm_ascend.model_executor.warmup.nz_warmup import (
++            join_nz_warm_thread,
++            start_nz_warm_thread,
++        )
++
++        # Overlap the one-off NZ cast and Triton compile with weight I/O.
++        # Every model goes through here.
++        start_nz_warm_thread("thread")
++        start_early_kernel_warmup()
++        try:
++            aux_layers = get_pd_dspark_aux_layer_ids(self.vllm_config)
++            super().load_model(load_dummy_weights, *args, **kwargs)
++            self.pd_dspark_aux_layer_ids = aux_layers
++        finally:
++            # Join even when weight loading fails: these threads touch the NPU
++            # device and must not outlive this call. Joining here is also before
++            # memory profiling.
++            join_nz_warm_thread()
++            join_early_kernel_warmup("load_model")
++
+         # In cudagraph modes the dumper must be started before graph capture so
+         # that aclgraph capture/replay is instrumented (v1 parity: v1 starts
+         # the dumper at the end of load_model).

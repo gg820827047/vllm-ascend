@@ -1,0 +1,248 @@
+commit 090e3bbfac73f54d03ddc90515d395febc86eb85
+Author:     freyfwt <110148731+freyfwt@users.noreply.github.com>
+AuthorDate: Mon Oct 12 19:50:44 2026 +0800
+Commit:     GitHub <noreply@github.com>
+CommitDate: Mon Oct 12 19:50:44 2026 +0800
+
+    [BugFix][PCP] Clamp invalid slots before cache address computation (#18352)
+    
+    ### What this PR does / why we need it?
+    
+    `_copy_pcp_kv_cache_kernel` (introduced in #17502) guards its indirect
+    `tl.load`s with masks that combine row validity (`slot_indices >= 0`)
+    and column bounds (`feature_indices < k_dim`). On Ascend, the Triton
+    compiler lowers these masked 2D indirect loads into an **unconditional**
+    copy followed by an `arith.select`: the mask only zeroes the *result*
+    and never suppresses the *access*.
+    
+    A PCP invalid slot (`-1`) therefore still reaches address computation:
+    `(slot % cache_block_size) * k_stride_offset` evaluates to
+    `-k_stride_offset` elements, i.e. one row **before** the cache base. In
+    a production run this unconditional read crossed into an unmapped page
+    and raised an SMMU fault on the first offending task, after which the
+    PCP collective and the cross-host expert-parallel collectives failed in
+    cascade — the HCCL `aiv_all_gather` errors visible on the peer ranks are
+    secondary failures that hide the original device error.
+    
+    Fix: clamp invalid rows to slot 0 with `tl.where(valid_slots,
+    slot_indices, 0)` **before** computing key/RoPE offsets, in both the
+    single-row and the batched branch. The load masks are kept unchanged, so
+    the packed output still zero-fills invalid rows, but every computed
+    cache address is now in-bounds regardless of how the compiler lowers the
+    masked load.
+    
+    ### Does this PR introduce _any_ user-facing change?
+    
+    No API or config change. Packed output values are unchanged (invalid
+    rows were already zero-filled). The change removes a device-side SMMU
+    fault that fired whenever an invalid PCP slot happened to precede an
+    unmapped page.
+    
+    ### How was this patch tested?
+    
+    - Regression UT added:
+    `tests/ut/ops/test_pcp_kv_cache.py::test_batched_invalid_slots_stay_in_bounds`.
+    It drives the batched branch (240 tokens → 4-row tiles) with `-1` and a
+    very large negative slot mixed into the tiles, in a subprocess. Plain
+    output comparison can never catch this bug — the lowered `select` zeroes
+    whatever the illegal read returns, so outputs stay bit-correct — and the
+    `-1` sentinel alone faults only when the preceding page happens to be
+    unmapped. The large sentinel makes any unclamped address land far
+    outside every mapping, so the unclamped kernel faults deterministically
+    at `synchronize()` while a clamped kernel just zero-fills. Verified on a
+    real Ascend NPU (Atlas 800I A3): the test passes with this fix and
+    **fails on the parent commit** with the device error at synchronize. It
+    skips on CPU UT runners (conftest `torch.npu` mocks make
+    `is_available()` false).
+    - Existing nightly op tests still pass unchanged, covering `-1` slots
+    through the single-tensor (packed C8) and two-tensor (latent + RoPE)
+    layouts, strided and contiguous, both branches: `pytest -q
+    tests/e2e/nightly/single_node/ops/singlecard_ops/triton/test_pcp_kv_cache.py`
+    — all cases passed on a real Ascend NPU with this fix applied, along
+    with `pytest -q tests/ut/ops/test_pcp_kv_cache.py`.
+    
+    - vLLM main:
+    https://github.com/vllm-project/vllm/commit/8cc9aa5ad350f6f80cf3bebb298d410803ff75a9
+    
+    ---------
+    
+    Signed-off-by: freyfwt <freytian1996@gmail.com>
+
+diff --git a/tests/ut/ops/test_pcp_kv_cache.py b/tests/ut/ops/test_pcp_kv_cache.py
+index e6ca5342e..98ee34ac7 100644
+--- a/tests/ut/ops/test_pcp_kv_cache.py
++++ b/tests/ut/ops/test_pcp_kv_cache.py
+@@ -1,6 +1,9 @@
+ # SPDX-License-Identifier: Apache-2.0
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+ 
++import os
++import subprocess
++import sys
+ from unittest.mock import patch
+ 
+ import pytest
+@@ -26,3 +29,104 @@ from vllm_ascend.ops.triton.pcp_kv_cache import _get_pcp_kv_cache_rows
+ def test_pcp_kv_row_budget(num_tokens, block_cols, element_size, num_caches, ub_kib, expected):
+     with patch("vllm_ascend.ops.triton.pcp_kv_cache.get_ub_size_bytes", return_value=ub_kib * 1024):
+         assert _get_pcp_kv_cache_rows(num_tokens, 48, block_cols, element_size, num_caches) == expected
++
++
++# Exercises the batched branch of _copy_pcp_kv_cache_kernel with invalid slots.
++# Runs as a subprocess because an unclamped kernel raises a device error at
++# synchronize, which poisons the test process. The token count keeps
++# _get_pcp_kv_cache_rows above one row on supported devices. The child also
++# probes the device itself: the parent's torch.npu view can be mocked by the
++# CPU UT conftest, or report a driver whose devices are not visible to this
++# process, so the child reports "cannot exercise the kernel" through dedicated
++# exit codes that the parent maps to skips.
++_CHILD_EXIT_SINGLE_ROW = 3
++_CHILD_EXIT_NO_DEVICE = 4
++_BATCH_TOKENS = 240
++_FAULT_INJECTION_SLOT = -(2**35)
++
++_CHILD_TEMPLATE = """
++import torch
++try:
++    import torch_npu  # noqa: F401
++except ImportError:
++    raise SystemExit(__EXIT_NO_DEVICE__)
++try:
++    device_count = torch.npu.device_count()
++except Exception:
++    raise SystemExit(__EXIT_NO_DEVICE__)
++if device_count == 0:
++    raise SystemExit(__EXIT_NO_DEVICE__)
++from vllm_ascend.ops.triton.pcp_kv_cache import _get_pcp_kv_cache_rows, copy_pcp_kv_cache
++from vllm_ascend.ops.triton.triton_utils import get_vectorcore_num, init_device_properties_triton
++
++shape = (20, 32, 1, 656)
++num_rows = shape[0] * shape[1]
++raw = (torch.arange(num_rows * shape[3], dtype=torch.int32) % 256 - 128).to(torch.int8).reshape(shape)
++src = raw.to("npu")
++invalid_slots = (-1, __FAULT_SLOT__)
++indices = [(i * 7) % (num_rows - 2) for i in range(__TOKENS__)]
++for i in range(4, __TOKENS__, 8):
++    indices[i] = invalid_slots[(i // 8) % 2]
++slots = torch.tensor(indices, dtype=torch.int64, device="npu")
++init_device_properties_triton()
++rows = _get_pcp_kv_cache_rows(slots.numel(), get_vectorcore_num(), 1024, 1, 1)
++if rows < 2:
++    raise SystemExit(__EXIT_SINGLE_ROW__)
++packed = copy_pcp_kv_cache((src,), slots)
++torch.npu.synchronize()
++out = packed.cpu()
++for row, slot in enumerate(indices):
++    want = (
++        torch.zeros(shape[3], dtype=torch.int8)
++        if slot < 0
++        else raw[slot // shape[1], slot % shape[1], 0]
++    )
++    assert torch.equal(out[row], want), f"row {row} slot {slot} mismatch"
++print("CHILD-OK")
++"""
++
++_CHILD_SNIPPET = (
++    _CHILD_TEMPLATE.replace("__FAULT_SLOT__", str(_FAULT_INJECTION_SLOT))
++    .replace("__TOKENS__", str(_BATCH_TOKENS))
++    .replace("__EXIT_SINGLE_ROW__", str(_CHILD_EXIT_SINGLE_ROW))
++    .replace("__EXIT_NO_DEVICE__", str(_CHILD_EXIT_NO_DEVICE))
++)
++
++
++def test_batched_invalid_slots_stay_in_bounds():
++    """Invalid slots must not read outside the cache in the batched branch.
++
++    The Ascend compiler lowers the kernel's masked indirect loads into
++    unconditional copies followed by a select, so the load mask only zeroes
++    the result and never guards the access; invalid slots must be clamped
++    before address computation. The -1 sentinel alone under-reads by one row
++    and faults only when the preceding page is unmapped, so it cannot fail a
++    test deterministically. Mixing in a very large negative slot makes any
++    unclamped address land far outside every mapping and fault at synchronize,
++    while a clamped kernel just zero-fills those rows.
++    """
++    torch = pytest.importorskip("torch")
++    pytest.importorskip("torch_npu")
++    if not torch.npu.is_available():
++        pytest.skip("requires a real Ascend NPU")
++    repo_root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
++    env = dict(os.environ)
++    env["PYTHONPATH"] = os.pathsep.join(p for p in (repo_root, env.get("PYTHONPATH")) if p)
++    try:
++        proc = subprocess.run(
++            [sys.executable, "-c", _CHILD_SNIPPET],
++            capture_output=True,
++            text=True,
++            timeout=300,
++            env=env,
++        )
++    except subprocess.TimeoutExpired:
++        pytest.fail("kernel subprocess timed out: invalid slots wedged the device")
++    if proc.returncode == _CHILD_EXIT_SINGLE_ROW:
++        pytest.skip("device tiles the kernel into single rows; batched branch not exercised")
++    if proc.returncode == _CHILD_EXIT_NO_DEVICE:
++        pytest.skip("no usable Ascend NPU in a clean subprocess; requires real hardware")
++    assert proc.returncode == 0 and "CHILD-OK" in proc.stdout, (
++        "invalid slots crashed or corrupted the batched copy:\n"
++        f"exit={proc.returncode}\n{(proc.stderr or proc.stdout)[-2000:]}"
++    )
+diff --git a/vllm_ascend/ops/triton/pcp_kv_cache.py b/vllm_ascend/ops/triton/pcp_kv_cache.py
+index 08d776a65..2085cf859 100644
+--- a/vllm_ascend/ops/triton/pcp_kv_cache.py
++++ b/vllm_ascend/ops/triton/pcp_kv_cache.py
+@@ -48,9 +48,12 @@ def _copy_pcp_kv_cache_kernel(
+         for token_idx in range(tl.program_id(0), num_tokens, tl.num_programs(0)):
+             slot_idx = tl.load(slots + token_idx).to(tl.int64)
+             valid_slot = slot_idx >= 0
++            # Same clamping as the batched branch: keep computed addresses
++            # in-bounds instead of relying on the load mask.
++            load_slot_idx = tl.where(valid_slot, slot_idx, 0)
+             key_offsets = (
+-                (slot_idx // cache_block_size) * k_stride_block
+-                + (slot_idx % cache_block_size) * k_stride_offset
++                (load_slot_idx // cache_block_size) * k_stride_block
++                + (load_slot_idx % cache_block_size) * k_stride_offset
+                 + feature_indices * k_stride_d
+             )
+             key_values = tl.load(key_cache + key_offsets, mask=valid_slot & (feature_indices < k_dim), other=0)
+@@ -61,8 +64,8 @@ def _copy_pcp_kv_cache_kernel(
+             )
+             if rope_dim > 0:
+                 rope_offsets = (
+-                    (slot_idx // cache_block_size) * rope_stride_block
+-                    + (slot_idx % cache_block_size) * rope_stride_offset
++                    (load_slot_idx // cache_block_size) * rope_stride_block
++                    + (load_slot_idx % cache_block_size) * rope_stride_offset
+                     + feature_indices * rope_stride_d
+                 )
+                 rope_values = tl.load(
+@@ -79,9 +82,15 @@ def _copy_pcp_kv_cache_kernel(
+             token_indices = tile_idx * BLOCK_ROWS + tl.arange(0, BLOCK_ROWS)
+             slot_indices = tl.load(slots + token_indices, mask=token_indices < num_tokens, other=-1).to(tl.int64)
+             valid_slots = (token_indices < num_tokens) & (slot_indices >= 0)
++            # The Ascend compiler lowers these masked indirect loads into an
++            # unconditional copy followed by a select, so the mask only zeroes
++            # the result and never guards the access. Clamp invalid slots
++            # before computing addresses so slot -1 cannot read before the
++            # cache start and fault the SMMU.
++            load_slot_indices = tl.where(valid_slots, slot_indices, 0)
+             key_offsets = (
+-                (slot_indices[:, None] // cache_block_size) * k_stride_block
+-                + (slot_indices[:, None] % cache_block_size) * k_stride_offset
++                (load_slot_indices[:, None] // cache_block_size) * k_stride_block
++                + (load_slot_indices[:, None] % cache_block_size) * k_stride_offset
+                 + feature_indices * k_stride_d
+             )
+             key_values = tl.load(
+@@ -94,8 +103,8 @@ def _copy_pcp_kv_cache_kernel(
+             )  # type: ignore[index]
+             if rope_dim > 0:
+                 rope_offsets = (
+-                    (slot_indices[:, None] // cache_block_size) * rope_stride_block
+-                    + (slot_indices[:, None] % cache_block_size) * rope_stride_offset
++                    (load_slot_indices[:, None] // cache_block_size) * rope_stride_block
++                    + (load_slot_indices[:, None] % cache_block_size) * rope_stride_offset
+                     + feature_indices * rope_stride_d
+                 )
+                 rope_values = tl.load(

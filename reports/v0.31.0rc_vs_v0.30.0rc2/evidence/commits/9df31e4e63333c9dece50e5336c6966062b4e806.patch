@@ -1,0 +1,128 @@
+commit 9df31e4e63333c9dece50e5336c6966062b4e806
+Author:     LeiW777 <cloudmoodreal@gmail.com>
+AuthorDate: Tue Oct 13 22:34:02 2026 +0800
+Commit:     GitHub <noreply@github.com>
+CommitDate: Tue Oct 13 22:34:02 2026 +0800
+
+    [BugFix][Model] Patch MiniMax-M3 fused all-reduce norm on vLLM's real module instead of shadowing it (#18543)
+    
+    ## Summary
+    
+    On Ascend A3 with the B097 image, `MiniMax-M3` + mooncake KV pooling
+    failed to start with:
+    
+    ```
+    ImportError: cannot import name '_AR_RESIDUAL_RMS_NORM' from 'vllm.model_executor.layers.fused_allreduce_gemma_rms_norm' (unknown location)
+    ```
+    
+    Root cause: `_install_fused_allreduce_norm_fallback()` created a fake
+    `ModuleType` named
+    `vllm.model_executor.layers.fused_allreduce_gemma_rms_norm` and injected
+    it into `sys.modules`, shadowing vLLM's real module. The fake module
+    only exposes the single entry `fused_allreduce_gemma_rms_norm`, so any
+    consumer importing vLLM-internal symbols from that module — e.g. kimi_k3
+    DSpark's top-level `from
+    vllm.model_executor.layers.fused_allreduce_gemma_rms_norm import
+    _AR_RESIDUAL_RMS_NORM` — fails with the ImportError above ("unknown
+    location" = the fake module has no source file). Shadowing the real
+    module also couples vllm-ascend to upstream private symbols and affects
+    every importer of that module.
+    
+    ## Changes
+    
+    `vllm_ascend/models/minimax_m3/minimax_m3_vl.py` (only file touched):
+    
+    - Drop `import sys`, `from types import ModuleType`, `from typing import
+    Any, cast` — they existed solely for the fake-module mechanism.
+    - `_install_fused_allreduce_norm_fallback()` now imports vLLM's **real**
+    module
+    (`import vllm.model_executor.layers.fused_allreduce_gemma_rms_norm as
+    _real`)
+    and replaces only its public entry
+    `_real.fused_allreduce_gemma_rms_norm` with the Ascend implementation
+    (SP-MoE `reduce_scatter` + `all_reduce` + `GemmaRMSNorm`).
+    - The SP-MoE function body is unchanged; no fake module, no
+    `sys.modules` injection, no internal-symbol mirroring.
+    
+    ## Why
+    
+    - **Independence from upstream internals** — only the public API entry
+    is patched. If upstream renames or changes its private symbols,
+    vllm-ascend does not have to follow.
+    - **No shadowing** — the real module stays in `sys.modules` with all its
+    attributes intact; every importer of that module (kimi_k3 DSpark
+    included) gets the genuine module.
+    - **Uses upstream's own degradation path** — vLLM's real module already
+    handles a missing flashinfer inside try/except (optional symbols degrade
+    to `None`, `_can_use_flashinfer` returns `(False, 0)`), so Ascend
+    naturally lands on the plain all-reduce + RMSNorm fallback instead of
+    downstream faking that state.
+    
+    ## Test plan
+    
+    - [x] `py_compile` on the modified file.
+    - [x] On Ascend container: the real module
+    `vllm.model_executor.layers.fused_allreduce_gemma_rms_norm` imports OK
+    and its optional flashinfer symbols degrade to `None` (no import errors
+    on the kimi_k3 DSpark chain).
+    - [x] End-to-end `vllm serve` on A3 (B097): MiniMax-M3 with mooncake KV
+    pooling starts up, and `/v1/completions` (model `minimax-m3`) responds
+    correctly on both the P node and the D node.
+    
+    - vLLM main:
+    https://github.com/vllm-project/vllm/commit/8cc9aa5ad350f6f80cf3bebb298d410803ff75a9
+    
+    Signed-off-by: LeiW777 <cloudmoodreal@gmail.com>
+    Signed-off-by: lty <linhebiwen@gmail.com>
+    Co-authored-by: lty <linhebiwen@gmail.com>
+
+diff --git a/vllm_ascend/models/minimax_m3/minimax_m3_vl.py b/vllm_ascend/models/minimax_m3/minimax_m3_vl.py
+index 501860ce4..df0117395 100644
+--- a/vllm_ascend/models/minimax_m3/minimax_m3_vl.py
++++ b/vllm_ascend/models/minimax_m3/minimax_m3_vl.py
+@@ -12,11 +12,8 @@ while the language model path remains the Ascend-native implementation in
+ ``vllm_ascend.models.minimax_m3``.
+ """
+ 
+-import sys
+ from collections.abc import Iterable
+ from pathlib import Path
+-from types import ModuleType
+-from typing import Any, cast
+ 
+ import torch
+ import vllm
+@@ -77,12 +74,17 @@ MiniMaxM3VLProcessingInfo = _mm_preprocess.MiniMaxM3VLProcessingInfo
+ 
+ 
+ def _install_fused_allreduce_norm_fallback() -> None:
+-    """Avoid importing vLLM's CUDA-only fusion module on Ascend."""
+-    module_name = "vllm.model_executor.layers.fused_allreduce_gemma_rms_norm"
+-    if module_name in sys.modules:
+-        return
+-
+-    fallback_module = ModuleType(module_name)
++    """Install the Ascend fused all-reduce implementation on vLLM's real
++    module instead of shadowing it with a fake one.
++
++    vLLM's real module keeps its optional flashinfer symbols
++    (``_AR_RESIDUAL_RMS_NORM``, ``_can_use_flashinfer``,
++    ``flashinfer_trtllm_fused_allreduce_norm``) and degrades them to None on
++    Ascend through its own try/except, so the kimi_k3 DSpark imports succeed
++    against the real module. We only replace the single public entry
++    ``fused_allreduce_gemma_rms_norm`` and never mirror vLLM internal names.
++    """
++    import vllm.model_executor.layers.fused_allreduce_gemma_rms_norm as _real
+ 
+     def fused_allreduce_gemma_rms_norm(
+         hidden_states: torch.Tensor,
+@@ -107,8 +109,7 @@ def _install_fused_allreduce_norm_fallback() -> None:
+                 hidden_states = tensor_model_parallel_all_reduce(hidden_states)
+         return norm(hidden_states, residual)
+ 
+-    cast(Any, fallback_module).fused_allreduce_gemma_rms_norm = fused_allreduce_gemma_rms_norm
+-    sys.modules[module_name] = fallback_module
++    _real.fused_allreduce_gemma_rms_norm = fused_allreduce_gemma_rms_norm
+ 
+ 
+ _install_fused_allreduce_norm_fallback()

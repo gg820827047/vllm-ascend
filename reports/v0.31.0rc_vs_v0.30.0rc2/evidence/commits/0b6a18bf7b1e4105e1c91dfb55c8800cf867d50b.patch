@@ -1,0 +1,290 @@
+commit 0b6a18bf7b1e4105e1c91dfb55c8800cf867d50b
+Author:     Wang Dian <93850926+dianWang325@users.noreply.github.com>
+AuthorDate: Sun Oct 11 18:28:00 2026 +0800
+Commit:     GitHub <noreply@github.com>
+CommitDate: Sun Oct 11 18:28:00 2026 +0800
+
+    [BugFix][CPP][v0.30.0] Update the online calibration model linear term (#18303)
+    
+    ### What this PR does / why we need it?
+    
+    Backport of #18174 to `releases/v0.30.0`.
+    
+    This PR updates both the CPP online calibration model and how its
+    prediction is consumed by the scheduler:
+    
+    - Change the per-request latency model from `b * (C + H)` to `b * C`.
+    - Keep batch feature aggregation, latency prediction, and inverse
+    chunk-size calculation consistent with the updated model.
+    - Use non-negative least squares for online calibration to prevent
+    negative fitted latency components.
+    - Apply dynamic chunk-size prediction only to continued prefills; the
+    first prefill chunk follows the normal scheduling budgets.
+    - Remove cumulative predicted-time subtraction and profiling time-budget
+    admission gating from the RUNNING and WAITING scheduling loops.
+    - Update the existing scheduler tests and add coverage for non-negative
+    chunk-model fitting.
+    
+    ### Does this PR introduce _any_ user-facing change?
+    
+    No API or configuration changes. CPP online calibration and scheduling
+    behavior are corrected internally.
+    
+    ### How was this patch tested?
+    
+    - `git diff --check upstream/releases/v0.30.0...HEAD`
+    - Python syntax compilation for the two modified implementation files
+    and the focused CPP unit-test file
+    - The focused pytest suite cannot run in the current Windows environment
+    because `torch` is not installed; CI is expected to run the repository
+    test suite.
+    
+    Original PR: #18174
+    - vLLM main:
+    https://github.com/vllm-project/vllm/commit/ced6857afa0ea7b2e3f0846a62e1394e90f15607
+    
+    ---------
+    
+    Signed-off-by: dianWang325 <93850926+dianWang325@users.noreply.github.com>
+
+diff --git a/tests/ut/core/test_profiling_chunk.py b/tests/ut/core/test_profiling_chunk.py
+index a8215942a..38ac68e9b 100644
+--- a/tests/ut/core/test_profiling_chunk.py
++++ b/tests/ut/core/test_profiling_chunk.py
+@@ -214,7 +214,7 @@ class TestChunkSizePredictor(TestBase):
+         data = []
+         for i in range(10):
+             c, h = 1000 + i * 100, i * 500
+-            data.append([(c + h) * c, c + h, 1, 1e-9 * (c + h) * c + 0.001 * (c + h) + 0.5])
++            data.append([(c + h) * c, c, 1, 1e-9 * (c + h) * c + 0.001 * c + 0.5])
+         self.assertTrue(predictor.fit_chunk(data))
+         predictor.with_history_ready = True
+ 
+@@ -222,6 +222,16 @@ class TestChunkSizePredictor(TestBase):
+         self.assertIsNotNone(result)
+         self.assertEqual(result % 128, 0)
+ 
++    def test_fit_chunk_constrains_negative_coefficients(self):
++        predictor = ChunkSizePredictor()
++        # The unconstrained solution is a=0, b=-1, c=11.
++        data = [[c * c, c, 1, 11 - c] for c in range(1, 6)]
++
++        self.assertTrue(predictor.fit_chunk(data))
++        self.assertGreaterEqual(predictor.quadratic_chunk_a, 0.0)
++        self.assertGreaterEqual(predictor.linear_chunk_b, 0.0)
++        self.assertGreaterEqual(predictor.constant_chunk_c, 0.0)
++
+ 
+ # ===================================================================
+ # ProfilingChunkManager
+@@ -864,6 +874,7 @@ class TestProfilingChunkAsyncScheduler(TestBase):
+ 
+     def test_decode_placeholders_accumulate_without_update_from_output(self):
+         scheduler = self.create_scheduler()
++        scheduler.max_num_scheduled_tokens = 128
+         self._mark_ready(scheduler, predicted_chunk=64)
+         decode_request = create_requests(num_requests=1, num_tokens=10, request_id_prefix="decode-")[0]
+         prefill_request = create_requests(num_requests=1, num_tokens=2000, request_id_prefix="prefill-")[0]
+@@ -872,7 +883,7 @@ class TestProfilingChunkAsyncScheduler(TestBase):
+ 
+         first_output = scheduler.schedule()
+         self.assertEqual(first_output.num_scheduled_tokens["decode-0"], 10)
+-        self.assertEqual(first_output.num_scheduled_tokens["prefill-0"], 64)
++        self.assertEqual(first_output.num_scheduled_tokens["prefill-0"], 118)
+         # decode-0 finished its prefill in one chunk: placeholder accounting applies.
+         self.assertFalse(decode_request.is_prefill_chunk)
+         self.assertEqual(decode_request.num_output_placeholders, 1)
+@@ -903,6 +914,8 @@ class TestProfilingChunkAsyncScheduler(TestBase):
+         predicted_chunk = 64
+         sync_scheduler = self._mark_ready(self.create_scheduler(async_scheduling=False), predicted_chunk)
+         async_scheduler = self._mark_ready(self.create_scheduler(async_scheduling=True), predicted_chunk)
++        sync_scheduler.max_num_scheduled_tokens = 128
++        async_scheduler.max_num_scheduled_tokens = 128
+         sync_request = create_requests(num_requests=1, num_tokens=200, request_id_prefix="sync-")[0]
+         async_request = create_requests(num_requests=1, num_tokens=200, request_id_prefix="async-")[0]
+         sync_scheduler.add_request(sync_request)
+@@ -911,17 +924,21 @@ class TestProfilingChunkAsyncScheduler(TestBase):
+         # First chunk from the WAITING loop.
+         sync_first = sync_scheduler.schedule()
+         async_first = async_scheduler.schedule()
+-        self.assertEqual(sync_first.num_scheduled_tokens["sync-0"], predicted_chunk)
+-        self.assertEqual(async_first.num_scheduled_tokens["async-0"], predicted_chunk)
++        self.assertEqual(sync_first.num_scheduled_tokens["sync-0"], 128)
++        self.assertEqual(async_first.num_scheduled_tokens["async-0"], 128)
++        sync_scheduler.profiling_chunk_manager.predict_chunk_size.assert_not_called()
++        async_scheduler.profiling_chunk_manager.predict_chunk_size.assert_not_called()
+ 
+         # Continuation chunk from the RUNNING loop. Both schedulers have
+-        # advanced num_computed_tokens to 64 by now; the sync one consumes
++        # advanced num_computed_tokens to 128 by now; the sync one consumes
+         # its first output first, mirroring the synchronous engine loop.
+         sync_scheduler.update_from_output(sync_first, make_output(sync_scheduler))
+         sync_second = sync_scheduler.schedule()
+         async_second = async_scheduler.schedule()
+         self.assertEqual(sync_second.num_scheduled_tokens["sync-0"], predicted_chunk)
+         self.assertEqual(async_second.num_scheduled_tokens["async-0"], predicted_chunk)
++        sync_scheduler.profiling_chunk_manager.predict_chunk_size.assert_called_once()
++        async_scheduler.profiling_chunk_manager.predict_chunk_size.assert_called_once()
+         self.assertEqual(async_request.num_output_placeholders, 0)
+ 
+     def test_max_tokens_oversampling_guard_skips_decode(self):
+diff --git a/vllm_ascend/core/profiling_chunk_predictor.py b/vllm_ascend/core/profiling_chunk_predictor.py
+index 9be84fa6c..6f3004a5d 100644
+--- a/vllm_ascend/core/profiling_chunk_predictor.py
++++ b/vllm_ascend/core/profiling_chunk_predictor.py
+@@ -32,6 +32,7 @@ import time
+ 
+ import numpy as np
+ import torch
++from scipy.optimize import nnls  # type: ignore[import-untyped]
+ from vllm.logger import logger
+ 
+ 
+@@ -163,7 +164,7 @@ class ChunkSizePredictor:
+         return True
+ 
+     def fit_chunk(self, chunked_data: list) -> bool:
+-        """Fit time with chunks: f(C,H) = a*C(C+H) + b*C + c*H.
++        """Fit batch time: T = a*sum(C(C+H)) + b*sum(C) + c.
+ 
+         Returns:
+             True if fitting succeeded, False otherwise
+@@ -190,12 +191,12 @@ class ChunkSizePredictor:
+         input_x = chunked_data_array[:, :-1]
+ 
+         try:
+-            params, _, _, _ = np.linalg.lstsq(input_x, execute_time, rcond=None)
++            params, _ = nnls(input_x, execute_time)
+             fitted_a = float(params[0])
+             fitted_b = float(params[1])
+             fitted_c = float(params[2])
+-        except np.linalg.LinAlgError as e:
+-            logger.warning("[ProfilingChunk] Failed to fit chunked model: %s", e)
++        except (RuntimeError, ValueError, np.linalg.LinAlgError) as e:
++            logger.warning("[ProfilingChunk] Failed to fit non-negative chunked model: %s", e)
+             return False
+ 
+         self.quadratic_chunk_a = fitted_a
+@@ -246,10 +247,10 @@ class ChunkSizePredictor:
+         query_len: int,
+         num_computed_tokens: int,
+     ) -> float:
+-        """Get time T based on current seq_lens, f(C,H) = a*C(C+H) + b*(C+H) + c = T"""
++        """Get time T based on current seq_lens, f(C,H) = a*C(C+H) + b*C + c = T"""
+         return (
+             self.quadratic_chunk_a * query_len * (query_len + num_computed_tokens)
+-            + self.linear_chunk_b * (query_len + num_computed_tokens)
++            + self.linear_chunk_b * query_len
+             + self.constant_chunk_c
+         )
+ 
+@@ -322,7 +323,7 @@ class ChunkSizePredictor:
+         target_time: float = 0,
+     ) -> int | None:
+         """Predict next chunk size x using the history-aware model
+-        f(C,H) = a*C(C+H) + b*C + c*H.
++        f(C,H) = a*C(C+H) + b*C + c.
+ 
+         Args:
+             num_computed_tokens: Number of tokens already computed (C),
+@@ -346,17 +347,17 @@ class ChunkSizePredictor:
+         if not self.with_history_ready:
+             return None
+ 
+-        # f(x,H) = a*x*(x+H) + b*x + c*H, solving f(x,H)=T gives:
+-        # a*x^2 + (a*H + b)*x + (b*H + c - T) = 0
++        # f(x,H) = a*x*(x+H) + b*x + c, solving f(x,H)=T gives:
++        # a*x^2 + (a*H + b)*x + (c - T) = 0.
+         # Standard form: A*x^2 + B*x + C = 0, where H=num_computed_tokens, T=target_latency
+         A = self.quadratic_chunk_a
+         if A == 0:
+             return None
+         B = self.quadratic_chunk_a * num_computed_tokens + self.linear_chunk_b
+         if target_time > 0:
+-            C = self.linear_chunk_b * num_computed_tokens + self.constant_chunk_c - target_time
++            C = self.constant_chunk_c - target_time
+         else:
+-            C = self.linear_chunk_b * num_computed_tokens + self.constant_chunk_c - self.target_latency
++            C = self.constant_chunk_c - self.target_latency
+ 
+         discriminant = B * B - 4 * A * C
+         if discriminant < 0:
+@@ -455,7 +456,7 @@ class ProfilingChunkManager:
+         x1 = x2 = x3 = 0
+         for chunk, hist in request_chunks:
+             x1 += (chunk + hist) * chunk
+-            x2 += chunk + hist
++            x2 += chunk
+             x3 += 1
+         self.chunked_fit_data.append([x1, x2, x3, elapsed_time * 1000])
+         if not self.predictor.fit_chunk(self.chunked_fit_data):
+diff --git a/vllm_ascend/core/scheduler_profiling_chunk.py b/vllm_ascend/core/scheduler_profiling_chunk.py
+index 3350b74fa..6ad7eea2b 100644
+--- a/vllm_ascend/core/scheduler_profiling_chunk.py
++++ b/vllm_ascend/core/scheduler_profiling_chunk.py
+@@ -318,7 +318,7 @@ class ProfilingChunkScheduler(Scheduler):
+         # First, schedule the RUNNING requests.
+         req_index = 0
+         # >>> PROFILING CHUNK >>>
+-        while req_index < len(self.running) and token_budget > 0 and time_budget > 0:
++        while req_index < len(self.running) and token_budget > 0:
+             # <<< PROFILING CHUNK <<<
+             request = self.running[req_index]
+             if input_budget <= draft_slots:
+@@ -428,7 +428,7 @@ class ProfilingChunkScheduler(Scheduler):
+                 self.profiling_chunk_manager is not None
+                 and self.profiling_chunk_manager.is_ready
+                 and request.num_computed_tokens < request.num_prompt_tokens
+-                and (request.num_computed_tokens > 0 or not self.profiling_chunk_config.need_timing)
++                and request.num_computed_tokens > 0
+             ):
+                 predicted_chunk = self.profiling_chunk_manager.predict_chunk_size(
+                     num_computed_tokens=request.num_computed_tokens,
+@@ -574,12 +574,7 @@ class ProfilingChunkScheduler(Scheduler):
+             num_scheduled_tokens[request_id] = num_new_tokens
+             token_budget -= num_new_tokens
+             input_budget -= num_new_tokens + draft_slots
+-            # >>> PROFILING CHUNK >>>
+-            # Decode requests (num_new_tokens == 1) have negligible latency;
+-            # skip time_budget accounting so they don't starve other requests.
+-            if request.num_computed_tokens < request.num_prompt_tokens:
+-                time_budget -= self.profiling_chunk_manager.predict_time(num_new_tokens, request.num_computed_tokens)
+-            # <<< PROFILING CHUNK <<<
++
+             req_index += 1
+ 
+             # Speculative decode related.
+@@ -627,7 +622,7 @@ class ProfilingChunkScheduler(Scheduler):
+             step_skipped_waiting = create_request_queue(self.policy)
+ 
+             # >>> PROFILING CHUNK >>>
+-            while (self.waiting or self.skipped_waiting) and token_budget > 0 and time_budget > 0:
++            while (self.waiting or self.skipped_waiting) and token_budget > 0:
+                 # <<< PROFILING CHUNK <<<
+                 if input_budget <= draft_slots:
+                     break
+@@ -855,7 +850,7 @@ class ProfilingChunkScheduler(Scheduler):
+                         self.profiling_chunk_manager is not None
+                         and self.profiling_chunk_manager.is_ready
+                         and request.num_computed_tokens < request.num_prompt_tokens
+-                        and (request.num_computed_tokens > 0 or not self.profiling_chunk_config.need_timing)
++                        and request.num_computed_tokens > 0
+                     ):
+                         predicted_chunk = self.profiling_chunk_manager.predict_chunk_size(
+                             num_computed_tokens=num_computed_tokens,
+@@ -1042,14 +1037,7 @@ class ProfilingChunkScheduler(Scheduler):
+                 num_scheduled_tokens[request_id] = num_new_tokens
+                 token_budget -= num_new_tokens
+                 input_budget -= num_new_tokens + draft_slots
+-                # >>> PROFILING CHUNK >>>
+-                # Decode requests (num_new_tokens == 1) have negligible latency;
+-                # skip time_budget accounting so they don't starve other requests.
+-                if request.num_computed_tokens < request.num_prompt_tokens:
+-                    time_budget -= self.profiling_chunk_manager.predict_time(
+-                        num_new_tokens, request.num_computed_tokens
+-                    )
+-                # <<< PROFILING CHUNK <<<
++
+                 request.status = RequestStatus.RUNNING
+                 request.num_computed_tokens = num_computed_tokens
+                 if pad_spec_decode:

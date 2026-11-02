@@ -1,0 +1,720 @@
+commit fe686bc79a81bcc2cbcff5b1717b07ed67a66404
+Author:     AJF-cmd <wangruiqing6@h-partners.com>
+AuthorDate: Fri Oct 16 09:36:05 2026 +0800
+Commit:     GitHub <noreply@github.com>
+CommitDate: Fri Oct 16 09:36:05 2026 +0800
+
+    [Attention][Feature] Support C8 MXFP8 KV cache quantization in Ascend v2 worker (#18485)
+    
+    ### What this PR does / why we need it?
+    This pull request implements support for C8 MXFP8 KV cache quantization
+    in the Ascend v2 worker. Specifically, it:
+    - Rewrites `FullAttentionSpec` to `mxfp_cache_spec` when MXFP8 KV
+    quantization is enabled.
+    - Implements `_reshape_kv_cache_v2` to build appropriate views for MXFP8
+    caches.
+    - Adds initialization and management of static V scale caches
+    (`_fill_c8_mxfp_v_scale_caches`) and restores them during page
+    reassignment in `update_requests`.
+    - Integrates `AscendKVBlockZeroer` to handle zeroing of MXFP8 KV blocks
+    while preserving static V scales.
+    
+    Feedback on this PR suggests adding defensive checks in
+    `_fill_c8_mxfp_v_scale_caches` to avoid potential `ZeroDivisionError`
+    and `IndexError` when `num_blocks` is 0 or `kv_cache` is malformed, as
+    well as safely retrieving `static_forward_context` in
+    `_init_kv_zero_meta` to prevent `AttributeError`.
+    
+    ### Does this PR introduce _any_ user-facing change?
+    No, this is an internal enablement of MXFP8 KV cache quantization for
+    Ascend NPU backends.
+    
+    ### How was this patch tested?
+    New unit tests have been added in
+    `tests/ut/worker/test_attn_utils_v2.py` and
+    `tests/ut/worker/test_model_runner_v2.py` to verify the MXFP8 spec
+    rewriting, cache reshaping, V-scale filling, and zeroing logic.
+    
+    
+    - vLLM main:
+    https://github.com/vllm-project/vllm/commit/c4df37dfcc7f72ca41cd43801a468526ecf99a2b
+    
+    Signed-off-by: AJF-cmd <wangruiqing6@h-partners.com>
+
+diff --git a/tests/ut/worker/test_attn_utils_v2.py b/tests/ut/worker/test_attn_utils_v2.py
+index 4ea777d8e..07fd20631 100644
+--- a/tests/ut/worker/test_attn_utils_v2.py
++++ b/tests/ut/worker/test_attn_utils_v2.py
+@@ -25,6 +25,7 @@ from vllm.v1.worker.utils import AttentionGroup
+ 
+ from vllm_ascend.attention import dsa_attn_kv_plan, dsa_v1
+ from vllm_ascend.attention import utils as attention_utils
++from vllm_ascend.attention.attention_c8_mxfp import mxfp_cache_spec, mxfp_paged_cache_views
+ from vllm_ascend.attention.attention_v1 import (
+     AscendAttentionBackend,
+     AscendAttentionBackendImpl,
+@@ -804,6 +805,7 @@ def test_v2_model_runner_binds_tuple_aware_zeroer(monkeypatch):
+     )
+     runner = NPUModelRunner.__new__(NPUModelRunner)
+     runner.device = torch.device("cpu")
++    runner.vllm_config = SimpleNamespace(cache_config=SimpleNamespace(cache_dtype="auto"))
+     runner.attn_groups = [[group]]
+     runner.kernel_block_sizes = [4]
+     runner.compilation_config = SimpleNamespace(static_forward_context={})
+@@ -866,6 +868,67 @@ def test_v2_zeroer_covers_each_mla_component_view():
+     assert all(zeroer._meta[-1] == 3 for zeroer in zeroer._zeroers)
+ 
+ 
++def test_v2_zeroer_skips_static_v_scale_for_mxfp8(monkeypatch):
++    heads, k_dim, v_dim, block = 2, 64, 64, 512
++    num_blocks = 3
++    k_bytes = heads * block * k_dim
++    ks_bytes = heads * block * k_dim // 32
++    v_bytes = heads * block * v_dim
++    vs_bytes = heads * block * v_dim // 32
++    pitch = k_bytes + ks_bytes + v_bytes + vs_bytes + 256
++    raw = torch.full((128 + num_blocks * pitch + 128,), 37, dtype=torch.int8)
++    views = mxfp_paged_cache_views(raw[128:-128], num_blocks, heads, k_dim, v_dim, block, page_stride_bytes=pitch)
++    spec = mxfp_cache_spec(_plain_full_attention_spec())
++    zeroer = AscendV2KVBlockZeroer(
++        torch.device("cpu"),
++        attn_groups_iter=[
++            AttentionGroup(
++                backend=AscendAttentionBackend,
++                layer_names=["attn"],
++                kv_cache_spec=spec,
++                kv_cache_group_id=0,
++            )
++        ],
++        kernel_block_sizes=[512],
++        static_forward_context={"attn": SimpleNamespace(kv_cache=views)},
++        num_blocks=num_blocks,
++        cache_dtype="mxfp8",
++    )
++
++    # The 4-tuple is truncated: only k, v and k_scale components are zeroed.
++    assert len(zeroer._zeroers) == 3
++
++    # CPU runners cannot launch the Triton kernel; replay its segment-table
++    # zeroing in plain torch.
++    class _CpuZeroKernel:
++        def __getitem__(self, grid):
++            def launch(seg_addrs, seg_block_strides, seg_page_sizes, block_ids, BLOCK_SIZE):
++                buf = raw.view(torch.int32)
++                base = raw.data_ptr()
++                for seg in range(seg_addrs.numel()):
++                    start = (int(seg_addrs[seg]) - base) // 4
++                    stride = int(seg_block_strides[seg])
++                    page = int(seg_page_sizes[seg])
++                    for block_id in block_ids.tolist():
++                        buf[start + block_id * stride : start + block_id * stride + page] = 0
++
++            return launch
++
++    monkeypatch.setattr("vllm.v1.worker.utils._zero_kv_blocks_kernel", _CpuZeroKernel())
++    zeroer.zero_block_ids([0])
++
++    # Block 0 payload: k, k_scale and v are cleared, v_scale is preserved.
++    assert torch.all(raw[128 : 128 + k_bytes] == 0)
++    assert torch.all(raw[128 + k_bytes : 128 + k_bytes + ks_bytes] == 0)
++    assert torch.all(raw[128 + k_bytes + ks_bytes : 128 + k_bytes + ks_bytes + v_bytes] == 0)
++    vs_start = k_bytes + ks_bytes + v_bytes
++    assert torch.all(raw[128 + vs_start : 128 + vs_start + vs_bytes] == 37)
++    # Page padding, later blocks and guard regions are untouched.
++    assert torch.all(raw[128 + vs_start + vs_bytes : 128 + pitch] == 37)
++    assert torch.all(raw[128 + pitch :] == 37)
++    assert torch.all(raw[:128] == 37)
++
++
+ def test_main_dsv4_materializes_real_planner_geometry_once(monkeypatch):
+     small_name = "model.layers.0.self_attn.attn"
+     large_name = "model.layers.1.self_attn.attn"
+@@ -2562,6 +2625,131 @@ def test_tq_groups_without_a_dsa_builder_skip_the_formatted_mapping(for_capture,
+         assert builder.tq_group_block_sizes is None
+ 
+ 
++def _c8_mxfp_vllm_config(cache_dtype: str = "mxfp8") -> SimpleNamespace:
++    return SimpleNamespace(
++        cache_config=SimpleNamespace(cache_dtype=cache_dtype),
++        attention_config=SimpleNamespace(indexer_kv_dtype="auto"),
++        parallel_config=SimpleNamespace(decode_context_parallel_size=1),
++        model_config=SimpleNamespace(hf_text_config=SimpleNamespace(model_type="qwen3_next")),
++        quant_config=None,
++    )
++
++
++def _plain_full_attention_spec(head_size_v: int = 64) -> FullAttentionSpec:
++    return FullAttentionSpec(
++        block_size=512,
++        num_kv_heads=2,
++        head_size=64,
++        head_size_v=head_size_v,
++        dtype=torch.bfloat16,
++    )
++
++
++def _run_get_kv_cache_spec(monkeypatch, vllm_config, spec) -> dict:
++    attn_module = SimpleNamespace(
++        get_kv_cache_spec=lambda _cfg: spec,
++    )
++    monkeypatch.setattr(attn_utils, "get_layers_from_vllm_config", lambda _cfg, _type: {"attn": attn_module})
++    monkeypatch.setattr(attn_utils, "enable_sfa_dcp_replicated_indexer", lambda _cfg: False)
++    monkeypatch.setattr(attn_utils, "kv_cache_dtype_str_to_dtype", lambda _s, _m: torch.bfloat16)
++    return attn_utils.get_kv_cache_spec(vllm_config)
++
++
++@pytest.mark.parametrize("head_size_v", [64, 128])
++def test_get_kv_cache_spec_rewrites_c8_mxfp_spec(monkeypatch, head_size_v):
++    spec = _run_get_kv_cache_spec(monkeypatch, _c8_mxfp_vllm_config(), _plain_full_attention_spec(head_size_v))["attn"]
++
++    assert spec.dtype == torch.float8_e4m3fn
++    # Scales are budgeted through state_content_bytes: K + V + E8M0 groups.
++    assert spec.state_content_bytes == 64 + head_size_v + (64 + head_size_v) // 32
++    assert spec.page_size_bytes == 2 * 512 * spec.state_content_bytes
++    assert spec.block_size == 512
++
++
++def test_get_kv_cache_spec_keeps_plain_spec_without_mxfp8(monkeypatch):
++    spec = _run_get_kv_cache_spec(monkeypatch, _c8_mxfp_vllm_config(cache_dtype="auto"), _plain_full_attention_spec())[
++        "attn"
++    ]
++
++    assert spec.dtype == torch.bfloat16
++    assert spec.state_content_bytes is None
++
++
++@pytest.mark.parametrize("head_size_v", [64, 128])
++def test_reshape_kv_cache_v2_builds_c8_mxfp_views(monkeypatch, head_size_v):
++    spec = mxfp_cache_spec(_plain_full_attention_spec(head_size_v))
++    num_blocks = 3
++    layer_name = "attn"
++    raw = torch.full((num_blocks * spec.page_size_bytes,), 37, dtype=torch.int8)
++    kv_cache_config = KVCacheConfig(
++        num_blocks=num_blocks,
++        kv_cache_tensors=[_make_kv_cache_tensor(raw.numel(), [layer_name], spec.page_size_bytes)],
++        kv_cache_groups=[KVCacheGroupSpec(layer_names=[layer_name], kv_cache_spec=spec)],
++    )
++    monkeypatch.setattr(attn_utils, "get_current_vllm_config", lambda: _c8_mxfp_vllm_config())
++    monkeypatch.setattr(attn_utils, "_is_dsv4_model", lambda _cfg: False)
++    monkeypatch.setattr(attn_utils, "enable_sfa", lambda _cfg: False)
++
++    reshaped = attn_utils._reshape_kv_cache_v2(
++        attn_groups=[
++            AttentionGroup(
++                backend=AscendAttentionBackend,
++                layer_names=[layer_name],
++                kv_cache_spec=spec,
++                kv_cache_group_id=0,
++            )
++        ],
++        kv_cache_raw_tensors={layer_name: raw},
++        cache_dtype="mxfp8",
++        kernel_block_sizes=[512],
++        shared_kv_cache_layers={},
++        kv_cache_config=kv_cache_config,
++    )
++
++    k, v, k_scale, v_scale = reshaped[layer_name]
++    assert k.shape == (num_blocks, 2, 64 // 32, 512, 32)
++    assert v.shape == (num_blocks, 2, head_size_v // 32, 512, 32)
++    assert k.dtype == v.dtype == torch.float8_e4m3fn
++    # One kernel block per page: the dim-0 stride is the packet pitch.
++    assert k.stride(0) == spec.page_size_bytes
++    assert k_scale.shape == (num_blocks, 2, 512 // 16, 64 // 64, 16, 2)
++    assert v_scale.shape == (num_blocks, 2, head_size_v // 16, 512 // 64, 16, 2)
++    assert k_scale.dtype == v_scale.dtype == torch.uint8
++    for view in (k, v, k_scale, v_scale):
++        assert view.untyped_storage().data_ptr() == raw.untyped_storage().data_ptr()
++
++
++def test_reshape_kv_cache_v2_rejects_split_c8_raw(monkeypatch):
++    spec = mxfp_cache_spec(_plain_full_attention_spec())
++    layer_name = "attn"
++    raw = torch.full((spec.page_size_bytes,), 37, dtype=torch.int8)
++    kv_cache_config = KVCacheConfig(
++        num_blocks=1,
++        kv_cache_tensors=[_make_kv_cache_tensor(raw.numel(), [layer_name], spec.page_size_bytes)],
++        kv_cache_groups=[KVCacheGroupSpec(layer_names=[layer_name], kv_cache_spec=spec)],
++    )
++    monkeypatch.setattr(attn_utils, "get_current_vllm_config", lambda: _c8_mxfp_vllm_config())
++    monkeypatch.setattr(attn_utils, "_is_dsv4_model", lambda _cfg: False)
++    monkeypatch.setattr(attn_utils, "enable_sfa", lambda _cfg: False)
++
++    with pytest.raises(ValueError, match="one combined raw allocation"):
++        attn_utils._reshape_kv_cache_v2(
++            attn_groups=[
++                AttentionGroup(
++                    backend=AscendAttentionBackend,
++                    layer_names=[layer_name],
++                    kv_cache_spec=spec,
++                    kv_cache_group_id=0,
++                )
++            ],
++            kv_cache_raw_tensors={layer_name: (raw, raw.clone())},
++            cache_dtype="mxfp8",
++            kernel_block_sizes=[512],
++            shared_kv_cache_layers={},
++            kv_cache_config=kv_cache_config,
++        )
++
++
+ @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+ @pytest.mark.parametrize(
+     ("manager_block_size", "rope_dim", "page_padding_bytes", "raw_offset_bytes"),
+diff --git a/tests/ut/worker/test_model_runner_v2.py b/tests/ut/worker/test_model_runner_v2.py
+index 7f1d8cddb..f92804cad 100644
+--- a/tests/ut/worker/test_model_runner_v2.py
++++ b/tests/ut/worker/test_model_runner_v2.py
+@@ -17,11 +17,18 @@ from vllm.v1.worker.gpu import model_runner as vllm_model_runner
+ from vllm.v1.worker.gpu.model_runner import BatchReqState, GPUModelRunner
+ 
+ from vllm_ascend.ascend_forward_context import MoECommType
++from vllm_ascend.attention.attention_c8_mxfp import (
++    AscendC8MXFPAttentionBackendImpl,
++    fill_mxfp_v_scale_cache,
++    mxfp_paged_cache_views,
++    mxfp_v_scale_cache_shape,
++)
+ from vllm_ascend.attention.mla_v1 import AscendMLABackend, AscendMLAImpl
+ from vllm_ascend.utils import vllm_version_is
+ from vllm_ascend.worker.v2.input_batch import AscendInputBatch, AscendInputBuffers
+ from vllm_ascend.worker.v2.model_runner import NPUModelRunner
+ from vllm_ascend.worker.v2.pcp_manager import AscendPCPManager
++from vllm_ascend.worker.v2.utils import C8KVBlockZeroer
+ 
+ 
+ def _make_runner(need_timing: bool = True):
+@@ -1732,7 +1739,180 @@ def test_copy_num_computed_tokens_to_cpu_records_event():
+     npu_stream.assert_called_once_with(stream)
+     stream.wait_stream.assert_called_once_with(default_stream)
+     runner.num_computed_tokens_cpu.copy_.assert_called_once()
+-    runner.num_computed_tokens_event.record.assert_called_once_with()
++
++
++def _c8_mxfp_runner(layers: dict, num_blocks: int = 2) -> NPUModelRunner:
++    runner = NPUModelRunner.__new__(NPUModelRunner)
++    runner.kv_cache_config = SimpleNamespace(num_blocks=num_blocks)
++    runner.compilation_config = SimpleNamespace(static_forward_context=layers)
++    runner.vllm_config = SimpleNamespace(
++        cache_config=SimpleNamespace(cache_dtype="mxfp8"),
++        compilation_config=runner.compilation_config,
++    )
++    return runner
++
++
++def _c8_mxfp_layer(num_kv_heads: int = 2, v_dim: int = 64):
++    return SimpleNamespace(
++        v_cache_scale=torch.arange(num_kv_heads * v_dim, dtype=torch.int32).remainder(251).to(torch.uint8),
++        impl=object.__new__(AscendC8MXFPAttentionBackendImpl),
++    )
++
++
++def _c8_packet(ratio: int, k_dim: int = 64, v_dim: int = 64, num_pages: int = 2):
++    """Real packet views with padding, a nonzero offset and registered entries."""
++    heads, block = 2, 512
++    kernel_blocks = num_pages * ratio
++    pitch = heads * block * (k_dim + v_dim + (k_dim + v_dim) // 32) + 256
++    raw = torch.full((128 + kernel_blocks * pitch + 128,), 37, dtype=torch.int8)
++    views = mxfp_paged_cache_views(raw[128:-128], kernel_blocks, heads, k_dim, v_dim, block, page_stride_bytes=pitch)
++    layer = _c8_mxfp_layer(heads, v_dim)
++    layer.kv_cache = views
++    runner = _c8_mxfp_runner({"attn": layer}, num_blocks=num_pages)
++    runner._fill_c8_mxfp_v_scale_caches()
++    return raw, views, layer, runner, pitch
++
++
++def test_fill_c8_mxfp_v_scale_caches_fills_and_registers():
++    layer = _c8_mxfp_layer()
++    v_scale = torch.zeros(mxfp_v_scale_cache_shape(2, 128, 2, 64), dtype=torch.uint8)
++    layer.kv_cache = (MagicMock(), MagicMock(), MagicMock(), v_scale)
++    runner = _c8_mxfp_runner({"attn": layer})
++
++    runner._fill_c8_mxfp_v_scale_caches()
++
++    assert runner._c8_mxfp_v_scale_caches == [(layer.v_cache_scale, v_scale, 1)]
++    assert torch.equal(v_scale[0, :, :, 0, :, 0].reshape(-1), layer.v_cache_scale)
++    # Fill only prepares the entries; wrapper assembly happens later in
++    # _init_kv_zero_meta.
++    assert not hasattr(runner, "kv_block_zeroer")
++
++
++def test_fill_c8_mxfp_v_scale_caches_skips_non_c8_layers():
++    layer = SimpleNamespace(impl=object(), kv_cache=(MagicMock(), MagicMock()))
++    runner = _c8_mxfp_runner({"plain": layer})
++
++    runner._fill_c8_mxfp_v_scale_caches()
++
++    assert runner._c8_mxfp_v_scale_caches == []
++    assert not hasattr(runner, "kv_block_zeroer")
++
++
++@pytest.mark.parametrize("ratio", [1, 2, 4])
++@pytest.mark.parametrize(("k_dim", "v_dim"), [(64, 64), (64, 128)])
++def test_zero_block_ids_restores_reassigned_page_v_scales(ratio, k_dim, v_dim):
++    # A Mamba group writes over the whole physical page while it owns the
++    # block; zeroing and restoring must bring the static V scales back.
++    raw, _, layer, runner, pitch = _c8_packet(ratio, k_dim, v_dim)
++    raw[128 + ratio * pitch : 128 + 2 * ratio * pitch].fill_(73)
++    expected = raw.clone()
++    expected_views = mxfp_paged_cache_views(
++        expected[128:-128], 2 * ratio, 2, k_dim, v_dim, 512, page_stride_bytes=pitch
++    )
++    fill_mxfp_v_scale_cache(layer.v_cache_scale, expected_views[3][ratio : 2 * ratio])
++    events = []
++
++    delegate = MagicMock()
++    delegate.zero_block_ids.side_effect = lambda ids: events.append("zero")
++
++    def fill(scale, cache):
++        events.append("restore")
++        fill_mxfp_v_scale_cache(scale, cache)
++
++    runner.kv_block_zeroer = C8KVBlockZeroer(delegate, runner._c8_mxfp_v_scale_caches, fill)
++    runner.kv_block_zeroer.zero_block_ids([1])
++
++    assert events == ["zero", "restore"]
++    assert torch.equal(raw, expected)
++
++
++def test_zero_block_ids_with_empty_ids_is_noop():
++    _, _, _, runner, _ = _c8_packet(ratio=1)
++    delegate = MagicMock()
++    fill = MagicMock()
++    runner.kv_block_zeroer = C8KVBlockZeroer(delegate, runner._c8_mxfp_v_scale_caches, fill)
++
++    runner.kv_block_zeroer.zero_block_ids([])
++
++    delegate.zero_block_ids.assert_not_called()
++    fill.assert_not_called()
++
++
++@pytest.mark.parametrize("block_ids", [[-1], [2], [0, 2]])
++def test_zero_block_ids_validates_ids_before_writes(block_ids):
++    raw, _, _, runner, _ = _c8_packet(ratio=1)
++    before = raw.clone()
++    delegate = MagicMock()
++    fill = MagicMock()
++    runner.kv_block_zeroer = C8KVBlockZeroer(delegate, runner._c8_mxfp_v_scale_caches, fill)
++
++    with pytest.raises(IndexError):
++        runner.kv_block_zeroer.zero_block_ids(block_ids)
++
++    delegate.zero_block_ids.assert_not_called()
++    fill.assert_not_called()
++    assert torch.equal(raw, before)
++
++
++def test_init_kv_zero_meta_wraps_tuple_aware_zeroer_for_mxfp8():
++    import vllm_ascend.worker.v2.model_runner as model_runner_mod
++
++    runner = NPUModelRunner.__new__(NPUModelRunner)
++    runner.vllm_config = SimpleNamespace(cache_config=SimpleNamespace(cache_dtype="mxfp8"))
++    runner.device = torch.device("cpu")
++    runner.attn_groups = []
++    runner.kernel_block_sizes = [512]
++    runner.cache_config = SimpleNamespace(cache_dtype="mxfp8")
++    runner.compilation_config = SimpleNamespace(static_forward_context={})
++    runner.kv_cache_config = SimpleNamespace(num_blocks=2)
++    entries = [(MagicMock(), MagicMock(), 1)]
++    runner._c8_mxfp_v_scale_caches = entries
++
++    with patch.object(model_runner_mod, "AscendV2KVBlockZeroer") as cls:
++        runner._init_kv_zero_meta()
++
++    cls.assert_called_once()
++    kwargs = cls.call_args.kwargs
++    assert kwargs["cache_dtype"] == "mxfp8"
++    assert kwargs["kernel_block_sizes"] == [512]
++    assert isinstance(runner.kv_block_zeroer, C8KVBlockZeroer)
++    assert runner.kv_block_zeroer.delegate is cls.return_value
++    assert runner.kv_block_zeroer.entries is entries
++
++
++def test_init_kv_zero_meta_uses_tuple_aware_zeroer_without_mxfp8():
++    import vllm_ascend.worker.v2.model_runner as model_runner_mod
++
++    runner = NPUModelRunner.__new__(NPUModelRunner)
++    runner.vllm_config = SimpleNamespace(cache_config=SimpleNamespace(cache_dtype="auto"))
++    runner.device = torch.device("cpu")
++    runner.attn_groups = []
++    runner.kernel_block_sizes = [512]
++    runner.compilation_config = SimpleNamespace(static_forward_context={})
++    runner.kv_cache_config = SimpleNamespace(num_blocks=2)
++    runner.cache_config = SimpleNamespace(cache_dtype="auto")
++
++    with patch.object(model_runner_mod, "AscendV2KVBlockZeroer") as generic_cls:
++        runner._init_kv_zero_meta()
++
++    generic_cls.assert_called_once()
++    assert runner.kv_block_zeroer is generic_cls.return_value
++    assert not isinstance(runner.kv_block_zeroer, C8KVBlockZeroer)
++
++
++def test_shutdown_releases_c8_views_and_unwraps_zeroer():
++    _, _, _, runner, _ = _c8_packet(ratio=1)
++    entries = runner._c8_mxfp_v_scale_caches
++    wrapper_entries = list(entries)
++    delegate = MagicMock()
++    runner.kv_block_zeroer = C8KVBlockZeroer(delegate, wrapper_entries, fill_mxfp_v_scale_cache)
++
++    with patch.object(GPUModelRunner, "shutdown") as parent:
++        runner.shutdown()
++
++    parent.assert_called_once_with()
++    assert entries == [] and wrapper_entries == []
++    assert runner.kv_block_zeroer is delegate
+ 
+ 
+ @pytest.mark.parametrize("model_type", ["deepseek_v41", "other_model"])
+diff --git a/vllm_ascend/utils.py b/vllm_ascend/utils.py
+index 2a13fa9f7..7a92e5e8a 100644
+--- a/vllm_ascend/utils.py
++++ b/vllm_ascend/utils.py
+@@ -1381,7 +1381,10 @@ C8_MXFP_KV_CACHE_DTYPE = "mxfp8"
+ 
+ 
+ def is_c8_mxfp_kv_quant(vllm_config: VllmConfig) -> bool:
+-    return vllm_config.cache_config.cache_dtype == C8_MXFP_KV_CACHE_DTYPE
++    # Tolerate partially constructed configs (e.g. SimpleNamespace in tests):
++    # a missing cache_config means the mxfp8 KV cache dtype is not enabled.
++    cache_config = getattr(vllm_config, "cache_config", None)
++    return cache_config is not None and cache_config.cache_dtype == C8_MXFP_KV_CACHE_DTYPE
+ 
+ 
+ def is_minimax_m3_fp8_kv_cache(vllm_config: VllmConfig | None) -> bool:
+diff --git a/vllm_ascend/worker/v2/attn_utils.py b/vllm_ascend/worker/v2/attn_utils.py
+index 605e8a469..3c54cfe74 100644
+--- a/vllm_ascend/worker/v2/attn_utils.py
++++ b/vllm_ascend/worker/v2/attn_utils.py
+@@ -58,6 +58,10 @@ from vllm.v1.worker.gpu.model_states.interface import ModelSpecificAttnMetadata
+ from vllm.v1.worker.utils import AttentionGroup
+ 
+ from vllm_ascend.ascend_config import KVPPConfig, get_ascend_config
++from vllm_ascend.attention.attention_c8_mxfp import (
++    mxfp_cache_spec,
++    mxfp_cache_views_for_spec,
++)
+ from vllm_ascend.attention.attention_v1 import AscendAttentionState
+ from vllm_ascend.attention.context_parallel.dsa_cp import AscendDSACPMetadataBuilder
+ from vllm_ascend.attention.dsa_attn_kv_plan import get_dsa_attn_kv_plan
+@@ -101,6 +105,7 @@ from vllm_ascend.utils import (
+     enable_sfa,
+     enable_sfa_dcp_replicated_indexer,
+     get_kv_cache_tensor_layers,
++    is_c8_mxfp_kv_quant,
+     is_hidden_state_cache_spec,
+     kv_cache_spec_uses_packed_sfa_main_cache,
+ )
+@@ -327,6 +332,8 @@ def get_kv_cache_spec(vllm_config: VllmConfig) -> dict[str, KVCacheSpec]:
+             )
+             continue
+ 
++        if type(spec) is FullAttentionSpec and is_c8_mxfp_kv_quant(vllm_config):
++            spec = mxfp_cache_spec(spec)
+         kv_cache_spec[layer_name] = spec
+         if isinstance(spec, AttentionSpec) and getattr(attn_module, "align_kv_cache_with_mamba", True):
+             attention_layer_names.append(layer_name)
+@@ -1269,6 +1276,10 @@ def _allocate_kv_cache(
+                 if type(layer_spec) is not FullAttentionSpec:
+                     kv_cache_raw_tensors[layer_name] = _allocate_int8_cache_tensor(layer_size, alignment, device)
+                     continue
++                if is_c8_mxfp_kv_quant(vllm_config):
++                    # One packet-backed allocation holds K, V and both scales.
++                    kv_cache_raw_tensors[layer_name] = _allocate_int8_cache_tensor(layer_size, alignment, device)
++                    continue
+                 if attn_layers is None:
+                     attn_layers = get_layers_from_vllm_config(vllm_config, AttentionLayerBase)
+                 layer = attn_layers.get(layer_name)
+@@ -1462,6 +1473,13 @@ def _reshape_kv_cache_v2(
+ 
+             kv_cache_spec = layer_kv_cache_spec[layer_name]
+ 
++            if type(kv_cache_spec) is FullAttentionSpec and is_c8_mxfp_kv_quant(vllm_config):
++                raw_cache = kv_cache_raw_tensors[layer_name]
++                if not isinstance(raw_cache, torch.Tensor):
++                    raise ValueError("C8_MXFP requires one combined raw allocation per layer.")
++                kv_caches[layer_name] = mxfp_cache_views_for_spec(raw_cache, kv_cache_spec, kernel_block_size)
++                continue
++
+             if layer_name in layer_tuple_strides:
+                 # Same view construction as model_runner_v1
+                 block_stride = layer_tuple_strides[layer_name]
+diff --git a/vllm_ascend/worker/v2/model_runner.py b/vllm_ascend/worker/v2/model_runner.py
+index 6a42678ed..869c9d4f9 100644
+--- a/vllm_ascend/worker/v2/model_runner.py
++++ b/vllm_ascend/worker/v2/model_runner.py
+@@ -60,6 +60,10 @@ from vllm_ascend.ascend_forward_context import (
+     set_mc2_mask,
+     set_mc2_tokens_capacity,
+ )
++from vllm_ascend.attention.attention_c8_mxfp import (
++    AscendC8MXFPAttentionBackendImpl,
++    fill_mxfp_v_scale_cache,
++)
+ from vllm_ascend.attention.attention_v1 import AscendAttentionBackend
+ from vllm_ascend.attention.mla_v1 import AscendMLABackend
+ from vllm_ascend.core.kv_cache_interface import is_circular_kv_cache_spec
+@@ -94,6 +98,7 @@ from vllm_ascend.observability.runtime_guard.hooks import (
+ from vllm_ascend.observability.runtime_guard.processor import RuntimeGuardProcessor
+ from vllm_ascend.ops.rotary_embedding import set_cos_and_sin, update_cos_sin
+ from vllm_ascend.utils import (
++    is_c8_mxfp_kv_quant,
+     is_deepseek_v41,
+     lmhead_tp_enable,
+     lmhead_tp_max_num_logits,
+@@ -119,6 +124,7 @@ from vllm_ascend.worker.v2.spec_decode.eagle.speculator import AscendEagleSpecul
+ from vllm_ascend.worker.v2.states import AscendRequestState
+ from vllm_ascend.worker.v2.utils import (
+     AscendV2KVBlockZeroer,
++    C8KVBlockZeroer,
+     communicator_switch,
+     prepare_v41_dummy_ring_state,
+     prepare_v41_source_rope,
+@@ -391,7 +397,6 @@ class NPUModelRunner(GPUModelRunner):
+ 
+     def _init_kv_zero_meta(self) -> None:
+         """Use a tuple-aware zeroer for Ascend V1-compatible cache protocols."""
+-
+         self.kv_block_zeroer = AscendV2KVBlockZeroer(
+             self.device,
+             attn_groups_iter=(g for groups in self.attn_groups for g in groups),
+@@ -400,6 +405,12 @@ class NPUModelRunner(GPUModelRunner):
+             num_blocks=self.kv_cache_config.num_blocks,
+             cache_dtype=self.cache_config.cache_dtype,
+         )
++        if is_c8_mxfp_kv_quant(self.vllm_config):
++            # The zeroer skips the static V scales (4th tuple component); the
++            # wrapper restores them on pages reassigned from Mamba.
++            self.kv_block_zeroer = C8KVBlockZeroer(  # type: ignore[assignment]
++                self.kv_block_zeroer, self._c8_mxfp_v_scale_caches, fill_mxfp_v_scale_cache
++            )
+ 
+     def initialize_kv_cache(
+         self,
+@@ -504,6 +515,34 @@ class NPUModelRunner(GPUModelRunner):
+         )
+         self.model_state.kvpp_runtime = self.kvpp
+ 
++        self._fill_c8_mxfp_v_scale_caches()
++
++    def _fill_c8_mxfp_v_scale_caches(self) -> None:
++        """Initialize C8 V scales and retain views for page reassignment."""
++        self._c8_mxfp_v_scale_caches = []
++        num_blocks = self.kv_cache_config.num_blocks
++        if num_blocks <= 0:
++            return
++        for layer in self.compilation_config.static_forward_context.values():
++            if isinstance(getattr(layer, "impl", None), AscendC8MXFPAttentionBackendImpl):
++                value_scale_cache = layer.kv_cache[3]
++                assert value_scale_cache.shape[0] % num_blocks == 0
++                kernel_blocks_per_page = value_scale_cache.shape[0] // num_blocks
++                self._c8_mxfp_v_scale_caches.append((layer.v_cache_scale, value_scale_cache, kernel_blocks_per_page))
++                fill_mxfp_v_scale_cache(layer.v_cache_scale, value_scale_cache)
++
++    def shutdown(self) -> None:
++        # Drop C8 packet views before the parent collects tensors and
++        # empties the allocator cache.
++        entries = getattr(self, "_c8_mxfp_v_scale_caches", None)
++        if entries is not None:
++            entries.clear()
++        zeroer = getattr(self, "kv_block_zeroer", None)
++        if isinstance(zeroer, C8KVBlockZeroer):
++            zeroer.entries.clear()
++            self.kv_block_zeroer = zeroer.delegate
++        super().shutdown()
++
+     def _register_sparse_kv_caches(self, kv_caches: dict[str, Any]) -> None:
+         """Bind host pools before the V2 KV connector registers its destinations."""
+         manager = self.sparse_kv_offload_manager
+diff --git a/vllm_ascend/worker/v2/utils.py b/vllm_ascend/worker/v2/utils.py
+index 45977955e..0da8b4576 100644
+--- a/vllm_ascend/worker/v2/utils.py
++++ b/vllm_ascend/worker/v2/utils.py
+@@ -1,4 +1,4 @@
+-from collections.abc import Iterable
++from collections.abc import Callable, Iterable
+ from contextlib import contextmanager
+ from dataclasses import replace
+ from types import SimpleNamespace
+@@ -47,14 +47,21 @@ class AscendV2KVBlockZeroer(KVBlockZeroer):
+         self._meta = None
+         runner_only_attn_layers = runner_only_attn_layers or set()
+         groups = list(attn_groups_iter)
+-        component_count = 1
++        # The 4th component of an mxfp8 tuple is the static checkpoint V
++        # scale: clearing a recycled block must preserve it.
++        layer_caches: dict[str, Any] = {}
+         for group in groups:
+             for layer_name in group.layer_names:
+                 if layer_name in runner_only_attn_layers:
+                     continue
+                 kv_cache = static_forward_context[layer_name].kv_cache
+-                if isinstance(kv_cache, (tuple, list)):
+-                    component_count = max(component_count, len(kv_cache))
++                if cache_dtype == "mxfp8" and isinstance(kv_cache, tuple) and len(kv_cache) == 4:
++                    kv_cache = kv_cache[:3]
++                layer_caches[layer_name] = kv_cache
++        component_count = 1
++        for kv_cache in layer_caches.values():
++            if isinstance(kv_cache, (tuple, list)):
++                component_count = max(component_count, len(kv_cache))
+ 
+         self._zeroers: list[KVBlockZeroer] = []
+         for component_id in range(component_count):
+@@ -65,7 +72,7 @@ class AscendV2KVBlockZeroer(KVBlockZeroer):
+                 for layer_name in group.layer_names:
+                     if layer_name in runner_only_attn_layers:
+                         continue
+-                    kv_cache = static_forward_context[layer_name].kv_cache
++                    kv_cache = layer_caches[layer_name]
+                     component = None
+                     if isinstance(kv_cache, torch.Tensor) and component_id == 0:
+                         component = kv_cache
+@@ -99,6 +106,47 @@ class AscendV2KVBlockZeroer(KVBlockZeroer):
+             zeroer.warmup(num_kv_blocks)
+ 
+ 
++class C8KVBlockZeroer:
++    """Zero recycled blocks via a delegate, then restore static C8 V scales.
++
++    A decorator around any KVBlockZeroer (or None): the delegate clears the
++    dynamic components, this class restores the checkpoint V-scale constants
++    that hybrid page reuse may have overwritten. Composition instead of
++    inheritance keeps the delegate swappable (re-wrapped on reinitialization,
++    unwrapped on shutdown) and optional (restore-only when no zeroer exists).
++    """
++
++    def __init__(self, delegate: Any, entries: list[tuple[Any, Any, int]], fill: Callable) -> None:
++        self.delegate = delegate
++        self.entries = entries
++        self.fill = fill
++
++    def __getattr__(self, name: str) -> Any:
++        return getattr(self.delegate, name)
++
++    def warmup(self, num_kv_blocks: int) -> None:
++        # The upstream warmup path forwards to the delegate when present.
++        warmup = getattr(self.delegate, "warmup", None)
++        if warmup is not None:
++            warmup(num_kv_blocks)
++
++    def zero_block_ids(self, block_ids: list[int]) -> None:
++        if not block_ids:
++            return
++        # Validate the whole batch before any device write.
++        for _, cache, ratio in self.entries:
++            num_blocks = cache.shape[0] // ratio
++            for block_id in block_ids:
++                if block_id < 0 or block_id >= num_blocks:
++                    raise IndexError(f"C8 physical block ID out of range: {block_id}")
++        if self.delegate is not None:
++            self.delegate.zero_block_ids(block_ids)
++        for value_scale, value_scale_cache, ratio in self.entries:
++            for block_id in block_ids:
++                start = block_id * ratio
++                self.fill(value_scale, value_scale_cache[start : start + ratio])
++
++
+ if TYPE_CHECKING:
+     from vllm_ascend.worker.v2.model_runner import NPUModelRunner
+ 

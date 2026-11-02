@@ -1,0 +1,282 @@
+commit 4f3648abd258a5cbdd1a9ae34165a85f5e44beaf
+Author:     Jinzhu Jia <jiajinzhu@huawei.com>
+AuthorDate: Wed Oct 21 01:26:16 2026 -0700
+Commit:     GitHub <noreply@github.com>
+CommitDate: Wed Oct 21 16:26:16 2026 +0800
+
+    [BugFix][MRV2] Preserve hybrid dummy query widths with DP and MTP (#19165)
+    
+    ### What this PR does / why we need it?
+    
+    Extend #18038 to hybrid targets. PIECEWISE dummy padding currently
+    changes their logical query width, so MTP fails when reusing the
+    target's DP synchronization state.
+    
+    Preserve the scheduled dummy queries and pass the padded input extent
+    separately through Mamba attention metadata. Re-enable `test_hang` on
+    MRV2 with DP2/EP, MTP3, PIECEWISE capture size 12 and three prompts at
+    the context boundary.
+    
+    ### Does this PR introduce _any_ user-facing change?
+    
+    N/A
+    
+    ### How was this patch tested?
+    
+    
+    
+    - vLLM main:
+    https://github.com/vllm-project/vllm/commit/a98247ab4db686ee03c66d5feb3c761e52a2f8ab
+    
+    Signed-off-by: jiajinzhu2 <jiajinzhu@huawei.com>
+
+diff --git a/tests/e2e/pull_request/two_card/spec_decode/test_spec_decode_heavy.py b/tests/e2e/pull_request/two_card/spec_decode/test_spec_decode_heavy.py
+index a40aed1cf..e86e36979 100644
+--- a/tests/e2e/pull_request/two_card/spec_decode/test_spec_decode_heavy.py
++++ b/tests/e2e/pull_request/two_card/spec_decode/test_spec_decode_heavy.py
+@@ -29,7 +29,7 @@ import pytest
+ import torch_npu
+ from transformers import AutoTokenizer
+ from vllm import SamplingParams
+-from vllm.config import CompilationConfig
++from vllm.config import CompilationConfig, CUDAGraphMode
+ from vllm.v1.metrics.reader import Counter, Vector
+ 
+ from tests.e2e.conftest import DPVllmRunner, VllmRunner, wait_until_npu_memory_free
+@@ -242,22 +242,13 @@ def test_eagle3_sliding_window():
+     assert match, f"acceptance_per_pos {acceptance_per_pos} does not match golden {golden}"
+ 
+ 
+-@pytest.mark.skip(reason="Model Runner V1 is outside the default CI path")
+ def test_hang(monkeypatch):
+-    """Reproduce the spec-decode hang fixed by vllm-ascend#10117.
+-
+-    The server deadlocks when all of the following hold:
+-      1. Data Parallelism is enabled (data_parallel_size >= 2);
+-      2. The draft model is MoE (here: 72 routed experts);
+-      3. prompt_len + generated_len approaches max_model_len (boundary case).
++    """Exercise DP/EP MTP at the context boundary with a hybrid target.
+ 
+-    ``ignore_eos=True`` drives generation to max_model_len so the request
+-    length saturates the boundary in (3). The model is a small random-weight
+-    DeepseekV3 MoE+MTP so the case runs on two cards with EP on.
++    Uneven work leaves one rank running padded dummy batches. Its draft must
++    reuse the target's DP agreement without changing the logical query width.
+     """
+-    # The deadlock was fixed on the V1 proposer. Qwen3_5MoeForCausalLM now
+-    # defaults to MRv2; keep this regression on V1.
+-    monkeypatch.setenv("VLLM_USE_V2_MODEL_RUNNER", "0")
++    monkeypatch.setenv("VLLM_USE_V2_MODEL_RUNNER", "1")
+     # Fail-fast: cap NPU operator execution timeout at 5 min. Without this the
+     # hang deadlocks for ~9 min until CANN's default vector-core timeout
+     # (~556s) fires — too long for CI.
+@@ -272,25 +263,9 @@ def test_hang(monkeypatch):
+         trust_remote_code=True,
+     )
+ 
+-    # Prompts padded to exactly max_model_len - 1 tokens so that
+-    # prompt_len + num_speculative_tokens > max_model_len at the FIRST draft
+-    # proposal — this deterministically triggers input_fits_in_drafter=False
+-    # (the path PR #10117 removed) instead of relying on generation to wander
+-    # into the boundary. The filler counts below tokenize to exactly 1023 for
+-    # this tokenizer; the assert guards against tokenizer drift.
+-    #
+-    # Three requests are needed:
+-    #   - With 1 request, once the hang triggers the single vllm worker dies,
+-    #     which tears the server down before the deadlock is observable.
+-    #   - With 2 requests, the scheduler may route both to the SAME DP rank
+-    #     (the other rank idle), so the cross-DP synchronization that the bug
+-    #     needs never happens — the hang only reproduces probabilistically.
+-    #   - With 3 requests across data_parallel_size=2, at least one request
+-    #     lands on each DP rank, so both ranks hit input_fits_in_drafter=False
+-    #     and deadlock on the cross-DP sync. Verified to reproduce 5/5 runs.
+-    #
+-    # All three prompts below tokenize to exactly 1023 tokens (max_model_len - 1)
+-    # for this tokenizer; the assert after apply_chat_template enforces it.
++    # Leave one token before the context limit. Three requests across two DP
++    # ranks create uneven work, so an idle rank must still join draft DP sync.
++    # The assertion below guards the fixed fillers against tokenizer drift.
+     prompts = [
+         {
+             "role": "user",
+@@ -331,7 +306,7 @@ def test_hang(monkeypatch):
+         "num_speculative_tokens": 3,
+     }
+ 
+-    compilation_config = CompilationConfig(cudagraph_capture_sizes=[12])
++    compilation_config = CompilationConfig(cudagraph_mode=CUDAGraphMode.PIECEWISE, cudagraph_capture_sizes=[12])
+ 
+     with DPVllmRunner(
+         main_model_name,
+@@ -349,10 +324,12 @@ def test_hang(monkeypatch):
+     ) as llm:
+         outputs = llm.generate(prompts, sampling_params=sampling_params)
+ 
++    assert len(outputs) == len(prompts)
+     for output in outputs:
+         # DPVllmRunner.generate returns list[tuple[list[list[int]], list[str]]]:
+         # (token_ids per seq, generated text per seq).
+         output_tokens = output[0][0]
++        assert len(output_tokens) == max_model_len
+         generated_text = output[1][0]
+         print(f"Generated text: {generated_text!r}")
+         print(f"Output tokens: {output_tokens}")
+diff --git a/tests/ut/worker/test_v2_dummy_padding.py b/tests/ut/worker/test_v2_dummy_padding.py
+index 0a2023558..961214edf 100644
+--- a/tests/ut/worker/test_v2_dummy_padding.py
++++ b/tests/ut/worker/test_v2_dummy_padding.py
+@@ -16,6 +16,7 @@ from vllm_ascend.worker.v2.aclgraph_utils import ModelAclGraphManager
+ from vllm_ascend.worker.v2.input_batch import AscendInputBatch, AscendInputBuffers
+ from vllm_ascend.worker.v2.model_runner import NPUModelRunner
+ from vllm_ascend.worker.v2.model_states.default import AscendModelState
++from vllm_ascend.worker.v2.model_states.mamba_hybrid import AscendMambaHybridModelState
+ 
+ 
+ @pytest.fixture
+@@ -123,9 +124,11 @@ def test_cpp_dummy_is_a_fresh_prefill_request(buffers):
+     torch.testing.assert_close(batch.positions, torch.arange(16, dtype=batch.positions.dtype))
+ 
+ 
++@pytest.mark.parametrize("is_hybrid", [False, True])
+ @pytest.mark.parametrize("draft_mode", [CUDAGraphMode.PIECEWISE, CUDAGraphMode.FULL_AND_PIECEWISE])
+ @pytest.mark.parametrize("capture_size,uniform", [(16, 1), (16, 2), (16, 4), (32, 2), (32, 4)])
+-def test_mixed_dp_dummy_keeps_graphs_and_reuses_sync(buffers, runner, draft_mode, uniform, capture_size):
++def test_mixed_dp_dummy_keeps_graphs_and_reuses_sync(buffers, runner, draft_mode, uniform, capture_size, is_hybrid):
++    runner.model_config.is_hybrid = is_hybrid
+     runner.decode_query_len = uniform
+     scheduler_output = SimpleNamespace(num_scheduled_tokens={"dummy": uniform}, total_num_scheduled_tokens=uniform)
+     _, original_uniform = runner.gather_batch_req_state(scheduler_output, dummy_run=True)
+@@ -142,7 +145,6 @@ def test_mixed_dp_dummy_keeps_graphs_and_reuses_sync(buffers, runner, draft_mode
+         votes[5, 1:] = torch.tensor([2, 3, 1])
+ 
+     def execute_dummy(num_tokens, **kwargs):
+-        assert buffers.dummy_num_tokens == uniform
+         desc, sync = dispatch_cg_and_sync_dp(target, 1, uniform, original_uniform, 4, 0, max_query_len=uniform)
+         assert sync is not None
+         assert sync.uniform_token_count == uniform
+@@ -153,11 +155,11 @@ def test_mixed_dp_dummy_keeps_graphs_and_reuses_sync(buffers, runner, draft_mode
+         actual_uniform = get_uniform_decode_token_count(
+             batch.num_reqs, batch.num_tokens, int(batch.num_scheduled_tokens.max()), batch.decode_graph_eligible
+         )
+-        assert actual_uniform == uniform
+         dp_sync_kwarg = "dp_sync" if vllm_version_is("0.31.0") else "dp_sync_state"
+         draft_desc, reused_sync = dispatch_cg_and_sync_dp(
+             draft, batch.num_reqs, batch.num_tokens_after_padding, actual_uniform, 4, 0, **{dp_sync_kwarg: sync}
+         )
++        assert actual_uniform == uniform
+         assert draft_desc.cg_mode == draft_mode.decode_mode()
+         assert draft_desc.num_tokens == capture_size
+         assert reused_sync is sync
+@@ -184,7 +186,7 @@ def test_mixed_dp_dummy_keeps_graphs_and_reuses_sync(buffers, runner, draft_mode
+         ({"context_len": 1}, CUDAGraphMode.PIECEWISE, None, False, 1),
+         ({"is_profile": True}, CUDAGraphMode.PIECEWISE, None, False, 1),
+         ({}, CUDAGraphMode.PIECEWISE, object(), False, None),
+-        ({}, CUDAGraphMode.PIECEWISE, None, True, None),
++        ({}, CUDAGraphMode.PIECEWISE, None, True, 1),
+         ({}, CUDAGraphMode.FULL_AND_PIECEWISE, None, False, None),
+         ({}, CUDAGraphMode.NONE, None, False, None),
+     ],
+@@ -357,15 +359,18 @@ def test_dummy_slot_mapping_uses_padded_persistent_buffer(buffers, runner):
+     runner.block_tables.get_dummy_slot_mappings.assert_called_once_with(2)
+ 
+ 
++@pytest.mark.parametrize("state_type", [AscendModelState, AscendMambaHybridModelState])
+ @pytest.mark.parametrize(
+     "mode,is_dummy,expected_input_tokens",
+     [(CUDAGraphMode.PIECEWISE, True, 16), (CUDAGraphMode.PIECEWISE, False, 2), (CUDAGraphMode.NONE, True, 2)],
+ )
+-def test_attention_keeps_actual_queries_and_padded_dummy_inputs(buffers, mode, is_dummy, expected_input_tokens):
++def test_attention_keeps_actual_queries_and_padded_dummy_inputs(
++    buffers, mode, is_dummy, expected_input_tokens, state_type
++):
+     with patch.object(buffers, "dummy_num_tokens", 2), patch("vllm_ascend.worker.v2.input_batch.update_cos_sin"):
+         batch = AscendInputBatch.make_dummy(1, 16, buffers)
+     batch.is_dummy = is_dummy
+-    state = AscendModelState.__new__(AscendModelState)
++    state = state_type.__new__(state_type)
+     state.decoder_replay = None
+     state.vllm_config = SimpleNamespace(
+         parallel_config=SimpleNamespace(prefill_context_parallel_size=1), num_speculative_tokens=0
+@@ -377,7 +382,7 @@ def test_attention_keeps_actual_queries_and_padded_dummy_inputs(buffers, mode, i
+     state.kvpp_runtime = None
+     state.kvpp_is_dummy_run = False
+     state.device_metadata = None
+-    with patch("vllm_ascend.worker.v2.model_states.default.build_attn_metadata", return_value={}) as build:
++    with patch(f"{state_type.__module__}.build_attn_metadata", return_value={}) as build:
+         assert state.prepare_attn(batch, mode, (), torch.full((1, 16), -1), [], None) == {}
+     kwargs = build.call_args.kwargs
+     assert kwargs["num_input_tokens"] == expected_input_tokens
+diff --git a/vllm_ascend/worker/v2/input_batch.py b/vllm_ascend/worker/v2/input_batch.py
+index 219b60a6a..6945361d2 100644
+--- a/vllm_ascend/worker/v2/input_batch.py
++++ b/vllm_ascend/worker/v2/input_batch.py
+@@ -124,6 +124,8 @@ class AscendInputBatch(InputBatch):
+         # The incoming count includes graph padding. Save it for the model input
+         # views below, while building query metadata from the original scheduled
+         # count used for DP synchronization. Only _dummy_run supplies that override.
++        # TODO: Remove this workaround once upstream dummy-batch preparation
++        # preserves logical query lengths separately from graph padding.
+         num_tokens_after_padding = num_tokens
+         if input_buffers.dummy_num_tokens is not None:
+             # PIECEWISE pads model inputs without adding scheduled queries.
+diff --git a/vllm_ascend/worker/v2/model_runner.py b/vllm_ascend/worker/v2/model_runner.py
+index fcb9484e0..3bca10e2c 100644
+--- a/vllm_ascend/worker/v2/model_runner.py
++++ b/vllm_ascend/worker/v2/model_runner.py
+@@ -1148,15 +1148,14 @@ class NPUModelRunner(GPUModelRunner):
+ 
+     @contextmanager
+     def _preserve_dummy_query_tokens(self, num_tokens: int, uniform_decode: bool):
++        # TODO: Remove this workaround once upstream dummy-batch preparation
++        # preserves logical query lengths separately from graph padding.
+         dummy_query_tokens: int | None = None
+         if (
+             # FULL modes can also pad requests; only change token-only PIECEWISE padding.
+             self.compilation_config.cudagraph_mode == CUDAGraphMode.PIECEWISE
+             # PCP prepares and partitions its own dummy input layout.
+             and self.pcp_manager is None
+-            # Hybrid models also need recurrent-state metadata to stay aligned.
+-            # TODO: Verify whether this hybrid-model guard can be removed.
+-            and not self.model_config.is_hybrid
+         ):
+             # Match the logical token count in the upstream dummy scheduler.
+             dummy_query_tokens = max(num_tokens, self.decode_query_len) if uniform_decode else num_tokens
+diff --git a/vllm_ascend/worker/v2/model_states/default.py b/vllm_ascend/worker/v2/model_states/default.py
+index ddb5ec094..c25cbeffa 100644
+--- a/vllm_ascend/worker/v2/model_states/default.py
++++ b/vllm_ascend/worker/v2/model_states/default.py
+@@ -438,6 +438,8 @@ class AscendModelState(DefaultModelState):
+             # Piecewise cudagraphs and eager use the actual request count.
+             num_reqs = input_batch.num_reqs
+ 
++        # TODO: Remove the PIECEWISE dummy condition once the common metadata
++        # path handles padded attention inputs separately from logical queries.
+         if (
+             cudagraph_mode == CUDAGraphMode.FULL
+             or self.vllm_config.parallel_config.prefill_context_parallel_size > 1
+diff --git a/vllm_ascend/worker/v2/model_states/mamba_hybrid.py b/vllm_ascend/worker/v2/model_states/mamba_hybrid.py
+index 8276f4e03..ebb11f0ac 100644
+--- a/vllm_ascend/worker/v2/model_states/mamba_hybrid.py
++++ b/vllm_ascend/worker/v2/model_states/mamba_hybrid.py
+@@ -357,6 +357,13 @@ class AscendMambaHybridModelState(MambaHybridModelState, AscendModelState):
+             num_reqs = input_batch.num_reqs
+             num_tokens = input_batch.num_tokens
+ 
++        # Keep recurrent queries logical while attention inputs include graph padding.
++        # TODO: Remove this dummy-padding special case once the common metadata
++        # path handles padded attention inputs separately from logical queries.
++        num_input_tokens = num_tokens
++        if cudagraph_mode == CUDAGraphMode.PIECEWISE and input_batch.is_dummy:
++            num_input_tokens = input_batch.num_tokens_after_padding
++
+         is_prefilling_np = input_batch.is_prefilling_np
+         if input_batch.prefill_runs_as_decode_np is not None:
+             # vLLM #58400 runs one-token prompt tails as decodes. Their
+@@ -405,6 +412,7 @@ class AscendMambaHybridModelState(MambaHybridModelState, AscendModelState):
+             num_actual_reqs=input_batch.num_reqs,
+             num_tokens=num_tokens,
+             num_actual_tokens=input_batch.num_tokens,
++            num_input_tokens=num_input_tokens,
+             query_start_loc_gpu=input_batch.query_start_loc,
+             query_start_loc_cpu=torch.from_numpy(input_batch.query_start_loc_np),
+             max_query_len=input_batch.num_scheduled_tokens.max().item(),

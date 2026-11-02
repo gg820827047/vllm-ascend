@@ -1,0 +1,727 @@
+commit d65368dc53e1775a62afe52b689c03d9de14fe8f
+Author:     tangdafu <43084046+tangdafu@users.noreply.github.com>
+AuthorDate: Mon Oct 12 17:57:38 2026 +0800
+Commit:     GitHub <noreply@github.com>
+CommitDate: Mon Oct 12 17:57:38 2026 +0800
+
+    [Feature][Worker] Support PCP with PIECEWISE and FULL_AND_PIECEWISE CUDA graphs- #17410 (#17995)
+    
+    ### What this PR does / why we need it?
+    
+    Enable and fix PCP (prefill context parallel) execution with PIECEWISE
+    and
+    FULL_AND_PIECEWISE CUDA graph modes.
+    
+    Previously, sparse attention (DSA/SFA) with PCP was restricted to eager
+    mode
+    or FULL_DECODE_ONLY graphs. This PR:
+    
+    1. **Supports sparse MLA (DSA) PCP with PIECEWISE / FULL_AND_PIECEWISE
+    graphs**
+    - Relaxes the graph-mode validation in `AscendPCPManager` to only reject
+    pure FULL graphs (prefill shapes are dynamic, FULL graph capture is not
+    applicable), allowing PIECEWISE and FULL_AND_PIECEWISE.
+    - Trims graph padding before DSA cache updates: rotary embedding and
+    `dsa_kv_compress_scatter` now operate on the actual token extent instead
+    of the padded graph shape, so padding tokens are never written into the
+    KV cache. FULL graph mode keeps the fixed padded shape as required.
+    - Pads compact restored hidden states back to the graph layout after PCP
+    all-gather, keeping downstream graph segments shape-consistent.
+    
+    2. **Fixes SFA-PCP crash with fused preprocessing (PROLOG_V3)**
+    - Under PCP, the attention impl receives rank-local tokens while the
+    slot mapping uses the global gathered layout (padded local tokens x PCP
+    world size). Fused preprocessing writes the KV cache inline with one
+    cache index per input token, so the layouts mismatch and trigger an
+    assertion (e.g. `token_x=256 and cache_index=512` with PCP=2).
+    - `AscendSFAPCPImpl` now overrides `_get_fused_type_unsupported_reasons`
+    to veto fused preprocessing under PCP, falling back to the NATIVE chain,
+    which gathers prefill cache inputs before the KV cache write and is
+    layout compatible. This mirrors the existing protection already in place
+    for DSA-CP.
+    
+    ### Does this PR introduce *any* user-facing change?
+    
+    Yes. Models using sparse attention (DSA/SFA, e.g. DeepSeek-V3.2, GLM5)
+    with `prefill_context_parallel_size > 1` can now run with `PIECEWISE`
+    and `FULL_AND_PIECEWISE` compilation modes. Previously these
+    configurations either raised `NotImplementedError` or crashed during
+    graph capture warmup.
+    
+    ### How was this patch tested?
+    
+    - Manual testing on Ascend NPU:
+    - GLM5 (SFA) with PCP=2 + PIECEWISE graph mode: previously failed in
+    graph capture warmup with `token_x=256 and cache_index=512` assertion;
+    now selects the NATIVE preprocessing chain and runs inference correctly.
+    - DSA models with PCP + FULL_AND_PIECEWISE: verified prefill runs under
+    PIECEWISE graphs and decode under FULL graphs, with KV cache updates
+    correctly trimmed to the actual token span.
+    
+    ### test in GPQA
+    | 模型 | 图模式 | 第一轮 | 第二轮 | 第三轮 | 均值 |
+    |---|---|---:|---:|---:|---:|
+    | Qwen3-0.6B | PIECEWISE | 54% | 54% | 54% | 54.00% |
+    | Qwen3-0.6B | FULL_DECODE_ONLY | 53% | 53% | 57% | 54.33% |
+    | DeepSeek-V2-Lite-Chat | PIECEWISE | 62% | 62% | 62% | 62.00% |
+    | DeepSeek-V2-Lite-Chat | FULL_DECODE_ONLY | 67% | 63% | 67% | 65.67% |
+    
+    | 模型 | PIECEWISE | FULL_DECODE_ONLY | 差值 |
+    |---|---:|---:|---:|
+    | DSA：DeepSeek-V4-Flash-W8A8 | 72% | 69% | +3 pp |
+    | SFA：GLM-5.2-W8A8C8 | 70% | 67% | +3 pp |
+    
+    
+    |模式 | 输出吞吐 | 相对 eager
+    -- | -- | --
+    eager(DeepSeek-V4-Flash-W8A8) | 11.62 token/s | 1.00×
+    PIECEWISE(DeepSeek-V4-Flash-W8A8) | 20.82 token/s | 1.79×
+    FULL_AND_PIECEWISE(DeepSeek-V4-Flash-W8A8) | 44.94 token/s | 3.87×|
+    
+    
+    
+    ### Hidden-state length validation follow-up
+    
+    Validate the restored global length before the no-padding early return,
+    so unpadded batches cannot silently accept an unexpected parent output
+    extent. Added regression coverage for short/long outputs with and
+    without padding, and a valid unpadded output that preserves the parent
+    tensor.
+    
+    Validation of this follow-up: seven isolated checks of the actual method
+    using mocked parent outputs, AST syntax checks for both changed Python
+    files, and `git diff --check` passed. Full pytest and `bash format.sh
+    ci` could not run locally because pytest/pre-commit and the vLLM/PyTorch
+    runtime are unavailable. Fresh CI validation remains required.
+    
+    - vLLM main:
+    https://github.com/vllm-project/vllm/commit/ced6857afa0ea7b2e3f0846a62e1394e90f15607
+    
+    Signed-off-by: leolee <yihao.li@huawei.com>
+    Signed-off-by: t00911734 <tangdafu@huawei.com>
+    Co-authored-by: t00911734 <tangdafu@huawei.com>
+
+diff --git a/docs/source/user_guide/feature_guide/context_parallel.md b/docs/source/user_guide/feature_guide/context_parallel.md
+index 104815464..ffd8ea809 100644
+--- a/docs/source/user_guide/feature_guide/context_parallel.md
++++ b/docs/source/user_guide/feature_guide/context_parallel.md
+@@ -19,11 +19,11 @@ PCP support is experimental and available only with ModelRunner V2. The followin
+ 
+ | Attention Backend | Basic PCP | Prefix Caching + PCP | Chunked Prefill + PCP | MLAPO + PCP | Speculative Decoding + PCP | P/D Disaggregation + PCP | KV Cache Pool + PCP | Sequence Parallelism (SP) + PCP |
+ | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+-| MLA | ✅ Full compatibility | ✅ Full compatibility | ✅ Full compatibility | ✅ Full compatibility | 🟠 Partial compatibility (MTP, eager and `FULL_DECODE_ONLY`) | ✅ Full compatibility (`MooncakeConnectorV1`, `MooncakeConnectorV2`) | 🟠 Partial compatibility (`AscendStoreConnector`, non-layerwise) | ✅ Full compatibility |
+-| GQA | ✅ Full compatibility | ✅ Full compatibility | ✅ Full compatibility | — Not applicable | 🟠 Partial compatibility (Eagle3, eager and `FULL_DECODE_ONLY`) | ✅ Full compatibility (`MooncakeConnectorV1`, `MooncakeConnectorV2`) | 🟠 Partial compatibility (`AscendStoreConnector`, non-layerwise) | ✅ Full compatibility |
+-| SFA | ✅ Full compatibility | ✅ Full compatibility | ✅ Full compatibility | ✅ Full compatibility | 🟠 Partial compatibility (MTP, eager and `FULL_DECODE_ONLY`) | ✅ Full compatibility (`MooncakeConnectorV1`, `MooncakeConnectorV2`) | 🟠 Partial compatibility (`AscendStoreConnector`, non-layerwise) | ✅ Full compatibility |
+-| DSA | ✅ Full compatibility | ✅ Full compatibility | ✅ Full compatibility | — Not applicable | 🟠 Partial compatibility (MTP and DSpark, eager and `FULL_DECODE_ONLY`) | ✅ Full compatibility (`MooncakeHybridConnector`, `MooncakeConnectorV2`) | 🟠 Partial compatibility (`AscendStoreConnector`, non-layerwise) | ✅ Full compatibility |
+-| DSA V4.1 | ✅ Full compatibility | ✅ Full compatibility | ✅ Full compatibility | — Not applicable | 🟠 Partial compatibility (DSpark, eager and `FULL_DECODE_ONLY`) | ✅ Full compatibility (`MooncakeHybridConnector`, `MooncakeConnectorV2`) | 🟠 Partial compatibility (`AscendStoreConnector`, non-layerwise) | ✅ Full compatibility |
++| MLA | ✅ Full compatibility | ✅ Full compatibility | ✅ Full compatibility | ✅ Full compatibility | 🟠 Partial compatibility (MTP, eager, `PIECEWISE`, `FULL_AND_PIECEWISE` and `FULL_DECODE_ONLY`) | ✅ Full compatibility (`MooncakeConnectorV1`, `MooncakeConnectorV2`) | 🟠 Partial compatibility (`AscendStoreConnector`, non-layerwise) | ✅ Full compatibility |
++| GQA | ✅ Full compatibility | ✅ Full compatibility | ✅ Full compatibility | — Not applicable | 🟠 Partial compatibility (Eagle3, eager, `PIECEWISE`, `FULL_AND_PIECEWISE` and `FULL_DECODE_ONLY`) | ✅ Full compatibility (`MooncakeConnectorV1`, `MooncakeConnectorV2`) | 🟠 Partial compatibility (`AscendStoreConnector`, non-layerwise) | ✅ Full compatibility |
++| SFA | ✅ Full compatibility | ✅ Full compatibility | ✅ Full compatibility | ✅ Full compatibility | 🟠 Partial compatibility (MTP, eager, `PIECEWISE`, `FULL_AND_PIECEWISE` and `FULL_DECODE_ONLY`) | ✅ Full compatibility (`MooncakeConnectorV1`, `MooncakeConnectorV2`) | 🟠 Partial compatibility (`AscendStoreConnector`, non-layerwise) | ✅ Full compatibility |
++| DSA | ✅ Full compatibility | ✅ Full compatibility | ✅ Full compatibility | — Not applicable | 🟠 Partial compatibility (MTP and DSpark, eager, `PIECEWISE`, `FULL_AND_PIECEWISE` and `FULL_DECODE_ONLY`) | ✅ Full compatibility (`MooncakeHybridConnector`, `MooncakeConnectorV2`) | 🟠 Partial compatibility (`AscendStoreConnector`, non-layerwise) | ✅ Full compatibility |
++| DSA V4.1 | ✅ Full compatibility | ✅ Full compatibility | ✅ Full compatibility | — Not applicable | 🟠 Partial compatibility (DSpark, eager, `PIECEWISE`, `FULL_AND_PIECEWISE` and `FULL_DECODE_ONLY`) | ✅ Full compatibility (`MooncakeHybridConnector`, `MooncakeConnectorV2`) | 🟠 Partial compatibility (`AscendStoreConnector`, non-layerwise) | ✅ Full compatibility |
+ 
+ - ✅ **Full compatibility**: The basic path or feature combination is supported.
+ - 🟠 **Partial compatibility**: The basic path or feature combination is supported with the stated limitations.
+@@ -104,7 +104,7 @@ vllm serve <gqa-target-model> \
+     --speculative-config '{"method": "eagle3", "model": "<eagle3-draft-model>", "num_speculative_tokens": 3}'
+ ```
+ 
+-For either method, remove `--enforce-eager` and add the following option to use the supported graph mode:
++For either method, remove `--enforce-eager` and add the following option to use a supported graph mode such as `PIECEWISE` or `FULL_DECODE_ONLY`:
+ 
+ ```bash
+ --compilation-config '{"cudagraph_mode": "FULL_DECODE_ONLY"}'
+@@ -117,8 +117,7 @@ For either method, remove `--enforce-eager` and add the following option to use
+ - KV cache pooling with PCP supports only `AscendStoreConnector` with `use_layerwise=false`.
+ - PCP speculative decoding supports MTP with MLA and DeepSeek-V4 DSA models,
+   Eagle3 with GQA models, and DSpark with DeepSeek-V4 and DeepSeek-V4.1 DSA models.
+-- Draft sampling must use the greedy method.
+-- Full graph execution with PCP is limited to `FULL_DECODE_ONLY`.
++- PCP does not support `FULL` CUDA graphs; use eager mode, `PIECEWISE`, `FULL_AND_PIECEWISE`, or `FULL_DECODE_ONLY`.
+ - Pipeline parallelism, encoder-decoder models, multimodal inputs, and LoRA are not supported with MRV2 PCP.
+ - SFA draft attention is not supported with PCP speculative decoding.
+ - PCP and DCP can be stacked for MLA, SFA, and GQA. MLA and SFA support DCP
+diff --git a/tests/ut/attention/test_dsa_cp.py b/tests/ut/attention/test_dsa_cp.py
+index d10bab00e..d09e88e6d 100644
+--- a/tests/ut/attention/test_dsa_cp.py
++++ b/tests/ut/attention/test_dsa_cp.py
+@@ -2,12 +2,18 @@
+ 
+ from types import SimpleNamespace
+ from typing import Any
++from unittest.mock import MagicMock, patch
+ 
+ import pytest
+ import torch
+ 
+ from vllm_ascend.attention.context_parallel import dsa_cp
+-from vllm_ascend.attention.context_parallel.dsa_cp import AscendDSACPImpl
++from vllm_ascend.attention.context_parallel.dsa_cp import (
++    AscendDSACPImpl,
++    AscendDSAPCPImpl,
++    AscendDSAPCPMetadataBuilder,
++)
++from vllm_ascend.worker.v2.pcp_manager import AscendPCPAttentionContext
+ 
+ 
+ class TestAscendDSACPLayerMetadata:
+@@ -42,6 +48,87 @@ class TestAscendDSACPLayerMetadata:
+         assert layer_metadata.indexer_state is indexer_state_metadata
+ 
+ 
++class TestAscendDSAPCPGraphPadding:
++    @pytest.mark.parametrize(
++        "full_graph_mode,expected_num_tokens",
++        [
++            (False, 6),
++            (True, 8),
++        ],
++    )
++    def test_restore_indices_match_graph_mode(self, full_graph_mode, expected_num_tokens):
++        """FULL graphs replay the fixed padded batch, so restore indices cover
++        every padded row; other modes restore only the actual token extent,
++        keeping placeholder rows out of the cache updates entirely."""
++        builder = AscendDSAPCPMetadataBuilder.__new__(AscendDSAPCPMetadataBuilder)
++        builder._hidden_restore_idx_buffer = torch.full((16,), -1, dtype=torch.int64)
++
++        global_batch = SimpleNamespace(num_tokens=6, num_tokens_after_padding=8, is_dummy=False)
++        hidden_restore_idx = torch.arange(10, 16, dtype=torch.int64)
++        pcp_context = AscendPCPAttentionContext(
++            global_batch=global_batch,
++            global_block_tables=(),
++            global_slot_mappings=torch.zeros(0, dtype=torch.int64),
++            hidden_restore_idx=hidden_restore_idx,
++        )
++
++        prepared = builder._prepare_graph_pcp_context(pcp_context, full_graph_mode=full_graph_mode)
++
++        assert prepared.hidden_restore_idx.shape[0] == expected_num_tokens
++        assert torch.equal(prepared.hidden_restore_idx[:6], hidden_restore_idx)
++        if full_graph_mode:
++            assert torch.equal(prepared.hidden_restore_idx[6:], torch.zeros(2, dtype=torch.int64))
++
++    def test_swa_cache_update_consumes_metadata_as_built(self):
++        """cos/sin/slot_mapping are built at the restored batch length (padded
++        for FULL graphs, actual tokens otherwise), so the cache update passes
++        them to the rotary/scatter kernels without any trimming."""
++        impl = AscendDSAPCPImpl.__new__(AscendDSAPCPImpl)
++        impl.nope_head_dim = 4
++        impl.rope_head_dim = 2
++        impl.head_dim = 6
++        impl.vllm_config = SimpleNamespace()
++        impl.wkv = MagicMock(side_effect=lambda x: x)
++        impl.kv_norm = MagicMock(side_effect=lambda x: x)
++
++        num_tokens = 3
++        cos = torch.randn(num_tokens, 2)
++        sin = torch.randn(num_tokens, 2)
++        slot_mapping = torch.arange(num_tokens, dtype=torch.int64)
++        req_metadata = SimpleNamespace(
++            cos={"layer": cos},
++            sin={"layer": sin},
++            slot_mapping=slot_mapping,
++        )
++        rotary = MagicMock()
++        scatter = MagicMock()
++        with (
++            patch(
++                "vllm_ascend.attention.dsa_v1._require_req_metadata",
++                return_value=req_metadata,
++            ),
++            # The op registers lazily at worker startup, so create the
++            # attribute on the op namespace for this CPU-only UT.
++            patch("torch.ops._C_ascend.inplace_partial_rotary_mul", rotary, create=True),
++            patch(
++                "vllm_ascend.attention.context_parallel.dsa_cp.get_dsa_attn_kv_plan",
++                return_value=SimpleNamespace(dsa_kv_compress_scatter=scatter),
++            ),
++        ):
++            impl._update_global_swa_cache(
++                "layer",
++                torch.randn(num_tokens, 6),
++                torch.randn(1),
++                MagicMock(),
++            )
++
++        rotary.assert_called_once()
++        assert rotary.call_args.args[1] is cos
++        assert rotary.call_args.args[2] is sin
++        scatter.assert_called_once()
++        assert scatter.call_args.args[2] is slot_mapping
++
++
+ @pytest.mark.parametrize("fail_at", [None, "project", "copy"])
+ def test_o_projection_keeps_weight_lifetime_in_caller(monkeypatch, fail_at):
+     events = []
+diff --git a/tests/ut/attention/test_dsa_v1.py b/tests/ut/attention/test_dsa_v1.py
+index 8d3561bb3..85a05a947 100644
+--- a/tests/ut/attention/test_dsa_v1.py
++++ b/tests/ut/attention/test_dsa_v1.py
+@@ -1036,6 +1036,63 @@ def test_build_classifies_short_speculative_extends_as_decodes(
+         assert torch.equal(shared_metadata["cos"], expected)
+ 
+ 
++@pytest.mark.parametrize("full_graph_mode,expected_num_positions", [(False, 14), (True, 16)])
++def test_build_matches_rope_positions_to_graph_mode(full_graph_mode: bool, expected_num_positions: int):
++    """FULL graphs replay fixed shapes, so cos/sin span the padded token
++    count; other modes build them at the actual token count."""
++    builder = _make_builder(compressor_ratio=1)
++    query_start_loc = torch.tensor([0, 7, 14], dtype=torch.int32)
++    seq_lens = torch.tensor([20, 14], dtype=torch.int32)
++    common_attn_metadata = SimpleNamespace(
++        num_reqs=2,
++        num_actual_tokens=14,
++        num_input_tokens=16,
++        max_query_len=7,
++        context_parallel_metadata=None,
++        query_start_loc=query_start_loc,
++        query_start_loc_cpu=query_start_loc,
++        positions=torch.arange(16, dtype=torch.int64),
++        seq_lens=seq_lens,
++        _seq_lens_cpu=seq_lens,
++        seq_lens_cpu=None,
++        is_prefilling=torch.tensor([False, True]),
++        slot_mapping=torch.arange(16, dtype=torch.int32),
++        block_table_tensor=torch.tensor([[1, 2], [3, 4]], dtype=torch.int32),
++        attn_state=MagicMock(),
++    )
++    builder.build_req_metadata = MagicMock(return_value=MagicMock())
++    captured: dict[str, int] = {}
++
++    def get_rope(positions, use_cache=False, **kwargs):
++        captured["num_positions"] = positions.shape[0]
++        return torch.zeros(positions.shape[0]), torch.zeros(positions.shape[0])
++
++    with (
++        patch(
++            "vllm_ascend.attention.utils.is_pd_decode_recompute_scheduler_enabled",
++            return_value=False,
++        ),
++        patch(
++            "vllm_ascend.attention.dsa_v1.get_dsa_attn_kv_plan",
++            return_value=_mock_dsa_kv_plan(
++                format_dsa_slot_mapping=torch.zeros((16, 2), dtype=torch.int32),
++            ),
++        ),
++        patch(
++            "vllm_ascend.attention.dsa_v1.get_cos_and_sin_dsa",
++            side_effect=get_rope,
++        ),
++    ):
++        builder.build(
++            common_prefix_len=0,
++            common_attn_metadata=common_attn_metadata,
++            common_ratio_to_sas_metadata={},
++            full_graph_mode=full_graph_mode,
++        )
++
++    assert captured["num_positions"] == expected_num_positions
++
++
+ @pytest.mark.parametrize("deferred", [False, True])
+ @pytest.mark.parametrize("causal", [False, True])
+ @pytest.mark.parametrize("seq_len", [127, 128, 129, 133, 261])
+diff --git a/tests/ut/worker/test_attn_utils_v2.py b/tests/ut/worker/test_attn_utils_v2.py
+index 33fe9fdcb..338455092 100644
+--- a/tests/ut/worker/test_attn_utils_v2.py
++++ b/tests/ut/worker/test_attn_utils_v2.py
+@@ -976,6 +976,7 @@ class _RecordingDSAMetadataBuilder(AscendDSAMetadataBuilder):
+             "pcp_context": kwargs.get("pcp_context"),
+             "pcp_cache_group_idx": kwargs.get("pcp_cache_group_idx"),
+             "formatted_slot_mapping": kwargs.get("formatted_slot_mapping"),
++            "full_graph_mode": kwargs.get("full_graph_mode"),
+         }
+         assert "block_size" not in kwargs
+         self.calls.append(call)
+@@ -1618,6 +1619,30 @@ def test_v41_capture_keeps_compressed_indexer_branches(monkeypatch, capture, ful
+     assert builder.extra_kwargs["full_graph_mode"] is (capture or full_graph)
+ 
+ 
++@pytest.mark.parametrize("capture", [False, True])
++@pytest.mark.parametrize("full_graph", [False, True])
++def test_dsa_builder_receives_full_graph_mode(capture, full_graph):
++    _, _, calls, attn_groups, kv_cache_config = _make_dsa_metadata_groups()
++    attn_utils.build_attn_metadata(
++        attn_groups=attn_groups,
++        num_reqs=1,
++        num_tokens=1,
++        query_start_loc_gpu=torch.tensor([0, 1], dtype=torch.int32),
++        query_start_loc_cpu=torch.tensor([0, 1], dtype=torch.int32),
++        max_query_len=1,
++        seq_lens=torch.tensor([1], dtype=torch.int32),
++        max_seq_len=1,
++        block_tables=(torch.zeros((1, 1), dtype=torch.int32),) * 2,
++        slot_mappings=(torch.zeros(1, dtype=torch.int64),) * 2,
++        kv_cache_config=kv_cache_config,
++        for_cudagraph_capture=capture,
++        full_graph_mode=full_graph,
++    )
++    assert len(calls) == 2
++    for call in calls:
++        assert call["full_graph_mode"] is (capture or full_graph)
++
++
+ @pytest.mark.parametrize("cache_only_backend", [False, True])
+ @pytest.mark.parametrize("for_cudagraph_capture", [False, True])
+ def test_build_attn_metadata_propagates_prefill_and_pcp_context(monkeypatch, for_cudagraph_capture, cache_only_backend):
+diff --git a/tests/ut/worker/test_pcp_manager_v2.py b/tests/ut/worker/test_pcp_manager_v2.py
+index ae064e3b2..825a97b10 100644
+--- a/tests/ut/worker/test_pcp_manager_v2.py
++++ b/tests/ut/worker/test_pcp_manager_v2.py
+@@ -196,18 +196,21 @@ def test_validate_config_allows_pipeline_parallelism():
+     AscendPCPManager.validate_config(vllm_config, supports_mm_inputs=False)
+ 
+ 
+-@pytest.mark.parametrize("cudagraph_mode", [CUDAGraphMode.PIECEWISE, CUDAGraphMode.FULL])
+-def test_validate_config_rejects_unsupported_sparse_mla_graph_modes(cudagraph_mode):
++@pytest.mark.parametrize(
++    "cudagraph_mode",
++    [CUDAGraphMode.PIECEWISE, CUDAGraphMode.FULL_AND_PIECEWISE],
++)
++def test_validate_config_allows_sparse_mla_piecewise_graph_modes(cudagraph_mode):
+     vllm_config = _make_pcp_config(cudagraph_mode)
+ 
+-    with pytest.raises(NotImplementedError, match="sparse MLA PCP supports"):
+-        AscendPCPManager.validate_config(vllm_config, supports_mm_inputs=False)
++    AscendPCPManager.validate_config(vllm_config, supports_mm_inputs=False)
+ 
+ 
+-def test_validate_config_rejects_full_graph_for_non_sparse_mla():
+-    vllm_config = _make_pcp_config(CUDAGraphMode.FULL, sparse_mla=False)
++@pytest.mark.parametrize("sparse_mla", [True, False])
++def test_validate_config_rejects_full_graph(sparse_mla):
++    vllm_config = _make_pcp_config(CUDAGraphMode.FULL, sparse_mla=sparse_mla)
+ 
+-    with pytest.raises(NotImplementedError, match="FULL_DECODE_ONLY"):
++    with pytest.raises(NotImplementedError, match="does not support FULL CUDA graphs"):
+         AscendPCPManager.validate_config(vllm_config, supports_mm_inputs=False)
+ 
+ 
+@@ -886,6 +889,45 @@ def test_pcp_manager_restores_model_owned_hidden_buffer() -> None:
+     torch.testing.assert_close(hidden_states[3], torch.zeros(2))
+ 
+ 
++@pytest.mark.parametrize("num_tokens", [3, 6], ids=["padded", "unpadded"])
++@pytest.mark.parametrize(
++    "parent_rows",
++    [3, 5, 7],
++    ids=["compact_parent_output", "unexpected_short_output", "unexpected_long_output"],
++)
++def test_pcp_manager_rejects_mismatched_restored_hidden_states(parent_rows: int, num_tokens: int) -> None:
++    """Parent output must match the global layout with or without padding."""
++    manager = AscendPCPManager.__new__(AscendPCPManager)
++    manager._global_batch = SimpleNamespace(num_tokens=num_tokens, num_tokens_after_padding=6)
++
++    with (
++        patch(
++            "vllm_ascend.worker.v2.pcp_manager.get_pp_group",
++            return_value=SimpleNamespace(is_last_rank=True),
++        ),
++        patch.object(PCPManager, "restore_hidden_states", return_value=torch.randn(parent_rows, 2)),
++        pytest.raises(RuntimeError, match="does not match the global graph layout"),
++    ):
++        manager.restore_hidden_states(torch.randn(num_tokens, 2))
++
++
++def test_pcp_manager_preserves_unpadded_restored_hidden_states() -> None:
++    manager = AscendPCPManager.__new__(AscendPCPManager)
++    manager._global_batch = SimpleNamespace(num_tokens=6, num_tokens_after_padding=6)
++    restored_hidden_states = torch.randn(6, 2)
++
++    with (
++        patch(
++            "vllm_ascend.worker.v2.pcp_manager.get_pp_group",
++            return_value=SimpleNamespace(is_last_rank=True),
++        ),
++        patch.object(PCPManager, "restore_hidden_states", return_value=restored_hidden_states),
++    ):
++        result = manager.restore_hidden_states(torch.randn(3, 2))
++
++    assert result is restored_hidden_states
++
++
+ def test_pcp_manager_skips_hidden_restore_before_last_pp_rank() -> None:
+     manager = AscendPCPManager.__new__(AscendPCPManager)
+     hidden_states = torch.randn(2, 4)
+@@ -1153,21 +1195,18 @@ def test_partition_batch_clears_padded_dcp_local_seq_lens() -> None:
+ 
+ 
+ @pytest.mark.parametrize(
+-    "dp_size,cudagraph_mode,allowed",
++    "dp_size,cudagraph_mode",
+     [
+-        (2, CUDAGraphMode.NONE, True),
+-        (2, CUDAGraphMode.FULL_DECODE_ONLY, True),
+-        (2, CUDAGraphMode.PIECEWISE, False),
+-        (1, CUDAGraphMode.PIECEWISE, True),
++        (2, CUDAGraphMode.NONE),
++        (2, CUDAGraphMode.FULL_DECODE_ONLY),
++        (2, CUDAGraphMode.PIECEWISE),
++        (2, CUDAGraphMode.FULL_AND_PIECEWISE),
++        (1, CUDAGraphMode.PIECEWISE),
+     ],
+ )
+-def test_validate_config_pcp_dp_graph_modes(dp_size, cudagraph_mode, allowed):
++def test_validate_config_pcp_dp_graph_modes(dp_size, cudagraph_mode):
+     config = _make_pcp_config(cudagraph_mode, sparse_mla=False, data_parallel_size=dp_size)
+-    if allowed:
+-        AscendPCPManager.validate_config(config, supports_mm_inputs=False)
+-    else:
+-        with pytest.raises(NotImplementedError, match=r"PCP\+DP supports eager mode or FULL_DECODE_ONLY"):
+-            AscendPCPManager.validate_config(config, supports_mm_inputs=False)
++    AscendPCPManager.validate_config(config, supports_mm_inputs=False)
+ 
+ 
+ @pytest.mark.parametrize("pcp_rank", [0, 1])
+diff --git a/vllm_ascend/attention/context_parallel/dsa_cp.py b/vllm_ascend/attention/context_parallel/dsa_cp.py
+index abb7d4924..a414c081f 100644
+--- a/vllm_ascend/attention/context_parallel/dsa_cp.py
++++ b/vllm_ascend/attention/context_parallel/dsa_cp.py
+@@ -2265,13 +2265,19 @@ class AscendDSAPCPMetadataBuilder(dsa_v1.AscendDSAMetadataBuilder):
+     def _prepare_graph_pcp_context(
+         self,
+         pcp_context: "AscendPCPAttentionContext",
++        full_graph_mode: bool,
+     ) -> "AscendPCPAttentionContext":
+         """Prepare graph-stable DSA tensors without changing the PCP batch layout."""
+         global_batch = pcp_context.global_batch
+         num_actual_tokens = global_batch.num_tokens
+ 
++        # FULL graphs replay the fixed padded batch, so the restore indices
++        # must cover every padded row. Other modes run the DSA cache update
++        # with the actual token extent, and compact indices avoid restoring
++        # placeholder rows that would be trimmed before the cache write anyway.
++        num_restore_tokens = global_batch.num_tokens_after_padding if full_graph_mode else num_actual_tokens
+         # Use the preallocated buffer to keep the address fixed for graph replay.
+-        hidden_restore_idx = self._hidden_restore_idx_buffer[: global_batch.num_tokens_after_padding]
++        hidden_restore_idx = self._hidden_restore_idx_buffer[:num_restore_tokens]
+         hidden_restore_idx[:num_actual_tokens].copy_(pcp_context.hidden_restore_idx[:num_actual_tokens])
+         hidden_restore_idx[num_actual_tokens:].zero_()
+ 
+@@ -2426,6 +2432,7 @@ class AscendDSAPCPMetadataBuilder(dsa_v1.AscendDSAMetadataBuilder):
+         fast_build: bool,
+         num_actual_reqs: int | None,
+         common_ratio_to_sas_metadata: dict[Any, Any],
++        full_graph_mode: bool = False,
+     ) -> dsa_v1.AscendDSAMetadata:
+         # A captured graph still runs its padded queries, so their metadata
+         # must be refreshed even when this rank owns no tokens.
+@@ -2436,6 +2443,7 @@ class AscendDSAPCPMetadataBuilder(dsa_v1.AscendDSAMetadataBuilder):
+                 fast_build,
+                 num_actual_reqs=num_actual_reqs,
+                 common_ratio_to_sas_metadata=common_ratio_to_sas_metadata,
++                full_graph_mode=full_graph_mode,
+             )
+ 
+         # Empty ranks still participate in the global cache update collectives.
+@@ -2461,6 +2469,7 @@ class AscendDSAPCPMetadataBuilder(dsa_v1.AscendDSAMetadataBuilder):
+         pcp_cache_group_idx: int | None = None,
+         num_actual_reqs: int | None = None,
+         common_ratio_to_sas_metadata: dict[Any, Any] | None = None,
++        full_graph_mode: bool = False,
+         **kwargs: Any,
+     ) -> dsa_v1.AscendDSAMetadata:
+         assert pcp_context is not None
+@@ -2471,7 +2480,10 @@ class AscendDSAPCPMetadataBuilder(dsa_v1.AscendDSAMetadataBuilder):
+         # owns different requests per rank, so it still needs global metadata.
+         needs_global_metadata = has_prefill or self._is_decode_sharded
+         if needs_global_metadata:
+-            pcp_context = self._prepare_graph_pcp_context(pcp_context)
++            pcp_context = self._prepare_graph_pcp_context(
++                pcp_context,
++                full_graph_mode=full_graph_mode,
++            )
+             global_common_attn_metadata = self._build_global_common_attn_metadata(
+                 pcp_context,
+                 pcp_cache_group_idx,
+@@ -2491,6 +2503,7 @@ class AscendDSAPCPMetadataBuilder(dsa_v1.AscendDSAMetadataBuilder):
+                 num_actual_reqs=pcp_context.global_batch.num_reqs,
+                 common_ratio_to_sas_metadata={},
+                 can_use_rope_cache=False,
++                full_graph_mode=full_graph_mode,
+             )
+             if (
+                 not has_prefill
+@@ -2522,6 +2535,7 @@ class AscendDSAPCPMetadataBuilder(dsa_v1.AscendDSAMetadataBuilder):
+             fast_build,
+             num_actual_reqs=num_actual_reqs,
+             common_ratio_to_sas_metadata=common_ratio_to_sas_metadata,
++            full_graph_mode=full_graph_mode,
+         )
+         # Replicated decode tokens stay in scheduler order on every PCP rank.
+         # The local metadata therefore describes the canonical cache update
+@@ -2747,6 +2761,9 @@ class AscendDSAPCPImpl(dsa_v1.AscendDSAImpl):
+             1,
+             self.nope_head_dim + self.rope_head_dim,
+         )
++        # cos/sin/slot_mapping are built at the restored batch length -- padded
++        # for FULL graphs, actual tokens otherwise -- so they already match the
++        # kv rows and need no trimming here.
+         torch.ops._C_ascend.inplace_partial_rotary_mul(
+             kv.unsqueeze(1),
+             req_metadata.cos[layer_name],
+diff --git a/vllm_ascend/attention/context_parallel/dsa_v41_cp.py b/vllm_ascend/attention/context_parallel/dsa_v41_cp.py
+index 117ce5b11..63b9f9de8 100644
+--- a/vllm_ascend/attention/context_parallel/dsa_v41_cp.py
++++ b/vllm_ascend/attention/context_parallel/dsa_v41_cp.py
+@@ -389,7 +389,9 @@ class AscendDSAV41PCPMetadataBuilder(_ReplicatedCacheMetadataBuilder):
+         self._global_builder.take_device_metadata_tasks()
+ 
+         if needs_global_metadata:
+-            pcp_context = AscendDSAPCPMetadataBuilder._prepare_graph_pcp_context(self, pcp_context)
++            pcp_context = AscendDSAPCPMetadataBuilder._prepare_graph_pcp_context(
++                self, pcp_context, full_graph_mode=kwargs.get("full_graph_mode", False)
++            )
+             global_common = AscendDSAPCPMetadataBuilder._build_global_common_attn_metadata(
+                 pcp_context, pcp_cache_group_idx, common_attn_metadata
+             )
+diff --git a/vllm_ascend/attention/dsa_v1.py b/vllm_ascend/attention/dsa_v1.py
+index 997181838..f2c21b6d9 100644
+--- a/vllm_ascend/attention/dsa_v1.py
++++ b/vllm_ascend/attention/dsa_v1.py
+@@ -850,6 +850,7 @@ class AscendDSAMetadataBuilder(AttentionMetadataBuilder[AscendDSAMetadata]):
+         fast_build: bool = False,
+         *,
+         can_use_rope_cache: bool = True,
++        full_graph_mode: bool = False,
+         **kwargs,
+     ) -> AscendDSAMetadata:
+         num_reqs = common_attn_metadata.num_reqs
+@@ -883,7 +884,11 @@ class AscendDSAMetadataBuilder(AttentionMetadataBuilder[AscendDSAMetadata]):
+             else:
+                 seq_lens_cpu = common_attn_metadata.seq_lens.cpu()
+             self.common_ratio_to_sas_metadata["seq_lens_cpu"] = seq_lens_cpu
+-            input_positions = common_attn_metadata.positions[:num_input_tokens].long()
++            # FULL graphs replay fixed shapes, so cos/sin must span the padded
++            # token count. Other modes consume only real tokens; build at the
++            # actual length so consumers never need to re-slice.
++            num_position_tokens = num_input_tokens if full_graph_mode else common_attn_metadata.num_actual_tokens
++            input_positions = common_attn_metadata.positions[:num_position_tokens].long()
+             need_use_rope_cache = can_use_rope_cache and self.num_prefills == 0
+             cos, sin = get_cos_and_sin_dsa(
+                 input_positions,
+@@ -922,7 +927,7 @@ class AscendDSAMetadataBuilder(AttentionMetadataBuilder[AscendDSAMetadata]):
+             num_actual_reqs=num_actual_reqs,
+             cos=cos,
+             sin=sin,
+-            full_graph_mode=kwargs.get("full_graph_mode", False),
++            full_graph_mode=full_graph_mode,
+         )
+ 
+         return self.metadata_cls(  # type: ignore
+diff --git a/vllm_ascend/worker/v2/attn_utils.py b/vllm_ascend/worker/v2/attn_utils.py
+index dc9d2c2fc..7d3fdd846 100644
+--- a/vllm_ascend/worker/v2/attn_utils.py
++++ b/vllm_ascend/worker/v2/attn_utils.py
+@@ -542,6 +542,10 @@ def build_attn_metadata(
+                 attn_metadata_extra_kwargs.update(
+                     num_actual_reqs=num_actual_reqs,
+                     common_ratio_to_sas_metadata=common_ratio_to_sas_metadata,
++                    # FULL graphs replay the padded batch; DSA PCP restore
++                    # indices must span the padded extent. Mirror the V4.1
++                    # branch so the flag also reaches builders during capture.
++                    full_graph_mode=full_graph_mode or for_cudagraph_capture,
+                 )
+                 if formatted_slot_mappings is not None:
+                     attn_metadata_extra_kwargs["formatted_slot_mapping"] = formatted_slot_mappings[i]
+diff --git a/vllm_ascend/worker/v2/pcp_manager.py b/vllm_ascend/worker/v2/pcp_manager.py
+index 07d4ecb0e..552f7f3cc 100644
+--- a/vllm_ascend/worker/v2/pcp_manager.py
++++ b/vllm_ascend/worker/v2/pcp_manager.py
+@@ -228,9 +228,8 @@ class AscendPCPManager(PCPManager):
+         supports_mm_inputs: bool,
+     ) -> None:
+         """Validate the graph-safe Ascend MRV2 PCP configuration."""
+-        parallel_config = vllm_config.parallel_config
+         model_config = vllm_config.model_config
+-        pcp_size = parallel_config.prefill_context_parallel_size
++        pcp_size = vllm_config.parallel_config.prefill_context_parallel_size
+         if pcp_size <= 1:
+             return
+ 
+@@ -238,26 +237,17 @@ class AscendPCPManager(PCPManager):
+             raise NotImplementedError("MRV2 PCP does not support encoder-decoder models yet.")
+         if vllm_config.lora_config is not None:
+             raise NotImplementedError("MRV2 PCP does not support LoRA yet.")
++
+         speculative_config = vllm_config.speculative_config
+         if speculative_config is not None:
+             if speculative_config.method not in ("mtp", "eagle3", "dspark"):
+                 raise NotImplementedError(
+                     "Ascend MRV2 PCP supports speculative decoding only with MTP, Eagle3 and DSpark."
+                 )
+-        is_sparse_mla = hasattr(model_config.hf_text_config, "index_topk")
++
+         cudagraph_mode = vllm_config.compilation_config.cudagraph_mode
+-        if parallel_config.data_parallel_size > 1 and cudagraph_mode not in {
+-            CUDAGraphMode.NONE,
+-            CUDAGraphMode.FULL_DECODE_ONLY,
+-        }:
+-            raise NotImplementedError("MRV2 PCP+DP supports eager mode or FULL_DECODE_ONLY CUDA graphs only.")
+-        if is_sparse_mla and cudagraph_mode not in {
+-            CUDAGraphMode.NONE,
+-            CUDAGraphMode.FULL_DECODE_ONLY,
+-        }:
+-            raise NotImplementedError("MRV2 sparse MLA PCP supports eager mode or FULL_DECODE_ONLY CUDA graphs only.")
+-        if cudagraph_mode.has_full_cudagraphs() and cudagraph_mode != CUDAGraphMode.FULL_DECODE_ONLY:
+-            raise NotImplementedError("MRV2 PCP supports FULL_DECODE_ONLY CUDA graphs only.")
++        if cudagraph_mode == CUDAGraphMode.FULL:
++            raise NotImplementedError("MRV2 PCP does not support FULL CUDA graphs.")
+ 
+     def get_global_graph_num_reqs(self, batch_desc: BatchExecutionDescriptor) -> int | None:
+         """Global request capacity of a sharded FULL decode graph, if any.
+@@ -267,7 +257,7 @@ class AscendPCPManager(PCPManager):
+         """
+         if not self.is_decode_sharded or batch_desc.cg_mode != CUDAGraphMode.FULL:
+             return None
+-        # validate_config only allows FULL_DECODE_ONLY, whose batches are uniform.
++        # FULL graphs are dispatched only for uniform decode batches.
+         assert batch_desc.num_reqs is not None and batch_desc.uniform_token_count is not None
+         return self._get_global_graph_num_reqs(batch_desc.num_reqs, batch_desc.uniform_token_count)
+ 
+@@ -483,15 +473,40 @@ class AscendPCPManager(PCPManager):
+         return
+ 
+     def restore_hidden_states(self, hidden_states: torch.Tensor) -> torch.Tensor:
+-        """Restore active tokens and zero any fixed-graph padding rows."""
++        """Restore tokens to the global PCP layout, following the batch length.
++
++        Output-length contract: the returned tensor matches the global batch
++        layout, i.e. ``num_tokens_after_padding`` rows when the batch is padded
++        for FULL graph replay and the compact ``num_tokens`` rows otherwise.
++        Downstream consumers (sampling, replicated drafters) index restored
++        states with the global batch layout, so padding rows must be present
++        for padded batches; they read as zeros. ``_pad_hidden_restore_idx``
++        extends the restore indices to the padded extent, so the parent is
++        expected to return exactly that length; anything else raises.
++        Fixed-K speculative decode sharding restores to the unpadded global
++        batch instead, returning the compact ``num_tokens`` rows.
++        """
+         if not self.is_last_pp_rank:
+             return hidden_states
+ 
+         restored_hidden_states = super().restore_hidden_states(hidden_states)
+-        if self._global_batch is not None:
+-            restored_hidden_states[self._global_batch.num_tokens :].zero_()
+-            if self._restore_unpadded_global_batch():
+-                restored_hidden_states = restored_hidden_states[: self._global_batch.num_tokens]
++        if self._global_batch is None:
++            return restored_hidden_states
++
++        num_tokens = self._global_batch.num_tokens
++        num_tokens_after_padding = self._global_batch.num_tokens_after_padding
++        if restored_hidden_states.shape[0] != num_tokens_after_padding:
++            raise RuntimeError(
++                "PCP restored hidden-state length does not match the global "
++                "graph layout: "
++                f"{restored_hidden_states.shape[0]} != {num_tokens_after_padding}."
++            )
++        if num_tokens == num_tokens_after_padding:
++            return restored_hidden_states
++
++        restored_hidden_states[num_tokens:].zero_()
++        if self._restore_unpadded_global_batch():
++            restored_hidden_states = restored_hidden_states[:num_tokens]
+         return restored_hidden_states
+ 
+     def _restore_unpadded_global_batch(self) -> bool:

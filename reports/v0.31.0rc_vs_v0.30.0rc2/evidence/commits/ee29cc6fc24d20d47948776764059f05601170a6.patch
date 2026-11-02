@@ -1,0 +1,842 @@
+commit ee29cc6fc24d20d47948776764059f05601170a6
+Author:     liyishi <114989844+SOMEONEUNSEEN@users.noreply.github.com>
+AuthorDate: Mon Oct 19 22:21:39 2026 +0800
+Commit:     GitHub <noreply@github.com>
+CommitDate: Mon Oct 19 22:21:39 2026 +0800
+
+    [Feature][MRV2][SpecDecode] Support block verification in MRV2 (#19138)
+    
+    ### What this PR does / why we need it?
+    
+    Implement upstream block verification for Ascend Model Runner V2.
+    Previously, `use_block_verification` was accepted but ignored.
+    
+    - Reuse upstream cumulative probability-ratio and residual-mass kernels.
+    - Add block acceptance and prefix-scaled residual resampling to the NPU
+    path.
+    - Preserve the upstream separation between acceptance and recovery
+    random streams.
+    - Align placeholder recovery with upstream: bonus tokens and invalid
+    draft tokens use the target distribution across standard, synthetic, and
+    block verification modes.
+    
+    ### Does this PR introduce _any_ user-facing change?
+    
+    Yes. MRV2 now supports enabling block verification through:
+    
+    `speculative_config={"rejection_sample_method": "block", ...}`
+    
+    Placeholder recovery is also corrected for all verification modes.
+    
+    ### How was this patch tested?
+    
+    Added or extended NPU tests covering:
+    
+    - Target-distribution preservation and accepted-prefix extension.
+    - Prefix-scaled residuals and independent acceptance/recovery draws.
+    - Placeholder recovery across verification modes.
+    - Greedy consistency, variable-length requests, request-state mapping,
+    vocabulary padding, and incompatible configurations.
+    
+    Test commands:
+    
+    pytest -sv \
+    
+    tests/e2e/nightly/single_node/ops/singlecard_ops/triton/test_rejection_sample_v2.py
+    \
+    
+    tests/e2e/nightly/single_node/ops/singlecard_ops/triton/test_resample.py
+    
+    ---
+    
+    ### Checklist
+    
+    #### Testing
+    
+    - [x] **Boundary / edge-case coverage**: I reviewed whether this change
+    involves
+    boundary conditions (e.g. empty input, single/zero element, min/max
+    values,
+    off-by-one, sequence-length limits, integer overflow). Where applicable,
+    I
+    added unit tests covering these edge cases in `tests/ut/` or
+    `tests/e2e/`.
+    - [ ] **Regression test**: If this PR fixes a bug, I added a regression
+    test
+      that would fail without the fix.
+    - [x] **Error / failure path coverage**: I covered abnormal paths
+    (exceptions,
+    timeouts, out-of-range, division by zero) in addition to the happy path.
+    - [x] **Meaningful & reliable tests**: New tests assert real behavior
+    and are
+      not written merely to satisfy CI.
+    - [ ] **Performance impact**: If this PR touches a performance-sensitive
+    path,
+      I attached benchmark results and added performance regression tests.
+    
+    
+    - vLLM main:
+    https://github.com/vllm-project/vllm/commit/c4df37dfcc7f72ca41cd43801a468526ecf99a2b
+    
+    ---------
+    
+    Signed-off-by: liyishi <1252651434@qq.com>
+
+diff --git a/docs/source/user_guide/feature_guide/speculative_decoding.md b/docs/source/user_guide/feature_guide/speculative_decoding.md
+index c57cdfc3c..7d926505b 100644
+--- a/docs/source/user_guide/feature_guide/speculative_decoding.md
++++ b/docs/source/user_guide/feature_guide/speculative_decoding.md
+@@ -841,8 +841,46 @@ vllm serve meta-llama/Llama-3.1-8B-Instruct \
+   }'
+ ```
+ 
++## Block Verification in Model Runner V2
++
++Model Runner V2 supports upstream vLLM's block verification for speculative decoding. It jointly verifies a block of draft tokens using cumulative target-to-draft probability ratios and samples a recovery token from the corresponding residual distribution. This can increase the accepted draft length while preserving the target sampling distribution. Performance gains depend on the draft model and workload.
++
++Model Runner V2 is enabled by default (`VLLM_USE_V2_MODEL_RUNNER=1`). To enable block verification, set `"rejection_sample_method": "block"` in `speculative_config`, alongside your existing proposer settings. The default remains `"standard"`; omit this field or set it to `"standard"` to disable block verification.
++
++**Offline inference**:
++
++```python
++from vllm import LLM, SamplingParams
++
++llm = LLM(
++    model="path/to/target/model",
++    speculative_config={
++        "method": "eagle3",
++        "model": "path/to/draft/model",
++        "num_speculative_tokens": 3,
++        "rejection_sample_method": "block",
++    },
++)
++outputs = llm.generate(["The future of AI is"], SamplingParams(temperature=0.8))
++```
++
++**Online serving**:
++
++```shell
++vllm serve path/to/target/model \
++  --speculative-config '{"method": "eagle3", "model": "path/to/draft/model", "num_speculative_tokens": 3, "rejection_sample_method": "block"}'
++```
++
++Block verification supports both greedy and probabilistic draft sampling. Target requests with `temperature=0` retain greedy verification behavior. It cannot be combined with synthetic rejection sampling; do not set `synthetic_acceptance_rates` or `synthetic_acceptance_length` when using `"block"`.
++
+ ## Block Verify and Entropy Verify {: #block-verify-and-entropy-verify }
+ 
++Block Verify and Entropy Verify currently support Model Runner V1 only. Set `VLLM_USE_V2_MODEL_RUNNER=0` before starting the server or offline inference process, then configure these features through `additional_config.rejection_sampler_config` as shown below. Model Runner V2 is enabled by default; its block verification is configured through `speculative_config.rejection_sample_method`, as described in [Block Verification in Model Runner V2](#block-verification-in-model-runner-v2).
++
++```shell
++export VLLM_USE_V2_MODEL_RUNNER=0
++```
++
+ vLLM Ascend provides two optional optimizations for the rejection sampler in speculative decoding: **Block Verify** and **Entropy Verify**. These features trade a small amount of output precision for improved inference throughput.
+ 
+ !!! warning
+diff --git a/tests/e2e/nightly/single_node/ops/singlecard_ops/triton/test_rejection_sample_v2.py b/tests/e2e/nightly/single_node/ops/singlecard_ops/triton/test_rejection_sample_v2.py
+index d10deeb75..0addcdd3a 100644
+--- a/tests/e2e/nightly/single_node/ops/singlecard_ops/triton/test_rejection_sample_v2.py
++++ b/tests/e2e/nightly/single_node/ops/singlecard_ops/triton/test_rejection_sample_v2.py
+@@ -156,8 +156,9 @@ def test_synthetic_rejection_sample(
+ 
+ 
+ @pytest.mark.parametrize("has_draft_logits", [True, False])
++@pytest.mark.parametrize("use_block_verification", [False, True])
+ @torch.inference_mode()
+-def test_draft_vocab_narrower_than_target_vocab(has_draft_logits: bool):
++def test_draft_vocab_narrower_than_target_vocab(has_draft_logits: bool, use_block_verification: bool):
+     """A draft vocab narrower than the target's must not read out of bounds.
+ 
+     Some draft/target pairs (e.g. MiMo v2.5 Pro + DFlash) pad the target's
+@@ -200,8 +201,12 @@ def test_draft_vocab_narrower_than_target_vocab(has_draft_logits: bool):
+         inputs["draft_logits"] = None
+         padded_inputs["draft_logits"] = None
+ 
+-    sampled, num_sampled = rejection_sample(**padded_inputs, num_speculative_steps=num_speculative_steps)
+-    baseline_sampled, baseline_num_sampled = rejection_sample(**inputs, num_speculative_steps=num_speculative_steps)
++    sampled, num_sampled = rejection_sample(
++        **padded_inputs, num_speculative_steps=num_speculative_steps, use_block_verification=use_block_verification
++    )
++    baseline_sampled, baseline_num_sampled = rejection_sample(
++        **inputs, num_speculative_steps=num_speculative_steps, use_block_verification=use_block_verification
++    )
+ 
+     assert torch.equal(num_sampled, baseline_num_sampled)
+     # Slots after the first rejection are never written; compare the rest.
+@@ -270,3 +275,156 @@ def test_placeholder_draft_tokens_are_rejected(has_draft_logits: bool):
+ 
+     gc.collect()
+     torch.npu.empty_cache()
++
++
++@pytest.mark.parametrize("num_speculative_steps", [1, 3])
++@pytest.mark.parametrize("temperature", [0.6, 1.0])
++@pytest.mark.parametrize("has_draft_logits", [True, False])
++@torch.inference_mode()
++def test_block_verification_preserves_target_distribution(num_speculative_steps, temperature, has_draft_logits):
++    """Check the complete verify/recover path, including independence of its draws."""
++    torch.manual_seed(42)
++    target = torch.tensor([0.2, 0.3, 0.5], device="npu")
++    draft = torch.tensor([0.5, 0.3, 0.2], device="npu")
++    inputs = _build_rejection_sample_inputs(
++        target.log(), draft.log() * temperature, num_speculative_steps, temperature, num_trials=8192
++    )
++    if not has_draft_logits:
++        inputs["draft_logits"] = None
++        # Deterministic one-hot proposals expose acceptance/recovery RNG
++        # coupling: reusing u would produce [0.2, 0.175, 0.625] at position 0.
++        inputs["draft_sampled"].zero_()
++    sampled, num_sampled = rejection_sample(
++        **inputs, num_speculative_steps=num_speculative_steps, use_block_verification=True
++    )
++    sampled = sampled.cpu()
++    num_sampled = num_sampled.cpu()
++    assert ((num_sampled >= 1) & (num_sampled <= num_speculative_steps + 1)).all()
++    for step in range(num_speculative_steps + 1):
++        tokens = sampled[num_sampled > step, step]
++        assert tokens.numel() > 0
++        observed = torch.bincount(tokens, minlength=3).float() / tokens.numel()
++        # Later one-hot positions have fewer observations.
++        tolerance = 5.0 * (0.25 / tokens.numel()) ** 0.5
++        torch.testing.assert_close(observed, target.cpu(), rtol=0, atol=tolerance)
++
++
++@pytest.mark.parametrize("placeholder_step", [0, 1])
++@pytest.mark.parametrize("method", ["standard", "synthetic", "block"])
++@pytest.mark.parametrize("has_draft_logits", [True, False])
++@pytest.mark.parametrize("temperature", [0.0, 1.0])
++@torch.inference_mode()
++def test_placeholder_recovers_from_target(placeholder_step, method, has_draft_logits, temperature):
++    """Every verification mode must recover a placeholder from the target."""
++    torch.manual_seed(7)
++    target = torch.tensor([0.1, 0.2, 0.3, 0.4], device="npu")
++    inputs = _build_rejection_sample_inputs(target.log(), target.log(), 3, temperature, num_trials=4096)
++    if temperature == 0.0 or not has_draft_logits:
++        inputs["draft_sampled"].view(-1, 4)[:, 1:] = 3
++    if not has_draft_logits:
++        inputs["draft_logits"] = None
++        # Ensure every request reaches the placeholder, even with one-hot
++        # proposals, while keeping its recovery distribution non-degenerate.
++        prefix_logits = inputs["target_logits"].view(-1, 4, 4)[:, :placeholder_step, :]
++        prefix_logits.fill_(-float("inf"))
++        prefix_logits[:, :, 3] = 0
++    inputs["draft_sampled"].view(-1, 4)[:, placeholder_step + 1] = -1
++    sampled, num_sampled = rejection_sample(
++        **inputs,
++        num_speculative_steps=3,
++        use_block_verification=method == "block",
++        synthetic_conditional_rates=torch.ones(3, device="npu") if method == "synthetic" else None,
++    )
++    assert (num_sampled == placeholder_step + 1).all()
++    if temperature == 0.0:
++        assert (sampled[:, placeholder_step] == 3).all()
++    else:
++        counts = torch.bincount(sampled[:, placeholder_step].cpu(), minlength=4).float()
++        torch.testing.assert_close(counts / counts.sum(), target.cpu(), rtol=0, atol=0.03)
++
++
++@torch.inference_mode()
++def test_block_verification_extends_accepted_prefix():
++    """Block verification must do more than silently run standard verification."""
++    torch.manual_seed(0)
++    target = torch.tensor([0.4, 0.3, 0.3], device="npu")
++    draft = torch.tensor([0.5, 0.2, 0.3], device="npu")
++    inputs = _build_rejection_sample_inputs(target.log(), draft.log(), 3, 1.0, num_trials=8192)
++    _, standard_counts = rejection_sample(**inputs, num_speculative_steps=3)
++    _, block_counts = rejection_sample(**inputs, num_speculative_steps=3, use_block_verification=True)
++    # Exact mean accepted lengths for these distributions are approximately
++    # 2.439 (standard) and 2.509 (block); leave room for sampling noise.
++    assert block_counts.float().mean().item() > standard_counts.float().mean().item() + 0.02
++
++
++@pytest.mark.parametrize("has_draft_logits", [True, False])
++@torch.inference_mode()
++def test_block_verification_ragged_requests_and_mapping(has_draft_logits):
++    """Cover bonus-only/short requests, mixed temperatures and multiple vocab blocks."""
++    lengths = [4, 1, 3, 2]
++    mapping = [3, 0, 2, 1]
++    vocab_size = 8193
++    expected_ids = torch.tensor([8192, 1024, 3, 0], device="npu")
++    state_logits = torch.full((4, vocab_size), -float("inf"), device="npu")
++    state_logits[torch.tensor(mapping, device="npu"), expected_ids] = 0
++    expanded_mapping = torch.repeat_interleave(torch.tensor(mapping, dtype=torch.int32), torch.tensor(lengths)).to(
++        "npu"
++    )
++    cu = torch.tensor([0, 4, 5, 8, 10], dtype=torch.int32, device="npu")
++    draft_sampled = torch.repeat_interleave(expected_ids, torch.tensor(lengths, device="npu"))
++    inputs = dict(
++        target_logits=state_logits[expanded_mapping.long()],
++        draft_logits=state_logits[:, None, :].expand(-1, 3, -1).contiguous() if has_draft_logits else None,
++        draft_sampled=draft_sampled,
++        cu_num_logits=cu,
++        pos=torch.arange(sum(lengths), dtype=torch.int32, device="npu"),
++        idx_mapping=torch.tensor(mapping, dtype=torch.int32, device="npu"),
++        expanded_idx_mapping=expanded_mapping,
++        expanded_local_pos=torch.cat([torch.arange(n, dtype=torch.int32) for n in lengths]).to("npu"),
++        temperature=torch.tensor([1.0, 0.6, 0.0, 1.0], device="npu"),
++        seed=torch.arange(4, dtype=torch.int64, device="npu"),
++    )
++    sampled, num_sampled = rejection_sample(**inputs, num_speculative_steps=3, use_block_verification=True)
++    assert num_sampled.cpu().tolist() == lengths
++    for row, length in enumerate(lengths):
++        assert (sampled[row, :length] == expected_ids[row]).all()
++
++
++@pytest.mark.parametrize("has_draft_logits", [True, False])
++@pytest.mark.parametrize("temperature", [0.0, 0.7])
++@torch.inference_mode()
++def test_block_verification_single_bonus_only_request(has_draft_logits, temperature):
++    """A one-logit batch must recover its bonus without a zero-sized residual grid."""
++    logits = torch.tensor([-float("inf"), 0.0, -float("inf")], device="npu")
++    inputs = _build_rejection_sample_inputs(logits, logits, 3, temperature, num_trials=1)
++    # Keep the persistent draft cache, but verify a request with no proposals.
++    for name in ("target_logits", "draft_sampled", "pos", "expanded_idx_mapping", "expanded_local_pos"):
++        inputs[name] = inputs[name][:1]
++    inputs["cu_num_logits"] = torch.tensor([0, 1], dtype=torch.int32, device="npu")
++    if not has_draft_logits:
++        inputs["draft_logits"] = None
++
++    sampled, num_sampled = rejection_sample(**inputs, num_speculative_steps=3, use_block_verification=True)
++
++    assert num_sampled.cpu().tolist() == [1]
++    assert sampled[:, 0].cpu().tolist() == [1]
++
++
++@pytest.mark.parametrize("has_draft_logits", [True, False])
++@torch.inference_mode()
++def test_block_verification_keeps_greedy_results(has_draft_logits):
++    torch.manual_seed(9)
++    logits = torch.tensor([-2.0, 0.0, 2.0], device="npu")
++    inputs = _build_rejection_sample_inputs(logits, logits, 3, 0.0, num_trials=16)
++    if not has_draft_logits:
++        inputs["draft_logits"] = None
++    # Include all accepted, first rejected, and placeholder paths.
++    drafts = inputs["draft_sampled"].view(-1, 4)
++    drafts[:, 1:] = 2
++    drafts[::3, 1] = 0
++    drafts[1::3, 2] = -1
++    expected, expected_counts = rejection_sample(**inputs, num_speculative_steps=3)
++    sampled, counts = rejection_sample(**inputs, num_speculative_steps=3, use_block_verification=True)
++    torch.testing.assert_close(counts, expected_counts)
++    valid = torch.arange(4, device="npu")[None, :] < counts[:, None]
++    torch.testing.assert_close(sampled[valid], expected[valid])
+diff --git a/tests/e2e/nightly/single_node/ops/singlecard_ops/triton/test_resample.py b/tests/e2e/nightly/single_node/ops/singlecard_ops/triton/test_resample.py
+index eaaed345f..233926687 100644
+--- a/tests/e2e/nightly/single_node/ops/singlecard_ops/triton/test_resample.py
++++ b/tests/e2e/nightly/single_node/ops/singlecard_ops/triton/test_resample.py
+@@ -454,6 +454,48 @@ def test_full_draft_residual_distribution_matches_positive_p_minus_q():
+     _assert_distribution(sampled[:, 0], expected)
+ 
+ 
++@torch.inference_mode()
++def test_block_residual_scales_target_by_accepted_prefix():
++    """Both mass passes must use p_tau * p - q, including across vocab blocks."""
++    vocab_size = 1025
++    p = torch.zeros(vocab_size)
++    q = torch.zeros(vocab_size)
++    support = [0, 1024, 2, 3]
++    p[support] = torch.tensor([0.4, 0.3, 0.2, 0.1])
++    q[support] = torch.tensor([0.1, 0.1, 0.4, 0.4])
++    prefix_ratio = 0.5
++    residual = torch.clamp(prefix_ratio * p - q, min=0)
++    expected = residual / residual.sum()
++    lengths = [3] * STAT_TRIALS
++    total_logits = sum(lengths)
++    target_logits = _repeat_rows(p.log(), total_logits).to(DEVICE)
++    draft_logits = q.log().view(1, 1, -1).expand(STAT_TRIALS, 2, -1).contiguous().to(DEVICE)
++    sampled = torch.full((STAT_TRIALS, 3), -1, dtype=torch.int64, device=DEVICE)
++    # One accepted token, followed by the rejected token and a bonus row.
++    num_sampled = torch.ones(STAT_TRIALS, dtype=torch.int32, device=DEVICE)
++    zeros = torch.zeros(STAT_TRIALS, device=DEVICE)
++    cumulative_log_p = torch.full((total_logits,), prefix_ratio, device=DEVICE).log()
++    resample(
++        sampled,
++        num_sampled,
++        target_logits,
++        zeros,
++        draft_logits,
++        zeros,
++        _cu_num_logits(lengths),
++        _expanded_mapping(lengths),
++        torch.zeros(total_logits, dtype=torch.int32, device=DEVICE),
++        torch.ones(STAT_TRIALS, device=DEVICE),
++        torch.arange(STAT_TRIALS, dtype=torch.int64, device=DEVICE),
++        _position_tensor(total_logits),
++        cumulative_log_p=cumulative_log_p,
++        use_block_verification=True,
++    )
++    assert (num_sampled == 2).all()
++    assert (sampled[:, 0] == -1).all()
++    _assert_distribution(sampled[:, 1], expected)
++
++
+ @torch.inference_mode()
+ def test_one_hot_residual_distribution_excludes_rejected_token_and_renormalizes():
+     probs = torch.tensor([0.10, 0.45, 0.20, 0.15, 0.10], dtype=torch.float32)
+@@ -656,8 +698,11 @@ def test_same_seed_and_position_are_deterministic():
+ 
+ @pytest.mark.parametrize("has_draft_logits", [False, True])
+ @pytest.mark.parametrize("rejection_step", [0, 1])
++@pytest.mark.parametrize("use_block_verification", [False, True])
+ @torch.inference_mode()
+-def test_rejection_sample_residual_is_independent_of_acceptance_draw(has_draft_logits, rejection_step):
++def test_rejection_sample_residual_is_independent_of_acceptance_draw(
++    has_draft_logits, rejection_step, use_block_verification
++):
+     """Reusing the acceptance draw would select only token 2 after rejection."""
+     num_spec_steps = rejection_step + 1
+     num_logits_per_req = num_spec_steps + 1
+@@ -682,6 +727,7 @@ def test_rejection_sample_residual_is_independent_of_acceptance_draw(has_draft_l
+         torch.ones(STAT_TRIALS, dtype=torch.float32, device=DEVICE),
+         torch.arange(STAT_TRIALS, dtype=torch.int64, device=DEVICE) + 4001,
+         num_spec_steps,
++        use_block_verification=use_block_verification,
+     )
+     torch.npu.synchronize()
+ 
+diff --git a/tests/ut/worker/v2/test_spec_decode.py b/tests/ut/worker/v2/test_spec_decode.py
+index 57997ad27..ff5e96523 100644
+--- a/tests/ut/worker/v2/test_spec_decode.py
++++ b/tests/ut/worker/v2/test_spec_decode.py
+@@ -10,6 +10,27 @@ import torch
+ from vllm.config import CompilationConfig, CompilationMode, CUDAGraphMode
+ 
+ from vllm_ascend.worker.v2.spec_decode import init_speculator
++from vllm_ascend.worker.v2.spec_decode.rejection_sampler_utils import rejection_sample
++
++
++def test_rejection_sample_rejects_block_with_synthetic_rates():
++    """Reject incompatible verification modes before allocating or launching on NPU."""
++    with pytest.raises(AssertionError, match="incompatible with synthetic"):
++        rejection_sample(
++            target_logits=torch.zeros(2, 1),
++            draft_logits=None,
++            draft_sampled=torch.zeros(2, dtype=torch.int64),
++            cu_num_logits=torch.tensor([0, 2], dtype=torch.int32),
++            pos=torch.arange(2, dtype=torch.int32),
++            idx_mapping=torch.zeros(1, dtype=torch.int32),
++            expanded_idx_mapping=torch.zeros(2, dtype=torch.int32),
++            expanded_local_pos=torch.arange(2, dtype=torch.int32),
++            temperature=torch.ones(1),
++            seed=torch.zeros(1, dtype=torch.int64),
++            num_speculative_steps=1,
++            synthetic_conditional_rates=torch.ones(1),
++            use_block_verification=True,
++        )
+ 
+ 
+ def _make_config(
+diff --git a/vllm_ascend/ops/triton/v2/spec_decode/resample.py b/vllm_ascend/ops/triton/v2/spec_decode/resample.py
+index a5dfaeecd..b7ab171de 100644
+--- a/vllm_ascend/ops/triton/v2/spec_decode/resample.py
++++ b/vllm_ascend/ops/triton/v2/spec_decode/resample.py
+@@ -51,11 +51,13 @@ def _resample_kernel(
+     expanded_idx_mapping_ptr,
+     draft_sampled_ptr,
+     temp_ptr,
++    cumulative_log_p_ptr,
+     num_reqs,
+     num_blocks,
+     vocab_size,
+     BLOCK_SIZE: tl.constexpr,
+     HAS_DRAFT_LOGITS: tl.constexpr,
++    USE_BLOCK_VERIFICATION: tl.constexpr,
+ ):
+     """Compute one probability-mass statistic per request/vocabulary block."""
+     worker_id = tl.program_id(0)
+@@ -83,6 +85,8 @@ def _resample_kernel(
+         needs_resample = (temperature != 0.0) | is_bonus
+ 
+         if needs_resample:
++            rejected_draft_token = tl.load(draft_sampled_ptr + resample_token_idx + 1, mask=not is_bonus, other=0)
++            is_valid_rejected_draft = rejected_draft_token >= 0
+             vocab_offsets = block_idx * BLOCK_SIZE + block_lanes
+             vocab_mask = vocab_offsets < vocab_size
+             target_block_logits = tl.load(
+@@ -91,7 +95,7 @@ def _resample_kernel(
+                 other=float("-inf"),
+             ).to(tl.float32)
+ 
+-            if is_bonus:
++            if is_bonus or not is_valid_rejected_draft:
+                 block_max, block_argmax = tl.max(target_block_logits, axis=0, return_indices=True)
+                 has_mass = block_max > float("-inf")
+                 safe_block_max = tl.where(has_mass, block_max, 0.0)
+@@ -103,7 +107,12 @@ def _resample_kernel(
+                 tl.store(local_mass_ptr + req_idx * local_mass_stride + block_idx, block_sumexp)
+             else:
+                 target_lse = tl.load(target_rejected_logsumexp_ptr + req_idx)
+-                target_prob = tl.exp(target_block_logits - target_lse)
++                target_log_probs = target_block_logits - target_lse
++                if USE_BLOCK_VERIFICATION and HAS_DRAFT_LOGITS:
++                    # block residual: max(p_tau * M_b - M_s, 0).
++                    log_p_tau = tl.load(cumulative_log_p_ptr + resample_token_idx - 1, mask=resample_idx > 0, other=0.0)
++                    target_log_probs += log_p_tau
++                target_prob = tl.exp(target_log_probs)
+ 
+                 if HAS_DRAFT_LOGITS:
+                     draft_block_logits = tl.load(
+@@ -127,7 +136,6 @@ def _resample_kernel(
+                     # occurs when the draft closely matches the target.
+                     token_mass = tl.maximum(target_prob - draft_prob, 0.0)
+                 else:
+-                    rejected_draft_token = tl.load(draft_sampled_ptr + resample_token_idx + 1)
+                     token_mass = tl.where(vocab_offsets != rejected_draft_token, target_prob, 0.0)
+ 
+                 token_mass = tl.where(vocab_mask, token_mass, 0.0)
+@@ -172,12 +180,14 @@ def _categorical_finalize_kernel(
+     temp_ptr,
+     seed_ptr,
+     pos_ptr,
++    cumulative_log_p_ptr,
+     vocab_size,
+     num_blocks,
+     BLOCK_SIZE: tl.constexpr,
+     PADDED_NUM_BLOCKS: tl.constexpr,
+     HAS_DRAFT_LOGITS: tl.constexpr,
+     RESAMPLE_NOISE_SALT: tl.constexpr,
++    USE_BLOCK_VERIFICATION: tl.constexpr,
+ ):
+     """Select the final token using one global categorical threshold per request."""
+     req_idx = tl.program_id(0)
+@@ -193,10 +203,12 @@ def _categorical_finalize_kernel(
+     temperature = tl.load(temp_ptr + req_state_idx).to(tl.float32)
+     is_greedy = temperature == 0.0
+     is_bonus = resample_token_idx == end_idx - 1
++    rejected_draft_token = tl.load(draft_sampled_ptr + resample_token_idx + 1, mask=not is_bonus, other=0)
++    is_valid_rejected_draft = rejected_draft_token >= 0
+     is_greedy_bonus = is_greedy & is_bonus
+     is_random = ~is_greedy
+-    is_random_bonus = is_random & is_bonus
+-    is_random_residual = is_random & (~is_bonus)
++    is_random_bonus = is_random & (is_bonus | ~is_valid_rejected_draft)
++    is_random_residual = is_random & ~is_bonus & is_valid_rejected_draft
+ 
+     block_ids = tl.arange(0, PADDED_NUM_BLOCKS)
+     valid_block_mask = block_ids < num_blocks
+@@ -228,7 +240,7 @@ def _categorical_finalize_kernel(
+         other=0.0,
+     ).to(tl.float32)
+ 
+-    # Bonus blocks use different local maxima, so convert their masses to one common scale.
++    # Target-distribution blocks use local maxima; convert masses to a common scale.
+     bonus_block_max = tl.load(
+         local_max_ptr + req_idx * local_max_stride + block_ids,
+         mask=valid_block_mask & is_random_bonus,
+@@ -237,7 +249,7 @@ def _categorical_finalize_kernel(
+     bonus_global_max = tl.max(bonus_block_max, axis=0)
+     safe_bonus_global_max = tl.where(bonus_global_max > float("-inf"), bonus_global_max, 0.0)
+     bonus_block_mass = stored_block_mass * tl.exp(bonus_block_max - safe_bonus_global_max)
+-    block_mass = tl.where(is_bonus, bonus_block_mass, stored_block_mass)
++    block_mass = tl.where(is_bonus | ~is_valid_rejected_draft, bonus_block_mass, stored_block_mass)
+     block_mass = tl.where(valid_block_mask & is_random, block_mass, 0.0)
+ 
+     total_mass = tl.sum(block_mass, axis=0)
+@@ -283,7 +295,15 @@ def _categorical_finalize_kernel(
+         target_block_logits,
+         float("-inf"),
+     )
+-    target_prob = tl.exp(residual_target_logits - target_lse)
++    target_log_probs = residual_target_logits - target_lse
++    if USE_BLOCK_VERIFICATION and HAS_DRAFT_LOGITS:
++        log_p_tau = tl.load(
++            cumulative_log_p_ptr + resample_token_idx - 1,
++            mask=is_random_residual & has_total_mass & (resample_idx > 0),
++            other=0.0,
++        )
++        target_log_probs += log_p_tau
++    target_prob = tl.exp(target_log_probs)
+ 
+     if HAS_DRAFT_LOGITS:
+         draft_block_logits = tl.load(
+@@ -298,12 +318,9 @@ def _categorical_finalize_kernel(
+         draft_prob = tl.exp(draft_block_logits - draft_lse)
+         residual_token_mass = tl.maximum(target_prob - draft_prob, 0.0)
+     else:
+-        rejected_draft_token = tl.load(
+-            draft_sampled_ptr + resample_token_idx + 1, mask=is_random_residual & has_total_mass, other=-1
+-        )
+         residual_token_mass = tl.where(token_ids != rejected_draft_token, target_prob, 0.0)
+ 
+-    token_mass = tl.where(is_bonus, bonus_token_mass, residual_token_mass)
++    token_mass = tl.where(is_bonus | ~is_valid_rejected_draft, bonus_token_mass, residual_token_mass)
+     token_mass = tl.where(active_token_mask, token_mass, 0.0)
+     selected_block_mass = tl.sum(token_mass, axis=0)
+     has_selected_block_mass = selected_block_mass > 0.0
+@@ -342,6 +359,8 @@ def resample(
+     seed: torch.Tensor,
+     pos: torch.Tensor,
+     has_draft_logits: bool | None = None,
++    cumulative_log_p: torch.Tensor | None = None,
++    use_block_verification: bool = False,
+ ) -> None:
+     """Resample the first rejected token or the bonus token in place.
+ 
+@@ -359,7 +378,13 @@ def resample(
+     contiguous. ``draft_logits=None`` selects the one-hot draft path. Callers
+     that already replaced ``None`` with a dummy tensor can pass
+     ``has_draft_logits=False`` explicitly to preserve the same semantics.
++
++    Block verification scales full-draft residuals by the accepted prefix's
++    joint ratio from ``cumulative_log_p``. For one-hot drafts that factor
++    cancels under normalization, as in upstream.
+     """
++    if use_block_verification:
++        assert cumulative_log_p is not None
+     num_reqs = cu_num_logits.shape[0] - 1
+     if num_reqs == 0:
+         return
+@@ -411,11 +436,13 @@ def resample(
+         expanded_idx_mapping,
+         draft_sampled,
+         temperature,
++        cumulative_log_p,
+         num_reqs,
+         num_blocks,
+         vocab_size,
+         BLOCK_SIZE=_RESAMPLE_BLOCK_SIZE,
+         HAS_DRAFT_LOGITS=has_draft_logits,
++        USE_BLOCK_VERIFICATION=use_block_verification,
+         has_auto_blockify_blacklist_op=True,
+     )
+ 
+@@ -443,10 +470,12 @@ def resample(
+         temperature,
+         seed,
+         pos,
++        cumulative_log_p,
+         vocab_size,
+         num_blocks,
+         BLOCK_SIZE=_RESAMPLE_BLOCK_SIZE,
+         PADDED_NUM_BLOCKS=triton.next_power_of_2(num_blocks),
+         HAS_DRAFT_LOGITS=has_draft_logits,
+         RESAMPLE_NOISE_SALT=1 << 29,
++        USE_BLOCK_VERIFICATION=use_block_verification,
+     )
+diff --git a/vllm_ascend/worker/v2/spec_decode/rejection_sampler_utils.py b/vllm_ascend/worker/v2/spec_decode/rejection_sampler_utils.py
+index 9bd8ab86c..2120fca18 100644
+--- a/vllm_ascend/worker/v2/spec_decode/rejection_sampler_utils.py
++++ b/vllm_ascend/worker/v2/spec_decode/rejection_sampler_utils.py
+@@ -19,6 +19,11 @@
+ 
+ import torch
+ from vllm.triton_utils import tl, triton
++from vllm.v1.worker.gpu.spec_decode.rejection_sampler_utils import (
++    _compute_cumulative_log_p_kernel,
++    _compute_global_residual_mass,
++    _compute_local_residual_mass_kernel,
++)
+ from vllm.v1.worker.gpu.spec_decode.rejection_sampler_utils import (
+     _compute_global_logsumexp as _compute_global_lse,
+ )
+@@ -76,10 +81,16 @@ def _probabilistic_rejection_kernel(
+     pos_ptr,
+     # [num_speculative_steps]
+     synthetic_conditional_rates_ptr,
++    # [num_logits]
++    cumulative_log_p_ptr,
++    # [num_logits, num_blocks]
++    local_residual_mass_ptr,
++    local_residual_mass_stride,
+     vocab_num_blocks,
+     PADDED_VOCAB_NUM_BLOCKS: tl.constexpr,
+     HAS_DRAFT_LOGITS: tl.constexpr,
+     SYNTHETIC_MODE: tl.constexpr,
++    USE_BLOCK_VERIFICATION: tl.constexpr,
+ ):
+     req_idx = tl.program_id(0)
+     # Cast to int64 before pointer arithmetic: triton-ascend computes
+@@ -92,7 +103,7 @@ def _probabilistic_rejection_kernel(
+     seed = tl.load(seed_ptr + req_state_idx)  # noqa: F841
+     temp = tl.load(temp_ptr + req_state_idx).to(tl.float32)
+ 
+-    rejected_step = 0
++    rejected_step = tl.full((), 0, tl.int64)
+     target_lse = 0.0
+     draft_lse = 0.0
+     accepted = True
+@@ -135,6 +146,42 @@ def _probabilistic_rejection_kernel(
+                 else:
+                     accepted &= target_argmax == draft_sampled
+                     tl.store(sampled_ptr + req_idx * sampled_stride + i, target_argmax)
++            elif USE_BLOCK_VERIFICATION:
++                accepted = draft_sampled >= 0
++                if accepted:
++                    u_pos = tl.load(pos_ptr + logit_idx).to(tl.int32)
++                    u_seed = tl.randint(seed, u_pos)
++                    u = tl.max(tl.rand(u_seed, tl.arange(0, 1)).to(tl.float32), axis=0)
++                    u = tl.maximum(u, 4.6566127342e-10)
++                    prefix_joint_ratio = tl.exp(tl.load(cumulative_log_p_ptr + logit_idx).to(tl.float32))
++                    next_draft_token = tl.load(
++                        draft_sampled_ptr + logit_idx + 2,
++                        mask=i < num_tokens - 2,
++                        other=-1,
++                    ).to(tl.int64)
++                    if next_draft_token >= 0:
++                        residual_mass = _compute_global_residual_mass(
++                            local_residual_mass_ptr,
++                            local_residual_mass_stride,
++                            prefix_joint_ratio,
++                            target_logits_ptr,
++                            target_logits_stride,
++                            target_local_max_ptr,
++                            target_local_max_stride,
++                            target_local_sumexp_ptr,
++                            target_local_sumexp_stride,
++                            next_draft_token,
++                            logit_idx + 1,
++                            vocab_num_blocks,
++                            PADDED_VOCAB_NUM_BLOCKS,
++                            HAS_DRAFT_LOGITS,
++                        )
++                        denom = residual_mass + 1.0 - prefix_joint_ratio
++                        h = tl.where(denom > 0.0, residual_mass / denom, 1.0)
++                    else:
++                        h = prefix_joint_ratio
++                    rejected_step = tl.where(u <= h, i + 1, rejected_step)
++                    tl.store(sampled_ptr + req_idx * sampled_stride + i, draft_sampled)
+             else:
+                 # -1 is used for placeholder draft token ids that should be
+                 # rejected.
+@@ -200,8 +247,30 @@ def _probabilistic_rejection_kernel(
+                 # -1 placeholder draft tokens can never be accepted.
+                 accepted &= is_valid_draft
+                 tl.store(sampled_ptr + req_idx * sampled_stride + i, draft_sampled)
+-            rejected_step += accepted
++            if not USE_BLOCK_VERIFICATION or temp == 0.0:
++                rejected_step += accepted
+     tl.store(rejected_steps_ptr + req_idx, rejected_step)
++    if USE_BLOCK_VERIFICATION and (temp != 0.0 and rejected_step < num_tokens - 1):
++        rejected_idx = start_idx + rejected_step
++        target_lse = _compute_global_lse(
++            target_local_max_ptr,
++            target_local_max_stride,
++            target_local_sumexp_ptr,
++            target_local_sumexp_stride,
++            rejected_idx,
++            vocab_num_blocks,
++            PADDED_VOCAB_NUM_BLOCKS,
++        )
++        if HAS_DRAFT_LOGITS:
++            draft_lse = _compute_global_lse(
++                draft_local_max_ptr,
++                draft_local_max_stride,
++                draft_local_sumexp_ptr,
++                draft_local_sumexp_stride,
++                rejected_idx,
++                vocab_num_blocks,
++                PADDED_VOCAB_NUM_BLOCKS,
++            )
+     tl.store(target_rejected_logsumexp_ptr + req_idx, target_lse)
+     tl.store(draft_rejected_logsumexp_ptr + req_idx, draft_lse)
+ 
+@@ -231,13 +300,14 @@ def rejection_sample(
+     # [num_speculative_steps]
+     synthetic_conditional_rates: torch.Tensor | None = None,
+     use_fp64: bool = False,
+-    # TODO: refactor speculative decoding functionality in a future PR.
+-    # `use_block_verification` is accepted but not yet implemented on NPU;
+-    # wire it up when the block verification path is supported.
+     use_block_verification: bool = False,
+ ) -> tuple[torch.Tensor, torch.Tensor]:
+     if use_fp64:
+         raise NotImplementedError("FP64 rejection sampling is not supported on NPU.")
++    if use_block_verification:
++        assert synthetic_conditional_rates is None, (
++            "Block verification is incompatible with synthetic acceptance rates."
++        )
+ 
+     num_reqs = cu_num_logits.shape[0] - 1
+     num_logits, vocab_size = target_logits.shape
+@@ -292,6 +362,68 @@ def rejection_sample(
+         has_auto_blockify_blacklist_op=True,
+     )
+ 
++    if use_block_verification:
++        cumulative_log_p = target_logits.new_empty(num_logits, dtype=torch.float32)
++        _compute_cumulative_log_p_kernel[(num_reqs,)](
++            cumulative_log_p,
++            target_logits,
++            target_logits.stride(0),
++            target_local_max,
++            target_local_max.stride(0),
++            target_local_sumexp,
++            target_local_sumexp.stride(0),
++            draft_sampled,
++            draft_logits,
++            draft_logits.stride(0),
++            draft_logits.stride(1),
++            draft_local_max,
++            draft_local_max.stride(0),
++            draft_local_sumexp,
++            draft_local_sumexp.stride(0),
++            cu_num_logits,
++            idx_mapping,
++            temperature,
++            vocab_num_blocks,
++            PADDED_VOCAB_NUM_BLOCKS=padded_vocab_num_blocks,
++            HAS_DRAFT_LOGITS=has_draft_logits,
++            num_warps=1,
++        )
++        if has_draft_logits:
++            local_residual_mass = target_logits.new_empty(num_logits, vocab_num_blocks, dtype=torch.float32)
++            if num_logits > 1:
++                _compute_local_residual_mass_kernel[(num_logits - 1, vocab_num_blocks)](
++                    local_residual_mass,
++                    local_residual_mass.stride(0),
++                    cumulative_log_p,
++                    target_logits,
++                    target_logits.stride(0),
++                    target_local_max,
++                    target_local_max.stride(0),
++                    target_local_sumexp,
++                    target_local_sumexp.stride(0),
++                    draft_logits,
++                    draft_logits.stride(0),
++                    draft_logits.stride(1),
++                    draft_local_max,
++                    draft_local_max.stride(0),
++                    draft_local_sumexp,
++                    draft_local_sumexp.stride(0),
++                    draft_sampled,
++                    expanded_idx_mapping,
++                    expanded_local_pos,
++                    temperature,
++                    vocab_size,
++                    num_speculative_steps,
++                    vocab_num_blocks,
++                    BLOCK_SIZE=VOCAB_BLOCK_SIZE,
++                    PADDED_VOCAB_NUM_BLOCKS=padded_vocab_num_blocks,
++                )
++        else:
++            local_residual_mass = None
++    else:
++        cumulative_log_p = None
++        local_residual_mass = None
++
+     # Sample up until the first rejected/bonus token, and store
+     # the step.
+     sampled = draft_sampled.new_empty(num_reqs, num_speculative_steps + 1, dtype=torch.int64)
+@@ -326,10 +458,14 @@ def rejection_sample(
+         seed,
+         pos,
+         synthetic_conditional_rates,
++        cumulative_log_p,
++        local_residual_mass,
++        local_residual_mass.stride(0) if local_residual_mass is not None else 0,
+         vocab_num_blocks,
+         PADDED_VOCAB_NUM_BLOCKS=padded_vocab_num_blocks,
+         HAS_DRAFT_LOGITS=has_draft_logits,
+         SYNTHETIC_MODE=synthetic_conditional_rates is not None,
++        USE_BLOCK_VERIFICATION=use_block_verification,
+         num_warps=1,
+     )
+ 
+@@ -348,5 +484,7 @@ def rejection_sample(
+         seed,
+         pos,
+         has_draft_logits=has_draft_logits,
++        cumulative_log_p=cumulative_log_p,
++        use_block_verification=use_block_verification,
+     )
+     return sampled, num_sampled

@@ -1,0 +1,1531 @@
+commit 8a8e1e05ecb64a30804c99c8f362909f9a0cb5bf
+Author:     zhangxiaoshanha <zhangxiaoshanha@163.com>
+AuthorDate: Thu Oct 15 16:22:38 2026 +0800
+Commit:     GitHub <noreply@github.com>
+CommitDate: Thu Oct 15 16:22:38 2026 +0800
+
+    [Performance][DSA] Fuse build_dspark_swa_indices into a single Triton kernel for DSv4 DSpark decode (#16542)
+    
+    ### What this PR does / why we need it?
+    
+    `build_dspark_swa_indices` builds the per-token visible-KV-slot index
+    table for DSv4 DSpark drafting. The eager implementation is a 12-op
+    PyTorch chain (24 kernel launches), launch-bound at decode step sizes.
+    This PR replaces it with a single-launch Triton-Ascend kernel wired into
+    both the eager and ACL-graph/executor-stream paths; the original torch
+    chain remains as fallback behind a host-only eligibility gate.
+    
+    Design highlights:
+    
+    - **Fixed capacity grid** `(R_alloc × NUM_CB)`: launch shape never
+    re-specializes across graph replays; pad rows `[T_active, T_padded)` are
+    reset to `(-1, 0)` every step so captured graphs never replay stale
+    values.
+    - **Fused `repeat_interleave`**: each request's slot row is computed
+    once in registers and stored `q_len` times.
+    - **Startup JIT warmup** before graph capture at the exact runtime
+    `(width, spec)` specialization; the proposer registers the exact
+    `num_query_per_req` (anchor `spec` / non-anchor `spec+1`).
+    
+    **Performance** (msprof device-time, 11 shapes, R=4..256, W=944..8192):
+    2.4–8.1 µs vs eager 98–410 µs per shape → **~47× geomean**, with
+    bit-identical slot outputs (UT-verified, zero tolerance).
+    
+    ### Does this PR introduce _any_ user-facing change?
+    
+    No. The kernel sits behind a host-only gate (`HAS_TRITON` × pow2 block
+    size × UB tile cap ≤ 8192); any miss falls back to the original eager
+    path unchanged.
+    
+    ### How was this patch tested?
+    
+    - New UT
+    `tests/e2e/nightly/single_node/ops/singlecard_ops/triton/test_dspark_swa_indices.py`:
+    25 cases — 13 fuzz shapes vs an eager reference (zero tolerance),
+    gate/fallback, capacity-grid pad cleanup and boundary, anchor-sampling
+    `num_query_per_req`, non-contiguous block table, int32 metadata. **25/25
+    passing.**
+    - Proposer UT covers the `num_query_per_req` registration.
+    - Performance: msprof `Task Duration` on 11 shapes; methodology and
+    per-shape tables in the comments.
+    
+    - vLLM main:
+    https://github.com/vllm-project/vllm/commit/c4df37dfcc7f72ca41cd43801a468526ecf99a2b
+    
+    ---------
+    
+    Signed-off-by: zhangxiaoshanha <zhangxiaoshanha@163.com>
+    Co-authored-by: ivyilike <wanwanpeng377@gmail.com>
+    Co-authored-by: frankie <wangyongsheng686@gmail.com>
+
+diff --git a/tests/e2e/nightly/single_node/ops/singlecard_ops/triton/test_dspark_swa_indices.py b/tests/e2e/nightly/single_node/ops/singlecard_ops/triton/test_dspark_swa_indices.py
+new file mode 100644
+index 000000000..372bb5811
+--- /dev/null
++++ b/tests/e2e/nightly/single_node/ops/singlecard_ops/triton/test_dspark_swa_indices.py
+@@ -0,0 +1,628 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""Unit tests for the fused Triton-Ascend DSpark SWA indices kernel.
++
++Checks the kernel against the eager reference implementation copied from
++vllm_ascend.attention.dsa_v1.build_dspark_swa_indices, including the
++graph-mode specifics that the integration review called out:
++
++* capacity grid with max_num_reqs > active num_reqs (pad rows must be
++  explicitly reset to -1/0 rather than left stale);
++* out-variant buffers whose extent exceeds the active rows;
++* non-contiguous (column-sliced) block tables: the kernel takes the row
++  pitch from ``stride(0)``, not ``shape[1]``;
++* int32 metadata inputs (query_start_loc / seq_lens / block_table);
++* the eager-vs-triton boundary on padded rows is asserted as an
++  intentional difference, not a regression.
++"""
++
++import pytest
++import torch
++
++from vllm_ascend.ops.triton.dspark_swa_indices import (
++    build_dspark_swa_slot_indices_triton,
++    dspark_swa_indices_supported,
++)
++
++DEVICE = "npu"
++
++
++def eager_dspark_swa_indices(
++    block_table,
++    num_speculative_tokens,
++    window_size,
++    block_size,
++    query_start_loc,
++    seq_lens,
++    num_decode_tokens=None,
++    index_width=None,
++):
++    """Reference implementation (mirrors dsa_v1.build_dspark_swa_indices)."""
++
++    if index_width is None:
++        min_width = int(window_size) + int(num_speculative_tokens)
++        index_width = ((min_width + 127) // 128) * 128
++
++    query_lens = query_start_loc[1:] - query_start_loc[:-1]
++    prefix_lens = seq_lens - query_lens
++    start_pos = (prefix_lens - int(window_size)).clamp(min=0)
++    visible_lens = seq_lens - start_pos
++
++    cols = torch.arange(index_width, device=start_pos.device)
++    col_mask = cols[None, :] < visible_lens[:, None]
++    pos = start_pos[:, None] + cols[None, :]
++    block_nums = pos // block_size
++    safe_nums = block_nums.clamp(min=0, max=int(block_table.shape[1]) - 1)
++    block_offsets = pos % block_size
++    block_ids = torch.gather(block_table, 1, safe_nums)
++    slot_ids = (block_ids * block_size + block_offsets).to(torch.int32)
++    slot_ids = slot_ids.where(col_mask, torch.full_like(slot_ids, -1))
++
++    if num_decode_tokens is None:
++        num_decode_tokens = int(query_start_loc[-1].item())
++    per_token_slots = torch.repeat_interleave(slot_ids, query_lens, dim=0, output_size=num_decode_tokens).unsqueeze(1)
++    per_token_lens = torch.repeat_interleave(visible_lens, query_lens, dim=0, output_size=num_decode_tokens)
++    return per_token_slots, per_token_lens
++
++
++def _make_inputs(
++    num_reqs,
++    num_speculative_tokens,
++    window_size,
++    block_size,
++    max_seq_len,
++    max_num_blocks,
++    seed=0,
++):
++    """Uniform-query DSpark decode batch: every request drafts spec+1 tokens."""
++
++    g = torch.Generator().manual_seed(seed)
++    num_query_per_req = num_speculative_tokens + 1
++    query_lens = torch.full((num_reqs,), num_query_per_req, dtype=torch.int64)
++    query_start_loc = torch.zeros(num_reqs + 1, dtype=torch.int64)
++    torch.cumsum(query_lens, 0, out=query_start_loc[1:])
++    seq_lens = torch.randint(low=num_query_per_req, high=max_seq_len, size=(num_reqs,), dtype=torch.int64, generator=g)
++    block_table = torch.randint(low=0, high=200_000, size=(num_reqs, max_num_blocks), dtype=torch.int32, generator=g)
++    return query_start_loc, seq_lens, block_table
++
++
++@pytest.mark.parametrize(
++    (
++        "num_reqs",
++        "num_speculative_tokens",
++        "window_size",
++        "block_size",
++        "max_seq_len",
++        "max_num_blocks",
++    ),
++    [
++        pytest.param(1, 4, 944, 128, 1200, 16, id="single-req"),
++        pytest.param(8, 4, 944, 128, 1200, 16, id="shape-under-review"),
++        pytest.param(64, 4, 944, 128, 4096, 64, id="r64"),
++        pytest.param(8, 4, 944, 128, 600, 8, id="seq-len-under-window"),
++        pytest.param(4, 4, 944, 4, 300, 128, id="block-size-4"),
++        pytest.param(4, 4, 944, 64, 2000, 64, id="block-size-64"),
++        pytest.param(8, 1, 512, 128, 800, 8, id="spec-1"),
++        pytest.param(8, 7, 512, 128, 800, 8, id="spec-7"),
++        pytest.param(5, 4, 944, 128, 5000, 64, id="odd-num-reqs"),
++        pytest.param(32, 4, 944, 128, 100_000, 2048, id="long-context"),
++        pytest.param(16, 4, 944, 128, 1200, 6, id="block-table-narrow"),
++        # window_size 8192 -> index_width 8320: not divisible by the default
++        # BLOCK_W=1024. Before the cdiv fix the tail programs read past the
++        # qsl/seq_lens arrays (MTE "DDR address out of range" vector-core
++        # fault); the tail column block must store with a lane mask.
++        pytest.param(8, 3, 8192, 128, 16_384, 128, id="window-8k-unaligned-width"),
++        pytest.param(8, 4, 512, 128, 1200, 16, id="window-544-unaligned-width"),
++    ],
++)
++def test_triton_matches_eager(
++    num_reqs,
++    num_speculative_tokens,
++    window_size,
++    block_size,
++    max_seq_len,
++    max_num_blocks,
++):
++    """Active rows must match the eager chain bit-exactly on every fuzz shape."""
++
++    if not dspark_swa_indices_supported(block_size, max_num_blocks):
++        pytest.skip("triton fast path not supported in this environment")
++
++    query_start_loc, seq_lens, block_table = _make_inputs(
++        num_reqs, num_speculative_tokens, window_size, block_size, max_seq_len, max_num_blocks
++    )
++    query_start_loc = query_start_loc.to(DEVICE)
++    seq_lens = seq_lens.to(DEVICE)
++    block_table = block_table.to(DEVICE)
++
++    ref_slots, ref_lens = eager_dspark_swa_indices(
++        block_table,
++        num_speculative_tokens,
++        window_size,
++        block_size,
++        query_start_loc,
++        seq_lens,
++    )
++    out_slots, out_lens = build_dspark_swa_slot_indices_triton(
++        block_table,
++        num_speculative_tokens,
++        window_size,
++        block_size,
++        query_start_loc,
++        seq_lens,
++    )
++
++    torch.testing.assert_close(out_slots, ref_slots)
++    torch.testing.assert_close(out_lens, ref_lens)
++
++
++def test_capacity_grid_padding():
++    """max_num_reqs > num_reqs: pad rows are reset to (-1, 0), not stale."""
++
++    num_reqs, num_speculative_tokens = 4, 4
++    window_size, block_size, max_seq_len, max_num_blocks = 944, 128, 2000, 32
++    if not dspark_swa_indices_supported(block_size, max_num_blocks):
++        pytest.skip("triton fast path not supported in this environment")
++
++    query_start_loc, seq_lens, block_table = _make_inputs(
++        num_reqs, num_speculative_tokens, window_size, block_size, max_seq_len, max_num_blocks
++    )
++    query_start_loc = query_start_loc.to(DEVICE)
++    seq_lens = seq_lens.to(DEVICE)
++    block_table = block_table.to(DEVICE)
++
++    num_query_per_req = num_speculative_tokens + 1
++    T_active = num_reqs * num_query_per_req
++    R_alloc = 16  # capture-size bound, deliberately > num_reqs
++    T_padded = R_alloc * num_query_per_req
++    index_width = ((window_size + num_speculative_tokens + 127) // 128) * 128
++
++    # Persistent buffers pre-filled with sentinel garbage: after the kernel
++    # runs, every row in [T_active, T_padded) must read -1 / 0.
++    slots_buf = torch.full((T_padded, 1, index_width), 12345, dtype=torch.int32, device=DEVICE)
++    lens_buf = torch.full((T_padded,), 777, dtype=torch.int64, device=DEVICE)
++
++    # qsl/seq_lens padded to the allocation extent: padded requests carry
++    # q_len == 0 (clamped cumulative series) and seq_len == 0, mirroring the
++    # upstream draft metadata builder.
++    qsl_alloc = torch.zeros(R_alloc + 1, dtype=torch.int64, device=DEVICE)
++    qsl_alloc[: num_reqs + 1] = query_start_loc
++    qsl_alloc[num_reqs + 1 :] = T_active
++    seq_lens_alloc = torch.zeros(R_alloc, dtype=torch.int64, device=DEVICE)
++    seq_lens_alloc[:num_reqs] = seq_lens
++    bt_alloc = torch.zeros((R_alloc, max_num_blocks), dtype=torch.int64, device=DEVICE)
++    bt_alloc[:num_reqs] = block_table
++
++    out_slots, out_lens = build_dspark_swa_slot_indices_triton(
++        bt_alloc,
++        num_speculative_tokens,
++        window_size,
++        block_size,
++        qsl_alloc,
++        seq_lens_alloc,
++        num_decode_tokens=T_active,
++        index_width=index_width,
++        indices_output=slots_buf,
++        lens_output=lens_buf,
++        max_num_reqs=R_alloc,
++    )
++
++    # Active extent matches the eager result bit-exactly.
++    ref_slots, ref_lens = eager_dspark_swa_indices(
++        block_table,
++        num_speculative_tokens,
++        window_size,
++        block_size,
++        query_start_loc,
++        seq_lens,
++        num_decode_tokens=T_active,
++        index_width=index_width,
++    )
++    torch.testing.assert_close(out_slots, ref_slots)
++    torch.testing.assert_close(out_lens, ref_lens)
++
++    # Padded extent is explicitly reset (the intentional superset of eager).
++    assert torch.equal(slots_buf[T_active:], torch.full_like(slots_buf[T_active:], -1)), (
++        "padded slot rows must be -1, found stale values"
++    )
++    assert torch.equal(lens_buf[T_active:], torch.zeros_like(lens_buf[T_active:])), (
++        "padded lens rows must be 0, found stale values"
++    )
++
++
++def test_num_decode_tokens_is_authoritative():
++    """num_decode_tokens drives T_active without any D2H sync."""
++
++    num_reqs, num_speculative_tokens = 3, 4
++    window_size, block_size, max_seq_len, max_num_blocks = 944, 128, 2000, 32
++    if not dspark_swa_indices_supported(block_size, max_num_blocks):
++        pytest.skip("triton fast path not supported in this environment")
++
++    query_start_loc, seq_lens, block_table = _make_inputs(
++        num_reqs, num_speculative_tokens, window_size, block_size, max_seq_len, max_num_blocks
++    )
++    query_start_loc = query_start_loc.to(DEVICE)
++    seq_lens = seq_lens.to(DEVICE)
++    block_table = block_table.to(DEVICE)
++
++    T_active = num_reqs * (num_speculative_tokens + 1)
++    out_slots, out_lens = build_dspark_swa_slot_indices_triton(
++        block_table,
++        num_speculative_tokens,
++        window_size,
++        block_size,
++        query_start_loc,
++        seq_lens,
++        num_decode_tokens=T_active,
++    )
++    ref_slots, ref_lens = eager_dspark_swa_indices(
++        block_table,
++        num_speculative_tokens,
++        window_size,
++        block_size,
++        query_start_loc,
++        seq_lens,
++        num_decode_tokens=T_active,
++    )
++    assert out_slots.shape[0] == T_active
++    torch.testing.assert_close(out_slots, ref_slots)
++    torch.testing.assert_close(out_lens, ref_lens)
++
++
++def test_capacity_grid_exact_sized_inputs():
++    """Capacity grid over exact-sized (non-padded) input tensors is safe.
++
++    The production caller pads qsl/seq_lens/block_table to the allocation
++    extent, but a capacity grid with max_num_reqs > R must not read past
++    exact-sized tensors either: programs with r >= R early-out before
++    touching qsl/seq_lens/block_table (previously an MTE out-of-range
++    vector-core fault on real hardware).
++    """
++
++    num_reqs, num_speculative_tokens = 4, 4
++    window_size, block_size, max_seq_len, max_num_blocks = 944, 128, 2000, 32
++    if not dspark_swa_indices_supported(block_size, max_num_blocks):
++        pytest.skip("triton fast path not supported in this environment")
++
++    query_start_loc, seq_lens, block_table = _make_inputs(
++        num_reqs, num_speculative_tokens, window_size, block_size, max_seq_len, max_num_blocks
++    )
++    query_start_loc = query_start_loc.to(DEVICE)
++    seq_lens = seq_lens.to(DEVICE)
++    block_table = block_table.to(DEVICE)
++
++    num_query_per_req = num_speculative_tokens + 1
++    T_active = num_reqs * num_query_per_req
++    R_alloc = 16  # deliberately far beyond the exact-sized inputs
++    T_padded = R_alloc * num_query_per_req
++    index_width = ((window_size + num_speculative_tokens + 127) // 128) * 128
++
++    slots_buf = torch.full((T_padded, 1, index_width), 12345, dtype=torch.int32, device=DEVICE)
++    lens_buf = torch.full((T_padded,), 777, dtype=torch.int64, device=DEVICE)
++
++    out_slots, out_lens = build_dspark_swa_slot_indices_triton(
++        block_table,  # exact-sized [num_reqs, max_num_blocks]
++        num_speculative_tokens,
++        window_size,
++        block_size,
++        query_start_loc,  # exact-sized [num_reqs + 1]
++        seq_lens,  # exact-sized [num_reqs]
++        num_decode_tokens=T_active,
++        index_width=index_width,
++        indices_output=slots_buf,
++        lens_output=lens_buf,
++        max_num_reqs=R_alloc,
++    )
++
++    ref_slots, ref_lens = eager_dspark_swa_indices(
++        block_table,
++        num_speculative_tokens,
++        window_size,
++        block_size,
++        query_start_loc,
++        seq_lens,
++        num_decode_tokens=T_active,
++        index_width=index_width,
++    )
++    torch.testing.assert_close(out_slots, ref_slots)
++    torch.testing.assert_close(out_lens, ref_lens)
++    assert torch.equal(slots_buf[T_active:], torch.full_like(slots_buf[T_active:], -1))
++    assert torch.equal(lens_buf[T_active:], torch.zeros_like(lens_buf[T_active:]))
++
++
++def test_active_sized_buffer_warns_and_disables_cleanup():
++    """A buffer sliced to the active rows under graph intent must warn.
++
++    The classic eager-style call site passes ``buffer[:T_active]`` as
++    indices_output; under a capacity grid (max_num_reqs > R) that silences
++    the pad-row cleanup, so the wrapper must flag it instead of failing
++    silently. With no graph intent (max_num_reqs is None) the same slice is
++    an ordinary allocation choice and must stay quiet.
++    """
++
++    num_reqs, num_speculative_tokens = 4, 4
++    window_size, block_size, max_seq_len, max_num_blocks = 944, 128, 2000, 32
++    if not dspark_swa_indices_supported(block_size, max_num_blocks):
++        pytest.skip("triton fast path not supported in this environment")
++
++    query_start_loc, seq_lens, block_table = _make_inputs(
++        num_reqs, num_speculative_tokens, window_size, block_size, max_seq_len, max_num_blocks
++    )
++    query_start_loc = query_start_loc.to(DEVICE)
++    seq_lens = seq_lens.to(DEVICE)
++    block_table = block_table.to(DEVICE)
++
++    num_query_per_req = num_speculative_tokens + 1
++    T_active = num_reqs * num_query_per_req
++    index_width = ((window_size + num_speculative_tokens + 127) // 128) * 128
++
++    # Buffer cut to exactly the active rows (the eager-style slice).
++    slots_slice = torch.zeros((T_active, 1, index_width), dtype=torch.int32, device=DEVICE)
++    lens_slice = torch.zeros((T_active,), dtype=torch.int64, device=DEVICE)
++
++    # Graph intent + active-sized slice -> UserWarning about disabled cleanup.
++    with pytest.warns(UserWarning, match="pad-row cleanup is disabled"):
++        build_dspark_swa_slot_indices_triton(
++            block_table,
++            num_speculative_tokens,
++            window_size,
++            block_size,
++            query_start_loc,
++            seq_lens,
++            num_decode_tokens=T_active,
++            index_width=index_width,
++            indices_output=slots_slice,
++            lens_output=lens_slice,
++            max_num_reqs=16,
++        )
++
++    # No graph intent + active-sized slice -> no warning.
++    import warnings as _warnings
++
++    with _warnings.catch_warnings():
++        _warnings.simplefilter("error")
++        build_dspark_swa_slot_indices_triton(
++            block_table,
++            num_speculative_tokens,
++            window_size,
++            block_size,
++            query_start_loc,
++            seq_lens,
++            num_decode_tokens=T_active,
++            index_width=index_width,
++            indices_output=slots_slice,
++            lens_output=lens_slice,
++        )
++
++
++def test_anchor_sampling_num_query_per_req():
++    """num_query_per_req=spec (anchor sampling) sizes the grid correctly.
++
++    DSpark anchor-sampling mode drafts num_speculative_tokens queries per
++    request (no +1). The capacity grid and pad cleanup must follow that
++    factor when it is passed explicitly.
++    """
++
++    num_reqs, num_speculative_tokens = 4, 4
++    window_size, block_size, max_seq_len, max_num_blocks = 944, 128, 2000, 32
++    if not dspark_swa_indices_supported(block_size, max_num_blocks):
++        pytest.skip("triton fast path not supported in this environment")
++
++    # Anchor mode: 4 queries per request, NOT spec+1 == 5.
++    nqp = num_speculative_tokens
++    query_start_loc, seq_lens, block_table = _make_inputs(
++        num_reqs, nqp - 1, window_size, block_size, max_seq_len, max_num_blocks
++    )
++    # Rebuild query_start_loc for nqp-per-request uniform drafting.
++    query_lens = torch.full((num_reqs,), nqp, dtype=torch.int64)
++    query_start_loc = torch.zeros(num_reqs + 1, dtype=torch.int64)
++    torch.cumsum(query_lens, 0, out=query_start_loc[1:])
++    query_start_loc = query_start_loc.to(DEVICE)
++    seq_lens = seq_lens.to(DEVICE)
++    block_table = block_table.to(DEVICE)
++
++    T_active = num_reqs * nqp
++    R_alloc = 8
++    T_padded = R_alloc * nqp
++    index_width = ((window_size + num_speculative_tokens + 127) // 128) * 128
++
++    slots_buf = torch.full((T_padded, 1, index_width), 12345, dtype=torch.int32, device=DEVICE)
++    lens_buf = torch.full((T_padded,), 777, dtype=torch.int64, device=DEVICE)
++
++    out_slots, out_lens = build_dspark_swa_slot_indices_triton(
++        block_table,
++        num_speculative_tokens,
++        window_size,
++        block_size,
++        query_start_loc,
++        seq_lens,
++        num_decode_tokens=T_active,
++        index_width=index_width,
++        indices_output=slots_buf,
++        lens_output=lens_buf,
++        max_num_reqs=R_alloc,
++        num_query_per_req=nqp,
++    )
++
++    ref_slots, ref_lens = eager_dspark_swa_indices(
++        block_table,
++        num_speculative_tokens,
++        window_size,
++        block_size,
++        query_start_loc,
++        seq_lens,
++        num_decode_tokens=T_active,
++        index_width=index_width,
++    )
++    torch.testing.assert_close(out_slots, ref_slots)
++    torch.testing.assert_close(out_lens, ref_lens)
++    # Pad extent follows nqp == spec, not spec + 1.
++    assert torch.equal(slots_buf[T_active:], torch.full_like(slots_buf[T_active:], -1))
++    assert torch.equal(lens_buf[T_active:], torch.zeros_like(lens_buf[T_active:]))
++
++
++def test_capacity_grid_exact_allocation_boundary():
++    """num_reqs == R_alloc: every grid program owns an active request.
++
++    The capacity grid is sized by R_alloc, so num_reqs == R_alloc is the
++    boundary where no pad programs exist beyond the active extent: the
++    R-guard (r >= R) never trips, yet T_padded == T_active means the pad
++    cleanup loop body is empty. This exercises the eligibility boundary the
++    wiring layer relies on (num_reqs <= max_num_reqs_for_dspark() passing
++    with equality) and pins that a full-capacity batch is bit-exact against
++    eager with zero stale rows.
++    """
++
++    num_reqs, num_speculative_tokens = 8, 4
++    window_size, block_size, max_seq_len, max_num_blocks = 944, 128, 2000, 32
++    if not dspark_swa_indices_supported(block_size, max_num_blocks):
++        pytest.skip("triton fast path not supported in this environment")
++
++    query_start_loc, seq_lens, block_table = _make_inputs(
++        num_reqs, num_speculative_tokens, window_size, block_size, max_seq_len, max_num_blocks
++    )
++    query_start_loc = query_start_loc.to(DEVICE)
++    seq_lens = seq_lens.to(DEVICE)
++    block_table = block_table.to(DEVICE)
++
++    num_query_per_req = num_speculative_tokens + 1
++    T_active = num_reqs * num_query_per_req
++    R_alloc = num_reqs  # boundary: allocation capacity exactly equals demand
++    T_padded = R_alloc * num_query_per_req
++    index_width = ((window_size + num_speculative_tokens + 127) // 128) * 128
++
++    slots_buf = torch.full((T_padded, 1, index_width), 12345, dtype=torch.int32, device=DEVICE)
++    lens_buf = torch.full((T_padded,), 777, dtype=torch.int64, device=DEVICE)
++
++    out_slots, out_lens = build_dspark_swa_slot_indices_triton(
++        block_table,
++        num_speculative_tokens,
++        window_size,
++        block_size,
++        query_start_loc,
++        seq_lens,
++        num_decode_tokens=T_active,
++        index_width=index_width,
++        indices_output=slots_buf,
++        lens_output=lens_buf,
++        max_num_reqs=R_alloc,
++    )
++
++    ref_slots, ref_lens = eager_dspark_swa_indices(
++        block_table,
++        num_speculative_tokens,
++        window_size,
++        block_size,
++        query_start_loc,
++        seq_lens,
++        num_decode_tokens=T_active,
++        index_width=index_width,
++    )
++    torch.testing.assert_close(out_slots, ref_slots)
++    torch.testing.assert_close(out_lens, ref_lens)
++    # T_padded == T_active: the whole buffer is the active extent and every
++    # row was rewritten (no sentinel survives anywhere).
++    assert not torch.equal(slots_buf, torch.full_like(slots_buf, 12345))
++    assert torch.equal(out_slots.view(T_active, index_width), slots_buf.view(T_active, index_width))
++
++
++def test_non_contiguous_block_table():
++    """A column-sliced block table must resolve rows via stride(0), not B.
++
++    Mirrors the production caller, which passes
++    ``block_table_tensor[:num_reqs]`` — a row slice of the padded
++    allocation whose stride(0) can differ from shape[1] when the
++    underlying tensor was allocated wider. The kernel must honor the
++    actual row pitch instead of assuming contiguous rows.
++    """
++
++    num_reqs, num_speculative_tokens = 8, 4
++    window_size, block_size, max_seq_len, max_num_blocks = 944, 128, 2000, 32
++    if not dspark_swa_indices_supported(block_size, max_num_blocks):
++        pytest.skip("triton fast path not supported in this environment")
++
++    query_start_loc, seq_lens, block_table = _make_inputs(
++        num_reqs, num_speculative_tokens, window_size, block_size, max_seq_len, max_num_blocks
++    )
++    query_start_loc = query_start_loc.to(DEVICE)
++    seq_lens = seq_lens.to(DEVICE)
++    # Allocate a table wider than the visible columns and hand the kernel a
++    # column slice: row pitch (32 + 16) != shape[1] (32), so a kernel that
++    # indexes ``bt_ptr + r * B`` would read the wrong rows.
++    wide_table = torch.zeros((num_reqs, max_num_blocks + 16), dtype=block_table.dtype, device=DEVICE)
++    wide_table[:, :max_num_blocks] = block_table
++    sliced_table = wide_table[:, :max_num_blocks]
++    assert sliced_table.stride(0) == max_num_blocks + 16 != sliced_table.shape[1]
++
++    ref_slots, ref_lens = eager_dspark_swa_indices(
++        sliced_table,
++        num_speculative_tokens,
++        window_size,
++        block_size,
++        query_start_loc,
++        seq_lens,
++    )
++    out_slots, out_lens = build_dspark_swa_slot_indices_triton(
++        sliced_table,
++        num_speculative_tokens,
++        window_size,
++        block_size,
++        query_start_loc,
++        seq_lens,
++    )
++    torch.testing.assert_close(out_slots, ref_slots)
++    torch.testing.assert_close(out_lens, ref_lens)
++
++
++def test_int32_metadata_inputs():
++    """int32 query_start_loc / seq_lens / block_table must work end-to-end.
++
++    The kernel reads qsl/seq_lens/block_table through pointer casts, so the
++    JIT must specialize on whatever dtype the runtime metadata carries
++    (the warmup path compiles against the real tensors' dtypes).
++    """
++
++    num_reqs, num_speculative_tokens = 8, 4
++    window_size, block_size, max_seq_len, max_num_blocks = 944, 128, 2000, 32
++    if not dspark_swa_indices_supported(block_size, max_num_blocks):
++        pytest.skip("triton fast path not supported in this environment")
++
++    query_start_loc, seq_lens, block_table = _make_inputs(
++        num_reqs, num_speculative_tokens, window_size, block_size, max_seq_len, max_num_blocks
++    )
++    query_start_loc = query_start_loc.to(torch.int32).to(DEVICE)
++    seq_lens = seq_lens.to(torch.int32).to(DEVICE)
++    block_table = block_table.to(torch.int32).to(DEVICE)
++
++    ref_slots, ref_lens = eager_dspark_swa_indices(
++        block_table,
++        num_speculative_tokens,
++        window_size,
++        block_size,
++        query_start_loc,
++        seq_lens,
++    )
++    out_slots, out_lens = build_dspark_swa_slot_indices_triton(
++        block_table,
++        num_speculative_tokens,
++        window_size,
++        block_size,
++        query_start_loc,
++        seq_lens,
++    )
++    torch.testing.assert_close(out_slots, ref_slots)
++    # The eager chain's lens dtype follows seq_lens (int32 here), while the
++    # triton wrapper always allocates int64 lens — a documented contract.
++    # Compare values through the canonical int64 dtype.
++    torch.testing.assert_close(out_lens, ref_lens.to(torch.int64))
++
++
++@pytest.mark.parametrize("bad_block_size", [100, 96, 0])
++def test_gate_rejects_non_pow2_block_size(bad_block_size):
++    """The host-side gate must reject non-power-of-two block sizes."""
++
++    assert not dspark_swa_indices_supported(bad_block_size, 16)
++
++
++def test_gate_accepts_valid_config():
++    assert dspark_swa_indices_supported(128, 64)
+diff --git a/tests/ut/spec_decode/test_dspark_proposer.py b/tests/ut/spec_decode/test_dspark_proposer.py
+index c4258273d..4f6304047 100644
+--- a/tests/ut/spec_decode/test_dspark_proposer.py
++++ b/tests/ut/spec_decode/test_dspark_proposer.py
+@@ -976,6 +976,7 @@ class TestInitializeAttnBackend(_DSparkProposerTestBase):
+         proposer.dcp_size = 1
+         proposer._per_group_block_tables = {}
+         proposer._per_group_slot_mappings = {}
++        proposer.num_query_per_req = 4
+         return proposer
+ 
+     def test_deepseek_v41_draft_uses_only_group_twelve(self, monkeypatch):
+@@ -1026,6 +1027,10 @@ class TestInitializeAttnBackend(_DSparkProposerTestBase):
+         class DraftBuilder:
+             def __init__(self):
+                 self.max_num_tokens = None
++                self.num_query_per_req = None
++
++            def set_dspark_num_query_per_req(self, num_query_per_req):
++                self.num_query_per_req = num_query_per_req
+ 
+             def enable_dspark_device_metadata(self, max_num_tokens):
+                 self.max_num_tokens = max_num_tokens
+@@ -1059,6 +1064,7 @@ class TestInitializeAttnBackend(_DSparkProposerTestBase):
+             proposer.initialize_attn_backend(kv_cache_config)
+ 
+         assert builder.max_num_tokens == expected_tokens
++        assert builder.num_query_per_req == (proposer.num_query_per_req if expected_tokens is not None else None)
+ 
+     def test_initialization_tracks_logical_block_size_per_gid(self, monkeypatch):
+         manager_specs = [MagicMock(), MagicMock()]
+diff --git a/vllm_ascend/attention/dsa_v1.py b/vllm_ascend/attention/dsa_v1.py
+index f2c21b6d9..c7817a56e 100644
+--- a/vllm_ascend/attention/dsa_v1.py
++++ b/vllm_ascend/attention/dsa_v1.py
+@@ -64,16 +64,26 @@ from vllm_ascend.worker.npu_input_batch import NPUInputBatch
+ if TYPE_CHECKING:
+     from vllm.v1.core.sched.output import SchedulerOutput
+ 
++    from vllm_ascend.ops.triton.dspark_swa_indices import (
++        build_dspark_swa_slot_indices_triton,
++        dspark_swa_indices_supported,
++    )
+     from vllm_ascend.ops.triton.rms_norm import triton_q_rms
+ 
+ if HAS_TRITON:
++    from vllm_ascend.ops.triton.dspark_swa_indices import (  # noqa: F811
++        build_dspark_swa_slot_indices_triton,
++        dspark_swa_indices_supported,
++    )
+     from vllm_ascend.ops.triton.rms_norm import triton_q_rms  # noqa: F811
+     from vllm_ascend.ops.triton.spec_decode.dspark_swa_indices import (
+         build_dspark_swa_indices_triton,
+     )
+ else:
+-    build_dspark_swa_indices_triton = None  # type: ignore
++    build_dspark_swa_slot_indices_triton = None  # type: ignore
+     triton_q_rms = None  # type: ignore
++    build_dspark_swa_indices_triton = None  # type: ignore
++    dspark_swa_indices_supported = None  # type: ignore
+ 
+ 
+ # The SAS and QLI metadata operators use a fixed 1024-element int32 layout.
+@@ -277,7 +287,7 @@ class AscendDSABackend(AttentionBackend):
+         return AscendDSAImpl
+ 
+     @staticmethod
+-    def get_supported_kernel_block_sizes(kv_cache_spec=None) -> list[int]:
++    def get_supported_kernel_block_sizes() -> list[int]:
+         return [2, 4, 8, 16, 32, 64, 128]
+ 
+ 
+@@ -287,7 +297,7 @@ class AscendDSAC4Backend(AscendDSABackend):
+         return "ASCEND_DSA_C4"
+ 
+     @staticmethod
+-    def get_supported_kernel_block_sizes(kv_cache_spec=None) -> list[int]:
++    def get_supported_kernel_block_sizes() -> list[int]:
+         # Align with upstream's logical block-size contract: Ascend's physical
+         # 32/64/128-token C4 pages represent 128/256/512 raw scheduler tokens.
+         return [128, 256, 512]
+@@ -299,7 +309,7 @@ class AscendDSAC128Backend(AscendDSABackend):
+         return "ASCEND_DSA_C128"
+ 
+     @staticmethod
+-    def get_supported_kernel_block_sizes(kv_cache_spec=None) -> list[int]:
++    def get_supported_kernel_block_sizes() -> list[int]:
+         # Align with upstream's logical block-size contract: Ascend's physical
+         # 32/64/128-token C128 pages represent 4096/8192/16384 raw scheduler tokens.
+         return [4096, 8192, 16384]
+@@ -311,7 +321,7 @@ class AscendDSASWABackend(AscendDSABackend):
+         return "ASCEND_DSA_SWA"
+ 
+     @staticmethod
+-    def get_supported_kernel_block_sizes(kv_cache_spec=None) -> list[int]:
++    def get_supported_kernel_block_sizes() -> list[int]:
+         return [32, 64, 128]
+ 
+ 
+@@ -321,7 +331,7 @@ class AscendDSAC4StateBackend(AscendDSABackend):
+         return "ASCEND_DSA_C4_STATE"
+ 
+     @staticmethod
+-    def get_supported_kernel_block_sizes(kv_cache_spec=None) -> list[int]:
++    def get_supported_kernel_block_sizes() -> list[int]:
+         return [2, 4, 8]
+ 
+ 
+@@ -331,7 +341,7 @@ class AscendDSAC128StateBackend(AscendDSABackend):
+         return "ASCEND_DSA_C128_STATE"
+ 
+     @staticmethod
+-    def get_supported_kernel_block_sizes(kv_cache_spec=None) -> list[int]:
++    def get_supported_kernel_block_sizes() -> list[int]:
+         if get_current_hardware_profile().supports(HardwareCapability.DSA_C128_STATE_SMALL_BLOCK_SIZES):
+             return [4, 8, 16]
+         return [8, 16, 32]
+@@ -727,6 +737,21 @@ class AscendDSAMetadataBuilder(AttentionMetadataBuilder[AscendDSAMetadata]):
+         self.qli_cmp_residual_k: torch.Tensor = torch.zeros(max_qli_reqs + 1, dtype=torch.int32, device=self.device)
+         self._device_metadata_enabled = False
+         self._device_metadata_tasks: tuple[DeviceMetadataTask, ...] = ()
++        # DSpark triton fast-path state: exact per-request query count (set by
++        # the proposer; None -> spec+1 fallback) and the aligned index width.
++        # dspark_lens_scratch pairs with dspark_swa_indices_buffer (allocated
++        # in enable_dspark_device_metadata) so the executor-stream task never
++        # allocates. JIT warmup runs from kernel_warmup (see
++        # warmup/dspark_swa_indices_warmup.py), before ACL graph capture.
++        self.dspark_lens_scratch: torch.Tensor | None = None
++        self._dspark_num_query_per_req: int | None = None
++        self._dspark_index_width = (
++            _aligned_dspark_index_width(
++                self.model_config.hf_config.sliding_window, self.speculative_config.num_speculative_tokens
++            )
++            if self.speculative_config
++            else None
++        )
+         self.cu_seqlens_ori_kv = torch.tensor([], device=self.device)
+         self.cu_seqlens_cmp_kv = torch.tensor([], device=self.device)
+         self.seqused_q = torch.tensor([], device=self.device)
+@@ -1071,10 +1096,110 @@ class AscendDSAMetadataBuilder(AttentionMetadataBuilder[AscendDSAMetadata]):
+             self.model_config.hf_config.sliding_window,
+             self.speculative_config.num_speculative_tokens,
+         )
+-        self.dspark_swa_indices_buffer = torch.empty(
+-            (max_num_tokens, 1, index_width),
+-            dtype=torch.int32,
+-            device=self.device,
++        # The buffer keeps the __init__ allocation (sized for the token-count
++        # cap) unless the caller's query-token quota needs more rows; either
++        # way the row count must cover the triton capacity grid, which is
++        # derived from the builder's padded request capacity below.
++        min_rows = self.max_num_reqs_for_dspark() * self.dspark_num_query_per_req()
++        if self.dspark_swa_indices_buffer is None or self.dspark_swa_indices_buffer.shape[0] < max(
++            max_num_tokens, min_rows
++        ):
++            self.dspark_swa_indices_buffer = torch.empty(
++                (max(max_num_tokens, min_rows), 1, index_width),
++                dtype=torch.int32,
++                device=self.device,
++            )
++        # Lens is scratch (the production call site discards it), but keep it
++        # persistent alongside the indices buffer so the executor-stream task
++        # avoids a per-step transient allocation. Same pattern as
++        # spec_sas_metadata. Independent predicate: the regrow branch above is
++        # rarely taken (the __init__ allocation usually already covers the
++        # quota), so sizing the scratch only inside it would leave it None on
++        # the common path.
++        if (
++            self.dspark_lens_scratch is None
++            or self.dspark_lens_scratch.shape[0] < (self.dspark_swa_indices_buffer.shape[0])
++        ):
++            self.dspark_lens_scratch = torch.empty(
++                (self.dspark_swa_indices_buffer.shape[0],),
++                dtype=torch.int64,
++                device=self.device,
++            )
++
++    def max_num_reqs_for_dspark(self) -> int:
++        """Padded request capacity for the DSpark capacity grid.
++
++        Mirrors the __init__ sizing of the per-request QLI buffers: full-decode
++        graphs pad the request count beyond max_num_seqs (cudagraph capture
++        sizes plus the FIA dummy request), so the triton capacity grid
++        ``grid=(R_alloc * NUM_CB,)`` must stay fixed across replays.
++        """
++        max_num_reqs = self.vllm_config.scheduler_config.max_num_seqs * self._request_capacity_factor
++        compilation_config = self.vllm_config.compilation_config
++        if compilation_config.cudagraph_mode != CUDAGraphMode.NONE and compilation_config.cudagraph_capture_sizes:
++            max_num_reqs = max(max_num_reqs, compilation_config.max_cudagraph_capture_size)
++        return max_num_reqs
++
++    def dspark_num_query_per_req(self) -> int:
++        """Row-expansion factor per request, as configured by the proposer.
++
++        DSpark anchor sampling drafts ``num_speculative_tokens`` queries per
++        request; the non-anchor path drafts one more. Falls back to the
++        DFlash-style ``spec + 1`` when device metadata is disabled and the
++        proposer never registered the exact factor.
++        """
++        if self._dspark_num_query_per_req is not None:
++            return self._dspark_num_query_per_req
++        return self.speculative_config.num_speculative_tokens + 1
++
++    def set_dspark_num_query_per_req(self, num_query_per_req: int) -> None:
++        """Register the proposer's exact per-request query count."""
++        self._dspark_num_query_per_req = int(num_query_per_req)
++
++    def _dspark_swa_indices_fast_path_eligible(self, num_decode_reqs: int) -> bool:
++        """Whether the fused triton build can replace the eager torch chain."""
++        if build_dspark_swa_slot_indices_triton is None or self._dspark_index_width is None:
++            return False
++        return dspark_swa_indices_supported(self.storage_block_size, self.block_table.shape[1]) and (
++            num_decode_reqs <= self.max_num_reqs_for_dspark()
++        )
++
++    def _build_dspark_swa_indices_eager(
++        self, dspark_swa_args: tuple, buffer: torch.Tensor | None = None
++    ) -> tuple[torch.Tensor, torch.Tensor]:
++        """Eager (non-device-metadata) DSpark indices build, triton fast path first.
++
++        The eager path has no captured graph to protect, so the triton kernel
++        runs with the plain active-row allocation (no max_num_reqs capacity
++        grid) and falls back to the reference torch chain when the kernel is
++        unavailable or the shape is unsupported. ``buffer`` keeps the
++        stable-address contract of the previous eager call sites.
++        """
++        block_table, num_speculative_tokens, window_size, block_size, query_start_loc, seq_lens, num_decode_tokens = (
++            dspark_swa_args
++        )
++        if self._dspark_swa_indices_fast_path_eligible(query_start_loc.shape[0] - 1):
++            return build_dspark_swa_slot_indices_triton(
++                block_table,
++                num_speculative_tokens,
++                window_size,
++                block_size,
++                query_start_loc,
++                seq_lens,
++                num_decode_tokens=num_decode_tokens,
++                index_width=self._dspark_index_width,
++                indices_output=buffer,
++                num_query_per_req=self.dspark_num_query_per_req(),
++            )
++        return build_dspark_swa_indices(
++            block_table,
++            num_speculative_tokens,
++            window_size,
++            block_size,
++            query_start_loc,
++            seq_lens,
++            num_decode_tokens=num_decode_tokens,
++            buffer=buffer,
+         )
+ 
+     def take_device_metadata_tasks(self) -> tuple[DeviceMetadataTask, ...]:
+@@ -1158,14 +1283,16 @@ class AscendDSAMetadataBuilder(AttentionMetadataBuilder[AscendDSAMetadata]):
+             # current step's block table / sequence lengths, so they must be
+             # rebuilt whenever a DSpark draft step runs.
+             assert self.speculative_config is not None
+-            dspark_swa_indices, _ = build_dspark_swa_indices(
+-                self.block_table[: self.num_decodes],
+-                self.speculative_config.num_speculative_tokens,
+-                self.model_config.hf_config.sliding_window,
+-                self.storage_block_size,
+-                query_start_loc[: self.num_decodes + 1],
+-                self.seq_lens[: self.num_decodes],
+-                self.num_decode_tokens,
++            dspark_swa_indices, _ = self._build_dspark_swa_indices_eager(
++                (
++                    self.block_table[: self.num_decodes],
++                    self.speculative_config.num_speculative_tokens,
++                    self.model_config.hf_config.sliding_window,
++                    self.storage_block_size,
++                    query_start_loc[: self.num_decodes + 1],
++                    self.seq_lens[: self.num_decodes],
++                    self.num_decode_tokens,
++                ),
+                 buffer=self.dspark_swa_indices_buffer,
+             )
+             ori_win_left, ori_win_right = get_dspark_sparse_sas_window(self.vllm_config)
+@@ -1449,13 +1576,49 @@ class AscendDSAMetadataBuilder(AttentionMetadataBuilder[AscendDSAMetadata]):
+                         "DSpark SWA metadata rows exceed the persistent buffer capacity: "
+                         f"active={self.num_actual_tokens}, capacity={self.dspark_swa_indices_buffer.shape[0]}"
+                     )
+-                dspark_swa_indices = self.dspark_swa_indices_buffer[: self.num_actual_tokens]
+-                build_dspark_swa = lambda: build_dspark_swa_indices(
+-                    *dspark_swa_args,
+-                    indices_output=dspark_swa_indices,
+-                )
++                # Fused triton fast path: capacity grid + FULL buffer. The
++                # eager torch chain needs indices_output pre-sliced to the
++                # active rows (its copy_ has a shape check), while the triton
++                # kernel writes in place and requires the full-capacity
++                # buffer so the pad-row cleanup ([T_active, T_padded)) fires
++                # and a captured graph never replays stale rows.
++                if self._dspark_swa_indices_fast_path_eligible(num_reqs):
++                    num_query_per_req = self.dspark_num_query_per_req()
++                    num_actual_tokens = self.num_actual_tokens
++                    max_num_reqs = self.max_num_reqs_for_dspark()
++                    buffer = self.dspark_swa_indices_buffer
++                    lens_scratch = self.dspark_lens_scratch
++                    window = self.model_config.hf_config.sliding_window
++
++                    def build_dspark_swa_triton():
++                        slots, _ = build_dspark_swa_slot_indices_triton(
++                            dspark_swa_args[0],
++                            dspark_swa_args[1],
++                            window,
++                            dspark_swa_args[3],
++                            dspark_swa_args[4],
++                            dspark_swa_args[5],
++                            num_decode_tokens=num_actual_tokens,
++                            index_width=self._dspark_index_width,
++                            indices_output=buffer,
++                            lens_output=lens_scratch,
++                            max_num_reqs=max_num_reqs,
++                            num_query_per_req=num_query_per_req,
++                        )
++                        return slots
++
++                    build_dspark_swa = build_dspark_swa_triton
++                    dspark_swa_indices = buffer[: self.num_actual_tokens]
++                else:
++                    dspark_swa_indices = self.dspark_swa_indices_buffer[: self.num_actual_tokens]
++                    build_dspark_swa = lambda: build_dspark_swa_indices(
++                        *dspark_swa_args,
++                        indices_output=dspark_swa_indices,
++                    )
+             else:
+-                dspark_swa_indices, _ = build_dspark_swa_indices(*dspark_swa_args)
++                dspark_swa_indices, _ = self._build_dspark_swa_indices_eager(
++                    dspark_swa_args, buffer=self.dspark_swa_indices_buffer
++                )
+                 dspark_swa_indices = dspark_swa_indices[: self.num_actual_tokens]
+             ori_win_left, ori_win_right = get_dspark_sparse_sas_window(self.vllm_config)
+ 
+diff --git a/vllm_ascend/model_executor/warmup/dspark_swa_indices_warmup.py b/vllm_ascend/model_executor/warmup/dspark_swa_indices_warmup.py
+new file mode 100644
+index 000000000..eb8b02ee5
+--- /dev/null
++++ b/vllm_ascend/model_executor/warmup/dspark_swa_indices_warmup.py
+@@ -0,0 +1,86 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""Warm the DSpark SWA slot-indices Triton kernel before ACL graph capture."""
++
++from __future__ import annotations
++
++from typing import TYPE_CHECKING
++
++import torch
++from vllm.triton_utils import HAS_TRITON
++
++from vllm_ascend.ops.triton.dspark_swa_indices import (
++    build_dspark_swa_slot_indices_triton,
++    dspark_swa_indices_supported,
++)
++
++if TYPE_CHECKING:
++    from vllm_ascend.worker.worker import NPUWorker
++
++
++@torch.inference_mode()
++def dspark_swa_indices_warmup(worker: NPUWorker) -> None:
++    """JIT-warm the fused kernel for the exact (B, W) variant seen at runtime.
++
++    The kernel's JIT key is the constexpr set (WINDOW_SIZE, BLOCK_SIZE,
++    INDEX_W, BLOCK_W, ROW_POW2, Q_POW2). All of them are fixed by the startup
++    configuration: ROW_POW2 derives from the block-table width the draft
++    builder sees at runtime -- the full per-group table, or the
++    SlidingWindowAdapter's cropped clone when ``draft_window_size`` is set --
++    and Q_POW2 from the spec token count. A post-capture JIT would block the
++    replay path, so this runs from ``kernel_warmup`` -- after
++    ``initialize_kv_cache`` (the proposer has registered the exact per-request
++    query count and the persistent buffers exist) and before ``capture_model``.
++    """
++    if not HAS_TRITON:
++        return
++    runner = worker.model_runner
++    drafter = getattr(runner, "drafter", None)
++    if drafter is None or not hasattr(drafter, "draft_attn_groups"):
++        return
++
++    from vllm_ascend.attention.dsa_v1 import AscendDSAMetadataBuilder
++
++    sliding_window_adapter = getattr(drafter, "sliding_window", None)
++    for attn_group in drafter.draft_attn_groups:
++        builder = attn_group.get_metadata_builder()
++        if not isinstance(builder, AscendDSAMetadataBuilder):
++            continue
++        # Only the device-metadata (graph-capture) path needs pre-capture JIT;
++        # the eager path compiles on first call outside any graph.
++        if not getattr(builder, "_device_metadata_enabled", False):
++            continue
++        if build_dspark_swa_slot_indices_triton is None or builder._dspark_index_width is None:
++            continue
++        # builder.block_table is assigned per step from the runtime metadata
++        # and is still None here. Compute the width the builder will see: the
++        # sliding-window adapter crops the table to its window clone, the
++        # plain path reads the full per-group table from the input batch.
++        if sliding_window_adapter is not None:
++            table_width = sliding_window_adapter.max_window_blocks
++        else:
++            gid = attn_group.kv_cache_group_id
++            table_width = runner.input_batch.block_table[gid].get_device_tensor().shape[1]
++        if not dspark_swa_indices_supported(builder.storage_block_size, table_width):
++            continue
++        max_num_reqs = builder.max_num_reqs_for_dspark()
++        num_query_per_req = builder.dspark_num_query_per_req()
++        # Dummies mirror the runtime buffers: query_start_loc is the runner's
++        # int32 buffer, seq_lens int32, block_table int32, so the warmup
++        # compiles the exact pointer specializations the real call launches.
++        # All-zero metadata means the launch exercises compilation and the
++        # capacity grid only; no gather or store executes.
++        build_dspark_swa_slot_indices_triton(
++            torch.zeros(max_num_reqs, table_width, dtype=torch.int32, device=builder.device),
++            builder.speculative_config.num_speculative_tokens,
++            builder.model_config.hf_config.sliding_window,
++            builder.storage_block_size,
++            torch.zeros(max_num_reqs + 1, dtype=torch.int32, device=builder.device),
++            torch.zeros(max_num_reqs, dtype=torch.int32, device=builder.device),
++            num_decode_tokens=max_num_reqs * num_query_per_req,
++            index_width=builder._dspark_index_width,
++            indices_output=builder.dspark_swa_indices_buffer,
++            lens_output=builder.dspark_lens_scratch,
++            max_num_reqs=max_num_reqs,
++            num_query_per_req=num_query_per_req,
++        )
+diff --git a/vllm_ascend/model_executor/warmup/kernel_warmup.py b/vllm_ascend/model_executor/warmup/kernel_warmup.py
+index 8211fb069..4c00cdde3 100644
+--- a/vllm_ascend/model_executor/warmup/kernel_warmup.py
++++ b/vllm_ascend/model_executor/warmup/kernel_warmup.py
+@@ -10,6 +10,9 @@ from typing import TYPE_CHECKING
+ from vllm.logger import logger
+ from vllm.triton_utils import HAS_TRITON
+ 
++from vllm_ascend.model_executor.warmup.dspark_swa_indices_warmup import (
++    dspark_swa_indices_warmup,
++)
+ from vllm_ascend.model_executor.warmup.indexer_triton_warmup import (
+     indexer_triton_warmup,
+ )
+@@ -48,6 +51,7 @@ def kernel_warmup(worker: NPUWorker) -> None:
+     _run_warmup("penalties", penalties_triton_warmup, worker)
+     _run_warmup("rms", triton_rms_warmup, worker)
+     _run_warmup("indexer", indexer_triton_warmup, worker)
++    _run_warmup("dspark_swa_indices", dspark_swa_indices_warmup, worker)
+ 
+     elapsed = time.perf_counter() - start
+     logger.info("Triton kernel warmup finished in %.3fs.", elapsed)
+diff --git a/vllm_ascend/ops/triton/docs/dspark_swa_indices.md b/vllm_ascend/ops/triton/docs/dspark_swa_indices.md
+new file mode 100644
+index 000000000..b96430b41
+--- /dev/null
++++ b/vllm_ascend/ops/triton/docs/dspark_swa_indices.md
+@@ -0,0 +1,64 @@
++# dspark_swa_indices
++
++## Description
++
++- **Function**: Builds the non-causal visible-slot indices and visible lengths for DSpark (DeepSeek V4.1) parallel drafting over a paged sliding-window attention (SWA) cache. It replaces the eager ~15-op torch chain (`arange` / `sub` / `clamp` / `floordiv` / `gather` / `where` / `repeat_interleave` / `copy_` ...) in `build_dspark_swa_indices` of `vllm_ascend/attention/dsa_v1.py` with a single fused Triton kernel.
++- **Formula** (per request `r`, all integer arithmetic):
++    - `q_len = query_start_loc[r + 1] - query_start_loc[r]` (uniform across requests)
++    - `prefix_len = seq_lens[r] - q_len`
++    - `start_pos = max(prefix_len - window_size, 0)`
++    - `visible_len = seq_lens[r] - start_pos`
++    - for column `c` in `[0, index_width)`: `pos = start_pos + c`; `block_num = pos // block_size`; `block_off = pos - block_num * block_size`
++    - `slot[c] = block_table[r, block_num] * block_size + block_off` if `c < visible_len`, else `-1`
++    - every active output row of request `r` receives the same `slot` vector; `lens[row] = visible_len`; padded rows `[num_rows, num_rows_padded)` are reset to `slots = -1`, `lens = 0`
++- **Algorithm flow** (processed per request-column-block item, independently):
++  1. Compute grid: `grid_size = min(get_vectorcore_num(), max_num_reqs * NUM_CB)` where `NUM_CB = ceil(index_width / BLOCK_W)`; the kernel claims work items `w = pid, pid + grid_size, ...` grid-stride, with item `w` mapping to request `r = w // NUM_CB`, column block `cb = w % NUM_CB`.
++  2. Distributed pad-row cleanup: each item resets the slice of `[num_rows, num_rows_padded)` inside its row band `[r * num_query_per_req, (r + 1) * num_query_per_req)`, so a captured ACL graph never replays stale rows.
++  3. For active items: load the request's full block-table row (up to `ROW_POW2 = next_pow2(num_blocks)` lanes) into UB, clamp column block numbers into the table range, gather physical block IDs via `tl.gather`, and compute the slot vector for the column block.
++  4. One 2D store writes the `[q_len, index_width]` output tile: the slot vector is broadcast over `Q_POW2 = next_pow2(num_speculative_tokens + 1)` rows (the uniform-query contract bounds `q_len <= Q_POW2`); the first column block also stores `visible_len` into `lens`.
++- **Supported modes**: Atlas A2 (910B series; verified on 910B4) and A3 (910C series — same kernel ISA family). 950PR&950DT Products N/A — the eager torch chain remains the fallback. Used by the DSA metadata builder for DSpark non-causal parallel drafting in both eager and graph-capture modes.
++
++## Parameters
++
++| Parameter | Input/Output/Attribute | Description | Data type | Data format |
++| --- | --- | --- | --- | --- |
++| `block_table` | Input | Block table of the SWA KV cache, row-sliced to the active requests `[num_reqs, num_blocks]`; row stride passed separately so a padded/sliced table works | int32 / int64 | ND |
++| `query_start_loc` | Input | Cumulative query offsets `[num_reqs + 1]`; under the uniform-query contract each request contributes the same `q_len` | int32 / int64 | 1D |
++| `seq_lens` | Input | Per-request context lengths `[num_reqs]` | int32 / int64 | 1D |
++| `num_speculative_tokens` | Input (attribute) | Number of draft tokens per request; output row-tile height is `next_pow2(num_speculative_tokens + 1)` | int32 | scalar |
++| `window_size` | Input (attribute) | Sliding-window size of the SWA cache (model constant) | int32 | scalar |
++| `block_size` | Input (attribute) | DSA KV-cache block size; must be a power of two | int32 | scalar |
++| `index_width` | Input (attribute) | Aligned index width of the output (`ceil((window_size + num_speculative_tokens) / 128) * 128`) | int32 | scalar |
++| `num_decode_tokens` | Input (attribute) | Total active output rows (`sum(query_lens)`), supplied by the caller to avoid a D2H sync | int32 | scalar |
++| `max_num_reqs` | Input (attribute) | Capture-time request-slot capacity sizing the fixed grid; optional (defaults to `num_reqs`) | int32 | scalar |
++| `num_query_per_req` | Input (attribute) | Row-expansion factor per request slot; defaults to `num_speculative_tokens + 1`, anchor-sampling mode passes `num_speculative_tokens` | int32 | scalar |
++| `indices_output` | Output | Visible physical slot ids `[num_rows_padded, 1, index_width]`, `-1` for invisible/padded lanes; pre-allocated persistent buffer for graph capture, or freshly allocated when omitted | int32 | ND |
++| `lens_output` | Output | Visible length per row `[num_rows_padded]`, `0` on padded rows; pre-allocated persistent buffer or freshly allocated when omitted. Always int64 — an intentional API difference from the eager chain, whose lens dtype follows `seq_lens` (int32 when the runtime metadata is int32). Slot values are identical; production call sites discard the lens output | int64 | 1D |
++
++## Constraints
++
++- `block_size` must be a power of two (`//` and `%` lower to shift/mask).
++- `next_pow2(num_blocks)` must not exceed 8192 (UB-preload tile cap; the host gate falls back to the eager chain beyond it).
++- `q_len <= num_speculative_tokens + 1` for every request (uniform-query contract of DSpark drafting); the 2D output tile relies on it.
++- `indices_output` must be int32. When a persistent `indices_output` is passed for graph capture, the FULL buffer (`buffer`, not `buffer[:num_rows]`) must be provided so the pad-row cleanup stays armed; an active-sized slice disables the cleanup and triggers a `UserWarning`.
++- `lens_output` / the freshly allocated lens is always int64. This is an intentional API difference: the eager chain's `per_token_lens` follows the dtype of `seq_lens` (int32 with int32 runtime metadata), while the fused kernel fixes lens at int64. Slot values are identical; production call sites currently discard the lens output.
++- Padded rows `[num_rows, num_rows_padded)` are reset to `slots = -1`, `lens = 0` in place — a strict superset of the eager behavior, which leaves those rows stale.
++- `block_table` may be int32 or int64; the kernel narrows the loaded rows to int32 in-register (no-op on i32, value-preserving truncation on i64 — physical block IDs fit int32).
++- All runtime scalars (`num_blocks`, `num_reqs`, `num_rows_padded`, `num_rows`, `num_query_per_req`, `num_slots`) are `do_not_specialize`, so no recompilation is triggered by varying batch sizes; only the constexpr set (`WINDOW_SIZE`, `BLOCK_SIZE`, `INDEX_W`, `BLOCK_W`, `ROW_POW2`, `Q_POW2`) forms the JIT key, which is startup-constant for a serving run and warmed once from `model_executor/warmup` before ACL graph capture.
++- `get_vectorcore_num()` must have been initialised: the wrapper calls `init_device_properties_triton()` (idempotent) before each launch. In serving this happens during worker start-up as well; standalone callers get it implicitly.
++- Inference-only (decode, DSpark non-causal drafting); works under both eager and ACL graph-capture modes (fixed launch grid derived from `max_num_reqs`, stable tensor addresses from persistent buffers).
++
++## Origin and Differences
++
++- **Origin**: Rewritten from scratch based on the eager torch implementation `build_dspark_swa_indices` in `vllm_ascend/attention/dsa_v1.py` (DSpark non-causal SWA index build), fused into a single Triton-Ascend kernel.
++- **Differences**:
++    - NPU adaptation for performance: fuses the ~15-op eager chain (device time 213-8046 us across 9 shapes) into one kernel launch (4.7-90.5 us, 45-89x per shape, ~70x geometric mean on 910B4); grid-stride claiming over a fixed capacity grid keeps the launch shape stable for ACL-graph capture; distributed pad-row cleanup parallelizes the graph-padding reset that the eager chain performs serially; `tl.gather` payload bitcasts through fp32 (bits preserved) and window arithmetic runs on int32 directly.
++    - Modified for a specific vllm-ascend logic or different input parameters: adds the capacity-grid parameters (`max_num_reqs`, `num_query_per_req`, `num_slots`) and in-place `indices_output` / `lens_output` buffers required by the device-metadata graph-capture contract of the DSA metadata builder; pad rows are explicitly reset so captured graphs never replay stale rows.
++
++## Test Cases
++
++Accuracy tests use the real inference shapes of DeepSeek V4.1 DSpark drafting (`window_size=944`, `block_size=128`, `index_width=1088`, the DFlash uniform-query contract `num_query_per_req = num_speculative_tokens + 1`, graph-capture pad-row cleanup, the wide-window and narrow-block-table boundary cases) plus a broader generic parameter space (varying request counts, block sizes 4-128, long contexts, 8192-wide block tables). As this is an integer index-building operator, the unified precision tolerance is bit-exact (`rtol=0, atol=0`) on the slot values; the lens output is compared as values (the eager result cast to the kernel's fixed int64) per the intentional dtype difference noted under Parameters.
++
++```bash
++pytest -sv tests/e2e/nightly/single_node/ops/singlecard_ops/triton/test_dspark_swa_indices.py
++```
+diff --git a/vllm_ascend/ops/triton/dspark_swa_indices.py b/vllm_ascend/ops/triton/dspark_swa_indices.py
+new file mode 100644
+index 000000000..cbf32b2fc
+--- /dev/null
++++ b/vllm_ascend/ops/triton/dspark_swa_indices.py
+@@ -0,0 +1,296 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""Triton-Ascend fused implementation of build_dspark_swa_indices.
++
++See docs/dspark_swa_indices.md for the full description, semantics,
++constraints and Ascend-specific lowering notes.
++"""
++
++from __future__ import annotations
++
++import warnings
++
++import torch
++from vllm.triton_utils import HAS_TRITON, tl, triton
++
++from vllm_ascend.ops.triton.triton_utils import get_vectorcore_num, init_device_properties_triton
++
++if HAS_TRITON:
++
++    @triton.jit(
++        do_not_specialize=[
++            "num_blocks",
++            "num_reqs",
++            "num_rows_padded",
++            "num_rows",
++            "num_query_per_req",
++            "num_slots",
++        ]
++    )
++    def _dspark_swa_indices_kernel(
++        bt_ptr,  # block_table       [R_alloc, num_blocks]  i32/i64 (narrowed in-kernel)
++        stride_bt_r,  # block_table.stride(0): row pitch of a possibly sliced/padded table
++        qsl_ptr,  # query_start_loc  [R_alloc + 1]  i32/i64
++        seq_lens_ptr,  # seq_lens         [R_alloc]  i32/i64
++        slots_ptr,  # out_slots        [num_rows_padded, 1, INDEX_W]  i32
++        lens_ptr,  # out_lens         [num_rows_padded]  i64
++        num_blocks,  # block_table.shape[1]
++        num_reqs,  # active request count == block_table.shape[0]
++        num_rows_padded,  # padded row count == R_alloc * num_query_per_req
++        num_rows,  # active row count == sum(query_lens)
++        num_query_per_req,  # row-expansion factor per request slot
++        num_slots,  # request-slot capacity (row bands are [r*nqp, (r+1)*nqp))
++        WINDOW_SIZE: tl.constexpr,  # sliding window size (model constant)
++        BLOCK_SIZE: tl.constexpr,  # DSA block size (power of two)
++        INDEX_W: tl.constexpr,  # aligned index width
++        BLOCK_W: tl.constexpr,  # column-block width
++        ROW_POW2: tl.constexpr,  # next_pow2(num_blocks): UB preload tile shape
++        Q_POW2: tl.constexpr,  # next_pow2(spec + 1): output row-tile height
++    ):
++        # NUM_CB must be ceil: a floor division sends tail items' r past
++        # num_slots, reading qsl/seq_lens out of bounds (MTE "DDR address
++        # out of range" faults on non-divisible widths).
++        NUM_CB: tl.constexpr = (INDEX_W + BLOCK_W - 1) // BLOCK_W
++        ALIGNED_W: tl.constexpr = (INDEX_W % BLOCK_W) == 0
++        pid = tl.program_id(0)
++        num_progs = tl.num_programs(0)
++        total_items = num_slots * NUM_CB
++
++        # Grid-stride: each program claims w = pid, pid + num_progs, ...
++        for w in range(pid, total_items, num_progs):
++            r = w // NUM_CB
++            cb = w % NUM_CB
++
++            # Distributed pad-row cleanup: reset the slice of
++            # [num_rows, num_rows_padded) in this item's row band
++            # [r*nqp, (r+1)*nqp). Must precede every guard below.
++            row_lo = tl.maximum(r * num_query_per_req, num_rows)
++            row_hi = tl.minimum((r + 1) * num_query_per_req, num_rows_padded)
++            if row_lo < row_hi:
++                pad_offs = tl.arange(0, BLOCK_W)
++                pad_mask = (cb * BLOCK_W + pad_offs) < INDEX_W
++                for row in range(row_lo, row_hi):
++                    base = row * INDEX_W + cb * BLOCK_W
++                    tl.store(slots_ptr + base + pad_offs, -1, mask=pad_mask)
++                    if cb == 0:
++                        tl.store(lens_ptr + row, 0)
++
++            # Positive guards (Triton has no `continue`): skipping an item
++            # must not drop the remaining items this program owns.
++            if r < num_reqs:
++                q0 = tl.load(qsl_ptr + r).to(tl.int32)
++                q1 = tl.load(qsl_ptr + r + 1).to(tl.int32)
++                q_len = q1 - q0
++                seq_len = tl.load(seq_lens_ptr + r).to(tl.int32)
++                prefix_len = seq_len - q_len
++                start_pos = tl.maximum(prefix_len - WINDOW_SIZE, 0)
++                visible_len = seq_len - start_pos
++
++                if q_len > 0:
++                    offs_w = cb * BLOCK_W + tl.arange(0, BLOCK_W)
++                    pos = start_pos + offs_w
++                    blk_num = pos // BLOCK_SIZE
++                    # Clamp so gather never reads OOB; clamped lanes are
++                    # discarded by the visible mask below.
++                    safe_num = tl.minimum(tl.maximum(blk_num, 0), num_blocks - 1)
++
++                    # triton-ascend's tl.gather rejects int32 payloads; ride
++                    # the id through fp32 bitcast (bits preserved). Narrow the
++                    # loaded row to int32 first: no-op on i32 tables, a
++                    # value-preserving truncation on i64 (same pattern as
++                    # qsl/seq_lens above; physical block IDs fit int32).
++                    r_offs = tl.arange(0, ROW_POW2)
++                    bt_row = tl.load(
++                        bt_ptr + r * stride_bt_r + r_offs,
++                        mask=r_offs < num_blocks,
++                        other=0,
++                    ).to(tl.int32)
++                    block_id = tl.gather(bt_row.to(tl.float32, bitcast=True), safe_num, 0).to(tl.int32, bitcast=True)
++
++                    blk_off = pos - blk_num * BLOCK_SIZE
++                    slot = block_id * BLOCK_SIZE + blk_off
++                    slot = tl.where(offs_w < visible_len, slot, -1)
++
++                    is_first_cb = cb == 0
++                    lens_val = visible_len.to(tl.int64)
++
++                    # One 2D store for the [q_len, INDEX_W] tile: rows
++                    # [q0, q0+q_len) broadcast the same slot vector (the
++                    # uniform-query contract keeps q_len <= Q_POW2).
++                    t_offs = tl.arange(0, Q_POW2)
++                    slot_tile = tl.broadcast_to(slot[None, :], (Q_POW2, BLOCK_W))
++                    tile_ptrs = slots_ptr + (q0 + t_offs)[:, None] * INDEX_W + offs_w[None, :]
++                    if ALIGNED_W:
++                        tl.store(tile_ptrs, slot_tile, mask=(t_offs < q_len)[:, None])
++                    else:
++                        tl.store(
++                            tile_ptrs,
++                            slot_tile,
++                            mask=(t_offs < q_len)[:, None] & (offs_w < INDEX_W)[None, :],
++                        )
++                    tl.store(lens_ptr + q0 + t_offs, lens_val, mask=(t_offs < q_len) & is_first_cb)
++
++
++# Column-block width for the 1D grid split (optimum of the 910B4 benchmark
++# ladder: 1024 -> 66.7x vs eager, 512 -> 65.6x, 256 -> 51.0x).
++_DEFAULT_BLOCK_W = 1024
++
++# UB-preload tile cap: next_pow2(block_table_width) beyond this no longer
++# fits the per-program UB budget, and the wrapper falls back to eager.
++_MAX_ROW_POW2 = 8192
++
++
++def dspark_swa_indices_supported(
++    block_size: int,
++    block_table_width: int,
++) -> bool:
++    """Host-only fast-path eligibility check (no device synchronization).
++
++    Conditions:
++    * triton-ascend is importable (HAS_TRITON);
++    * ``block_size`` is a power of two (kernel lowers ``//`` and ``%`` to
++      shift/mask, which requires a constexpr pow2 divisor);
++    * the UB-preload tile fits: ``next_pow2(block_table_width)`` lanes must
++      stay within the kernel's register/UB budget (ROW_POW2 cap).
++    """
++
++    if not HAS_TRITON:
++        return False
++    if block_size <= 0 or (block_size & (block_size - 1)) != 0:
++        return False
++    return triton.next_power_of_2(block_table_width) <= _MAX_ROW_POW2
++
++
++def build_dspark_swa_slot_indices_triton(
++    block_table: torch.Tensor,
++    num_speculative_tokens: int,
++    window_size: int,
++    block_size: int,
++    query_start_loc: torch.Tensor,
++    seq_lens: torch.Tensor,
++    num_decode_tokens: int | None = None,
++    index_width: int | None = None,
++    indices_output: torch.Tensor | None = None,
++    lens_output: torch.Tensor | None = None,
++    max_num_reqs: int | None = None,
++    num_query_per_req: int | None = None,
++    block_w: int = _DEFAULT_BLOCK_W,
++) -> tuple[torch.Tensor, torch.Tensor]:
++    """Fused Triton-Ascend build of DSpark non-causal SWA indices.
++
++    Fast path for ``vllm_ascend.attention.dsa_v1.build_dspark_swa_indices``
++    (same leading signature and index_width semantics). One intentional API
++    difference: the lens output is always int64, while the eager chain's
++    ``per_token_lens`` follows the dtype of ``seq_lens``. See
++    docs/dspark_swa_indices.md for the output contract, the graph-capture
++    buffer rules and the parameter semantics.
++    """
++
++    num_reqs = query_start_loc.shape[0] - 1
++    if index_width is None:
++        # Same alignment rule as dsa_v1._aligned_dspark_index_width.
++        min_width = int(window_size) + int(num_speculative_tokens)
++        index_width = ((min_width + 127) // 128) * 128
++    W = int(index_width)
++
++    # num_decode_tokens avoids the only D2H sync on this path
++    # (query_start_loc[num_reqs].item()).
++    if num_decode_tokens is not None:
++        num_rows = int(num_decode_tokens)
++    else:
++        num_rows = int(query_start_loc[num_reqs].item())
++
++    # The grid must stay fixed across replays: derive it from the
++    # capture-time bound max_num_reqs, never from num_reqs.
++    R_alloc = int(max_num_reqs) if max_num_reqs is not None else num_reqs
++    if R_alloc < num_reqs:
++        R_alloc = num_reqs
++    if num_query_per_req is None:
++        num_query_per_req = int(num_speculative_tokens) + 1
++    num_query_per_req = int(num_query_per_req)
++    if num_query_per_req < 1:
++        raise ValueError(f"dspark_swa_indices num_query_per_req must be >= 1, got {num_query_per_req}")
++    num_rows_padded = R_alloc * num_query_per_req
++
++    if indices_output is not None:
++        if indices_output.dtype != torch.int32:
++            raise ValueError(f"dspark_swa_indices indices_output must be int32, got {indices_output.dtype}")
++        out_slots = indices_output
++        if out_slots.shape[0] < num_rows:
++            raise ValueError(
++                "dspark_swa_indices indices_output has fewer rows than active tokens: "
++                f"output={out_slots.shape[0]}, active={num_rows}"
++            )
++        if out_slots.shape[0] < num_rows_padded:
++            # Clamp the pad cleanup to the buffer extent; warn when the
++            # caller signaled graph intent but passed an active-sized slice,
++            # which silences the cleanup.
++            if max_num_reqs is not None and R_alloc > num_reqs:
++                warnings.warn(
++                    "dspark_swa_indices indices_output has fewer rows than the "
++                    "capacity grid "
++                    f"(output={out_slots.shape[0]}, capacity={R_alloc * num_query_per_req}): "
++                    "the pad-row cleanup is disabled. Pass the FULL buffer "
++                    "(indices_output=buffer, not buffer[:num_rows]) so captured "
++                    "graphs never replay stale rows.",
++                    UserWarning,
++                    stacklevel=2,
++                )
++            num_rows_padded = out_slots.shape[0]
++    else:
++        # Fresh active-sized allocation: clamp num_rows_padded so the pad cleanup
++        # stays in bounds.
++        out_slots = torch.empty((num_rows, 1, W), dtype=torch.int32, device=block_table.device)
++        num_rows_padded = min(num_rows_padded, num_rows)
++
++    if lens_output is not None:
++        out_lens = lens_output
++        if out_lens.shape[0] < num_rows:
++            raise ValueError(
++                f"dspark_swa_indices lens_output has fewer rows than active tokens: "
++                f"output={out_lens.shape[0]}, active={num_rows}"
++            )
++        num_rows_padded = min(num_rows_padded, out_lens.shape[0])
++    elif indices_output is not None:
++        # No persistent lens buffer: allocate scratch sized to the cleanup
++        # extent.
++        out_lens = torch.empty((max(num_rows, num_rows_padded),), dtype=torch.int64, device=block_table.device)
++    else:
++        out_lens = torch.empty((num_rows,), dtype=torch.int64, device=block_table.device)
++
++    num_blocks = block_table.shape[1]
++    row_pow2 = triton.next_power_of_2(num_blocks)
++    eff_block_w = min(block_w, W)  # BLOCK_W > INDEX_W would zero NUM_CB
++    num_cb = triton.cdiv(W, eff_block_w)
++
++    # num_slots (R_alloc) stays unclamped so buffer-extent clamping of
++    # num_rows_padded does not shrink the kernel's claim space. The kernel
++    # claims work items grid-stride, so the core count is a performance
++    # knob only; any grid >= 1 covers the work.
++    total_items = R_alloc * num_cb
++    init_device_properties_triton()
++    grid = min(get_vectorcore_num(), total_items)
++
++    _dspark_swa_indices_kernel[(grid,)](
++        block_table,
++        block_table.stride(0),
++        query_start_loc,
++        seq_lens,
++        out_slots,
++        out_lens,
++        num_blocks,
++        num_reqs,
++        num_rows_padded,
++        num_rows,
++        num_query_per_req,
++        R_alloc,
++        WINDOW_SIZE=int(window_size),
++        BLOCK_SIZE=int(block_size),
++        INDEX_W=W,
++        BLOCK_W=eff_block_w,
++        ROW_POW2=row_pow2,
++        Q_POW2=triton.next_power_of_2(int(num_speculative_tokens) + 1),
++    )
++
++    # Return views sized to the active extent, mirroring the eager function.
++    return out_slots[:num_rows], out_lens[:num_rows]
+diff --git a/vllm_ascend/spec_decode/dspark_proposer.py b/vllm_ascend/spec_decode/dspark_proposer.py
+index ac8bd3ef0..543e085bc 100644
+--- a/vllm_ascend/spec_decode/dspark_proposer.py
++++ b/vllm_ascend/spec_decode/dspark_proposer.py
+@@ -186,6 +186,11 @@ class AscendDSparkProposer(AscendDflashProposer):
+             for attn_group in self.draft_attn_groups:
+                 builder = attn_group.get_metadata_builder()
+                 if isinstance(builder, AscendDSAMetadataBuilder):
++                    # Register the exact per-request query count first so the
++                    # buffer quota and the triton capacity grid agree: anchor
++                    # sampling drafts spec queries per request, the non-anchor
++                    # path drafts spec+1.
++                    builder.set_dspark_num_query_per_req(self.num_query_per_req)
+                     builder.enable_dspark_device_metadata(self.max_query_tokens)
+                 else:
+                     from vllm_ascend.attention.dsa_v41 import AscendDSAV41MetadataBuilder

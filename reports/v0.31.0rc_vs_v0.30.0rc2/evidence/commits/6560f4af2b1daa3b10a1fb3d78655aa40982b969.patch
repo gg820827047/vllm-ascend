@@ -1,0 +1,125 @@
+commit 6560f4af2b1daa3b10a1fb3d78655aa40982b969
+Author:     leolee <83689697+li1how@users.noreply.github.com>
+AuthorDate: Thu Oct 15 20:47:27 2026 +0800
+Commit:     GitHub <noreply@github.com>
+CommitDate: Thu Oct 15 20:47:27 2026 +0800
+
+    [BugFix][PCP] Clear V4.1 query metadata on empty ranks (#18876)
+    
+    ### What this PR does / why we need it?
+    
+    With V4.1 PCP decode request sharding, a rank can have no real queries
+    while FULL graph replay still executes captured attention operators. The
+    empty-rank builder bypasses the ordinary builder's metadata reset,
+    leaving stale SMLA/QLI tasks in persistent buffers.
+    
+    Clear the query metadata buffers in place on empty ranks, preserving
+    their captured addresses and the global cache metadata. Add regression
+    coverage for padded widths 1 and 8, including packed-cache buffers.
+    
+    ### Does this PR introduce _any_ user-facing change?
+    
+    Fixes SparseFlashMla MTE failures on A3 when V4.1 PCP FULL decode
+    encounters empty query ranks. No configuration changes.
+    
+    ### How was this patch tested?
+    
+    - **A3: verified fixed.** The same production fix passed the original
+    failing workload: MRV2, DP2/TP1/PCP8, `FULL_DECODE_ONLY`, batch 4,
+    65,536 input tokens and 1,024 output tokens. Two warmup batches and
+    three measured batches completed without the original MTE; all 12
+    measured requests had the expected lengths. This validation used base
+    `218024e425` plus the fix, before rebasing this PR.
+    - **A5: this issue was not reproduced.** MRV2, DP1/TP1/PCP4,
+    `FULL_DECODE_ONLY`; unpatched main `23d1d9055` and patched `8d0ab519d`
+    each passed 15/15 requests, including real FULL decode on empty query
+    ranks. Neither had MTE errors; all corresponding outputs matched. This
+    is a passing baseline and regression check, rather than an A5
+    reproduction-and-fix claim.
+    - Existing CPU metadata validation: 28 passed; the four new empty-rank
+    cases fail against the old helper and pass with the fix. These check
+    buffer contents/address preservation, not NPU graph execution.
+    - After rebasing onto current main: `./format.sh ci` passed. NPU
+    validation was not rerun on the rebased commit.
+    
+    ---
+    
+    ### Checklist
+    
+    #### Testing
+    
+    - [x] **Boundary / edge-case coverage**: Empty query ranks and padded
+    graph widths 1 and 8 are covered.
+    - [x] **Regression test**: Added cases fail without the buffer reset.
+    - [ ] **Error / failure path coverage**: Additional exception paths are
+    not changed.
+    - [x] **Meaningful & reliable tests**: Tests check persistent buffer
+    contents, addresses, and global cache isolation.
+    - [ ] **Performance impact**: No performance regression benchmark is
+    claimed.
+    
+    - vLLM main:
+    https://github.com/vllm-project/vllm/commit/c4df37dfcc7f72ca41cd43801a468526ecf99a2b
+    
+    Signed-off-by: leolee <yihao.li@huawei.com>
+
+diff --git a/tests/ut/attention/test_dsa_v41_cp.py b/tests/ut/attention/test_dsa_v41_cp.py
+index 1557c8c8f..30a8b907f 100644
+--- a/tests/ut/attention/test_dsa_v41_cp.py
++++ b/tests/ut/attention/test_dsa_v41_cp.py
+@@ -448,6 +448,40 @@ class TestLegacyMetadata:
+ 
+ 
+ class TestPCPMetadata:
++    @pytest.mark.parametrize("graph_width", [1, 8])
++    @pytest.mark.parametrize("packed_cache", [False, True])
++    def test_empty_rank_disables_captured_query_tasks(self, builders, graph_width, packed_cache):
++        owners = builders(world=4, rank=3, decode_sharded=True)
++        _build_planes(owners, _batch(4, 3, "prefill", decode_sharded=True))
++        builder = owners["swa"]
++        if packed_cache:
++            builder._a5_smla_metadata = torch.ones(dsa_v41.V41_METADATA_BUFFER_SIZE, dtype=torch.int32)
++        captured = [builder._smla_metadata, builder._qli_metadata]
++        if packed_cache:
++            captured.append(builder._a5_smla_metadata)
++        for buffer in captured:
++            buffer.fill_(1)
++        addresses = [buffer.data_ptr() for buffer in captured]
++        global_metadata = builder._global_builder._seq_lens
++        assert global_metadata.numel() > 0
++        global_metadata.fill_(7)
++        batch = _batch(4, 3, "decode", decode_sharded=True)
++        common = batch.local.replace(
++            num_reqs=graph_width,
++            num_input_tokens=graph_width,
++            query_start_loc=torch.arange(graph_width + 1, dtype=torch.int32),
++        )
++
++        result = builder._build_empty_local_metadata(common)
++
++        assert result.num_actual_tokens == 0
++        assert result.num_input_tokens == graph_width
++        assert torch.count_nonzero(result.seq_lens) == 0
++        assert torch.all(result.slot_mapping == -1)
++        assert [buffer.data_ptr() for buffer in captured] == addresses
++        assert all(torch.count_nonzero(buffer) == 0 for buffer in captured)
++        assert torch.all(global_metadata == 7)
++
+     @pytest.mark.parametrize(
+         "world,rank,scenario,decode_sharded",
+         [
+diff --git a/vllm_ascend/attention/context_parallel/dsa_v41_cp.py b/vllm_ascend/attention/context_parallel/dsa_v41_cp.py
+index bf7bdf2d9..2ad2c78c4 100644
+--- a/vllm_ascend/attention/context_parallel/dsa_v41_cp.py
++++ b/vllm_ascend/attention/context_parallel/dsa_v41_cp.py
+@@ -344,6 +344,10 @@ class AscendDSAV41PCPMetadataBuilder(_ReplicatedCacheMetadataBuilder):
+     def _build_empty_local_metadata(self, common: AscendCommonAttentionMetadata) -> AscendDSAV41Metadata:
+         # Skip SMLA/QLI metadata ops on ranks with no queries.
+         self._device_metadata_tasks = ()
++        self._smla_metadata.zero_()
++        self._qli_metadata.zero_()
++        if self._a5_smla_metadata is not None:
++            self._a5_smla_metadata.zero_()
+         num_tokens, num_reqs = common.num_input_tokens, common.num_reqs
+         is_state = self._cache_kind == "compressor_state"
+         slots = self._slot_mapping if is_state else self._slot_mapping_2d

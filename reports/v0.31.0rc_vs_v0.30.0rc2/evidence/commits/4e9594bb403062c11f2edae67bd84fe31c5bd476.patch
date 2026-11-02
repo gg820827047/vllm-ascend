@@ -1,0 +1,318 @@
+commit 4e9594bb403062c11f2edae67bd84fe31c5bd476
+Author:     vllm-ascend-ci <vllmcibot@gmail.com>
+AuthorDate: Sun Oct 11 20:14:07 2026 +0800
+Commit:     GitHub <noreply@github.com>
+CommitDate: Sun Oct 11 20:14:07 2026 +0800
+
+    [Revert] Revert "[BugFix][Worker] Zero static KV buffers after cudagraph capture (v0.30.0 backport)" (#18263) (#18305)
+    
+    Revert of PR #18263 (merged onto `releases/v0.30.0`).
+    
+    Original PR: #18263
+    Original author: @Toneymiller
+    Merge commit: `334d4d70505836f1290404a311cfe2c9529ed06d`
+    
+    ---
+    ### What this PR does / why we need it?
+    
+    Backport of #17659 to releases/v0.30.0.
+    
+    GLM-5.3-Flash (KDA+SFA hybrid, fp8 C8 KV cache) collapses into emitting
+    '!' forever on A5 with FULL_DECODE_ONLY capture. During capture the
+    dummy forward bypasses the block allocator: SFA writes carry
+    slot_mapping=-1 (dropped by the scatter op), while KDA state_indices
+    default to slot 0 and really execute, writing bf16 dummy state into slot
+    0 of the backing shared with the SFA fp8 pool; reinterpreted as fp8 e4m3
+    those bytes contain NaN encodings. Nothing resets the buffers after
+    capture, so the first real request reads resident NaNs that defeat the
+    softmax additive mask and poison the residual stream.
+    
+    This PR zeroes every persistent KV/state tensor registered in
+    static_forward_context once, right after capture_model().
+    
+    Note: this intentionally carries the ORIGINAL implementation of #17659
+    (RuntimeError fallback chain), not the revised dtype-dispatch + chunked
+    version now on main, so we can compare v0.30.0 CI behaviour against
+    main's (where the original fallback's same-size temporary OOMed a2
+    runners). Happy to sync to the final main version before merge - see
+    #17659 for the full discussion.
+    
+    ### Does this PR introduce _any_ user-facing change?
+    
+    No. Startup-only internal fix.
+    
+    ### How was this patch tested?
+    
+    - Unit tests added: tests/ut/worker/test_zero_static_kv_buffers.py
+    (original version from #17659)
+    - Manually verified on A5 with GLM-5.3-Flash: without this fix the model
+    emits '!' after FULL_DECODE_ONLY capture; with it, output is normal.
+    
+    - vLLM main:
+    https://github.com/vllm-project/vllm/commit/ced6857afa0ea7b2e3f0846a62e1394e90f15607
+    
+    Co-authored-by: github-actions[bot] <github-actions[bot]@users.noreply.github.com>
+
+diff --git a/tests/ut/worker/test_zero_static_kv_buffers.py b/tests/ut/worker/test_zero_static_kv_buffers.py
+deleted file mode 100644
+index 48a3ab05e..000000000
+--- a/tests/ut/worker/test_zero_static_kv_buffers.py
++++ /dev/null
+@@ -1,131 +0,0 @@
+-from unittest.mock import MagicMock
+-
+-import pytest
+-import torch
+-
+-from vllm_ascend.worker.model_runner_v1 import _zero_static_kv_buffers
+-
+-
+-class _FakeAttnModule(torch.nn.Module):
+-    def __init__(self, kv_cache):
+-        super().__init__()
+-        self.kv_cache = kv_cache
+-
+-
+-def _make_runner(static_forward_context):
+-    runner = MagicMock()
+-    runner.compilation_config.static_forward_context = static_forward_context
+-    return runner
+-
+-
+-def _walk(obj):
+-    if isinstance(obj, torch.Tensor):
+-        assert torch.count_nonzero(obj).item() == 0
+-    elif isinstance(obj, dict):
+-        for v in obj.values():
+-            _walk(v)
+-    elif isinstance(obj, (list, tuple)):
+-        for v in obj:
+-            _walk(v)
+-
+-
+-def test_zero_static_kv_buffers_zeroes_everything():
+-    ctx = {
+-        "layer0": _FakeAttnModule([torch.full((4, 4), float("nan")), torch.ones(8)]),
+-        "layer1": _FakeAttnModule({"k_cache": torch.tensor([[1.0, 2.0]]), "v_cache": torch.full((3,), float("inf"))}),
+-        "layer2": _FakeAttnModule(torch.ones(2, 2, dtype=torch.bfloat16)),
+-        "layer3": _FakeAttnModule(None),
+-        "layer4": _FakeAttnModule([]),
+-        "layer5": _FakeAttnModule(torch.empty(0)),
+-    }
+-    _zero_static_kv_buffers(_make_runner(ctx))
+-    for mod in ctx.values():
+-        _walk(mod.kv_cache)
+-
+-
+-def test_zero_static_kv_buffers_tolerates_empty_context():
+-    _zero_static_kv_buffers(_make_runner({}))
+-    _zero_static_kv_buffers(_make_runner(None))
+-
+-
+-def test_zero_static_kv_buffers_fp8_via_int8_view():
+-    # fp8 storages may not implement zero_(); the runner zeroes them through
+-    # an int8 reinterpretation of the same bytes.
+-    t = torch.ones(4, dtype=torch.uint8).view(torch.float8_e4m3fn)
+-    ctx = {"layer0": _FakeAttnModule([t])}
+-    _zero_static_kv_buffers(_make_runner(ctx))
+-    assert torch.count_nonzero(t.view(torch.int8)).item() == 0
+-
+-
+-def test_zero_static_kv_buffers_fp8_non_contiguous_copies_scalar_not_full_buffer():
+-    # Regression test for the CI OOM on a nearly-full card: the fallback for
+-    # non-contiguous fp8 buffers must broadcast a scalar zero and must never
+-    # allocate a zeros_like() buffer the size of the resident KV pool.
+-    copy_src_shapes = []
+-
+-    class _CopyRecorder(torch.Tensor):
+-        def copy_(self, src):
+-            copy_src_shapes.append(tuple(src.shape))
+-            return super().copy_(src)
+-
+-    t = torch.ones(4, 4, dtype=torch.uint8).view(torch.float8_e4m3fn).as_subclass(_CopyRecorder).t()
+-    assert not t.is_contiguous()
+-    ctx = {"layer0": _FakeAttnModule([t])}
+-    _zero_static_kv_buffers(_make_runner(ctx))
+-    assert copy_src_shapes == [()]
+-    assert torch.count_nonzero(t.contiguous().view(torch.int8)).item() == 0
+-
+-
+-def test_zero_static_kv_buffers_chunks_large_non_contiguous(monkeypatch):
+-    # Mirrors the a2 CI OOM: a non-contiguous buffer whose zero_() wants a
+-    # same-size temporary must be re-zeroed in dim-0 chunks so each chunk's
+-    # kernel-side temporary stays bounded (full-size copy_ wanted 6.13 GiB
+-    # with only 4.33 GiB free).
+-    monkeypatch.setattr("vllm_ascend.worker.model_runner_v1._ZERO_CHUNK_BYTES", 64)
+-    copy_src_shapes = []
+-
+-    class _OomRecorder(torch.Tensor):
+-        def zero_(self):
+-            raise torch.OutOfMemoryError("NPU out of memory")
+-
+-        def copy_(self, src):
+-            copy_src_shapes.append(tuple(src.shape))
+-            return super().copy_(src)
+-
+-    t = torch.ones(8, 8).as_subclass(_OomRecorder).t()
+-    assert not t.is_contiguous()
+-    ctx = {"layer0": _FakeAttnModule([t])}
+-    _zero_static_kv_buffers(_make_runner(ctx))
+-    # 64 bytes / 32-byte row = 2 rows per chunk -> 4 chunks, scalar each
+-    assert copy_src_shapes == [(), (), (), ()]
+-    assert torch.count_nonzero(t).item() == 0
+-
+-
+-def test_zero_static_kv_buffers_oom_falls_back_to_int8_view():
+-    # Regression test for the a2 CI OOM: plain zero_() can materialize a
+-    # same-size temporary on NPU (6-12 GiB extra on a nearly-full card).
+-    # Only OutOfMemoryError may take the in-place int8-view fallback.
+-    class _OomTensor(torch.Tensor):
+-        def zero_(self):
+-            if self.dtype != torch.int8:
+-                raise torch.OutOfMemoryError("NPU out of memory")
+-            return super().zero_()
+-
+-    t = torch.ones(4).as_subclass(_OomTensor)
+-    ctx = {"layer0": _FakeAttnModule([t])}
+-    _zero_static_kv_buffers(_make_runner(ctx))
+-    assert torch.count_nonzero(t).item() == 0
+-
+-
+-def test_zero_static_kv_buffers_propagates_unexpected_errors():
+-    # RuntimeError from zero_() on ordinary dtypes is not a recoverable
+-    # dtype/layout issue: it must abort startup instead of leaving a
+-    # poisoned buffer behind.
+-    class _NoZeroTensor(torch.Tensor):
+-        def zero_(self):
+-            raise RuntimeError("zero_ not implemented for this dtype")
+-
+-    t = torch.ones(4).as_subclass(_NoZeroTensor)
+-    ctx = {"layer0": _FakeAttnModule([t])}
+-    with pytest.raises(RuntimeError, match="zero_ not implemented"):
+-        _zero_static_kv_buffers(_make_runner(ctx))
+diff --git a/vllm_ascend/worker/model_runner_v1.py b/vllm_ascend/worker/model_runner_v1.py
+index ab1e5ba18..13578b94d 100644
+--- a/vllm_ascend/worker/model_runner_v1.py
++++ b/vllm_ascend/worker/model_runner_v1.py
+@@ -22,7 +22,7 @@ import math
+ import sys
+ import time
+ from collections import defaultdict, deque
+-from collections.abc import Callable, Iterator, Sequence
++from collections.abc import Callable, Sequence
+ from contextlib import AbstractContextManager, contextmanager, nullcontext
+ from copy import copy, deepcopy
+ from dataclasses import dataclass, replace
+@@ -361,98 +361,6 @@ class ExecuteModelState(NamedTuple):
+     batch_desc: BatchDescriptor
+ 
+ 
+-def _iter_kv_tensors(kv_cache: Any) -> Iterator[torch.Tensor]:
+-    """Yield every tensor nested inside a kv_cache container."""
+-    if isinstance(kv_cache, torch.Tensor):
+-        yield kv_cache
+-    elif isinstance(kv_cache, (list, tuple)):
+-        for item in kv_cache:
+-            yield from _iter_kv_tensors(item)
+-    elif isinstance(kv_cache, dict):
+-        for item in kv_cache.values():
+-            yield from _iter_kv_tensors(item)
+-
+-
+-# fp8 storages may not implement zero_(); they are zeroed through an int8
+-# reinterpretation (or a scalar broadcast when not contiguous) instead.
+-_FP8_DTYPES = frozenset(
+-    getattr(torch, name)
+-    for name in ("float8_e4m3fn", "float8_e5m2", "float8_e4m3fnuz", "float8_e5m2fnuz")
+-    if hasattr(torch, name)
+-)
+-
+-
+-# Upper bound for one chunked fill of a non-contiguous buffer, so the
+-# kernel-side temporary stays small even on a nearly-full card.
+-_ZERO_CHUNK_BYTES = 64 * 1024 * 1024
+-
+-
+-def _zero_without_temp_buffer(t: torch.Tensor) -> None:
+-    """Zero a tensor in place without allocating a same-size temporary.
+-
+-    Contiguous tensors are filled through an int8 reinterpretation of the
+-    same bytes, which needs no workspace. Non-contiguous ones make even
+-    zero_()/copy_() materialize a temporary proportional to the operand
+-    size on NPU (a2 CI OOMed with 6-12 GiB extra on a nearly-full card),
+-    so they are filled with a scalar broadcast in dim-0 chunks bounded by
+-    _ZERO_CHUNK_BYTES.
+-    """
+-    if t.is_contiguous():
+-        t.view(torch.int8).zero_()
+-        return
+-    if t.dim() == 0 or t.numel() * t.element_size() <= _ZERO_CHUNK_BYTES:
+-        t.copy_(torch.zeros((), dtype=t.dtype, device=t.device))
+-        return
+-    rows_per_chunk = max(1, _ZERO_CHUNK_BYTES // (t[0].numel() * t.element_size()))
+-    zero = torch.zeros((), dtype=t.dtype, device=t.device)
+-    for start in range(0, t.shape[0], rows_per_chunk):
+-        t[start:start + rows_per_chunk].copy_(zero)
+-
+-
+-def _zero_tensor(t: torch.Tensor) -> None:
+-    """Zero a tensor in place.
+-
+-    fp8 storages may not implement zero_() at all, and plain zero_() can
+-    itself materialize a same-size temporary for some NPU dtypes/layouts
+-    (a2 CI runners: 6-12 GiB extra while the pool is nearly full). Both
+-    cases take the no-temporary path. Only OutOfMemoryError is treated as
+-    recoverable; any other failure must abort startup loudly rather than
+-    leave a poisoned buffer behind.
+-    """
+-    if t.dtype in _FP8_DTYPES:
+-        _zero_without_temp_buffer(t)
+-        return
+-    try:
+-        t.zero_()
+-    except torch.OutOfMemoryError:
+-        _zero_without_temp_buffer(t)
+-
+-
+-def _zero_static_kv_buffers(runner) -> None:
+-    """Zero every KV-cache / recurrent-state tensor in static_forward_context.
+-
+-    Fix for the GLM-5.3-Flash C8 accuracy collapse: FULL_DECODE_ONLY capture
+-    runs dummy decodes that really execute the KDA/SFA write paths over the
+-    persistent buffers. On this model the KDA conv/recurrent state caches
+-    share backing storage with the SFA fp8 KV pool (per 4-layer group the
+-    KDA state tensors and the next SFA pool have the same data_ptr), so the
+-    bf16 garbage written by causal_conv1d/recurrent_kda lands in pool blocks
+-    0-8; reinterpreted as fp8 e4m3 those bytes include NaN encodings
+-    (0x7F/0xFF), which the SFA forward then reads into the residual stream.
+-    Nothing resets the buffers after capture, so the first real request
+-    reads poisoned state and collapses into emitting '!' forever. Zeroing
+-    right after capture_model() restores the logically-empty state the
+-    engine assumes at startup. It runs exactly once per startup, outside
+-    any captured graph, so graph replay and steady-state inference are
+-    unaffected.
+-    """
+-    compilation_config = getattr(runner, "compilation_config", None)
+-    ctx = getattr(compilation_config, "static_forward_context", None) or {}
+-    for mod in ctx.values():
+-        for tensor in _iter_kv_tensors(getattr(mod, "kv_cache", None)):
+-            _zero_tensor(tensor)
+-
+-
+ class NPUModelRunner(GPUModelRunner):
+     # vLLM #51718 describes compatible KV cache groups as views over one
+     # standardized backing allocation. The default runner preserves that
+@@ -6524,13 +6432,6 @@ class NPUModelRunner(GPUModelRunner):
+         finally:
+             self._engram_capture_active = False
+ 
+-        # Capture runs dummy forwards that can leave garbage in the static
+-        # KV/state buffers (e.g. GLM-5.3-Flash: KDA dummy state lands in the
+-        # aliased SFA fp8 pool and reads back as NaN). Zero them once here so
+-        # real requests start from the logically-empty state the engine
+-        # assumes. See _zero_static_kv_buffers for the full story.
+-        _zero_static_kv_buffers(self)
+-
+         mgr = self.encoder_cudagraph_manager
+         if mgr is not None and self.update_stream is not None:
+             mgr.update_stream = self.update_stream

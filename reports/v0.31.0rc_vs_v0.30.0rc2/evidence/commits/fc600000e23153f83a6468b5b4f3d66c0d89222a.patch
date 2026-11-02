@@ -1,0 +1,2779 @@
+commit fc600000e23153f83a6468b5b4f3d66c0d89222a
+Author:     DengJiechao <68845610+goodgoodname@users.noreply.github.com>
+AuthorDate: Fri Oct 16 19:44:02 2026 +0800
+Commit:     GitHub <noreply@github.com>
+CommitDate: Fri Oct 16 19:44:02 2026 +0800
+
+    [Performance][Kernel] Optimize hc_pre kernels/main (#18293)
+    
+    ### What this PR does / why we need it
+    
+    Integrate an optimized `hc_pre` operator implementation for evaluation
+    on Ascend A3. The operator source was adapted from the
+    [cann-recipes-infer
+    implementation](https://gitcode.com/renruhai/cann-recipes-infer/tree/master/ops/ascendc/src/hc_pre).
+    
+    The changes are limited to the operator implementation and its build
+    integration. They also include a follow-up HF32 mode fix. The Python API
+    and model call sites are unchanged. This PR does not claim an A5
+    performance improvement.
+    
+    ### Does this PR introduce any user-facing change?
+    
+    There is no change to the inputs or outputs for supported
+    configurations.
+    
+    ### How was this patch tested?
+    
+    - Built and installed the custom operator on Ascend A3.
+    - Ran the existing single-card `hc_pre` correctness tests after the HF32
+    fix: 5 passed.
+    - Compared pre-optimization commit `cc06c1e5` with fixed optimized
+    commit `648d8b6d` on the same Ascend910_9382 host using GLM-5.3-Flash
+    W8A8. The `hc_pre` source at `648d8b6d` matches this PR. The figures are
+    median `HcPre` device durations from the same DP0/TP0 rank.
+    
+    | Capture | Input shape | Calls per version | Baseline | Optimized |
+    Change |
+    | --- | --- | ---: | ---: | ---: | ---: |
+    | Prefill | `[432, 4, 4096]` | 90 | 112.758 μs | 68.919 μs | −38.9% |
+    | Prefill | `[80, 4, 4096]` | 90 | 48.709 μs | 41.859 μs | −14.1% |
+    | Prefill | `[1, 4, 4096]` | 90 | 29.469 μs | 31.170 μs | +5.8% |
+    | Decode | `[2, 4, 4096]` | 1,890 | 37.090 μs | 34.130 μs | −8.0% |
+    - vLLM main:
+    https://github.com/vllm-project/vllm/commit/c4df37dfcc7f72ca41cd43801a468526ecf99a2b
+    
+    ---------
+    
+    Signed-off-by: dengjiechao <dengjiechao2@huawei.com>
+    Co-authored-by: dengjiechao <dengjiechao2@huawei.com>
+
+diff --git a/csrc/moe/hc_pre/op_host/hc_pre_tiling.cpp b/csrc/moe/hc_pre/op_host/hc_pre_tiling.cpp
+index acc15c28d..35a2a97d6 100644
+--- a/csrc/moe/hc_pre/op_host/hc_pre_tiling.cpp
++++ b/csrc/moe/hc_pre/op_host/hc_pre_tiling.cpp
+@@ -43,6 +43,7 @@ constexpr int64_t REPEAT_SIZE = 256;
+ constexpr int64_t UB_RESEVED_SIZE = 8192;
+ constexpr int64_t DOUBLE_BUFFER = 2;
+ constexpr uint64_t M_L1_MAX_SIZE = 256;
++constexpr uint64_t CV_LOOP_K_SIZE = 1024;
+ constexpr uint64_t K_MULIT_CORE_SPLIT_BASE_SIZE = 256;
+ constexpr uint64_t A_L1_SIZE = 128 * 256;
+ constexpr uint64_t K_L1_MAX_SIZE = 1024;
+@@ -52,6 +53,16 @@ constexpr int64_t ITER_TIMES_ATTR_IDX = 1;
+ constexpr int64_t HC_EPS_ATTR_IDX = 2;
+ constexpr int64_t NORM_EPS_ATTR_IDX = 3;
+ constexpr int64_t DEFAULT_ITER_TIMES = 20;
++constexpr int64_t SUPPORTED_HC_MULT = 4;
++constexpr int64_t SQUARE_SUM_SIZE = 16;
++constexpr int64_t MASK_PATTERN_DIM_SIZE = 16;
++constexpr int64_t PRE_POST_ROW_WORK_SCALE = 3;
++constexpr int64_t SINKHORN_ROW_WORK_SCALE = 64;
++constexpr int64_t SINKHORN_SETUP_ITER_EQUIVALENT = 4;
++constexpr int64_t SMALL_BS_THRESHOLD = 32;
++constexpr uint64_t MPMD_TILING_KEY = 0;
++constexpr uint64_t ORIGINAL_TILING_KEY = 1;
++constexpr uint64_t PREMIX_TILING_KEY = 2;
+ }
+ 
+ ge::graphStatus HcPreTiling::GetPlatformInfo()
+@@ -96,21 +107,34 @@ ge::graphStatus HcPreTiling::GetAttr()
+ 
+ ge::graphStatus HcPreTiling::GetShapeAttrsInfoInner()
+ {
++    OPS_ERR_IF(GetAttr() != ge::GRAPH_SUCCESS,
++                  OPS_LOG_E(context_->GetNodeName(), "get attr failed."),
++                  return ge::GRAPH_FAILED);
++
+     // (b, s, hc_mult, d) or (bs, hc_mult, d)
+     auto xShape = context_->GetInputShape(0);
+     OPS_LOG_E_IF_NULL(context_, xShape, return ge::GRAPH_FAILED);
+     size_t xDimNum = xShape->GetStorageShape().GetDimNum();
++    int64_t shapeHcMult = 0;
+     if (xDimNum == 3) {
+         bs_ = xShape->GetStorageShape().GetDim(0);
+-        hcMult_ = xShape->GetStorageShape().GetDim(1);
++        shapeHcMult = xShape->GetStorageShape().GetDim(1);
+         d_ = xShape->GetStorageShape().GetDim(2);
+     } else if (xDimNum == 4) {
+         int64_t b = xShape->GetStorageShape().GetDim(0);
+         int64_t s = xShape->GetStorageShape().GetDim(1);
+         bs_ = b * s;
+-        hcMult_ = xShape->GetStorageShape().GetDim(2);
++        shapeHcMult = xShape->GetStorageShape().GetDim(2);
+         d_ = xShape->GetStorageShape().GetDim(3);
+     }
++    OPS_ERR_IF(shapeHcMult != hcMult_,
++                OPS_LOG_E(context_->GetNodeName(),
++                          "hc_mult attr %ld should match x hc_mult dimension %ld", hcMult_, shapeHcMult),
++                return ge::GRAPH_FAILED);
++    OPS_ERR_IF(hcMult_ != SUPPORTED_HC_MULT,
++                OPS_LOG_E(context_->GetNodeName(),
++                          "HcPre only supports hc_mult=%ld, but got %ld", SUPPORTED_HC_MULT, hcMult_),
++                return ge::GRAPH_FAILED);
+ 
+     auto shapeHcFn = context_->GetInputShape(1);
+     hcMix_ = shapeHcFn->GetStorageShape().GetDim(0);
+@@ -134,20 +158,263 @@ ge::graphStatus HcPreTiling::GetShapeAttrsInfoInner()
+                              "hc_base size should be equal with mixhc, but is %ld", baseFirstDim),
+                     return ge::GRAPH_FAILED);
+ 
+-    // 可选输入 pre_mix: [bs, hc_mult] fp32
+-    tilingData_.set_hasPreMix(context_->GetInputShape(4) != nullptr ? 1 : 0);
+-    // 可选输出 pre: 内部计算的 pre 结果拷出
+-    tilingData_.set_hasPreOut(context_->GetOutputShape(3) != nullptr ? 1 : 0);
+-
+-    OPS_ERR_IF(GetAttr() != ge::GRAPH_SUCCESS,
+-                  OPS_LOG_E(context_->GetNodeName(), "get attr failed."),
+-                  return ge::GRAPH_FAILED);
++    // 可选输入 pre_mix: [bs, hc_mult] fp32; gen_placeholder模式下GetInputShape恒非空, 必须用GetOptionalInputTensor判空
++    tilingData_.set_hasPreMix(context_->GetOptionalInputTensor(4) != nullptr ? 1 : 0);
++    // 可选输出 pre: 无GetOptionalOutputTensor对应API, 用shape内容判别(占位shape无有效首维)
++    auto preOutShape = context_->GetOutputShape(3);
++    bool hasPreOut = preOutShape != nullptr && preOutShape->GetStorageShape().GetDimNum() > 0 &&
++                     preOutShape->GetStorageShape().GetDim(0) > 0;
++    tilingData_.set_hasPreOut(hasPreOut ? 1 : 0);
+ 
+     return ge::GRAPH_SUCCESS;
+ }
+ 
+ 
++void HcPreTiling::CalcVectorCoreNum()
++{
++    int64_t totalCoreNum = static_cast<int64_t>(aivCoreNum_);
++    int64_t effectiveIterTimes = std::max(iterTimes_, static_cast<int64_t>(1));
++
++    // Estimate the work per row and test each core split with rounded row counts.
++    uint64_t prePostRowWork = static_cast<uint64_t>(PRE_POST_ROW_WORK_SCALE) * d_;
++    uint64_t sinkhornRowWork = static_cast<uint64_t>(SINKHORN_ROW_WORK_SCALE) * hcMult_ *
++        (effectiveIterTimes + SINKHORN_SETUP_ITER_EQUIVALENT);
++    uint64_t bestLatency = 0;
++    uint64_t bestImbalance = 0;
++    bool hasCandidate = false;
++
++    for (int64_t candidatePrePostCoreNum = 1; candidatePrePostCoreNum < totalCoreNum;
++        candidatePrePostCoreNum++) {
++        int64_t candidateSinkhornCoreNum = totalCoreNum - candidatePrePostCoreNum;
++        uint64_t prePostLatency = static_cast<uint64_t>(CeilDiv(bs_, candidatePrePostCoreNum)) *
++            prePostRowWork;
++        uint64_t sinkhornLatency = static_cast<uint64_t>(CeilDiv(bs_, candidateSinkhornCoreNum)) *
++            sinkhornRowWork;
++        uint64_t latency = std::max(prePostLatency, sinkhornLatency);
++        uint64_t imbalance = prePostLatency > sinkhornLatency ?
++            prePostLatency - sinkhornLatency : sinkhornLatency - prePostLatency;
++        if (!hasCandidate || latency < bestLatency ||
++            (latency == bestLatency && imbalance < bestImbalance)) {
++            hasCandidate = true;
++            bestLatency = latency;
++            bestImbalance = imbalance;
++            prePostCoreNum_ = candidatePrePostCoreNum;
++            sinkhornCoreNum_ = candidateSinkhornCoreNum;
++        }
++    }
++}
++
+ ge::graphStatus HcPreTiling::CalcMKSplitCoreMembasePart2Tiling()
++{
++    // preMix 场景使用独立的 tilingKey=2 和按行分配策略。
++    if (tilingData_.get_hasPreMix() != 0) {
++        return CalcPremixPart2Tiling();
++    }
++    bool useOriginal = bs_ <= SMALL_BS_THRESHOLD;
++    if (useOriginal) {
++        tilingKey_ = ORIGINAL_TILING_KEY;
++        rowOfFormerBlock_ = CeilDiv(bs_, static_cast<int64_t>(aivCoreNum_));
++    } else {
++        tilingKey_ = MPMD_TILING_KEY;
++        OPS_ERR_IF(aivCoreNum_ < 2,
++            OPS_LOG_E(context_->GetNodeName(),
++                "HcPre MPMD requires at least two vector cores, but got %lu", aivCoreNum_),
++            return ge::GRAPH_FAILED);
++        CalcVectorCoreNum();
++        rowOfFormerBlock_ = CeilDiv(bs_, prePostCoreNum_);
++    }
++
++    int64_t stage2CoreNum = useOriginal ? static_cast<int64_t>(aivCoreNum_) : prePostCoreNum_;
++    usedAivCoreNums_ = std::min(CeilDiv(bs_, rowOfFormerBlock_), stage2CoreNum);
++    rowOfTailBlock_ = bs_ - (usedAivCoreNums_ - 1) * rowOfFormerBlock_;
++
++    int64_t minRowPerCore = 1;
++    int64_t rowOnceLoop = std::min(rowOfFormerBlock_, minRowPerCore);
++    int64_t kBlockNum = tilingData_.get_cubeBlockDimK();
++
++    hcMultAlign_ = RoundUp(hcMult_, BLOCK_SIZE / sizeof(float));
++    int64_t mix0OriginSize = kBlockNum * rowOnceLoop * hcMultAlign_ * sizeof(float) * DOUBLE_BUFFER;
++    int64_t mix1OriginSize = kBlockNum * rowOnceLoop * hcMultAlign_ * sizeof(float) * DOUBLE_BUFFER;
++    int64_t mix0Size = rowOnceLoop * hcMultAlign_ * sizeof(float);
++    int64_t mix1Size = rowOnceLoop * hcMultAlign_ * sizeof(float);
++    int64_t squareSumSize = kBlockNum * RoundUp(rowOnceLoop * 16, 16) * sizeof(float) * DOUBLE_BUFFER;
++    int64_t squareReduceSize = rowOnceLoop * SQUARE_SUM_SIZE * sizeof(float);
++    int64_t rsqrtSize = RoundUp(rowOnceLoop, BLOCK_SIZE / sizeof(float)) * sizeof(float);
++    int64_t xSize = rowOnceLoop * hcMult_ * RoundUp(d_, 16) * 2 * DOUBLE_BUFFER; // x是bfloat16_t 类型
++    int64_t ySize = rowOnceLoop * RoundUp(d_, 16) * 2 * DOUBLE_BUFFER;
++    int64_t postSize = rowOnceLoop * hcMultAlign_ * sizeof(float) * DOUBLE_BUFFER;
++    int64_t base0Size = hcMultAlign_ * sizeof(float);
++    int64_t base1Size = hcMultAlign_ * sizeof(float);
++    int64_t xCastSize = rowOnceLoop * hcMult_ * RoundUp(d_, 8) * sizeof(float);
++    int64_t yCastSize = rowOnceLoop * RoundUp(d_, 8) * sizeof(float);
++    int64_t rowBrcb0Size = RoundUp(rowOnceLoop, 8) * BLOCK_SIZE;
++    int64_t hcBrcb1Size = RoundUp(rowOnceLoop * hcMultAlign_, 8) * BLOCK_SIZE;
++    int64_t maskPatternSize = (rowOnceLoop + MASK_PATTERN_DIM_SIZE - 1) * BLOCK_SIZE;
++    auto calcOriginalExtraSize = [&](int64_t rowFactor) {
++        if (!useOriginal) {
++            return static_cast<int64_t>(0);
++        }
++        int64_t mix2OriginSize = kBlockNum * rowFactor * hcMult_ * hcMultAlign_ *
++            sizeof(float) * DOUBLE_BUFFER;
++        int64_t combFragSize = rowFactor * hcMult_ * hcMultAlign_ *
++            sizeof(float) * DOUBLE_BUFFER;
++        int64_t base2Size = hcMult_ * hcMultAlign_ * sizeof(float);
++        int64_t reduceBufSize = rowFactor * hcMultAlign_ * sizeof(float);
++        int64_t mix2Size = rowFactor * hcMult_ * hcMultAlign_ * sizeof(float);
++        return mix2OriginSize + combFragSize + base2Size + reduceBufSize + mix2Size;
++    };
++    int64_t originalExtraSize = calcOriginalExtraSize(rowOnceLoop);
++
++    int64_t totalSize = mix0OriginSize + mix1OriginSize + mix0Size + mix1Size +
++                     squareSumSize + squareReduceSize + rsqrtSize + xSize + ySize + postSize + base0Size + base1Size +
++                     xCastSize + yCastSize +
++                     rowBrcb0Size + hcBrcb1Size + maskPatternSize + originalExtraSize;
++    rowFactor_ = rowOnceLoop;
++    if (totalSize <= ubSize_) {
++        // row和d均可以在ub内全载
++        dLoop_ = 1;
++        dFactor_ = d_;
++        tailDFactor_ = dFactor_;
++    } else {
++        int64_t usedUbSize = mix0OriginSize + mix1OriginSize + mix0Size + mix1Size +
++                     squareSumSize + squareReduceSize + rsqrtSize +
++                     postSize + base0Size + base1Size +
++                     rowBrcb0Size + hcBrcb1Size + maskPatternSize + originalExtraSize;
++        int64_t ubRemain = ubSize_ - usedUbSize;
++        dFactor_ = d_;
++        int64_t base = 2;
++        while (1) {
++            dFactor_ = CeilDiv(d_, base);
++            xSize = rowOnceLoop * hcMult_ * RoundUp(dFactor_, 16) * 2 * DOUBLE_BUFFER; // x是bfloat16_t 类型
++            ySize = rowOnceLoop * RoundUp(dFactor_, 16) * 2 * DOUBLE_BUFFER;
++            xCastSize = rowOnceLoop * hcMult_ * RoundUp(dFactor_, 8) * sizeof(float);
++            yCastSize = rowOnceLoop * RoundUp(dFactor_, 8) * sizeof(float);
++            int64_t targetSize = xSize + ySize + xCastSize + yCastSize;
++            if (targetSize <= ubRemain) {
++                break;
++            }
++            base++;
++        }
++        if (dFactor_ > 32) {
++            dFactor_ = DownAlign(dFactor_, 32);
++        }
++        dLoop_ = CeilDiv(d_, dFactor_);
++        tailDFactor_ = d_ % dFactor_ == 0 ? dFactor_ : d_ % dFactor_;
++    }
++
++    // d全载,尝试搬入更多的bs
++    if (dFactor_ == d_) {
++        while (rowFactor_ <= rowOfFormerBlock_) {
++            mix0OriginSize = kBlockNum * rowFactor_ * hcMultAlign_ * sizeof(float) * DOUBLE_BUFFER;
++            mix1OriginSize = kBlockNum * rowFactor_ * hcMultAlign_ * sizeof(float) * DOUBLE_BUFFER;
++            mix0Size = rowFactor_ * hcMultAlign_ * sizeof(float);
++            mix1Size = rowFactor_ * hcMultAlign_ * sizeof(float);
++            squareSumSize = kBlockNum * RoundUp(rowFactor_ * 16, 16) * sizeof(float) * DOUBLE_BUFFER;
++            squareReduceSize = rowFactor_ * SQUARE_SUM_SIZE * sizeof(float);
++            rsqrtSize = RoundUp(rowFactor_, BLOCK_SIZE / sizeof(float)) * sizeof(float);
++            xSize = rowFactor_ * hcMult_ * RoundUp(d_, 16) * 2 * DOUBLE_BUFFER; // x是bfloat16_t 类型
++            ySize = rowFactor_ * RoundUp(d_, 16) * 2 * DOUBLE_BUFFER;
++            postSize = rowFactor_ * hcMultAlign_ * sizeof(float) * DOUBLE_BUFFER;
++            xCastSize = rowFactor_ * hcMult_ * RoundUp(d_, 8) * sizeof(float);
++            yCastSize = rowFactor_ * RoundUp(d_, 8) * sizeof(float);
++            rowBrcb0Size = RoundUp(rowFactor_, 8) * BLOCK_SIZE;
++            hcBrcb1Size = RoundUp(rowFactor_ * hcMultAlign_, 8) * BLOCK_SIZE;
++            maskPatternSize = (rowFactor_ + MASK_PATTERN_DIM_SIZE - 1) * BLOCK_SIZE;
++            originalExtraSize = calcOriginalExtraSize(rowFactor_);
++            totalSize = mix0OriginSize + mix1OriginSize + mix0Size + mix1Size +
++            squareSumSize + squareReduceSize + rsqrtSize +
++            xSize + ySize + postSize + base0Size + base1Size + xCastSize + yCastSize +
++            rowBrcb0Size + hcBrcb1Size + maskPatternSize + originalExtraSize;
++            if (totalSize > ubSize_) {
++                rowFactor_ = rowFactor_ - 1;
++                break;
++            }
++            rowFactor_ = rowFactor_ + 1;
++        }
++        rowFactor_ = rowFactor_ > rowOfFormerBlock_ ? rowFactor_ - 1 : rowFactor_;
++    }
++
++    // The pre/post transforms only need row-sized state; y still uses the
++    // full-D buffers above. Give pre/post its own row tile so a full-D shape
++    // does not force sigmoid and RMSNorm setup to run once per row.
++    int64_t prePostRowFactor = rowFactor_;
++    if (!useOriginal) {
++        auto calcPrePostSize = [&](int64_t candidateRow) {
++            int64_t originSize = kBlockNum * candidateRow * hcMultAlign_ * sizeof(float) * DOUBLE_BUFFER;
++            int64_t reduceSize = candidateRow * hcMultAlign_ * sizeof(float);
++            int64_t squareSize = kBlockNum * RoundUp(candidateRow * 16, 16) * sizeof(float) * DOUBLE_BUFFER;
++            int64_t squareReduce = candidateRow * SQUARE_SUM_SIZE * sizeof(float);
++            int64_t rsqrt = RoundUp(candidateRow, BLOCK_SIZE / sizeof(float)) * sizeof(float);
++            int64_t post = rowFactor_ * hcMultAlign_ * sizeof(float) * DOUBLE_BUFFER;
++            int64_t rowBrcb = RoundUp(candidateRow, BLOCK_SIZE / sizeof(float)) * BLOCK_SIZE;
++            int64_t hcBrcb = RoundUp(candidateRow * hcMultAlign_, BLOCK_SIZE / sizeof(float)) * BLOCK_SIZE;
++            int64_t mask = (candidateRow + MASK_PATTERN_DIM_SIZE - 1) * BLOCK_SIZE;
++            int64_t yX = rowFactor_ * hcMult_ * RoundUp(dFactor_, 16) * 2 * DOUBLE_BUFFER;
++            int64_t yY = rowFactor_ * RoundUp(dFactor_, 16) * 2 * DOUBLE_BUFFER;
++            int64_t yXCast = rowFactor_ * hcMult_ * RoundUp(dFactor_, 8) * sizeof(float);
++            int64_t yYCast = rowFactor_ * RoundUp(dFactor_, 8) * sizeof(float);
++            return originSize * 2 + reduceSize * 2 + squareSize + squareReduce + rsqrt +
++                post + base0Size + base1Size + yX + yY + yXCast + yYCast + rowBrcb + hcBrcb + mask;
++        };
++        prePostRowFactor = 1;
++        for (int64_t candidateRow = 1; candidateRow <= rowOfFormerBlock_; candidateRow++) {
++            if (calcPrePostSize(candidateRow) > static_cast<int64_t>(ubSize_)) {
++                break;
++            }
++            prePostRowFactor = candidateRow;
++        }
++        // Cap the pre/post row batch at four after checking UB capacity.
++        if (prePostRowFactor > 4) {
++            prePostRowFactor = 4;
++        }
++    }
++    int64_t prePostRowLoopOfFormerBlock = CeilDiv(rowOfFormerBlock_, prePostRowFactor);
++    int64_t prePostRowLoopOfTailBlock = CeilDiv(rowOfTailBlock_, prePostRowFactor);
++    int64_t prePostTailRowFactorOfFormerBlock = rowOfFormerBlock_ % prePostRowFactor == 0 ?
++        prePostRowFactor : rowOfFormerBlock_ % prePostRowFactor;
++    int64_t prePostTailRowFactorOfTailBlock = rowOfTailBlock_ % prePostRowFactor == 0 ?
++        prePostRowFactor : rowOfTailBlock_ % prePostRowFactor;
++    rowLoopOfFormerBlock_ = CeilDiv(rowOfFormerBlock_, rowFactor_);
++    rowLoopOfTailBlock_ = CeilDiv(rowOfTailBlock_, rowFactor_);
++    tailRowFactorOfFormerBlock_ = rowOfFormerBlock_ % rowFactor_ == 0 ? rowFactor_ : rowOfFormerBlock_ % rowFactor_;
++    tailRowFactorOfTailBlock_ = rowOfTailBlock_ % rowFactor_ == 0 ? rowFactor_ : rowOfTailBlock_ % rowFactor_;
++
++    tilingData_.set_bs(bs_);
++    tilingData_.set_hcMix(hcMix_);
++    tilingData_.set_hcMult(hcMult_);
++    tilingData_.set_d(d_);
++    tilingData_.set_hcMultAlign(hcMultAlign_);
++    tilingData_.set_rowOfFormerBlock(rowOfFormerBlock_);
++    tilingData_.set_rowOfTailBlock(rowOfTailBlock_);
++    tilingData_.set_rowLoopOfFormerBlock(rowLoopOfFormerBlock_);
++    tilingData_.set_rowLoopOfTailBlock(rowLoopOfTailBlock_);
++    tilingData_.set_stage2RowFactor(rowFactor_);
++    tilingData_.set_secondUsedCoreNum(usedAivCoreNums_);
++    tilingData_.set_tailRowFactorOfFormerBlock(tailRowFactorOfFormerBlock_);
++    tilingData_.set_tailRowFactorOfTailBlock(tailRowFactorOfTailBlock_);
++    tilingData_.set_dLoop(dLoop_);
++    tilingData_.set_dFactor(dFactor_);
++    tilingData_.set_tailDFactor(tailDFactor_);
++    tilingData_.set_iterTimes(iterTimes_);
++    tilingData_.set_hcEps(hcEps_);
++    tilingData_.set_normEps(normEps_);
++    tilingData_.set_prePostCoreNum(prePostCoreNum_);
++    tilingData_.set_sinkhornCoreNum(sinkhornCoreNum_);
++    tilingData_.set_prePostRowOfFormerBlock(rowOfFormerBlock_);
++    tilingData_.set_prePostRowOfTailBlock(rowOfTailBlock_);
++    tilingData_.set_prePostRowLoopOfFormerBlock(prePostRowLoopOfFormerBlock);
++    tilingData_.set_prePostRowLoopOfTailBlock(prePostRowLoopOfTailBlock);
++    tilingData_.set_prePostRowFactor(prePostRowFactor);
++    tilingData_.set_prePostTailRowFactorOfFormerBlock(prePostTailRowFactorOfFormerBlock);
++    tilingData_.set_prePostTailRowFactorOfTailBlock(prePostTailRowFactorOfTailBlock);
++    if (useOriginal) {
++        return ge::GRAPH_SUCCESS;
++    }
++    return CalcSinkhornTiling();
++}
++
++// preMix 场景的 Part2 tiling：按行分配，UB 预算包含 mix2、combFrag、base2 和 reduceBuf。
++ge::graphStatus HcPreTiling::CalcPremixPart2Tiling()
+ {
+     rowOfFormerBlock_ = CeilDiv(bs_, static_cast<int64_t>(aivCoreNum_));
+     usedAivCoreNums_ = std::min(CeilDiv(bs_, rowOfFormerBlock_), static_cast<int64_t>(aivCoreNum_));
+@@ -257,6 +524,7 @@ ge::graphStatus HcPreTiling::CalcMKSplitCoreMembasePart2Tiling()
+     tailRowFactorOfFormerBlock_ = rowOfFormerBlock_ % rowFactor_ == 0 ? rowFactor_ : rowOfFormerBlock_ % rowFactor_;
+     tailRowFactorOfTailBlock_ = rowOfTailBlock_ % rowFactor_ == 0 ? rowFactor_ : rowOfTailBlock_ % rowFactor_;
+ 
++    tilingKey_ = PREMIX_TILING_KEY;
+     tilingData_.set_bs(bs_);
+     tilingData_.set_hcMix(hcMix_);
+     tilingData_.set_hcMult(hcMult_);
+@@ -279,13 +547,90 @@ ge::graphStatus HcPreTiling::CalcMKSplitCoreMembasePart2Tiling()
+     return ge::GRAPH_SUCCESS;
+ }
+ 
++ge::graphStatus HcPreTiling::CalcSinkhornTiling()
++{
++    sinkhornRowOfFormerBlock_ = CeilDiv(bs_, sinkhornCoreNum_);
++    sinkhornUsedCoreNum_ = std::min(CeilDiv(bs_, sinkhornRowOfFormerBlock_), sinkhornCoreNum_);
++    sinkhornRowOfTailBlock_ = bs_ - (sinkhornUsedCoreNum_ - 1) * sinkhornRowOfFormerBlock_;
++
++    int64_t kBlockNum = tilingData_.get_cubeBlockDimK();
++    auto calcTotalSize = [&](int64_t rowFactor) {
++        int64_t rowFactorAlign = RoundUp(rowFactor, BLOCK_SIZE / sizeof(float));
++        int64_t matrixSize = hcMult_ * hcMult_;
++        int64_t mix2OriginSize = kBlockNum * rowFactor * matrixSize * sizeof(float) * DOUBLE_BUFFER;
++        int64_t combFragSize = rowFactor * matrixSize * sizeof(float) * DOUBLE_BUFFER;
++        int64_t squareSumSize = kBlockNum * RoundUp(rowFactor * SQUARE_SUM_SIZE, SQUARE_SUM_SIZE) *
++                                sizeof(float) * DOUBLE_BUFFER;
++        int64_t rsqrtSize = RoundUp(rowFactor, BLOCK_SIZE / sizeof(float)) * sizeof(float);
++        int64_t squareReduceSize = rowFactor * SQUARE_SUM_SIZE * sizeof(float);
++        int64_t mixes02ReduceSize = matrixSize * rowFactorAlign * sizeof(float);
++        int64_t reduceBufSize = hcMult_ * rowFactorAlign * sizeof(float);
++        int64_t rowBrcb0Size = RoundUp(rowFactor, BLOCK_SIZE / sizeof(float)) * BLOCK_SIZE;
++        int64_t hcBrcb1Size = matrixSize * BLOCK_SIZE;
++        int64_t maskPatternSize = (rowFactor + MASK_PATTERN_DIM_SIZE - 1) * BLOCK_SIZE;
++        return mix2OriginSize + combFragSize + squareSumSize + rsqrtSize + squareReduceSize +
++               mixes02ReduceSize + reduceBufSize + rowBrcb0Size + hcBrcb1Size + maskPatternSize;
++    };
++
++    int64_t base2Size = hcMult_ * hcMult_ * sizeof(float);
++
++    int64_t maxSinkhornRowFactor = std::min(sinkhornRowOfFormerBlock_, static_cast<int64_t>(64));
++    // Keep double buffering for generalized batch sizes. The row-factor search
++    // accounts for both queue slots so the allocation stays in UB.
++    sinkhornRowFactor_ = 1;
++    while (sinkhornRowFactor_ <= maxSinkhornRowFactor) {
++        if (calcTotalSize(sinkhornRowFactor_) + base2Size > static_cast<int64_t>(ubSize_)) {
++            sinkhornRowFactor_--;
++            break;
++        }
++        sinkhornRowFactor_++;
++    }
++    sinkhornRowFactor_ = std::min(sinkhornRowFactor_, maxSinkhornRowFactor);
++    OPS_ERR_IF(sinkhornRowFactor_ < 1,
++        OPS_LOG_E(context_->GetNodeName(), "HcPre sinkhorn buffers exceed UB size %lu", ubSize_),
++        return ge::GRAPH_FAILED);
++
++    sinkhornRowLoopOfFormerBlock_ = CeilDiv(sinkhornRowOfFormerBlock_, sinkhornRowFactor_);
++    sinkhornRowLoopOfTailBlock_ = CeilDiv(sinkhornRowOfTailBlock_, sinkhornRowFactor_);
++    sinkhornTailRowFactorOfFormerBlock_ = sinkhornRowOfFormerBlock_ % sinkhornRowFactor_ == 0 ?
++        sinkhornRowFactor_ : sinkhornRowOfFormerBlock_ % sinkhornRowFactor_;
++    sinkhornTailRowFactorOfTailBlock_ = sinkhornRowOfTailBlock_ % sinkhornRowFactor_ == 0 ?
++        sinkhornRowFactor_ : sinkhornRowOfTailBlock_ % sinkhornRowFactor_;
++
++    tilingData_.set_sinkhornUsedCoreNum(sinkhornUsedCoreNum_);
++    tilingData_.set_sinkhornRowOfFormerBlock(sinkhornRowOfFormerBlock_);
++    tilingData_.set_sinkhornRowOfTailBlock(sinkhornRowOfTailBlock_);
++    tilingData_.set_sinkhornRowLoopOfFormerBlock(sinkhornRowLoopOfFormerBlock_);
++    tilingData_.set_sinkhornRowLoopOfTailBlock(sinkhornRowLoopOfTailBlock_);
++    tilingData_.set_sinkhornRowFactor(sinkhornRowFactor_);
++    tilingData_.set_sinkhornTailRowFactorOfFormerBlock(sinkhornTailRowFactorOfFormerBlock_);
++    tilingData_.set_sinkhornTailRowFactorOfTailBlock(sinkhornTailRowFactorOfTailBlock_);
++    return ge::GRAPH_SUCCESS;
++}
++
+ ge::graphStatus HcPreTiling::CalcOpTiling() {
+     uint64_t kSize = hcMult_ * d_;
+     tilingData_.set_k(kSize);
+     // 计算bs_轴切核
+     uint64_t mDimNum = std::min(aicCoreNum_, static_cast<uint64_t>(CeilDiv(bs_, M_L1_MAX_SIZE)));
+-    uint64_t singleCoreM = RoundUp(CeilDiv(bs_, mDimNum), AscendC::BLOCK_CUBE);
+     uint64_t kDimNum = aicCoreNum_ / mDimNum;
++    if (kDimNum == 1) {
++        // K cannot use the remaining AICs, so distribute M across all cores.
++        mDimNum = aicCoreNum_;
++    } else if (aicCoreNum_ % mDimNum != 0) {
++        // Align mDimNum up to the nearest factor of aicCoreNum_ so that
++        // mDimNum * kDimNum == aicCoreNum_ holds exactly. Without this the
++        // integer division truncates kDimNum and the trailing AIC cores idle
++        // (e.g. bs=2024: mDimNum=8, kDimNum=2, only 16 of 20 AICs run).
++        for (uint64_t factor = mDimNum; factor <= aicCoreNum_; ++factor) {
++            if (aicCoreNum_ % factor == 0) {
++                mDimNum = factor;
++                break;
++            }
++        }
++    }
++    uint64_t singleCoreM = RoundUp(CeilDiv(bs_, static_cast<int64_t>(mDimNum)), AscendC::BLOCK_CUBE);
++    kDimNum = aicCoreNum_ / mDimNum;
+     uint64_t splitKSize = RoundUp(CeilDiv(kSize, kDimNum), K_MULIT_CORE_SPLIT_BASE_SIZE);
+ 
+     tilingData_.set_cubeBlockDimM(mDimNum);
+@@ -296,7 +641,7 @@ ge::graphStatus HcPreTiling::CalcOpTiling() {
+     tilingData_.set_kL1Size(std::min(A_L1_SIZE / tilingData_.get_mL1Size(),
+     static_cast<uint64_t>(K_L1_MAX_SIZE)) / K_L1_ALIGN_SIZE * K_L1_ALIGN_SIZE);
+ 
+-    tilingData_.set_cvLoopKSize(1024);
++    tilingData_.set_cvLoopKSize(CV_LOOP_K_SIZE);
+ 
+     // vector stage1 tiling
+     tilingData_.set_cubeCoreNum(static_cast<int64_t>(aicCoreNum_));
+@@ -356,8 +701,14 @@ ge::graphStatus HcPreTiling::GetWorkspaceSize()
+ 
+ ge::graphStatus HcPreTiling::PostTiling()
+ {
+-    context_->SetTilingKey(0);
++    context_->SetTilingKey(tilingKey_);
+     context_->SetBlockDim(aicCoreNum_);
++    if (tilingKey_ == MPMD_TILING_KEY) {
++        auto ret = context_->SetScheduleMode(1);
++        OPS_ERR_IF(ret != ge::GRAPH_SUCCESS,
++            OPS_LOG_E(context_, "Failed to set schedule mode to 1 for HcPre."),
++            return ge::GRAPH_FAILED);
++    }
+     size_t* workspaces = context_->GetWorkspaceSizes(1);
+     workspaces[0] = workspaceSize_;
+     tilingData_.SaveToBuffer(context_->GetRawTilingData()->GetData(), context_->GetRawTilingData()->GetCapacity());
+diff --git a/csrc/moe/hc_pre/op_host/hc_pre_tiling.h b/csrc/moe/hc_pre/op_host/hc_pre_tiling.h
+index 79ead7e6c..b78c4aef9 100644
+--- a/csrc/moe/hc_pre/op_host/hc_pre_tiling.h
++++ b/csrc/moe/hc_pre/op_host/hc_pre_tiling.h
+@@ -78,7 +78,7 @@ TILING_DATA_FIELD_DEF(int64_t, cubeBlockDimK);
+ TILING_DATA_FIELD_DEF(int64_t, kUbSize); // ub一次处理k的size
+ TILING_DATA_FIELD_DEF(int64_t, cvLoopKSize); // cv同步使用的k轴长度
+ TILING_DATA_FIELD_DEF(int64_t, multCoreSplitKSize); // 多核切K后的单核k处理长度
+-TILING_DATA_FIELD_DEF(int64_t, multCoreSplitMSize); // 多核切K后的单核k处理长度
++TILING_DATA_FIELD_DEF(int64_t, multCoreSplitMSize); // 多核切 M 后单核处理的 M 轴长度
+ TILING_DATA_FIELD_DEF(int64_t, tailKSizeOfFormerBlock);
+ TILING_DATA_FIELD_DEF(int64_t, tailKSizeOfTailBlock);
+ 
+@@ -102,6 +102,24 @@ TILING_DATA_FIELD_DEF(int64_t, mUbSize);
+ TILING_DATA_FIELD_DEF(int64_t, hasPreMix);
+ TILING_DATA_FIELD_DEF(int64_t, hasPreOut);
+ 
++TILING_DATA_FIELD_DEF(int64_t, prePostCoreNum);
++TILING_DATA_FIELD_DEF(int64_t, sinkhornCoreNum);
++TILING_DATA_FIELD_DEF(int64_t, prePostRowOfFormerBlock);
++TILING_DATA_FIELD_DEF(int64_t, prePostRowOfTailBlock);
++TILING_DATA_FIELD_DEF(int64_t, prePostRowLoopOfFormerBlock);
++TILING_DATA_FIELD_DEF(int64_t, prePostRowLoopOfTailBlock);
++TILING_DATA_FIELD_DEF(int64_t, prePostRowFactor);
++TILING_DATA_FIELD_DEF(int64_t, prePostTailRowFactorOfFormerBlock);
++TILING_DATA_FIELD_DEF(int64_t, prePostTailRowFactorOfTailBlock);
++TILING_DATA_FIELD_DEF(int64_t, sinkhornUsedCoreNum);
++TILING_DATA_FIELD_DEF(int64_t, sinkhornRowOfFormerBlock);
++TILING_DATA_FIELD_DEF(int64_t, sinkhornRowOfTailBlock);
++TILING_DATA_FIELD_DEF(int64_t, sinkhornRowLoopOfFormerBlock);
++TILING_DATA_FIELD_DEF(int64_t, sinkhornRowLoopOfTailBlock);
++TILING_DATA_FIELD_DEF(int64_t, sinkhornRowFactor);
++TILING_DATA_FIELD_DEF(int64_t, sinkhornTailRowFactorOfFormerBlock);
++TILING_DATA_FIELD_DEF(int64_t, sinkhornTailRowFactorOfTailBlock);
++
+ END_TILING_DATA_DEF;
+ 
+ REGISTER_TILING_DATA_CLASS(HcPre, HcPreTilingData)
+@@ -127,7 +145,10 @@ public:
+     ge::graphStatus GetAttr();
+     ge::graphStatus GetShapeAttrsInfoInner();
+     ge::graphStatus CalcOpTiling();
++    void CalcVectorCoreNum();
+     ge::graphStatus CalcMKSplitCoreMembasePart2Tiling();
++    ge::graphStatus CalcPremixPart2Tiling();
++    ge::graphStatus CalcSinkhornTiling();
+ 
+ private:
+     gert::TilingContext *context_ = nullptr;
+@@ -157,7 +178,17 @@ private:
+     double hcEps_ = 0.0;
+     double normEps_ = 0.0;
+     platform_ascendc::SocVersion socVersion_ = platform_ascendc::SocVersion::ASCEND910B;
++    int64_t prePostCoreNum_ = 0;
++    int64_t sinkhornCoreNum_ = 0;
++    int64_t sinkhornUsedCoreNum_ = 0;
++    int64_t sinkhornRowOfFormerBlock_ = 0;
++    int64_t sinkhornRowOfTailBlock_ = 0;
++    int64_t sinkhornRowLoopOfFormerBlock_ = 0;
++    int64_t sinkhornRowLoopOfTailBlock_ = 0;
++    int64_t sinkhornRowFactor_ = 0;
++    int64_t sinkhornTailRowFactorOfFormerBlock_ = 0;
++    int64_t sinkhornTailRowFactorOfTailBlock_ = 0;
+ };
+ 
+ }  // namespace optiling
+-#endif  // HC_PRE_SINKHORN_TILING_H
++#endif  // HC_PRE_SINKHORN_TILING_H
+\ No newline at end of file
+diff --git a/csrc/moe/hc_pre/op_kernel/hc_pre.cpp b/csrc/moe/hc_pre/op_kernel/hc_pre.cpp
+index 1a96d8864..0c87a4249 100644
+--- a/csrc/moe/hc_pre/op_kernel/hc_pre.cpp
++++ b/csrc/moe/hc_pre/op_kernel/hc_pre.cpp
+@@ -99,7 +99,38 @@ extern "C" __global__ __aicore__ void hc_pre(GM_ADDR x, GM_ADDR hc_fn, GM_ADDR h
+             pipe.Destroy();
+ 
+             TPipe pipeStage2;
+-            HcPre::HcPreMembaseKSplitCorePart2<DTYPE_X> op2;
++            HcPre::HcPreMembaseKSplitCorePart2<DTYPE_X, false> op2;
++            op2.Init(x, hc_scale, hc_base, y, post, comb_frag, pre_mix, pre, userWs, tilingData, &pipeStage2);
++            op2.Process();
++
++            pipeStage2.Destroy();
++        } else if (TILING_KEY_IS(1)) {
++            GET_TILING_DATA_WITH_STRUCT(HcPreTilingData, tiling_data_in, tiling);
++            const HcPreTilingData *__restrict tilingData = &tiling_data_in;
++            HcPre::HcPreMembaseKSplitCorePart1<DTYPE_X> op;
++            op.Init(x, hc_fn, userWs, tilingData, &pipe);
++            op.Process();
++
++            pipe.Destroy();
++
++            TPipe pipeStage2;
++            HcPre::HcPreMembaseKSplitCorePart2<DTYPE_X, true> op2;
++            op2.Init(x, hc_scale, hc_base, y, post, comb_frag, pre_mix, pre, userWs, tilingData, &pipeStage2);
++            op2.Process();
++
++            pipeStage2.Destroy();
++        } else if (TILING_KEY_IS(2)) {
++            // preMix 场景使用独立的 Part2 实现。
++            GET_TILING_DATA_WITH_STRUCT(HcPreTilingData, tiling_data_in, tiling);
++            const HcPreTilingData *__restrict tilingData = &tiling_data_in;
++            HcPre::HcPreMembaseKSplitCorePart1<DTYPE_X> op;
++            op.Init(x, hc_fn, userWs, tilingData, &pipe);
++            op.Process();
++
++            pipe.Destroy();
++
++            TPipe pipeStage2;
++            HcPre::HcPreMembaseKSplitCorePremixPart2<DTYPE_X> op2;
+             op2.Init(x, hc_scale, hc_base, y, post, comb_frag, pre_mix, pre, userWs, tilingData, &pipeStage2);
+             op2.Process();
+ 
+diff --git a/csrc/moe/hc_pre/op_kernel/hc_pre_base.h b/csrc/moe/hc_pre/op_kernel/hc_pre_base.h
+index 65f15c6af..5c0b67836 100644
+--- a/csrc/moe/hc_pre/op_kernel/hc_pre_base.h
++++ b/csrc/moe/hc_pre/op_kernel/hc_pre_base.h
+@@ -20,25 +20,31 @@
+ 
+ namespace HcPre {
+ using namespace AscendC;
+-constexpr int32_t BLOCK_SIZE = 32;
+-constexpr int32_t DEFAULT_BLOCK_STRIDE = 1;
+-constexpr int32_t DEFAULT_REPEAT_STRIDE = 8;
+-constexpr int32_t ONE_REPEAT_BLOCK_NUMS = 8;
+-constexpr int32_t REPEAT_SIZE = 256;
+-constexpr int32_t MAX_REPEAT_STRIDE = 255;
+-constexpr int32_t WORKSPACE_ALIGN_SIZE = 512;
+-constexpr uint32_t ONE = 1;
+-constexpr uint32_t SHIFT_COEFF = 17;
+-constexpr int32_t DOUBLE_BUFFER = 2;
+-constexpr int32_t CV_RATIO = 2;
++
++// ==================== A3架构常量定义 ====================
++// 以下常量用于AscendC A3架构的Vector API参数配置
++constexpr int32_t BLOCK_SIZE = 32;          // 一个Block的字节数（32 Bytes）
++constexpr int32_t DEFAULT_BLOCK_STRIDE = 1; // 默认Block步长（相邻两个Block间隔1个Block）
++constexpr int32_t DEFAULT_REPEAT_STRIDE = 8; // 默认Repeat步长（8个Block = 256 Bytes = 1个Repeat）
++constexpr int32_t ONE_REPEAT_BLOCK_NUMS = 8; // 一个Repeat包含8个Block（256/32=8）
++constexpr int32_t REPEAT_SIZE = 256;         // 一个Repeat的字节大小（256 Bytes）
++constexpr int32_t MAX_REPEAT_STRIDE = 255;   // Repeat步长最大值（255个Block）
++constexpr int32_t WORKSPACE_ALIGN_SIZE = 512; // Workspace地址对齐大小（512 Bytes）
++constexpr uint32_t ONE = 1;                  // GatherMask掩码基础值（bit[0]=1）
++constexpr uint32_t SHIFT_COEFF = 17;        // 移位系数
++constexpr int32_t DOUBLE_BUFFER = 2;        // 双缓冲数量
++constexpr int32_t CV_RATIO = 2;             // Cube:Vector核数比 = 1:2（1个AIC配2个AIV）
+ constexpr uint64_t N_SIZE = 24;
+-constexpr uint64_t NUM_TWO = 2;
+-constexpr uint64_t SQUARE_SUM_SIZE = 16;
+-constexpr uint64_t MASK_PATTERN_BASE_SIZE = 16;
+-constexpr uint64_t MASK_PATTERN_REPEAT_SIZE = 8;
+-constexpr uint64_t MASK_PATTERN_DIM_SIZE = 16;
+-constexpr uint64_t MM_CACHE_LINE_BYTES = 512;
++constexpr uint64_t NUM_TWO = 2;             // 常量2
++constexpr uint64_t SQUARE_SUM_SIZE = 16;    // 平方和输出大小（NZ格式下M×M=16×16）
++constexpr uint64_t MASK_PATTERN_BASE_SIZE = 16;   // GatherMask掩码基础维度大小
++constexpr uint64_t MASK_PATTERN_REPEAT_SIZE = 8;  // 掩码重复子大小
++constexpr uint64_t MASK_PATTERN_DIM_SIZE = 16;    // 掩码单次处理的维度大小
++constexpr uint64_t MM_CACHE_LINE_BYTES = 512;      // MatMul缓存行大小（512 Bytes）
++
++// ==================== 对齐工具函数 ====================
+ 
++// 向上取整除法：返回(a + b - 1) / b
+ __aicore__ inline int32_t CeilDiv(int32_t a, int32_t b)
+ {
+     if (b == 0) {
+@@ -47,74 +53,92 @@ __aicore__ inline int32_t CeilDiv(int32_t a, int32_t b)
+     return (a + b - 1) / b;
+ }
+ 
++// 向上对齐：将a向上对齐到b的倍数
+ __aicore__ inline int32_t CeilAlign(int32_t a, int32_t b)
+ {
+     return CeilDiv(a, b) * b;
+ }
+ 
++// 按类型T的Block元素数向上对齐：用于确保元素数满足32字节Block对齐要求
+ template <typename T>
+ __aicore__ inline int32_t RoundUp(int32_t num)
+ {
+-    int32_t elemNum = BLOCK_SIZE / sizeof(T);
++    int32_t elemNum = BLOCK_SIZE / sizeof(T); // 每个Block中T类型元素的个数
+     return CeilAlign(num, elemNum);
+ }
+ 
+-__aicore__ inline void SetGatherMaskPattern(const LocalTensor<uint32_t>& maskPattern)
++// ==================== GatherMask对角提取（用于RMSNorm平方和） ====================
++
++// 设置GatherMask的循环对角掩码：生成 patternRows 行，第 i 行 base = 1 << (i % 16)
++// 调用方按 rowFactor + MASK_PATTERN_DIM_SIZE - 1 行生成循环模式，
++// 保证后续 GatherMask 单次调用中所有操作数保持 32 字节对齐
++__aicore__ inline void SetGatherMaskPattern(const LocalTensor<uint32_t>& maskPattern, uint16_t patternRows)
+ {
+-    uint32_t base = ONE;
+-    for (uint32_t i = 0; i < 16; i++) {
++    for (uint32_t i = 0; i < patternRows; i++) {
++        uint32_t base = ONE << (i % MASK_PATTERN_DIM_SIZE);
+         Duplicate(maskPattern[i * 8], base, 8);
+-        base = (base << 1);
+     }
+     PipeBarrier<PIPE_V>();
+ }
+ 
++// 使用循环对角掩码从NZ格式的平方和结果中提取对角线元素（单次GatherMask完成dim0行）
++// 输入input: NZ格式的平方和矩阵(dim0×16行×16列)
++// 输出output: 提取的对角线元素(dim0个)
++// maskPattern: 由SetGatherMaskPattern生成的循环对角掩码
++// dim0: 需要处理的行数
++// diagonalOffset: 当前行块在16×16 NZ块中的对角相位（globalRowOffset % SQUARE_SUM_SIZE）
+ __aicore__ inline void GatherMaskByDiagonal(const LocalTensor<float>& output, const LocalTensor<float>& input,
+-                                            const LocalTensor<uint32_t> maskPattern, uint16_t dim0)
++                                            const LocalTensor<uint32_t> maskPattern, uint16_t dim0,
++                                            uint16_t diagonalOffset)
+ {
+-    uint32_t totalCount = MASK_PATTERN_DIM_SIZE * MASK_PATTERN_DIM_SIZE;
+-    uint32_t remainCount = (dim0 % MASK_PATTERN_DIM_SIZE) * MASK_PATTERN_DIM_SIZE;
+-    uint32_t loopCount = dim0 / MASK_PATTERN_DIM_SIZE;
++    uint16_t patternIdx = diagonalOffset % MASK_PATTERN_DIM_SIZE;
+     uint64_t rsvdCnt = 0;
+-    for (uint32_t loopIdx = 0; loopIdx < loopCount; loopIdx++) {
+-        GatherMask(output[loopIdx * MASK_PATTERN_DIM_SIZE],
+-            input[loopIdx * totalCount], maskPattern, true, totalCount,
+-            {1, 1, 8, 8}, rsvdCnt);
+-    }
+-    GatherMask(output[loopCount * MASK_PATTERN_DIM_SIZE],
+-        input[loopCount * totalCount], maskPattern, true, remainCount,
+-        {1, 1, 8, 8}, rsvdCnt);
++    // The caller provides dim0 + 15 cyclic patterns so all operands stay 32-byte aligned in one call.
++    GatherMask(output, input, maskPattern[patternIdx * MASK_PATTERN_REPEAT_SIZE], true,
++        MASK_PATTERN_DIM_SIZE, {1, dim0, 2, 1}, rsvdCnt);
+     PipeBarrier<PIPE_V>();
+ }
+ 
+ 
++// ==================== 末维广播乘法 ====================
++
++// output[dim0, dim1] = input0[dim0, dim1] * broadcast(input1[1, dim1])
++// 将一维向量input1沿第0维广播后与input0逐元素相乘
++// 参数: curRowNum=行数(dim0), curColNum=列数(dim1)
++// tmpBuffer用于存放Brcb广播后的input1
++// needBrc: 是否需要执行Brcb广播（false时input1已广播好）
++// 策略选择: 当列数较大时，根据dstRepStride是否超255来选择Col方向或Row方向开Repeat
+ template <typename T, bool needBrc = true>
+ __aicore__ inline void MulABLastDimBrcInline(const LocalTensor<T> &output, const LocalTensor<T> &input0,
+                                              const LocalTensor<T> &input1, const LocalTensor<T> &tmpBuffer,
+                                              const int32_t curRowNum, const int32_t curColNum)
+ {
++    // 第一步：通过Brcb将input1沿第0维广播到curRowNum行
+     if constexpr (needBrc) {
+         uint32_t repeatTimes = CeilDiv(curRowNum, ONE_REPEAT_BLOCK_NUMS);
+         Brcb(tmpBuffer, input1, repeatTimes, {DEFAULT_BLOCK_STRIDE, DEFAULT_REPEAT_STRIDE});
+     }
+     PipeBarrier<PIPE_V>();
+-    uint32_t elemInOneBlock = BLOCK_SIZE / sizeof(T);
+-    uint32_t elemInOneRepeat = REPEAT_SIZE / sizeof(T);
+-    uint32_t curColNumAlign = RoundUp<T>(curColNum);
++    uint32_t elemInOneBlock = BLOCK_SIZE / sizeof(T);   // 一个Block中T类型元素个数
++    uint32_t elemInOneRepeat = REPEAT_SIZE / sizeof(T);  // 一个Repeat中T类型元素个数
++    uint32_t curColNumAlign = RoundUp<T>(curColNum);     // 列数向上对齐到Block
++    // 简单场景：列数不超过一个Block，直接连续乘法
+     if (curColNum <= elemInOneBlock) {
+         Mul(output, input0, tmpBuffer, curRowNum * curColNumAlign);
+     } else {
+-        int32_t numRepeatPerLine = curColNum / elemInOneRepeat;
+-        int32_t numRemainPerLine = curColNum % elemInOneRepeat;
+-        int32_t dstRepStridePerLine = CeilDiv(curColNum, elemInOneBlock);
++        // 复杂场景：列数超过一个Block，需要分Repeat处理
++        int32_t numRepeatPerLine = curColNum / elemInOneRepeat; // 每行完整Repeat数
++        int32_t numRemainPerLine = curColNum % elemInOneRepeat; // 每行尾部剩余元素数
++        int32_t dstRepStridePerLine = CeilDiv(curColNum, elemInOneBlock); // 每行占多少个Block
+         BinaryRepeatParams instrParams;
+ 
+         if (numRepeatPerLine > 0) {
++            // 判断是否可以用Row方向Repeat（条件：步长不超255且行数>=每行Repeat数）
+             if (dstRepStridePerLine > MAX_REPEAT_STRIDE || curRowNum < numRepeatPerLine) {
+-                // 在Col方向开Repeat, 并且Repeat小于255
++                // 策略1：在Col方向开Repeat（逐行处理），适用于步长超限或行数较少的场景
+                 instrParams.dstBlkStride = 1;
+                 instrParams.src0BlkStride = 1;
+-                instrParams.src1BlkStride = 0;
++                instrParams.src1BlkStride = 0;  // src1(广播向量)不随行移动
+                 instrParams.dstRepStride = DEFAULT_REPEAT_STRIDE;
+                 instrParams.src0RepStride = DEFAULT_REPEAT_STRIDE;
+                 instrParams.src1RepStride = 0;
+@@ -123,13 +147,13 @@ __aicore__ inline void MulABLastDimBrcInline(const LocalTensor<T> &output, const
+                         elemInOneRepeat, numRepeatPerLine, instrParams);
+                 }
+             } else {
+-                // 在Row方向开Repeat
++                // 策略2：在Row方向开Repeat（逐Repeat处理），利用repeatTimes=curRowNum提高指令并行度
+                 instrParams.dstBlkStride = 1;
+                 instrParams.src0BlkStride = 1;
+-                instrParams.src1BlkStride = 0;
++                instrParams.src1BlkStride = 0;  // src1(广播向量)固定不变
+                 instrParams.dstRepStride = dstRepStridePerLine;
+                 instrParams.src0RepStride = dstRepStridePerLine;
+-                instrParams.src1RepStride = 1;
++                instrParams.src1RepStride = 1;  // src1按Block递增跟随
+                 for (uint32_t i = 0; i < numRepeatPerLine; i++) {
+                     Mul(output[i * elemInOneRepeat], input0[i * elemInOneRepeat], tmpBuffer, elemInOneRepeat, curRowNum,
+                         instrParams);
+@@ -137,8 +161,10 @@ __aicore__ inline void MulABLastDimBrcInline(const LocalTensor<T> &output, const
+             }
+         }
+ 
++        // 处理每行尾部不足一个Repeat的剩余元素
+         if (numRemainPerLine > 0) {
+             if (dstRepStridePerLine > MAX_REPEAT_STRIDE) {
++                // 步长超限：逐行处理尾部元素
+                 instrParams.dstBlkStride = 1;
+                 instrParams.src0BlkStride = 1;
+                 instrParams.src1BlkStride = 0;
+@@ -151,6 +177,7 @@ __aicore__ inline void MulABLastDimBrcInline(const LocalTensor<T> &output, const
+                         numRemainPerLine, 1, instrParams);
+                 }
+             } else {
++                // 步长不超限：一次性处理所有行的尾部元素
+                 instrParams.dstBlkStride = 1;
+                 instrParams.src0BlkStride = 1;
+                 instrParams.src1BlkStride = 0;
+@@ -165,6 +192,9 @@ __aicore__ inline void MulABLastDimBrcInline(const LocalTensor<T> &output, const
+     PipeBarrier<PIPE_V>();
+ }
+ 
++// ==================== 末维广播减法 ====================
++// 与MulABLastDimBrcInline结构完全相同，仅将Mul替换为Sub
++// output[dim0, dim1] = input0[dim0, dim1] - broadcast(input1[1, dim1])
+ template <typename T, bool needBrc = true>
+ __aicore__ inline void SubABLastDimBrcInline(const LocalTensor<T> &output, const LocalTensor<T> &input0,
+                                              const LocalTensor<T> &input1, const LocalTensor<T> &tmpBuffer,
+@@ -243,6 +273,9 @@ __aicore__ inline void SubABLastDimBrcInline(const LocalTensor<T> &output, const
+ }
+ 
+ 
++// ==================== 末维广播除法 ====================
++// 与MulABLastDimBrcInline结构完全相同，仅将Mul替换为Div
++// output[dim0, dim1] = input0[dim0, dim1] / broadcast(input1[1, dim1])
+ template <typename T, bool needBrc = true>
+ __aicore__ inline void DivABLastDimBrcInline(const LocalTensor<T> &output, const LocalTensor<T> &input0,
+                                              const LocalTensor<T> &input1, const LocalTensor<T> &tmpBuffer,
+@@ -321,6 +354,12 @@ __aicore__ inline void DivABLastDimBrcInline(const LocalTensor<T> &output, const
+ }
+ 
+ 
++// ==================== 首维广播加法 ====================
++
++// output[dim0, dim1] = input0[dim0, dim1] + broadcast(input1[1, dim1])
++// 将一维向量input1沿第0维广播后加到input0的每一行
++// 与MulABLastDimBrcInline不同：此处input1不需要Brcb预广播，直接作为src1（src1BlkStride=1）
++// 参数: curRowNum=行数(dim0), curColNum=列数(dim1)
+ template <typename T>
+ __aicore__ inline void AddBAFirstDimBrcInline(const LocalTensor<T> &output, const LocalTensor<T> &input0,
+                                               const LocalTensor<T> &input1, const int32_t curRowNum,
+@@ -387,37 +426,48 @@ __aicore__ inline void AddBAFirstDimBrcInline(const LocalTensor<T> &output, cons
+     PipeBarrier<PIPE_V>();
+ }
+ 
++// ==================== Sigmoid优化实现 ====================
++
++// 计算sigmoid分母: output = 1 + exp(-x)
++// 分三步: x取负(-1*x) → exp(-x) → +1
++// 用于后续SigmoidPerf中的除法计算: sigmoid(x) = 1 / (1 + exp(-x))
+ template <typename T>
+ __aicore__ inline void CalcDenominator(const LocalTensor<T> &output, const LocalTensor<T> &input,
+                                        const uint32_t calCount)
+ {
+-    Muls(output, input, static_cast<T>(-1.0), calCount);
++    Muls(output, input, static_cast<T>(-1.0), calCount); // output = -x
+     PipeBarrier<PIPE_V>();
+-    Exp(output, output, calCount);
++    Exp(output, output, calCount);                        // output = exp(-x)
+     PipeBarrier<PIPE_V>();
+-    Adds(output, output, static_cast<T>(1.0), calCount);
++    Adds(output, output, static_cast<T>(1.0), calCount);  // output = 1 + exp(-x)
+     PipeBarrier<PIPE_V>();
+ }
+ 
++// 优化版sigmoid: sigmoid(x) = 1 / (1 + exp(-x))
++// 相比原生Exp+Div实现，利用Duplicate生成常数1再用Div计算，减少一次标量运算
+ // 暂时不处理repeat超限场景
++// 参数: calCount=元素总数, tmpBuffer用于存放常数1.0
+ template <typename T>
+ __aicore__ inline void SigmoidPerf(const LocalTensor<T> &output, const LocalTensor<T> &input,
+                                    const LocalTensor<T> &tmpBuffer, const int64_t calCount)
+ {
+     uint32_t elemInOneBlock = BLOCK_SIZE / sizeof(T);
+-    Duplicate(tmpBuffer, static_cast<T>(1.0), elemInOneBlock);
+-    CalcDenominator(output, input, calCount);
++    Duplicate(tmpBuffer, static_cast<T>(1.0), elemInOneBlock); // 生成常数1.0（只需一个Block大小）
++    CalcDenominator(output, input, calCount);                  // output = 1 + exp(-x)
+     uint32_t elemInOneRepeat = REPEAT_SIZE / sizeof(T);
+-    int32_t numRepeatPerLine = calCount / elemInOneRepeat;
+-    int32_t numRemainPerLine = calCount % elemInOneRepeat;
++    int32_t numRepeatPerLine = calCount / elemInOneRepeat;     // 完整Repeat数
++    int32_t numRemainPerLine = calCount % elemInOneRepeat;    // 尾部剩余元素数
+     BinaryRepeatParams instrParams;
++    // src0(常数1)的Block步长=0, Repeat步长=0 → 保持固定；src1(分母)正常递进
+     instrParams.dstBlkStride = 1;
+     instrParams.src0BlkStride = 0;
+     instrParams.src1BlkStride = 1;
+     instrParams.dstRepStride = DEFAULT_REPEAT_STRIDE;
+     instrParams.src0RepStride = 0;
+     instrParams.src1RepStride = DEFAULT_REPEAT_STRIDE;
++    // 整除部分: output = 1 / (1 + exp(-x))
+     Div(output, tmpBuffer, output, elemInOneRepeat, numRepeatPerLine, instrParams);
++    // 尾部剩余部分
+     if (numRemainPerLine != 0) {
+         Div(output[numRepeatPerLine * elemInOneRepeat], tmpBuffer, output[numRepeatPerLine * elemInOneRepeat],
+             numRemainPerLine, 1, instrParams);
+@@ -425,21 +475,38 @@ __aicore__ inline void SigmoidPerf(const LocalTensor<T> &output, const LocalTens
+     PipeBarrier<PIPE_V>();
+ }
+ 
++// ==================== 超连接前处理核心计算 ====================
++
++// 计算pre = sigmoid(mix * rsqrt * scale + base) + eps
++// 参数说明:
++//   mixLocal: 输入混合向量(M×N)，输出为中间结果
++//   rsqrtLocal: RMSNorm的1/sqrt(mean+eps)值，沿行广播
++//   hcBaseLocal: base偏置值(base0)，沿行广播
++//   scale: hc_scale[0]标量缩放系数
++//   eps: 防止分母为0的小量
++//   curRowNum, curColNum: 行数和列数
++// 计算步骤: mix *= rsqrt → mix *= scale → mix += base → sigmoid → pre += eps
+ __aicore__ inline void ProcessPre(const LocalTensor<float> &preLocal, const LocalTensor<float> &mixLocal,
+                                   const LocalTensor<float> &hcBaseLocal, const LocalTensor<float> &rsqrtLocal,
+                                   const LocalTensor<float> &tmpBuffer0, const LocalTensor<float> &tmpBuffer1,
+                                   float scale, float eps, const int32_t curRowNum, const int32_t curColNum)
+ {
+     int32_t curColNumAlign = RoundUp<float>(curColNum);
+-    MulABLastDimBrcInline<float, true>(mixLocal, mixLocal, rsqrtLocal, tmpBuffer0, curRowNum, curColNum);
+-    Muls(mixLocal, mixLocal, scale, curRowNum * curColNumAlign);
++    MulABLastDimBrcInline<float, true>(mixLocal, mixLocal, rsqrtLocal, tmpBuffer0, curRowNum, curColNum); // mix *= rsqrt
++    Muls(mixLocal, mixLocal, scale, curRowNum * curColNumAlign);                                          // mix *= scale
+     PipeBarrier<PIPE_V>();
+-    AddBAFirstDimBrcInline<float>(mixLocal, mixLocal, hcBaseLocal, curRowNum, curColNum);
+-    SigmoidPerf(preLocal, mixLocal, tmpBuffer1, curRowNum * curColNumAlign);
+-    Adds(preLocal, preLocal, eps, curRowNum * curColNumAlign);
++    AddBAFirstDimBrcInline<float>(mixLocal, mixLocal, hcBaseLocal, curRowNum, curColNum);                // mix += base
++    SigmoidPerf(preLocal, mixLocal, tmpBuffer1, curRowNum * curColNumAlign);                              // pre = sigmoid(mix)
++    Adds(preLocal, preLocal, eps, curRowNum * curColNumAlign);                                           // pre += eps
+     PipeBarrier<PIPE_V>();
+ }
+ 
++// ==================== 沿dim1轴归约求和 ====================
++
++// All-Reduce-Along dim1: output[dim0, dim2] = Σ_j input[dim0, j, dim2]
++// 将3D张量(dim0, dim1, dim2)沿中间维度dim1求和，输出2D张量(dim0, dim2)
++// 用于K-split多核归约：多个核各算一部分K，最后在此求和合并
++// 参数: dim0=批次, dim1=K-split核数(归约轴), dim2=每核输出大小
+ __aicore__ inline void ReduceSumARAPerf(const LocalTensor<float> &output, const LocalTensor<float> &input,
+                                         const uint32_t dim0, const uint32_t dim1, const uint32_t dim2)
+ {
+@@ -447,17 +514,17 @@ __aicore__ inline void ReduceSumARAPerf(const LocalTensor<float> &output, const
+     uint32_t elemInOneRepeat = REPEAT_SIZE / sizeof(float);
+     uint32_t dim2Align = RoundUp<float>(dim2);
+ 
+-    // 拷贝第一个R到output上
++    // 拷贝第一个R到output上（作为累加初始值）
+     DataCopyParams copyParams;
+     copyParams.blockCount = dim0;
+     copyParams.blockLen = dim2Align / elemInOneBlock;
+-    copyParams.srcStride = (dim1 - 1) * (dim2Align / elemInOneBlock);
++    copyParams.srcStride = (dim1 - 1) * (dim2Align / elemInOneBlock); // 跳过dim1-1个dim2块
+     copyParams.dstStride = 0;
+     DataCopy(output, input, copyParams);
+     PipeBarrier<PIPE_V>();
+     uint32_t dim2RepeatTimes = dim2 / elemInOneRepeat;
+     uint32_t dim2Reminder = dim2 % elemInOneRepeat;
+-    // 沿着dim2方向开repeat
++    // 沿着dim2方向开repeat（每个元素累加）
+     BinaryRepeatParams instrParams;
+     instrParams.dstBlkStride = 1;
+     instrParams.src0BlkStride = 1;
+@@ -465,6 +532,9 @@ __aicore__ inline void ReduceSumARAPerf(const LocalTensor<float> &output, const
+     instrParams.dstRepStride = DEFAULT_REPEAT_STRIDE;
+     instrParams.src0RepStride = DEFAULT_REPEAT_STRIDE;
+     instrParams.src1RepStride = DEFAULT_REPEAT_STRIDE;
++    // 对每个dim0批次，遍历dim1(从1开始)累加到output。
++    // 连续 Add 对同一 output 读改写时，后一条指令可能在前一条写回前读取数据。
++    // 每轮累加后同步 Vector 流水，避免归约结果错误。
+     for (uint32_t i = 0; i < dim0; i++) {
+         for (uint32_t j = 1; j < dim1; j++) {
+             Add(output[i * dim2Align], output[i * dim2Align], input[i * dim1 * dim2Align + j * dim2Align],
+@@ -481,53 +551,198 @@ __aicore__ inline void ReduceSumARAPerf(const LocalTensor<float> &output, const
+     PipeBarrier<PIPE_V>();
+ }
+ 
++// Sinkhorn 的列归约固定为 4x4。专用路径保持与通用归约相同的
++// 左到右累加顺序，但省去首行 DataCopy 和每个加数后的 barrier。
++__aicore__ inline void ReduceSum4x4Perf(const LocalTensor<float> &output,
++                                        const LocalTensor<float> &input,
++                                        const uint32_t dim0)
++{
++    constexpr uint32_t dim2 = 4;
++    const uint32_t dim2Align = RoundUp<float>(dim2);
++    for (uint32_t i = 0; i < dim0; i++) {
++        const uint32_t inOffset = i * dim2 * dim2Align;
++        const uint32_t outOffset = i * dim2Align;
++        Add(output[outOffset], input[inOffset], input[inOffset + dim2Align], dim2);
++        Add(output[outOffset], output[outOffset], input[inOffset + 2 * dim2Align], dim2);
++        Add(output[outOffset], output[outOffset], input[inOffset + 3 * dim2Align], dim2);
++    }
++    PipeBarrier<PIPE_V>();
++}
++
++// ==================== 二维Cast类型转换 ====================
++
++// 将2D张量从T1类型转换到T0类型，逐行处理
++// 参数: dim0=行数, dim1=列数
++// bfloat16→float使用CAST_NONE（无损），其他类型使用CAST_RINT（四舍五入）
++// syncAfter=false: 跳过尾部PipeBarrier, 由调用方合并同步点或依赖队列
++// 事件(EnQue的V_MTE3)兜底——用于连续Cast与Brcb等dst互不重叠的指令
++// 并行发射后统一一次屏障(见ProcessYHc4), 减少热路径屏障密度.
+ template <typename T0, typename T1>
+ __aicore__ inline void CastTwoDim(const LocalTensor<T0> &output, const LocalTensor<T1> &input, const uint32_t dim0,
+-                                  const uint32_t dim1)
++                                  const uint32_t dim1, const bool syncAfter = true)
+ {
+-    uint32_t dim1AlignT0 = RoundUp<T0>(dim1);
+-    uint32_t dim1AlignT1 = RoundUp<T1>(dim1);
++    uint32_t dim1AlignT0 = RoundUp<T0>(dim1); // 输出类型对齐后的列数
++    uint32_t dim1AlignT1 = RoundUp<T1>(dim1); // 输入类型对齐后的列数
++    // 对齐的连续二维 tile 可以一次完成 Cast，避免在 Stage1 和 ProcessY
++    // 中为每一行生成独立的 Vector 指令与循环控制。
++    if (dim1AlignT0 == dim1 && dim1AlignT1 == dim1) {
++        if constexpr (IsSameType<T1, bfloat16_t>::value && IsSameType<T0, float>::value) {
++            Cast(output, input, AscendC::RoundMode::CAST_NONE, dim0 * dim1);
++        } else {
++            Cast(output, input, AscendC::RoundMode::CAST_RINT, dim0 * dim1);
++        }
++        if (syncAfter) {
++            PipeBarrier<PIPE_V>();
++        }
++        return;
++    }
+     if constexpr (IsSameType<T1, bfloat16_t>::value && IsSameType<T0, float>::value) {
++        // bf16→fp32: 无需舍入模式，直接转换（无损扩展）
+         for (uint32_t i = 0; i < dim0; i++) {
+             Cast(output[i * dim1AlignT0], input[i * dim1AlignT1], AscendC::RoundMode::CAST_NONE, dim1);
+         }
+     } else {
++        // 其他类型转换: 使用CAST_RINT（四舍五入到最近偶数）
+         for (uint32_t i = 0; i < dim0; i++) {
+             Cast(output[i * dim1AlignT0], input[i * dim1AlignT1], AscendC::RoundMode::CAST_RINT, dim1);
+         }
+     }
+-    PipeBarrier<PIPE_V>();
++    if (syncAfter) {
++        PipeBarrier<PIPE_V>();
++    }
+ }
+ 
+ 
++// ==================== 计算输出y ====================
++
++// 计算 y = Σ_{j=0}^{hc_mult-1} (weight[:,j] * x[:,j,:])
++// 权重由调用方传入：普通路径使用 pre，preMix 路径使用 preMix。
++// hc_mult=4 时使用融合乘加；其他情况逐元素乘权重后沿 hc_mult 维度归约。
++// 参数: dim0=batch数, dim1=hc_mult, dim2=d_factor
++// Brcb 后每路权重仅占一个 Block；src1BlkStride=0 使权重在整行内复用，
++// 避免按连续地址读取时跨入下一路权重。
++// 每个 pass 处理一路权重；pass 间用 PipeBarrier 同步对 y 的读改写。
++template <typename T>
++__aicore__ void inline ProcessYHc4(const LocalTensor<T> &yLocal, const LocalTensor<T> &xLocal,
++                                    const LocalTensor<float> &mix01Local, const LocalTensor<float> &hcBrcbLocal1,
++                                    const LocalTensor<float> &xCastLocal, const LocalTensor<float> &yCastLocal,
++                                    const uint32_t dim0, const uint32_t dim2,
++                                    const bool needBrc = true)
++{
++    const uint32_t rows = dim0 * 4;
++    const uint32_t dim2Align = RoundUp<float>(dim2);
++    const uint32_t elemInOneBlock = BLOCK_SIZE / sizeof(float);
++    const uint32_t elemInOneRepeat = REPEAT_SIZE / sizeof(float);
++    const uint32_t repeatTimes = CeilDiv(rows, ONE_REPEAT_BLOCK_NUMS);
++
++    // Cast(xCast)与Brcb(hcBrcbLocal1)写不同dst, 可并行发射, 合并为一个
++    // 同步点(Mul需两者都完成才可取数)——相比各自屏障省一次V流水排空.
++    // 尾部Cast(yLocal)同样免屏障: Pass3后的屏障已保证MulAddDst写回,
++    // yLocal→CopyOut的可见性由yQue.EnQue的V_MTE3事件保证.
++    CastTwoDim(xCastLocal, xLocal, rows, dim2, /*syncAfter=*/false);
++    if (needBrc) {
++        Brcb(hcBrcbLocal1, mix01Local, repeatTimes,
++             {DEFAULT_BLOCK_STRIDE, DEFAULT_REPEAT_STRIDE});
++    }
++    PipeBarrier<PIPE_V>();
++    BinaryRepeatParams instrParams;
++    instrParams.dstBlkStride = 1;
++    instrParams.src0BlkStride = 1;
++    instrParams.src1BlkStride = 0;             // 权重块(8个相同值)在行内所有Block间复用
++    instrParams.dstRepStride = DEFAULT_REPEAT_STRIDE;  // repeat 沿列方向连续推进
++    instrParams.src0RepStride = DEFAULT_REPEAT_STRIDE;
++    instrParams.src1RepStride = 0;
++    const uint32_t nRep = dim2 / elemInOneRepeat;
++    const uint32_t rem = dim2 % elemInOneRepeat;
++
++    // Pass 0: 第0路乘法 y = x0 * w0
++    for (uint32_t i = 0; i < dim0; i++) {
++        const uint32_t xOffset = i * 4 * dim2Align;
++        const uint32_t yOffset = i * dim2Align;
++        const uint32_t weightOffset = i * 4 * elemInOneBlock;
++        if (nRep > 0) {
++            Mul(yCastLocal[yOffset], xCastLocal[xOffset], hcBrcbLocal1[weightOffset],
++                elemInOneRepeat, nRep, instrParams);
++        }
++        if (rem > 0) {
++            Mul(yCastLocal[yOffset + nRep * elemInOneRepeat],
++                xCastLocal[xOffset + nRep * elemInOneRepeat], hcBrcbLocal1[weightOffset],
++                rem, 1, instrParams);
++        }
++    }
++    PipeBarrier<PIPE_V>();
++    // Pass k=1..3: 乘加 y += xk * wk (pass 内各行独立, pass 间屏障隔离读改写)
++    for (uint32_t k = 1; k < 4; k++) {
++        for (uint32_t i = 0; i < dim0; i++) {
++            const uint32_t xOffset = i * 4 * dim2Align + k * dim2Align;
++            const uint32_t yOffset = i * dim2Align;
++            const uint32_t weightOffset = i * 4 * elemInOneBlock + k * elemInOneBlock;
++            if (nRep > 0) {
++                MulAddDst(yCastLocal[yOffset], xCastLocal[xOffset], hcBrcbLocal1[weightOffset],
++                          static_cast<uint64_t>(elemInOneRepeat), nRep, instrParams);
++            }
++            if (rem > 0) {
++                MulAddDst(yCastLocal[yOffset + nRep * elemInOneRepeat],
++                          xCastLocal[xOffset + nRep * elemInOneRepeat], hcBrcbLocal1[weightOffset],
++                          static_cast<uint64_t>(rem), 1, instrParams);
++            }
++        }
++        PipeBarrier<PIPE_V>();
++    }
++    // 尾Cast免屏障(见函数头说明): yLocal的GM可见性由yQue.EnQue事件保证.
++    CastTwoDim(yLocal, yCastLocal, dim0, dim2, /*syncAfter=*/false);
++}
++
+ template <typename T>
+ __aicore__ void inline ProcessY(const LocalTensor<T> &yLocal, const LocalTensor<T> &xLocal,
+                                 const LocalTensor<float> &mix01Local, const LocalTensor<float> &hcBrcbLocal1,
+                                 const LocalTensor<float> &xCastLocal, const LocalTensor<float> &yCastLocal,
+-                                const uint32_t dim0, const uint32_t dim1, const uint32_t dim2)
++                                const uint32_t dim0, const uint32_t dim1, const uint32_t dim2,
++                                const bool needBrc = true)
+ {
+-    CastTwoDim(xCastLocal, xLocal, dim0 * dim1, dim2);
+-    MulABLastDimBrcInline<float, true>(xCastLocal, xCastLocal, mix01Local, hcBrcbLocal1, dim0 * dim1, dim2);
+-    ReduceSumARAPerf(yCastLocal, xCastLocal, dim0, dim1, dim2);
+-    CastTwoDim(yLocal, yCastLocal, dim0, dim2);
++    if (dim1 == 4) {
++        ProcessYHc4(yLocal, xLocal, mix01Local, hcBrcbLocal1,
++                    xCastLocal, yCastLocal, dim0, dim2, needBrc);
++        return;
++    }
++    CastTwoDim(xCastLocal, xLocal, dim0 * dim1, dim2);                                    // 1. x bf16→fp32
++    MulABLastDimBrcInline<float, true>(xCastLocal, xCastLocal, mix01Local, hcBrcbLocal1, dim0 * dim1, dim2); // 2. x_cast *= 输入权重
++    ReduceSumARAPerf(yCastLocal, xCastLocal, dim0, dim1, dim2);                           // 3. Σ沿hc_mult维度
++    CastTwoDim(yLocal, yCastLocal, dim0, dim2);                                           // 4. y fp32→bf16
+ }
+ 
+ 
++// ==================== 计算输出post ====================
++
++// 计算post = sigmoid(mix * rsqrt * scale + base) * 2
++// 对应计算公式步骤4中的post部分
++// 与ProcessPre结构相同，但最终是*2而非+eps
++// 参数说明:
++//   mixLocal: 输入混合向量(M×N)，输出为中间结果
++//   rsqrtLocal: RMSNorm的1/sqrt(mean+eps)值，沿行广播
++//   hcBaseLocal: base偏置值(base1)，沿行广播
++//   scale: hc_scale[1]标量缩放系数
++//   needBrc=false: rsqrtLocal已由ProcessPre阶段广播好，无需再次Brcb
++// 计算步骤: mix *= rsqrt → mix *= scale → mix += base → sigmoid → post *= 2
+ __aicore__ inline void ProcessPost(const LocalTensor<float> &postLocal, const LocalTensor<float> &mixLocal,
+                                    const LocalTensor<float> &hcBaseLocal, const LocalTensor<float> &rsqrtLocal,
+                                    const LocalTensor<float> &tmpBuffer0, const LocalTensor<float> &tmpBuffer1,
+                                    float scale, const int32_t curRowNum, const int32_t curColNum)
+ {
+     int32_t curColNumAlign = RoundUp<float>(curColNum);
+-    MulABLastDimBrcInline<float, false>(mixLocal, mixLocal, rsqrtLocal, tmpBuffer0, curRowNum, curColNum);
+-    Muls(mixLocal, mixLocal, scale, curRowNum * curColNumAlign);
++    MulABLastDimBrcInline<float, false>(mixLocal, mixLocal, rsqrtLocal, tmpBuffer0, curRowNum, curColNum); // mix *= rsqrt (无需Brcb)
++    Muls(mixLocal, mixLocal, scale, curRowNum * curColNumAlign);                                          // mix *= scale
+     PipeBarrier<PIPE_V>();
+-    AddBAFirstDimBrcInline<float>(mixLocal, mixLocal, hcBaseLocal, curRowNum, curColNum);
+-    SigmoidPerf(postLocal, mixLocal, tmpBuffer1, curRowNum * curColNumAlign);
+-    Muls(postLocal, postLocal, static_cast<float>(2.0f), curRowNum * curColNumAlign);
++    AddBAFirstDimBrcInline<float>(mixLocal, mixLocal, hcBaseLocal, curRowNum, curColNum);                // mix += base
++    SigmoidPerf(postLocal, mixLocal, tmpBuffer1, curRowNum * curColNumAlign);                             // post = sigmoid(mix)
++    Muls(postLocal, postLocal, static_cast<float>(2.0f), curRowNum * curColNumAlign);                   // post *= 2
+     PipeBarrier<PIPE_V>();
+ }
+ 
++// ==================== 末维归约Max/Sum ====================
++
++// 沿最后一维求最大值: output[curRowNum] = max(input[curRowNum, curColNum])
++// 使用WholeReduceMax，输出仅为值（不含索引）
+ __aicore__ inline void LastDimReduceMaxPerf(const LocalTensor<float> &output, const LocalTensor<float> &input,
+                                             const uint32_t curRowNum, const uint32_t curColNum)
+ {
+@@ -537,6 +752,8 @@ __aicore__ inline void LastDimReduceMaxPerf(const LocalTensor<float> &output, co
+     PipeBarrier<PIPE_V>();
+ }
+ 
++// 沿最后一维求和: output[curRowNum] = Σ input[curRowNum, curColNum]
++// 使用WholeReduceSum
+ __aicore__ inline void LastDimReduceSumPerf(const LocalTensor<float> &output, const LocalTensor<float> &input,
+                                             const uint32_t curRowNum, const uint32_t curColNum)
+ {
+@@ -546,25 +763,35 @@ __aicore__ inline void LastDimReduceSumPerf(const LocalTensor<float> &output, co
+ }
+ 
+ 
+-// 暂时只支持R轴小于64,既curColNum不能超过64
++// ==================== FP32 Softmax ====================
++
++// 沿最后一维计算softmax: output = softmax(input) + eps
++// 对应计算公式步骤4中的comb_frag部分（softmax+Sinkhorn迭代的第一步）
++// 暂时只支持R轴(末维)小于64, 即curColNum不能超过64
++// 计算步骤: max → sub(max) → exp → sum → div(sum) → +eps
++// 参数: curRowNum=行数, curColNum=列数(=hc_mult), eps=防0小量
+ __aicore__ inline void SoftmaxFP32Perf(const LocalTensor<float> &output, const LocalTensor<float> &input,
+                                        const LocalTensor<float> &tmpReduceBuffer,
+                                        const LocalTensor<float> tmpBrcbBuffer, const int32_t curRowNum,
+                                        const int32_t curColNum, float eps)
+ {
+-    LastDimReduceMaxPerf(tmpReduceBuffer, input, curRowNum, curColNum);
+-    SubABLastDimBrcInline<float, true>(output, input, tmpReduceBuffer, tmpBrcbBuffer, curRowNum, curColNum);
++    LastDimReduceMaxPerf(tmpReduceBuffer, input, curRowNum, curColNum);                                // 1. 求每行最大值
++    SubABLastDimBrcInline<float, true>(output, input, tmpReduceBuffer, tmpBrcbBuffer, curRowNum, curColNum); // 2. 减去最大值（数值稳定）
+     uint32_t curColNumAlign = RoundUp<float>(curColNum);
+-    Exp(output, output, curRowNum * curColNumAlign);
++    Exp(output, output, curRowNum * curColNumAlign);                                                   // 3. 求exp
+     PipeBarrier<PIPE_V>();
+-    LastDimReduceSumPerf(tmpReduceBuffer, output, curRowNum, curColNum);
+-    DivABLastDimBrcInline<float, true>(output, output, tmpReduceBuffer, tmpBrcbBuffer, curRowNum, curColNum);
+-    Adds(output, output, eps, curRowNum * curColNumAlign);
++    LastDimReduceSumPerf(tmpReduceBuffer, output, curRowNum, curColNum);                               // 4. 求每行和
++    DivABLastDimBrcInline<float, true>(output, output, tmpReduceBuffer, tmpBrcbBuffer, curRowNum, curColNum); // 5. 除以和（归一化）
++    Adds(output, output, eps, curRowNum * curColNumAlign);                                             // 6. +eps（用于Sinkhorn迭代防0）
+     PipeBarrier<PIPE_V>();
+ }
+ 
+-// (bs, hc_mult, hc_mult) = (bs, hc_mult, hc_mult) +  (bs, 1, hc_mult)
++// ==================== 三维广播除法（用于Sinkhorn迭代） ====================
+ 
++// output[dim0, dim1, dim2] = input0[dim0, dim1, dim2] / input1[dim0, 1, dim2]
++// input1沿dim1方向广播后与input0逐元素相除
++// 用于Sinkhorn迭代的行归一化: comb_frag(bs, hc_mult, hc_mult) /= row_sum(bs, 1, hc_mult)
++// 参数: dim0=bs, dim1=hc_mult, dim2=hc_mult
+ template <typename T>
+ __aicore__ inline void DivABABrcInline(const LocalTensor<T> &output, const LocalTensor<T> &input0,
+                                        const LocalTensor<T> &input1, const uint32_t dim0, const uint32_t dim1,
+@@ -579,12 +806,13 @@ __aicore__ inline void DivABABrcInline(const LocalTensor<T> &output, const Local
+     // 在dim1方向开repeat
+     BinaryRepeatParams instrParams;
+     if (dim1 >= dim2RepeatTimes) {
++        // 策略1：在dim1方向开Repeat（src1的Repeat步长=0，沿dim1不移动）
+         instrParams.dstBlkStride = 1;
+         instrParams.src0BlkStride = 1;
+         instrParams.src1BlkStride = 1;
+         instrParams.dstRepStride = dim2RepeatStride;
+         instrParams.src0RepStride = dim2RepeatStride;
+-        instrParams.src1RepStride = 0;
++        instrParams.src1RepStride = 0; // src1沿dim1不移动（广播）
+         for (uint32_t i = 0; i < dim0; i++) {
+             for (uint32_t j = 0; j < dim2RepeatTimes; j++) {
+                 Div(output[i * dim1 * dim2Align + j * elemInOneRepeat],
+@@ -598,7 +826,7 @@ __aicore__ inline void DivABABrcInline(const LocalTensor<T> &output, const Local
+             }
+         }
+     } else {
+-        // 在dim2方向开repeat
++        // 策略2：在dim2方向开repeat（逐dim1行处理，src1固定为对应dim0的行向量）
+         instrParams.dstBlkStride = 1;
+         instrParams.src0BlkStride = 1;
+         instrParams.src1BlkStride = 1;
+@@ -615,6 +843,11 @@ __aicore__ inline void DivABABrcInline(const LocalTensor<T> &output, const Local
+     PipeBarrier<PIPE_V>();
+ }
+ 
++// ==================== GM↔UB数据搬运工具 ====================
++
++// 从Global Memory拷贝数据到UB（LocalTensor）
++// 使用DataCopyPad支持非对齐长度的数据拷贝
++// 参数: nBurst=数据块数(行数), copyLen=每行元素数, srcStride=源行间间隔, dstStride=目的行间间隔(以Block为单位)
+ template <typename T>
+ __aicore__ inline void CopyIn(const GlobalTensor<T> &inputGm, const LocalTensor<T> &inputTensor, const uint16_t nBurst,
+                               const uint32_t copyLen, uint32_t srcStride = 0, uint32_t dstStride = 0)
+@@ -634,7 +867,9 @@ __aicore__ inline void CopyIn(const GlobalTensor<T> &inputGm, const LocalTensor<
+     DataCopyPad(inputTensor, inputGm, dataCoptExtParams, dataCopyPadExtParams);
+ }
+ 
+-// (bs, hc_mult, hc_mult) --> (bs, hc_mult, hc_mult_align)
++// 3D数据拷贝: (outerLoop, nBurst, gmLastDim) → UB (outerLoop, nBurst, ubLastDimAlign)
++// 外层循环按outerLoop遍历，每层调用CopyIn拷贝nBurst行
++// 适用于GM和UB最后一维长度不同（UB有对齐padding）的场景
+ template <typename T>
+ __aicore__ inline void CopyInWithOuterFor(const GlobalTensor<T> &inputGm, const LocalTensor<T> &inputTensor,
+                                           const uint16_t outerLoop, const uint16_t nBurst, const uint32_t copyLen,
+@@ -648,6 +883,10 @@ __aicore__ inline void CopyInWithOuterFor(const GlobalTensor<T> &inputGm, const
+     }
+ }
+ 
++// 4D数据拷贝: (outerLoop, gmFirstDim, gmLastDim) → UB (outerLoop, nBurst, ubLastDimAlign)
++// 支持非连续内存访问模式，根据outerLoop与nBurst的大小关系选择不同遍历策略
++// 当outerLoop <= nBurst时：按outerLoop遍历，每次取nBurst行
++// 当outerLoop > nBurst时：按nBurst遍历，每次取outerLoop个分散数据段
+ template <typename T>
+ __aicore__ inline void CopyInWithOuterFor(const GlobalTensor<T> &inputGm,
+ const LocalTensor<T> &inputTensor, const uint16_t outerLoop,
+@@ -671,6 +910,8 @@ const uint32_t gmLastDim)
+     }
+ }
+ 
++// 从UB（LocalTensor）拷贝数据到Global Memory
++// 参数: nBurst=数据块数(行数), copyLen=每行元素数, dstStride=目的行间间隔(以字节为单位)
+ template <typename T>
+ __aicore__ inline void CopyOut(const LocalTensor<T> &outputTensor, const GlobalTensor<T> &outputGm,
+                                const uint16_t nBurst, const uint32_t copyLen, uint32_t dstStride = 0)
+@@ -685,4 +926,4 @@ __aicore__ inline void CopyOut(const LocalTensor<T> &outputTensor, const GlobalT
+ 
+ } // namespace HcPre
+ 
+-#endif
+\ No newline at end of file
++#endif
+diff --git a/csrc/moe/hc_pre/op_kernel/hc_pre_cube_compute.h b/csrc/moe/hc_pre/op_kernel/hc_pre_cube_compute.h
+index 4502d3d93..c0b69744d 100644
+--- a/csrc/moe/hc_pre/op_kernel/hc_pre_cube_compute.h
++++ b/csrc/moe/hc_pre/op_kernel/hc_pre_cube_compute.h
+@@ -55,10 +55,15 @@ public:
+     __aicore__ inline HcCubeCompute(){};
+ 
+     __aicore__ inline void Init(const GlobalTensor<float>& xGm, const GlobalTensor<float>& fnGm, TPipe *tpipe);
+-    __aicore__ inline void ComputeDecode(const AscendC::GlobalTensor<float> &xGm, const AscendC::GlobalTensor<float> &workspaceGlobalA2,
+-        const AscendC::GlobalTensor<float> &workspaceGlobalAB, const MmParams &mmParams);
++    __aicore__ inline void ComputeDecode(const AscendC::GlobalTensor<float> &xGm,
++        const AscendC::GlobalTensor<float> &nextXGm,
++        const AscendC::GlobalTensor<float> &workspaceGlobalA2,
++        const AscendC::GlobalTensor<float> &workspaceGlobalAB, const MmParams &mmParams,
++        bool a1Preloaded, bool preloadNextTile, uint64_t nextB1Offset, uint64_t nextB1Size);
+     __aicore__ inline void CopyInB1(
+     uint64_t mGmOffset, uint64_t kGmOffset, uint64_t kL1Size, const MmParams &mmParams);
++    __aicore__ inline void PreloadNextB1(
++    uint64_t kGmOffset, uint64_t kL1Size, const MmParams &mmParams);
+     __aicore__ inline void SetBL1Mte1ToMte2Flag();
+     __aicore__ inline void WaitBL1Mte1ToMte2Flag();
+     __aicore__ inline void End();
+@@ -80,6 +85,8 @@ private:
+         uint64_t kL1Offset, uint64_t kL0Size, uint64_t l1LoopIdx, const MmParams &mmParams);
+     __aicore__ inline void MmadAB(
+     uint64_t kGmOffset, uint64_t kL0Size, bool isLastK, const MmParams &mmParams);
++    __aicore__ inline void ComputeL0Pairs(
++        uint64_t l1BaseKOffset, uint64_t curKL1Size, bool closeAccumulator, const MmParams &mmParams);
+ 
+     TPipe *pipe_;
+     const HcPreTilingData *tiling_;
+@@ -96,11 +103,16 @@ private:
+     GlobalTensor<float> yGm_;
+ 
+     static constexpr uint64_t MM1_MTE2_MTE1_EVENT = 2;
++    static constexpr uint64_t B_MTE2_MTE1_EVENT = 4;
+     static constexpr uint64_t X_MTE1_MTE2_EVENT = 2;
+     static constexpr uint64_t B_MTE1_MTE2_EVENT = 4;
+     static constexpr uint64_t M_MTE1_EVENT_L0A = 3;
+     static constexpr uint64_t M_MTE1_EVENT_L0B = 5;
++    // Keep the MTE1->M flag tied to the L0B slot. A2 and AB use different
++    // double-buffer slots, so sharing one event serializes otherwise
++    // independent Mmad launches.
+     static constexpr uint64_t MTE1_M_EVENT = 2;
++    static constexpr uint64_t SYNC_AIV_TO_AIC_FLAG = 8;
+ 
+     static constexpr uint64_t L1_BUF_NUM = 2;
+     static constexpr uint64_t L0A_BUF_NUM = 2;
+@@ -172,6 +184,7 @@ __aicore__ inline void HC_PRE_CUBE_COMPUTE_TEMPLATE_CLASS::Init(const GlobalTens
+         SetFlag<HardEvent::MTE1_MTE2>(X_MTE1_MTE2_EVENT + i);
+         SetFlag<HardEvent::MTE1_MTE2>(B_MTE1_MTE2_EVENT + i);
+     }
++    AscendC::SetHF32TransMode(1);
+ }
+ 
+ HC_PRE_CUBE_COMPUTE_TEMPLATE_PARAM
+@@ -205,6 +218,27 @@ __aicore__ inline void HC_PRE_CUBE_COMPUTE_TEMPLATE_CLASS::CopyInB1(
+     nd2nzParams.dstNzNStride = 1;
+     nd2nzParams.dstNzMatrixStride = 1;
+     DataCopy(l1b_[(l1bLoopIdx_ % L1_BUF_NUM) * L1_BUF_OFFSET], fnGm_[kGmOffset], nd2nzParams);
++    SetFlag<HardEvent::MTE2_MTE1>(B_MTE2_MTE1_EVENT + l1bLoopIdx_ % L1_BUF_NUM);
++}
++
++HC_PRE_CUBE_COMPUTE_TEMPLATE_PARAM
++__aicore__ inline void HC_PRE_CUBE_COMPUTE_TEMPLATE_CLASS::PreloadNextB1(
++    uint64_t kGmOffset, uint64_t kL1Size, const MmParams &mmParams)
++{
++    uint64_t nextB1Idx = (l1bLoopIdx_ + 1) % L1_BUF_NUM;
++    WaitFlag<HardEvent::MTE1_MTE2>(B_MTE1_MTE2_EVENT + nextB1Idx);
++
++    AscendC::Nd2NzParams nd2nzParams;
++    nd2nzParams.ndNum = 1;
++    nd2nzParams.nValue = mmParams.curNL1;
++    nd2nzParams.dValue = kL1Size;
++    nd2nzParams.srcNdMatrixStride = 1;
++    nd2nzParams.srcDValue = mmParams.kGmSize;
++    nd2nzParams.dstNzC0Stride = CeilAlign(mmParams.curNL1, BLOCK_CUBE);
++    nd2nzParams.dstNzNStride = 1;
++    nd2nzParams.dstNzMatrixStride = 1;
++    DataCopy(l1b_[nextB1Idx * L1_BUF_OFFSET], fnGm_[kGmOffset], nd2nzParams);
++    SetFlag<HardEvent::MTE2_MTE1>(B_MTE2_MTE1_EVENT + nextB1Idx);
+ }
+ 
+ HC_PRE_CUBE_COMPUTE_TEMPLATE_PARAM
+@@ -247,7 +281,7 @@ __aicore__ inline void HC_PRE_CUBE_COMPUTE_TEMPLATE_CLASS::Fixp(const AscendC::G
+         mmParams.curML1,
+         mmParams.curNL1,
+         true,
+-        mmParams.nOutSize);  // ND M/N are 512B aligned.
++        mmParams.nOutSize);  // ND row stride is aligned to 512B.
+ }
+ 
+ HC_PRE_CUBE_COMPUTE_TEMPLATE_PARAM
+@@ -263,18 +297,80 @@ __aicore__ inline void HC_PRE_CUBE_COMPUTE_TEMPLATE_CLASS::WaitBL1Mte1ToMte2Flag
+     WaitFlag<HardEvent::MTE1_MTE2>(B_MTE1_MTE2_EVENT + l1bLoopIdx_ % L1_BUF_NUM);
+ }
+ 
++HC_PRE_CUBE_COMPUTE_TEMPLATE_PARAM
++__aicore__ inline void HC_PRE_CUBE_COMPUTE_TEMPLATE_CLASS::ComputeL0Pairs(
++    uint64_t l1BaseKOffset, uint64_t curKL1Size, bool closeAccumulator, const MmParams &mmParams)
++{
++    for (uint64_t kL1Offset = 0; kL1Offset < curKL1Size; kL1Offset += K_L0_SIZE * 2) {
++        uint64_t firstKOffset = l1BaseKOffset + kL1Offset;
++        bool firstIsLast = closeAccumulator && kL1Offset + K_L0_SIZE >= curKL1Size;
++
++        WaitFlag<HardEvent::M_MTE1>(M_MTE1_EVENT_L0A + l0aLoopIdx_ % L0A_BUF_NUM);
++        LoadAToL0A(kL1Offset, K_L0_SIZE, l1aLoopIdx_, mmParams);
++
++        WaitFlag<HardEvent::M_MTE1>(M_MTE1_EVENT_L0B + l0bLoopIdx_ % L0B_BUF_NUM);
++        LoadAToL0B(kL1Offset, K_L0_SIZE, l1aLoopIdx_, mmParams);
++        MmadA2(firstKOffset, K_L0_SIZE, firstIsLast, mmParams);
++        SetFlag<HardEvent::M_MTE1>(M_MTE1_EVENT_L0B + l0bLoopIdx_ % L0B_BUF_NUM);
++        l0bLoopIdx_++;
++
++        WaitFlag<HardEvent::M_MTE1>(M_MTE1_EVENT_L0B + l0bLoopIdx_ % L0B_BUF_NUM);
++        LoadBToL0B(firstKOffset % mmParams.xWsKSize, K_L0_SIZE, l1bLoopIdx_, mmParams);
++        AscendC::SetHF32Mode(1);
++        MmadAB(firstKOffset, K_L0_SIZE, firstIsLast, mmParams);
++        AscendC::SetHF32Mode(0);
++        SetFlag<HardEvent::M_MTE1>(M_MTE1_EVENT_L0B + l0bLoopIdx_ % L0B_BUF_NUM);
++        l0bLoopIdx_++;
++        SetFlag<HardEvent::M_MTE1>(M_MTE1_EVENT_L0A + l0aLoopIdx_ % L0A_BUF_NUM);
++        l0aLoopIdx_++;
++
++        uint64_t secondKL1Offset = kL1Offset + K_L0_SIZE;
++        if (secondKL1Offset >= curKL1Size) {
++            AscendC::SetHF32Mode(0);
++            continue;
++        }
++
++        uint64_t secondKOffset = l1BaseKOffset + secondKL1Offset;
++        bool secondIsLast = closeAccumulator && secondKL1Offset + K_L0_SIZE >= curKL1Size;
++        WaitFlag<HardEvent::M_MTE1>(M_MTE1_EVENT_L0A + l0aLoopIdx_ % L0A_BUF_NUM);
++        LoadAToL0A(secondKL1Offset, K_L0_SIZE, l1aLoopIdx_, mmParams);
++
++        WaitFlag<HardEvent::M_MTE1>(M_MTE1_EVENT_L0B + l0bLoopIdx_ % L0B_BUF_NUM);
++        LoadAToL0B(secondKL1Offset, K_L0_SIZE, l1aLoopIdx_, mmParams);
++        MmadA2(secondKOffset, K_L0_SIZE, secondIsLast, mmParams);
++        SetFlag<HardEvent::M_MTE1>(M_MTE1_EVENT_L0B + l0bLoopIdx_ % L0B_BUF_NUM);
++        l0bLoopIdx_++;
++
++        WaitFlag<HardEvent::M_MTE1>(M_MTE1_EVENT_L0B + l0bLoopIdx_ % L0B_BUF_NUM);
++        LoadBToL0B(secondKOffset % mmParams.xWsKSize, K_L0_SIZE, l1bLoopIdx_, mmParams);
++        AscendC::SetHF32Mode(1);
++        MmadAB(secondKOffset, K_L0_SIZE, secondIsLast, mmParams);
++        SetFlag<HardEvent::M_MTE1>(M_MTE1_EVENT_L0B + l0bLoopIdx_ % L0B_BUF_NUM);
++        l0bLoopIdx_++;
++        AscendC::SetHF32Mode(0);
++        SetFlag<HardEvent::M_MTE1>(M_MTE1_EVENT_L0A + l0aLoopIdx_ % L0A_BUF_NUM);
++        l0aLoopIdx_++;
++    }
++}
++
+ HC_PRE_CUBE_COMPUTE_TEMPLATE_PARAM
+ __aicore__ inline void HC_PRE_CUBE_COMPUTE_TEMPLATE_CLASS::ComputeDecode(
+     const AscendC::GlobalTensor<float> &xGm,
++    const AscendC::GlobalTensor<float> &nextXGm,
+     const AscendC::GlobalTensor<float> &workspaceGlobalA2, const AscendC::GlobalTensor<float> &workspaceGlobalAB,
+-    const MmParams &mmParams)
++    const MmParams &mmParams, bool a1Preloaded, bool preloadNextTile,
++    uint64_t nextB1Offset, uint64_t nextB1Size)
+ {
+-    WaitFlag<HardEvent::MTE1_MTE2>(X_MTE1_MTE2_EVENT + l1aLoopIdx_ % L1_BUF_NUM);
++    WaitFlag<HardEvent::MTE2_MTE1>(B_MTE2_MTE1_EVENT + l1bLoopIdx_ % L1_BUF_NUM);
+     uint64_t kGmOffset = 0;
++    bool nextB1Issued = false;
+     uint64_t curKL1Size = (kGmOffset + mmParams.curKL1 >= mmParams.singleCoreK) ? (mmParams.singleCoreK - kGmOffset) : mmParams.curKL1;
+-    CopyInA1(curKL1Size, xGm[kGmOffset], l1a_[(l1aLoopIdx_ % DOUBLE_BUFFER) * L1_BUF_OFFSET], mmParams);
+-
+-    SetFlag<HardEvent::MTE2_MTE1>(MM1_MTE2_MTE1_EVENT + l1aLoopIdx_ % L1_BUF_NUM);
++    if (!a1Preloaded) {
++        WaitFlag<HardEvent::MTE1_MTE2>(X_MTE1_MTE2_EVENT + l1aLoopIdx_ % L1_BUF_NUM);
++        CopyInA1(curKL1Size, xGm[kGmOffset],
++            l1a_[(l1aLoopIdx_ % DOUBLE_BUFFER) * L1_BUF_OFFSET], mmParams);
++        SetFlag<HardEvent::MTE2_MTE1>(MM1_MTE2_MTE1_EVENT + l1aLoopIdx_ % L1_BUF_NUM);
++    }
+     kGmOffset += mmParams.curKL1;
+     while (kGmOffset < mmParams.singleCoreK) {
+         WaitFlag<HardEvent::MTE1_MTE2>(X_MTE1_MTE2_EVENT + (l1aLoopIdx_ + 1) % L1_BUF_NUM);
+@@ -282,64 +378,39 @@ __aicore__ inline void HC_PRE_CUBE_COMPUTE_TEMPLATE_CLASS::ComputeDecode(
+         CopyInA1(nextKL1Size, xGm[kGmOffset], l1a_[((l1aLoopIdx_ + 1) % DOUBLE_BUFFER) * L1_BUF_OFFSET], mmParams);
+ 
+         SetFlag<HardEvent::MTE2_MTE1>(MM1_MTE2_MTE1_EVENT + (l1aLoopIdx_ + 1) % L1_BUF_NUM);
++        if (preloadNextTile && kGmOffset + nextKL1Size >= mmParams.singleCoreK) {
++            // Queue the next B1 behind the final current-tile A1.
++            PreloadNextB1(nextB1Offset, nextB1Size, mmParams);
++            nextB1Issued = true;
++        }
+         WaitFlag<HardEvent::MTE2_MTE1>(MM1_MTE2_MTE1_EVENT + l1aLoopIdx_ % L1_BUF_NUM);
+ 
+-        for (uint64_t kL1Offset = 0; kL1Offset < curKL1Size; kL1Offset += K_L0_SIZE) {  // K_L0_SIZE 32
+-            WaitFlag<HardEvent::M_MTE1>(M_MTE1_EVENT_L0A + l0aLoopIdx_ % L0A_BUF_NUM);
+-            LoadAToL0A(kL1Offset, K_L0_SIZE, l1aLoopIdx_, mmParams);
+-
+-            WaitFlag<HardEvent::M_MTE1>(M_MTE1_EVENT_L0B + l0bLoopIdx_ % L0B_BUF_NUM);
+-            LoadAToL0B(kL1Offset, K_L0_SIZE, l1aLoopIdx_, mmParams);
+-            MmadA2(kGmOffset + kL1Offset - mmParams.curKL1, K_L0_SIZE,
+-            false,
+-            mmParams);
+-            SetFlag<HardEvent::M_MTE1>(M_MTE1_EVENT_L0B + l0bLoopIdx_ % L0B_BUF_NUM);
+-            l0bLoopIdx_++;
+-
+-            WaitFlag<HardEvent::M_MTE1>(M_MTE1_EVENT_L0B + l0bLoopIdx_ % L0B_BUF_NUM);
+-            LoadBToL0B((kGmOffset + kL1Offset - mmParams.curKL1) % mmParams.xWsKSize, K_L0_SIZE, l1bLoopIdx_, mmParams);
+-            MmadAB(kGmOffset + kL1Offset - mmParams.curKL1, K_L0_SIZE,
+-                false,
+-                mmParams);
+-            SetFlag<HardEvent::M_MTE1>(M_MTE1_EVENT_L0B + l0bLoopIdx_ % L0B_BUF_NUM);
+-            l0bLoopIdx_++;
+-
+-            SetFlag<HardEvent::M_MTE1>(M_MTE1_EVENT_L0A + l0aLoopIdx_ % L0A_BUF_NUM);
+-            l0aLoopIdx_++;
+-        }
++        ComputeL0Pairs(kGmOffset - mmParams.curKL1, curKL1Size, false, mmParams);
+         SetFlag<HardEvent::MTE1_MTE2>(X_MTE1_MTE2_EVENT + l1aLoopIdx_ % L1_BUF_NUM);
+         l1aLoopIdx_++;
+         kGmOffset += mmParams.curKL1;
+         curKL1Size = nextKL1Size;
+     }
+ 
+-    WaitFlag<HardEvent::MTE2_MTE1>(MM1_MTE2_MTE1_EVENT + l1aLoopIdx_ % L1_BUF_NUM);
+-    for (uint64_t kL1Offset = 0; kL1Offset < curKL1Size; kL1Offset += K_L0_SIZE) {
+-        WaitFlag<HardEvent::M_MTE1>(M_MTE1_EVENT_L0A + l0aLoopIdx_ % L0A_BUF_NUM);
+-        LoadAToL0A(kL1Offset, K_L0_SIZE, l1aLoopIdx_, mmParams);  // to l0a
+-
+-        WaitFlag<HardEvent::M_MTE1>(M_MTE1_EVENT_L0B + l0bLoopIdx_ % L0B_BUF_NUM);
+-        LoadAToL0B(kL1Offset, K_L0_SIZE, l1aLoopIdx_, mmParams);  // to l0b
+-        MmadA2(kGmOffset + kL1Offset - mmParams.curKL1, K_L0_SIZE,
+-            mmParams.isLastK && kL1Offset + K_L0_SIZE >= curKL1Size, mmParams);
+-        SetFlag<HardEvent::M_MTE1>(M_MTE1_EVENT_L0B + l0bLoopIdx_ % L0B_BUF_NUM);
+-        l0bLoopIdx_++;
+-
+-        WaitFlag<HardEvent::M_MTE1>(M_MTE1_EVENT_L0B + l0bLoopIdx_ % L0B_BUF_NUM);
+-        LoadBToL0B((kGmOffset + kL1Offset - mmParams.curKL1)  % mmParams.xWsKSize, K_L0_SIZE, l1bLoopIdx_, mmParams);  // to l0b
+-        MmadAB(kGmOffset + kL1Offset - mmParams.curKL1, K_L0_SIZE,
+-            mmParams.isLastK && kL1Offset + K_L0_SIZE >= curKL1Size,
+-            mmParams);
+-        SetFlag<HardEvent::M_MTE1>(M_MTE1_EVENT_L0B + l0bLoopIdx_ % L0B_BUF_NUM);
+-        l0bLoopIdx_++;
+-
+-        SetFlag<HardEvent::M_MTE1>(M_MTE1_EVENT_L0A + l0aLoopIdx_ % L0A_BUF_NUM);
+-        l0aLoopIdx_++;
++    if (preloadNextTile) {
++        // Keep the shared MTE2 queue bounded to the next B1 transfer and first
++        // A1 tile. Single-L1 tiles use this fallback to issue B1 here.
++        if (!nextB1Issued) {
++            PreloadNextB1(nextB1Offset, nextB1Size, mmParams);
++        }
++        CrossCoreWaitFlag(SYNC_AIV_TO_AIC_FLAG);
++        uint64_t nextA1Idx = (l1aLoopIdx_ + 1) % L1_BUF_NUM;
++        WaitFlag<HardEvent::MTE1_MTE2>(X_MTE1_MTE2_EVENT + nextA1Idx);
++        uint64_t nextA1Size = nextB1Size < mmParams.curKL1 ? nextB1Size : mmParams.curKL1;
++        CopyInA1(nextA1Size, nextXGm, l1a_[nextA1Idx * L1_BUF_OFFSET], mmParams);
++        SetFlag<HardEvent::MTE2_MTE1>(MM1_MTE2_MTE1_EVENT + nextA1Idx);
+     }
++    WaitFlag<HardEvent::MTE2_MTE1>(MM1_MTE2_MTE1_EVENT + l1aLoopIdx_ % L1_BUF_NUM);
++    ComputeL0Pairs(kGmOffset - mmParams.curKL1, curKL1Size, mmParams.isLastK, mmParams);
+     SetFlag<HardEvent::MTE1_MTE2>(X_MTE1_MTE2_EVENT + l1aLoopIdx_ % L1_BUF_NUM);
+     l1aLoopIdx_++;
+     if (mmParams.isLastK) {
+-        Fixp(workspaceGlobalA2, workspaceGlobalAB, mmParams);  // l0cLoopIdx_++;
++        Fixp(workspaceGlobalA2, workspaceGlobalAB, mmParams);
+     }
+ }
+ 
+@@ -418,8 +489,9 @@ HC_PRE_CUBE_COMPUTE_TEMPLATE_PARAM
+ __aicore__ inline void HC_PRE_CUBE_COMPUTE_TEMPLATE_CLASS::MmadA2(
+     uint64_t kGmOffset, uint64_t kL0Size, bool isLastK, const MmParams &mmParams)
+ {
+-    SetFlag<HardEvent::MTE1_M>(MTE1_M_EVENT);
+-    WaitFlag<HardEvent::MTE1_M>(MTE1_M_EVENT);
++    uint64_t mte1MEvent = MTE1_M_EVENT + (l0bLoopIdx_ % L0B_BUF_NUM);
++    SetFlag<HardEvent::MTE1_M>(mte1MEvent);
++    WaitFlag<HardEvent::MTE1_M>(mte1MEvent);
+     for (uint64_t mL0Offset = 0; mL0Offset < mmParams.curML1; mL0Offset += BLOCK_CUBE) {
+         MmadParams mmadParams;
+         mmadParams.m = BLOCK_CUBE;
+@@ -457,10 +529,9 @@ HC_PRE_CUBE_COMPUTE_TEMPLATE_PARAM
+ __aicore__ inline void HC_PRE_CUBE_COMPUTE_TEMPLATE_CLASS::MmadAB(
+     uint64_t kGmOffset, uint64_t kL0Size, bool isLastK, const MmParams &mmParams)
+ {
+-    SetFlag<HardEvent::MTE1_M>(MTE1_M_EVENT);
+-    WaitFlag<HardEvent::MTE1_M>(MTE1_M_EVENT);
+-    AscendC::SetHF32Mode(1);
+-    AscendC::SetHF32TransMode(1);
++    uint64_t mte1MEvent = MTE1_M_EVENT + (l0bLoopIdx_ % L0B_BUF_NUM);
++    SetFlag<HardEvent::MTE1_M>(mte1MEvent);
++    WaitFlag<HardEvent::MTE1_M>(mte1MEvent);
+     MmadParams mmadParams;
+     mmadParams.m = CeilAlign(mmParams.curML1, BLOCK_CUBE);
+     mmadParams.n = mmParams.curNL1;
+@@ -473,7 +544,6 @@ __aicore__ inline void HC_PRE_CUBE_COMPUTE_TEMPLATE_CLASS::MmadAB(
+         l0a_[(l0aLoopIdx_ % L0A_BUF_NUM) * L0AB_BUF_OFFSET],
+         l0b_[(l0bLoopIdx_ % L0AB_BUF_NUM) * L0AB_BUF_OFFSET],
+         mmadParams);
+-    AscendC::SetHF32Mode(0);
+ }
+ 
+ }  // namespace HcPre
+diff --git a/csrc/moe/hc_pre/op_kernel/hc_pre_cube_compute_arch35.h b/csrc/moe/hc_pre/op_kernel/hc_pre_cube_compute_arch35.h
+index bcb3f48a2..ae0e51ff3 100644
+--- a/csrc/moe/hc_pre/op_kernel/hc_pre_cube_compute_arch35.h
++++ b/csrc/moe/hc_pre/op_kernel/hc_pre_cube_compute_arch35.h
+@@ -238,4 +238,4 @@ namespace HcPreNs
+         }
+     };
+ }
+-#endif
++#endif
+\ No newline at end of file
+diff --git a/csrc/moe/hc_pre/op_kernel/hc_pre_m_k_split_core.h b/csrc/moe/hc_pre/op_kernel/hc_pre_m_k_split_core.h
+index 82b4e7fe7..255375ce2 100644
+--- a/csrc/moe/hc_pre/op_kernel/hc_pre_m_k_split_core.h
++++ b/csrc/moe/hc_pre/op_kernel/hc_pre_m_k_split_core.h
+@@ -71,99 +71,138 @@ public:
+         pipe->InitBuffer(mmInQue, NUM_TWO, xQueNum * sizeof(float));
+     }
+ 
+-    __aicore__ inline void Process()
++    // 计算 (m,k) 网格分块索引与 GM 范围; curVectorBlockIdx 为 AIV 原始 blockIdx(奇偶分半用)
++    __aicore__ inline void GetMkBlockInfo(uint64_t &mGmBaseOffset, uint64_t &mGmEndOffset,
++        uint64_t &kGmStartOffset, uint64_t &kGmEndOffset, uint64_t &curVectorBlockIdx)
+     {
+-        if ASCEND_IS_AIC{
+-            // 初始设置
+-            CrossCoreSetFlag<SYNC_MODE2, PIPE_FIX>(SYNC_AIC_TO_AIV_FLAG);
+-            CrossCoreSetFlag<SYNC_MODE2, PIPE_FIX>(SYNC_AIC_TO_AIV_FLAG);
+-        }
+-
+         uint64_t curBlockIdx = GetBlockIdx();
+-        uint64_t curVectorBlockIdx = curBlockIdx;
++        curVectorBlockIdx = curBlockIdx;
+         if ASCEND_IS_AIV {
+             curBlockIdx = curBlockIdx / NUM_TWO;
+         }
+         uint64_t mBlkDimIdx = curBlockIdx / tilingData->cubeBlockDimK;
+         uint64_t kBlkDimIdx = curBlockIdx % tilingData->cubeBlockDimK;
+-        uint64_t kGmStartOffset = tilingData->multCoreSplitKSize * kBlkDimIdx;
+-        uint64_t kGmEndOffset = kGmStartOffset + tilingData->multCoreSplitKSize;
+-        if (kGmEndOffset > tilingData->k) {
+-            kGmEndOffset = tilingData->k;
++        kBlkDimIdx_ = kBlkDimIdx;
++        kGmStartOffset = tilingData->multCoreSplitKSize * kBlkDimIdx;
++        kGmEndOffset = kGmStartOffset + tilingData->multCoreSplitKSize;
++        if (kGmEndOffset > static_cast<uint64_t>(tilingData->k)) {
++            kGmEndOffset = static_cast<uint64_t>(tilingData->k);
+         }
+-
+-        uint64_t mGmBaseOffset = mBlkDimIdx * tilingData->multCoreSplitMSize;
+-        uint64_t mGmEndOffset = mGmBaseOffset + tilingData->multCoreSplitMSize;
+-        if (mGmEndOffset > tilingData->bs) {
+-            mGmEndOffset = tilingData->bs;
++        mGmBaseOffset = mBlkDimIdx * tilingData->multCoreSplitMSize;
++        mGmEndOffset = mGmBaseOffset + tilingData->multCoreSplitMSize;
++        if (mGmEndOffset > static_cast<uint64_t>(tilingData->bs)) {
++            mGmEndOffset = static_cast<uint64_t>(tilingData->bs);
+         }
+-        for (uint64_t mGmOffset = mGmBaseOffset; mGmOffset < mGmEndOffset;
+-                mGmOffset += tilingData->mL1Size) {
+-            uint64_t realMSize = mGmOffset + tilingData->mL1Size > mGmEndOffset ?
+-                mGmEndOffset - mGmOffset : tilingData->mL1Size;
+-            for (uint64_t kGmBaseOffset = kGmStartOffset; kGmBaseOffset < kGmEndOffset;
+-                kGmBaseOffset += tilingData->cvLoopKSize) {
+-                uint64_t realKGmSize = kGmBaseOffset + tilingData->cvLoopKSize > kGmEndOffset ?
+-                    kGmEndOffset - kGmBaseOffset : tilingData->cvLoopKSize;
+-                if ASCEND_IS_AIC{
+-                    MmParams mmParams;
+-                    mmParams.curML1 = realMSize;
+-                    mmParams.curKL1 = tilingData->kL1Size;
+-                    mmParams.curNL1 = N_SIZE;
+-                    mmParams.singleCoreK = realKGmSize;
+-                    mmParams.xWsKSize = tilingData->cvLoopKSize;
+-                    mmParams.nOutSize = mmOuterInnerSize_;
+-                    mmParams.kGmBaseOffset = kGmBaseOffset;
+-                    mmParams.nGmSize = N_SIZE;
+-                    mmParams.kGmSize = tilingData->k;
+-                    mmParams.isLastK = kGmBaseOffset + tilingData->cvLoopKSize >= kGmEndOffset;
+-                    mmParams.isFirstK = kGmBaseOffset == kGmStartOffset;
++    }
+ 
++    // 单个 m-chunk 的完整 k 循环(原 Process 的 m 循环体). b1/a1 预取状态每 chunk 组重置,
++    // 跨 m-chunk 调用间不残留预取依赖. cvLoopIdx_ 跨调用连续, 维持 ws1 双 buffer 槽位交替.
++    __aicore__ inline void ProcessMChunk(uint64_t mGmOffset, uint64_t mGmEndOffset,
++        uint64_t kGmStartOffset, uint64_t kGmEndOffset, uint64_t curVectorBlockIdx)
++    {
++        uint64_t realMSize = mGmOffset + static_cast<uint64_t>(tilingData->mL1Size) > mGmEndOffset ?
++            mGmEndOffset - mGmOffset : static_cast<uint64_t>(tilingData->mL1Size);
++        bool b1Prefetched = false;
++        bool a1Prefetched = false;
++        for (uint64_t kGmBaseOffset = kGmStartOffset; kGmBaseOffset < kGmEndOffset;
++            kGmBaseOffset += tilingData->cvLoopKSize) {
++            uint64_t realKGmSize = kGmBaseOffset + tilingData->cvLoopKSize > kGmEndOffset ?
++                kGmEndOffset - kGmBaseOffset : tilingData->cvLoopKSize;
++            if ASCEND_IS_AIC{
++                MmParams mmParams;
++                mmParams.curML1 = realMSize;
++                mmParams.curKL1 = tilingData->kL1Size;
++                mmParams.curNL1 = N_SIZE;
++                mmParams.singleCoreK = realKGmSize;
++                mmParams.xWsKSize = tilingData->cvLoopKSize;
++                mmParams.nOutSize = mmOuterInnerSize_;
++                mmParams.kGmBaseOffset = kGmBaseOffset;
++                mmParams.nGmSize = N_SIZE;
++                mmParams.kGmSize = tilingData->k;
++                mmParams.isLastK = kGmBaseOffset + tilingData->cvLoopKSize >= kGmEndOffset;
++                mmParams.isFirstK = kGmBaseOffset == kGmStartOffset;
++
++                if (!b1Prefetched) {
+                     cubeCompute_.WaitBL1Mte1ToMte2Flag();
+                     cubeCompute_.CopyInB1(mGmOffset, kGmBaseOffset, realKGmSize, mmParams);
++                }
++
++                uint64_t nextB1Offset = kGmBaseOffset + tilingData->cvLoopKSize;
++                bool preloadNextB1 = nextB1Offset < kGmEndOffset;
++                uint64_t nextB1Size = 0;
++                if (preloadNextB1) {
++                    uint64_t nextB1Remain = kGmEndOffset - nextB1Offset;
++                    nextB1Size = nextB1Remain < static_cast<uint64_t>(tilingData->cvLoopKSize) ?
++                        nextB1Remain : static_cast<uint64_t>(tilingData->cvLoopKSize);
++                }
+ 
++                if (!a1Prefetched) {
+                     CrossCoreWaitFlag(SYNC_AIV_TO_AIC_FLAG);
+-                    cubeCompute_.ComputeDecode(xCastFp32WsGm[cvLoopIdx_ % DOUBLE_BUFFER * xCastFp32BufSize_],
+-                        squareSumFp32WsGm[kBlkDimIdx * squareSumFp32BufSize_ + mGmOffset * BLOCK_CUBE],
+-                        mmOutFp32WsGm[kBlkDimIdx * mmOutFp32BufSize_ + mGmOffset * mmOuterInnerSize_],
+-                        mmParams);
+-                    cubeCompute_.SetBL1Mte1ToMte2Flag();
+-                    CrossCoreSetFlag<SYNC_MODE2, PIPE_FIX>(SYNC_AIC_TO_AIV_FLAG);
+-                } else {
+-                    CrossCoreWaitFlag(SYNC_AIC_TO_AIV_FLAG);
+-                    // vec.compute();
+-                    int64_t mVectorOffset = mGmOffset;
+-                    int64_t mVectorLength = (realMSize + 1) / NUM_TWO;
+-                    if ((curVectorBlockIdx % NUM_TWO) == 1) {
+-                        mVectorOffset = mGmOffset + (realMSize + 1) / NUM_TWO;
+-                        mVectorLength = realMSize - mVectorLength;
+-                    }
+-                    int64_t curUbLoops = (mVectorLength + tilingData->stage1MFactor - 1) / tilingData->stage1MFactor;
+-                    int64_t curUbMfactorTail = mVectorLength - ((curUbLoops - 1) * tilingData->stage1MFactor);
+-                    for (int64_t i = 0; i < curUbLoops; ++i) {
+-                        int64_t curUbMFactor = (i != (curUbLoops - 1)) ? tilingData->stage1MFactor : curUbMfactorTail;
+-                        xLocal = xQue.template AllocTensor<T>();
+-                        int64_t curGlobalxOffset = (mVectorOffset + i * tilingData->stage1MFactor) *
+-                        tilingData->k + kGmBaseOffset;
+-                        CopyIn(xGm[curGlobalxOffset], xLocal, curUbMFactor, realKGmSize, tilingData->k - realKGmSize);
+-                        xQue.template EnQue(xLocal);
+-                        xLocal = xQue.template DeQue<T>();
+-                        xCastLocal = mmInQue.AllocTensor<float>();
+-                        CastTwoDim(xCastLocal, xLocal, curUbMFactor, realKGmSize);
+-                        xQue.template FreeTensor(xLocal);
+-                        mmInQue.template EnQue(xCastLocal);
+-                        xCastLocal = mmInQue.template DeQue<float>();
+-                        int64_t cutMmInOffset = cvLoopIdx_ % DOUBLE_BUFFER * xCastFp32BufSize_ +
+-                        (i * tilingData->stage1MFactor + mVectorOffset - mGmOffset) *
+-                        tilingData->cvLoopKSize;
+-                        CopyOut(xCastLocal, xCastFp32WsGm[cutMmInOffset], curUbMFactor, realKGmSize,
+-                        tilingData->cvLoopKSize - realKGmSize);
+-                        mmInQue.FreeTensor(xCastLocal);
+-                    }
+-                    CrossCoreSetFlag<SYNC_MODE2, PIPE_MTE3>(SYNC_AIV_TO_AIC_FLAG);
+                 }
+-                cvLoopIdx_++;
++                cubeCompute_.ComputeDecode(
++                    xCastFp32WsGm[cvLoopIdx_ % DOUBLE_BUFFER * xCastFp32BufSize_],
++                    xCastFp32WsGm[(cvLoopIdx_ + 1) % DOUBLE_BUFFER * xCastFp32BufSize_],
++                    squareSumFp32WsGm[kBlkDimIdx_ * squareSumFp32BufSize_ + mGmOffset * BLOCK_CUBE],
++                    mmOutFp32WsGm[kBlkDimIdx_ * mmOutFp32BufSize_ + mGmOffset * mmOuterInnerSize_],
++                    mmParams, a1Prefetched, preloadNextB1, nextB1Offset, nextB1Size);
++                cubeCompute_.SetBL1Mte1ToMte2Flag();
++                b1Prefetched = preloadNextB1;
++                a1Prefetched = preloadNextB1;
++                CrossCoreSetFlag<SYNC_MODE2, PIPE_FIX>(SYNC_AIC_TO_AIV_FLAG);
++            } else {
++                CrossCoreWaitFlag(SYNC_AIC_TO_AIV_FLAG);
++                // vec.compute();
++                int64_t mVectorOffset = mGmOffset;
++                int64_t mVectorLength = (realMSize + 1) / NUM_TWO;
++                if ((curVectorBlockIdx % NUM_TWO) == 1) {
++                    mVectorOffset = mGmOffset + (realMSize + 1) / NUM_TWO;
++                    mVectorLength = realMSize - mVectorLength;
++                }
++                int64_t curUbLoops = (mVectorLength + tilingData->stage1MFactor - 1) / tilingData->stage1MFactor;
++                int64_t curUbMfactorTail = mVectorLength - ((curUbLoops - 1) * tilingData->stage1MFactor);
++                for (int64_t i = 0; i < curUbLoops; ++i) {
++                    int64_t curUbMFactor = (i != (curUbLoops - 1)) ? tilingData->stage1MFactor : curUbMfactorTail;
++                    xLocal = xQue.template AllocTensor<T>();
++                    int64_t curGlobalxOffset = (mVectorOffset + i * tilingData->stage1MFactor) *
++                    tilingData->k + kGmBaseOffset;
++                    CopyIn(xGm[curGlobalxOffset], xLocal, curUbMFactor, realKGmSize, tilingData->k - realKGmSize);
++                    xQue.template EnQue(xLocal);
++                    xLocal = xQue.template DeQue<T>();
++                    xCastLocal = mmInQue.AllocTensor<float>();
++                    CastTwoDim(xCastLocal, xLocal, curUbMFactor, realKGmSize);
++                    xQue.template FreeTensor(xLocal);
++                    mmInQue.template EnQue(xCastLocal);
++                    xCastLocal = mmInQue.template DeQue<float>();
++                    int64_t cutMmInOffset = cvLoopIdx_ % DOUBLE_BUFFER * xCastFp32BufSize_ +
++                    (i * tilingData->stage1MFactor + mVectorOffset - mGmOffset) *
++                    tilingData->cvLoopKSize;
++                    CopyOut(xCastLocal, xCastFp32WsGm[cutMmInOffset], curUbMFactor, realKGmSize,
++                    tilingData->cvLoopKSize - realKGmSize);
++                    mmInQue.FreeTensor(xCastLocal);
++                }
++                CrossCoreSetFlag<SYNC_MODE2, PIPE_MTE3>(SYNC_AIV_TO_AIC_FLAG);
+             }
++            cvLoopIdx_++;
++        }
++    }
++
++    __aicore__ inline void Process()
++    {
++        if ASCEND_IS_AIC{
++            // 初始设置
++            CrossCoreSetFlag<SYNC_MODE2, PIPE_FIX>(SYNC_AIC_TO_AIV_FLAG);
++            CrossCoreSetFlag<SYNC_MODE2, PIPE_FIX>(SYNC_AIC_TO_AIV_FLAG);
++        }
++
++        uint64_t mGmBaseOffset = 0;
++        uint64_t mGmEndOffset = 0;
++        uint64_t kGmStartOffset = 0;
++        uint64_t kGmEndOffset = 0;
++        uint64_t curVectorBlockIdx = 0;
++        GetMkBlockInfo(mGmBaseOffset, mGmEndOffset, kGmStartOffset, kGmEndOffset, curVectorBlockIdx);
++        for (uint64_t mGmOffset = mGmBaseOffset; mGmOffset < mGmEndOffset;
++                mGmOffset += tilingData->mL1Size) {
++            ProcessMChunk(mGmOffset, mGmEndOffset, kGmStartOffset, kGmEndOffset, curVectorBlockIdx);
+         }
+         if ASCEND_IS_AIC {
+             cubeCompute_.End();
+@@ -199,19 +238,852 @@ private:
+     static constexpr uint64_t SYNC_MODE2 = NUM_TWO;
+ 
+     uint64_t cvLoopIdx_ = 0;
++    uint64_t kBlkDimIdx_ = 0;
+     uint64_t xCastFp32BufSize_;
+     uint64_t mmOuterInnerSize_;
+     uint64_t mmOutFp32BufSize_;
+     uint64_t squareSumFp32BufSize_;
+ };
+ 
+-template <typename T>
++template <typename T, bool useOriginal>
+ class HcPreMembaseKSplitCorePart2 {
+ public:
+     __aicore__ inline HcPreMembaseKSplitCorePart2()
+     {
+     }
+ 
++    __aicore__ inline void InitGlobalBuffers(GM_ADDR x, GM_ADDR hcScale,
++        GM_ADDR hcBase, GM_ADDR y, GM_ADDR post, GM_ADDR combFrag,
++        GM_ADDR preMix, GM_ADDR pre, GM_ADDR workspace)
++    {
++        xGm.SetGlobalBuffer((__gm__ T *)x);
++        hcScaleGm.SetGlobalBuffer((__gm__ float *)hcScale);
++        hcBaseGm.SetGlobalBuffer((__gm__ float *)hcBase);
++        yGm.SetGlobalBuffer((__gm__ T *)y);
++        postGm.SetGlobalBuffer((__gm__ float *)post);
++        combFragGm.SetGlobalBuffer((__gm__ float *)combFrag);
++        workspaceGm.SetGlobalBuffer((__gm__ float *)workspace);
++    }
++
++    __aicore__ inline void InitCommonBuffers(int64_t stage1UsedCoreNum, int64_t rowFactor)
++    {
++        pipe->InitBuffer(squareSumQue, NUM_TWO,
++            stage1UsedCoreNum * rowFactor * SQUARE_SUM_SIZE * sizeof(float));
++        pipe->InitBuffer(squareReduceBuf, rowFactor * SQUARE_SUM_SIZE * sizeof(float));
++        pipe->InitBuffer(rsqrtBuf, RoundUp<float>(rowFactor) * sizeof(float));
++        pipe->InitBuffer(rowBrcbBuf0, RoundUp<float>(rowFactor) * BLOCK_SIZE);
++        pipe->InitBuffer(maskPatternBuf,
++            RoundUp<uint32_t>((rowFactor + MASK_PATTERN_DIM_SIZE - 1) * MASK_PATTERN_REPEAT_SIZE) * sizeof(uint32_t));
++
++        squareReduceLocal = squareReduceBuf.Get<float>();
++        rsqrtLocal = rsqrtBuf.Get<float>();
++        rowBrcbLocal0 = rowBrcbBuf0.Get<float>();
++        maskPatternLocal = maskPatternBuf.Get<uint32_t>();
++        SetGatherMaskPattern(maskPatternLocal, static_cast<uint16_t>(rowFactor + MASK_PATTERN_DIM_SIZE - 1));
++    }
++
++    __aicore__ inline void InitPrePostBuffers(int64_t stage1UsedCoreNum)
++    {
++        int64_t rowFactor = tilingData->prePostRowFactor;
++        // Pre/post and y have different working-set shapes. Keep the y
++        // buffers at the stage2 row factor (normally one row for full-D
++        // tiles), while batching the row-only pre/post path separately.
++        int64_t yRowFactor = tilingData->stage2RowFactor;
++        int64_t xQueSize = yRowFactor * tilingData->hcMult * RoundUp<T>(tilingData->dFactor);
++        InitCommonBuffers(stage1UsedCoreNum, rowFactor);
++        pipe->InitBuffer(mixesQue01, NUM_TWO,
++            stage1UsedCoreNum * rowFactor * tilingData->hcMultAlign * NUM_TWO * sizeof(float));
++        pipe->InitBuffer(xQue, NUM_TWO, xQueSize * sizeof(T));
++        pipe->InitBuffer(yQue, NUM_TWO,
++            yRowFactor * RoundUp<T>(tilingData->dFactor) * sizeof(T));
++        // ProcessPost 按 prePostRowFactor 批量处理行，postQue 需容纳整个批次。
++        pipe->InitBuffer(postQue, NUM_TWO,
++            tilingData->prePostRowFactor * tilingData->hcMultAlign * sizeof(float));
++        pipe->InitBuffer(hcBaseBuf0, tilingData->hcMultAlign * sizeof(float));
++        pipe->InitBuffer(hcBaseBuf1, tilingData->hcMultAlign * sizeof(float));
++        pipe->InitBuffer(hcBrcbBuf1,
++            RoundUp<float>(rowFactor * tilingData->hcMultAlign) * BLOCK_SIZE);
++        pipe->InitBuffer(mixes01ReduceBuf,
++            rowFactor * tilingData->hcMultAlign * NUM_TWO * sizeof(float));
++        pipe->InitBuffer(xCastBuf, xQueSize * sizeof(float));
++        pipe->InitBuffer(yCastBuf,
++            yRowFactor * RoundUp<T>(tilingData->dFactor) * sizeof(float));
++
++        hcBase0Local = hcBaseBuf0.Get<float>();
++        hcBase1Local = hcBaseBuf1.Get<float>();
++        hcBrcbLocal1 = hcBrcbBuf1.Get<float>();
++        mixes01ReduceLocal = mixes01ReduceBuf.Get<float>();
++        xCastLocal = xCastBuf.Get<float>();
++        yCastLocal = yCastBuf.Get<float>();
++    }
++
++    __aicore__ inline void InitSinkhornBuffers(int64_t stage1UsedCoreNum)
++    {
++        int64_t rowFactor = tilingData->sinkhornRowFactor;
++        int64_t rowFactorAlign = RoundUp<float>(rowFactor);
++        InitCommonBuffers(stage1UsedCoreNum, rowFactor);
++        pipe->InitBuffer(mixesQue2, DOUBLE_BUFFER,
++            stage1UsedCoreNum * rowFactor * COMPACT_MATRIX_SIZE * sizeof(float));
++        pipe->InitBuffer(combFragQue, DOUBLE_BUFFER,
++            rowFactor * COMPACT_MATRIX_SIZE * sizeof(float));
++        pipe->InitBuffer(hcBaseBuf2, COMPACT_MATRIX_SIZE * sizeof(float));
++        pipe->InitBuffer(hcBrcbBuf1, COMPACT_MATRIX_SIZE * BLOCK_SIZE);
++        pipe->InitBuffer(reduceBuf,
++            COMPACT_HC_MULT * rowFactorAlign * sizeof(float));
++        pipe->InitBuffer(mixes02ReduceBuf,
++            COMPACT_MATRIX_SIZE * rowFactorAlign * sizeof(float));
++
++        hcBase2Local = hcBaseBuf2.Get<float>();
++        hcBrcbLocal1 = hcBrcbBuf1.Get<float>();
++        reduceLocal = reduceBuf.Get<float>();
++        mixes02ReduceLocal = mixes02ReduceBuf.Get<float>();
++    }
++
++    __aicore__ inline void InitOriginalBuffers(int64_t stage1UsedCoreNum)
++    {
++        int64_t rowFactor = tilingData->stage2RowFactor;
++        int64_t xQueSize = rowFactor * tilingData->hcMult * RoundUp<T>(tilingData->dFactor);
++        InitCommonBuffers(stage1UsedCoreNum, rowFactor);
++
++        pipe->InitBuffer(mixesQue01, NUM_TWO,
++            stage1UsedCoreNum * rowFactor * tilingData->hcMultAlign * NUM_TWO * sizeof(float));
++        pipe->InitBuffer(mixesQue2, NUM_TWO,
++            stage1UsedCoreNum * rowFactor * tilingData->hcMult * tilingData->hcMultAlign * sizeof(float));
++        pipe->InitBuffer(xQue, NUM_TWO, xQueSize * sizeof(T));
++        pipe->InitBuffer(yQue, NUM_TWO,
++            rowFactor * RoundUp<T>(tilingData->dFactor) * sizeof(T));
++        pipe->InitBuffer(postQue, NUM_TWO,
++            rowFactor * tilingData->hcMultAlign * sizeof(float));
++        pipe->InitBuffer(combFragQue, NUM_TWO,
++            rowFactor * tilingData->hcMult * tilingData->hcMultAlign * sizeof(float));
++
++        pipe->InitBuffer(hcBaseBuf0, tilingData->hcMultAlign * sizeof(float));
++        pipe->InitBuffer(hcBaseBuf1, tilingData->hcMultAlign * sizeof(float));
++        pipe->InitBuffer(hcBaseBuf2,
++            tilingData->hcMult * tilingData->hcMultAlign * sizeof(float));
++        pipe->InitBuffer(hcBrcbBuf1,
++            RoundUp<float>(rowFactor * tilingData->hcMultAlign) * BLOCK_SIZE);
++        pipe->InitBuffer(reduceBuf,
++            rowFactor * tilingData->hcMultAlign * sizeof(float));
++        pipe->InitBuffer(mixes01ReduceBuf,
++            rowFactor * tilingData->hcMultAlign * NUM_TWO * sizeof(float));
++        pipe->InitBuffer(mixes02ReduceBuf,
++            rowFactor * tilingData->hcMult * tilingData->hcMultAlign * sizeof(float));
++        pipe->InitBuffer(xCastBuf, xQueSize * sizeof(float));
++        pipe->InitBuffer(yCastBuf,
++            rowFactor * RoundUp<T>(tilingData->dFactor) * sizeof(float));
++
++        hcBase0Local = hcBaseBuf0.Get<float>();
++        hcBase1Local = hcBaseBuf1.Get<float>();
++        hcBase2Local = hcBaseBuf2.Get<float>();
++        hcBrcbLocal1 = hcBrcbBuf1.Get<float>();
++        reduceLocal = reduceBuf.Get<float>();
++        mixes01ReduceLocal = mixes01ReduceBuf.Get<float>();
++        mixes02ReduceLocal = mixes02ReduceBuf.Get<float>();
++        xCastLocal = xCastBuf.Get<float>();
++        yCastLocal = yCastBuf.Get<float>();
++    }
++
++    __aicore__ inline void Init(GM_ADDR x, GM_ADDR hcScale, GM_ADDR hcBase,
++        GM_ADDR y, GM_ADDR post, GM_ADDR combFrag, GM_ADDR preMix, GM_ADDR pre,
++        GM_ADDR workspace, const HcPreTilingData *tilingDataPtr, TPipe *pipePtr)
++    {
++        pipe = pipePtr;
++        tilingData = tilingDataPtr;
++        InitGlobalBuffers(x, hcScale, hcBase, y, post, combFrag, preMix, pre, workspace);
++        if ASCEND_IS_AIC {
++            return;
++        }
++        int64_t stage1UsedCoreNum = tilingData->cubeBlockDimK;
++        if constexpr (useOriginal) {
++            InitOriginalBuffers(stage1UsedCoreNum);
++        } else {
++            if (GetBlockIdx() < tilingData->prePostCoreNum) {
++                InitPrePostBuffers(stage1UsedCoreNum);
++            } else {
++                InitSinkhornBuffers(stage1UsedCoreNum);
++            }
++        }
++    }
++
++    __aicore__ inline void CalcRsqrt(int64_t stage1UsedCoreNum, int64_t globalRowOffset,
++                                    int64_t curRowFactor, int64_t workspaceSize1, int64_t workspaceSize2)
++    {
++        squareSumOutLocal = squareSumQue.AllocTensor<float>();
++        CopyIn(workspaceGm[workspaceSize1 + workspaceSize2 + globalRowOffset * SQUARE_SUM_SIZE],
++            squareSumOutLocal, stage1UsedCoreNum, curRowFactor * SQUARE_SUM_SIZE,
++            CeilAlign(tilingData->bs, SQUARE_SUM_SIZE) * SQUARE_SUM_SIZE - curRowFactor * SQUARE_SUM_SIZE);
++        squareSumQue.EnQue(squareSumOutLocal);
++        squareSumOutLocal = squareSumQue.DeQue<float>();
++        ReduceSumARAPerf(squareReduceLocal, squareSumOutLocal, 1, stage1UsedCoreNum,
++            curRowFactor * SQUARE_SUM_SIZE);
++        GatherMaskByDiagonal(rsqrtLocal, squareReduceLocal, maskPatternLocal, curRowFactor,
++            globalRowOffset % SQUARE_SUM_SIZE);
++        float coeff = 1.0f / static_cast<float>(tilingData->k);
++        Muls(rsqrtLocal, rsqrtLocal, coeff, curRowFactor);
++        PipeBarrier<PIPE_V>();
++        Adds(rsqrtLocal, rsqrtLocal, tilingData->normEps, curRowFactor);
++        PipeBarrier<PIPE_V>();
++        Sqrt(rsqrtLocal, rsqrtLocal, curRowFactor);
++        Duplicate(rowBrcbLocal0, static_cast<float>(1.0f), curRowFactor);
++        PipeBarrier<PIPE_V>();
++        Div(rsqrtLocal, rowBrcbLocal0, rsqrtLocal, curRowFactor);
++    }
++
++    __aicore__ inline void CopyInPartialCombCompact(int64_t stage1UsedCoreNum, int64_t workspaceSize1,
++                                                    int64_t mmLastAxisSize, int64_t globalRowOffset,
++                                                    int64_t curRowFactor)
++    {
++        int64_t combOffset = tilingData->hcMult * NUM_TWO;
++        for (int64_t kBlockIdx = 0; kBlockIdx < stage1UsedCoreNum; kBlockIdx++) {
++            int64_t gmOffset = workspaceSize1 + kBlockIdx * tilingData->bs * mmLastAxisSize +
++                globalRowOffset * mmLastAxisSize + combOffset;
++            int64_t ubOffset = kBlockIdx * curRowFactor * COMPACT_MATRIX_SIZE;
++            CopyIn(workspaceGm[gmOffset], mixes2Local[ubOffset], curRowFactor,
++                COMPACT_MATRIX_SIZE, mmLastAxisSize - COMPACT_MATRIX_SIZE);
++        }
++    }
++
++    __aicore__ inline void GatherCompactToElementMajor(const LocalTensor<float> &output,
++                                                        const LocalTensor<float> &input,
++                                                        int64_t curRowFactor)
++    {
++        int64_t rowFactorAlign = RoundUp<float>(curRowFactor);
++        Duplicate(output, 0.0f, COMPACT_MATRIX_SIZE * rowFactorAlign);
++        PipeBarrier<PIPE_V>();
++        for (int64_t matrixElement = 0; matrixElement < COMPACT_MATRIX_SIZE; matrixElement++) {
++            uint64_t rsvdCnt = 0;
++            GatherMask(output[matrixElement * rowFactorAlign], input,
++                maskPatternLocal[matrixElement * MASK_PATTERN_REPEAT_SIZE], true,
++                COMPACT_MATRIX_SIZE, {1, static_cast<uint16_t>(curRowFactor), 2, 0}, rsvdCnt);
++        }
++        PipeBarrier<PIPE_V>();
++    }
++
++    __aicore__ inline void GatherElementMajorToCompact(const LocalTensor<float> &output,
++                                                        const LocalTensor<float> &input,
++                                                        int64_t curRowFactor)
++    {
++        int64_t rowFactorAlign = RoundUp<float>(curRowFactor);
++        int64_t rowStride = rowFactorAlign / (BLOCK_SIZE / sizeof(float));
++        for (int64_t rowIdx = 0; rowIdx < curRowFactor; rowIdx++) {
++            int64_t rowGroupOffset = rowIdx / MASK_PATTERN_DIM_SIZE * MASK_PATTERN_DIM_SIZE;
++            int64_t rowInGroup = rowIdx % MASK_PATTERN_DIM_SIZE;
++            int64_t rowsInGroup = curRowFactor - rowGroupOffset;
++            if (rowsInGroup > MASK_PATTERN_DIM_SIZE) {
++                rowsInGroup = MASK_PATTERN_DIM_SIZE;
++            }
++            uint64_t rsvdCnt = 0;
++            // GatherMask patterns repeat every 16 elements. For row factors above 16,
++            // advance the source to the current group instead of aliasing row 16 to row 0.
++            GatherMask(output[rowIdx * COMPACT_MATRIX_SIZE], input[rowGroupOffset],
++                maskPatternLocal[rowInGroup * MASK_PATTERN_REPEAT_SIZE], true,
++                rowsInGroup, {1, COMPACT_MATRIX_SIZE, static_cast<uint16_t>(rowStride), 0}, rsvdCnt);
++        }
++        PipeBarrier<PIPE_V>();
++    }
++
++    template <bool reduceMax>
++    __aicore__ inline void ReduceCompactRows(const LocalTensor<float> &output,
++                                              const LocalTensor<float> &input,
++                                              int64_t curRowFactor)
++    {
++        int64_t rowFactorAlign = RoundUp<float>(curRowFactor);
++        int64_t rowStride = rowFactorAlign / (BLOCK_SIZE / sizeof(float));
++        BinaryRepeatParams params;
++        params.dstBlkStride = 1;
++        params.src0BlkStride = 1;
++        params.src1BlkStride = 1;
++        params.dstRepStride = rowStride;
++        params.src0RepStride = COMPACT_HC_MULT * rowStride;
++        params.src1RepStride = COMPACT_HC_MULT * rowStride;
++        if constexpr (reduceMax) {
++            Max(output, input, input[rowFactorAlign], curRowFactor, COMPACT_HC_MULT, params);
++            PipeBarrier<PIPE_V>();
++            params.src0RepStride = rowStride;
++            Max(output, output, input[NUM_TWO * rowFactorAlign], curRowFactor, COMPACT_HC_MULT, params);
++            PipeBarrier<PIPE_V>();
++            Max(output, output, input[3 * rowFactorAlign], curRowFactor, COMPACT_HC_MULT, params);
++        } else {
++            Add(output, input, input[rowFactorAlign], curRowFactor, COMPACT_HC_MULT, params);
++            PipeBarrier<PIPE_V>();
++            params.src0RepStride = rowStride;
++            Add(output, output, input[NUM_TWO * rowFactorAlign], curRowFactor, COMPACT_HC_MULT, params);
++            PipeBarrier<PIPE_V>();
++            Add(output, output, input[3 * rowFactorAlign], curRowFactor, COMPACT_HC_MULT, params);
++        }
++        PipeBarrier<PIPE_V>();
++    }
++
++    __aicore__ inline void ReduceCompactCols(const LocalTensor<float> &output,
++                                              const LocalTensor<float> &input,
++                                              int64_t curRowFactor)
++    {
++        int64_t rowFactorAlign = RoundUp<float>(curRowFactor);
++        int64_t rowStride = rowFactorAlign / (BLOCK_SIZE / sizeof(float));
++        BinaryRepeatParams params;
++        params.dstBlkStride = 1;
++        params.src0BlkStride = 1;
++        params.src1BlkStride = 1;
++        params.dstRepStride = rowStride;
++        params.src0RepStride = rowStride;
++        params.src1RepStride = rowStride;
++        Add(output, input, input[COMPACT_HC_MULT * rowFactorAlign],
++            curRowFactor, COMPACT_HC_MULT, params);
++        PipeBarrier<PIPE_V>();
++        Add(output, output, input[NUM_TWO * COMPACT_HC_MULT * rowFactorAlign],
++            curRowFactor, COMPACT_HC_MULT, params);
++        PipeBarrier<PIPE_V>();
++        Add(output, output, input[3 * COMPACT_HC_MULT * rowFactorAlign],
++            curRowFactor, COMPACT_HC_MULT, params);
++        PipeBarrier<PIPE_V>();
++    }
++
++    template <bool divide>
++    __aicore__ inline void ApplyCompactRowValues(const LocalTensor<float> &output,
++                                                  const LocalTensor<float> &input,
++                                                  const LocalTensor<float> &rowValues,
++                                                  int64_t curRowFactor)
++    {
++        int64_t rowFactorAlign = RoundUp<float>(curRowFactor);
++        int64_t rowStride = rowFactorAlign / (BLOCK_SIZE / sizeof(float));
++        BinaryRepeatParams params;
++        params.dstBlkStride = 1;
++        params.src0BlkStride = 1;
++        params.src1BlkStride = 1;
++        params.dstRepStride = COMPACT_HC_MULT * rowStride;
++        params.src0RepStride = COMPACT_HC_MULT * rowStride;
++        params.src1RepStride = rowStride;
++        for (int64_t colIdx = 0; colIdx < COMPACT_HC_MULT; colIdx++) {
++            if constexpr (divide) {
++                Div(output[colIdx * rowFactorAlign], input[colIdx * rowFactorAlign], rowValues,
++                    curRowFactor, COMPACT_HC_MULT, params);
++            } else {
++                Sub(output[colIdx * rowFactorAlign], input[colIdx * rowFactorAlign], rowValues,
++                    curRowFactor, COMPACT_HC_MULT, params);
++            }
++        }
++        PipeBarrier<PIPE_V>();
++    }
++
++    __aicore__ inline void ApplyCompactColValues(const LocalTensor<float> &output,
++                                                  const LocalTensor<float> &input,
++                                                  const LocalTensor<float> &colValues,
++                                                  int64_t curRowFactor)
++    {
++        int64_t rowFactorAlign = RoundUp<float>(curRowFactor);
++        int64_t rowStride = rowFactorAlign / (BLOCK_SIZE / sizeof(float));
++        BinaryRepeatParams params;
++        params.dstBlkStride = 1;
++        params.src0BlkStride = 1;
++        params.src1BlkStride = 1;
++        params.dstRepStride = rowStride;
++        params.src0RepStride = rowStride;
++        params.src1RepStride = rowStride;
++        for (int64_t matrixRow = 0; matrixRow < COMPACT_HC_MULT; matrixRow++) {
++            Div(output[matrixRow * COMPACT_HC_MULT * rowFactorAlign],
++                input[matrixRow * COMPACT_HC_MULT * rowFactorAlign], colValues,
++                curRowFactor, COMPACT_HC_MULT, params);
++        }
++        PipeBarrier<PIPE_V>();
++    }
++
++    __aicore__ inline void NormalizeCompactRows(const LocalTensor<float> &data,
++                                                 int64_t curRowFactor)
++    {
++        int64_t rowFactorAlign = RoundUp<float>(curRowFactor);
++        ReduceCompactRows<false>(reduceLocal, data, curRowFactor);
++        Adds(reduceLocal, reduceLocal, tilingData->hcEps,
++            COMPACT_HC_MULT * rowFactorAlign);
++        PipeBarrier<PIPE_V>();
++        ApplyCompactRowValues<true>(data, data, reduceLocal, curRowFactor);
++    }
++
++    __aicore__ inline void NormalizeCompactCols(const LocalTensor<float> &data,
++                                                 int64_t curRowFactor)
++    {
++        int64_t rowFactorAlign = RoundUp<float>(curRowFactor);
++        ReduceCompactCols(reduceLocal, data, curRowFactor);
++        Adds(reduceLocal, reduceLocal, tilingData->hcEps,
++            COMPACT_HC_MULT * rowFactorAlign);
++        PipeBarrier<PIPE_V>();
++        ApplyCompactColValues(data, data, reduceLocal, curRowFactor);
++    }
++
++    __aicore__ inline void SoftmaxCompactRows(const LocalTensor<float> &data,
++                                               int64_t curRowFactor)
++    {
++        int64_t rowFactorAlign = RoundUp<float>(curRowFactor);
++        ReduceCompactRows<true>(reduceLocal, data, curRowFactor);
++        ApplyCompactRowValues<false>(data, data, reduceLocal, curRowFactor);
++        Exp(data, data, COMPACT_MATRIX_SIZE * rowFactorAlign);
++        PipeBarrier<PIPE_V>();
++        ReduceCompactRows<false>(reduceLocal, data, curRowFactor);
++        ApplyCompactRowValues<true>(data, data, reduceLocal, curRowFactor);
++        Adds(data, data, tilingData->hcEps, COMPACT_MATRIX_SIZE * rowFactorAlign);
++        PipeBarrier<PIPE_V>();
++    }
++
++    __aicore__ inline void ProcessCompactSinkhorn(const LocalTensor<float> &data,
++                                                   int64_t curRowFactor, float hcScale)
++    {
++        int64_t rowFactorAlign = RoundUp<float>(curRowFactor);
++        int64_t rowStride = rowFactorAlign / (BLOCK_SIZE / sizeof(float));
++        Brcb(hcBrcbLocal1, hcBase2Local, NUM_TWO,
++            {DEFAULT_BLOCK_STRIDE, DEFAULT_REPEAT_STRIDE});
++        PipeBarrier<PIPE_V>();
++
++        BinaryRepeatParams mulParams;
++        mulParams.dstBlkStride = 1;
++        mulParams.src0BlkStride = 1;
++        mulParams.src1BlkStride = 1;
++        mulParams.dstRepStride = rowStride;
++        mulParams.src0RepStride = rowStride;
++        mulParams.src1RepStride = 0;
++        Mul(data, data, rsqrtLocal, curRowFactor, COMPACT_MATRIX_SIZE, mulParams);
++        PipeBarrier<PIPE_V>();
++        Muls(data, data, hcScale, COMPACT_MATRIX_SIZE * rowFactorAlign);
++        PipeBarrier<PIPE_V>();
++
++        BinaryRepeatParams biasParams = mulParams;
++        biasParams.src1BlkStride = 0;
++        biasParams.src1RepStride = 1;
++        Add(data, data, hcBrcbLocal1, curRowFactor, COMPACT_MATRIX_SIZE, biasParams);
++        PipeBarrier<PIPE_V>();
++
++        SoftmaxCompactRows(data, curRowFactor);
++        NormalizeCompactCols(data, curRowFactor);
++        for (int64_t iter = 0; iter < tilingData->iterTimes - 1; iter++) {
++            NormalizeCompactRows(data, curRowFactor);
++            NormalizeCompactCols(data, curRowFactor);
++        }
++    }
++
++    __aicore__ inline void PrePostLoadBase(float &hcScale0, float &hcScale1)
++    {
++        CopyIn(hcBaseGm, hcBase0Local, 1, tilingData->hcMult);
++        CopyIn(hcBaseGm[tilingData->hcMult], hcBase1Local, 1, tilingData->hcMult);
++        event_t eventId = static_cast<event_t>(GetTPipePtr()->FetchEventID(HardEvent::MTE2_V));
++        SetFlag<HardEvent::MTE2_V>(eventId);
++        WaitFlag<HardEvent::MTE2_V>(eventId);
++        hcScale0 = hcScaleGm.GetValue(0);
++        hcScale1 = hcScaleGm.GetValue(1);
++    }
++
++    // 连续 actualRow 行的一批 pre/post 处理(原 ProcessPrePost 行循环体主体)
++    __aicore__ inline void ProcessPrePostBatch(int64_t stage1UsedCoreNum, int64_t workspaceSize1,
++        int64_t workspaceSize2, int64_t mmLastAxisSize, int64_t globalRowOffset,
++        int64_t curRowFactor, float hcScale0, float hcScale1)
++    {
++        CalcRsqrt(stage1UsedCoreNum, globalRowOffset, curRowFactor, workspaceSize1, workspaceSize2);
++
++        mixes01Local = mixesQue01.AllocTensor<float>();
++
++        uint64_t mixBaseOffset = workspaceSize1 + globalRowOffset * mmLastAxisSize;
++        CopyInWithOuterFor(workspaceGm[mixBaseOffset], mixes01Local, stage1UsedCoreNum,
++            curRowFactor, tilingData->hcMult, tilingData->bs,
++            mmLastAxisSize);
++        CopyInWithOuterFor(workspaceGm[mixBaseOffset + tilingData->hcMult],
++            mixes01Local[stage1UsedCoreNum * curRowFactor *
++            tilingData->hcMultAlign], stage1UsedCoreNum, curRowFactor, tilingData->hcMult,
++            tilingData->bs, mmLastAxisSize);
++
++        mixesQue01.EnQue(mixes01Local);
++        mixes01Local = mixesQue01.DeQue<float>();
++        ReduceSumARAPerf(mixes01ReduceLocal, mixes01Local, NUM_TWO, stage1UsedCoreNum,
++            curRowFactor * tilingData->hcMultAlign);
++        ProcessPre(mixes01ReduceLocal, mixes01ReduceLocal, hcBase0Local, rsqrtLocal,
++            rowBrcbLocal0, hcBrcbLocal1, hcScale0, tilingData->hcEps,
++            curRowFactor, tilingData->hcMult);
++        mixesQue01.template FreeTensor(mixes01Local);
++        squareSumQue.template FreeTensor(squareSumOutLocal);
++
++        // Keep the D tile resident for each row. This lets the row-only
++        // pre/post transforms run in a larger batch without inflating the
++        // x/y UB buffers that are sized for one full-D row.
++        for (int64_t rowIdx = 0; rowIdx < curRowFactor; rowIdx++) {
++            int64_t rowOffset = globalRowOffset + rowIdx;
++            const LocalTensor<float> preRow =
++                mixes01ReduceLocal[rowIdx * tilingData->hcMultAlign];
++            for (int64_t dLoopIdx = 0; dLoopIdx < tilingData->dLoop; dLoopIdx++) {
++                int64_t curDFactor = dLoopIdx == tilingData->dLoop - 1 ?
++                    tilingData->tailDFactor : tilingData->dFactor;
++                xLocal = xQue.template AllocTensor<T>();
++                CopyIn(xGm[rowOffset * tilingData->hcMult * tilingData->d +
++                    dLoopIdx * tilingData->dFactor], xLocal,
++                    tilingData->hcMult, curDFactor, tilingData->d - curDFactor);
++                xQue.template EnQue(xLocal);
++                xLocal = xQue.template DeQue<T>();
++                yLocal = yQue.template AllocTensor<T>();
++                ProcessY(yLocal, xLocal, preRow, hcBrcbLocal1, xCastLocal, yCastLocal,
++                    1, tilingData->hcMult, curDFactor);
++                xQue.template FreeTensor(xLocal);
++                yQue.template EnQue(yLocal);
++                yLocal = yQue.template DeQue<T>();
++                CopyOut(yLocal, yGm[rowOffset * tilingData->d + dLoopIdx * tilingData->dFactor],
++                    1, curDFactor, tilingData->d - curDFactor);
++                yQue.template FreeTensor(yLocal);
++            }
++        }
++
++        // 在行循环外批量处理 post，减少 sigmoid/mul 链的逐行同步开销。
++        // rowBrcbLocal0 已按行广播；rsqrtLocal 在行循环中保持不变。
++        postLocal = postQue.AllocTensor<float>();
++        ProcessPost(postLocal, mixes01ReduceLocal[curRowFactor * tilingData->hcMultAlign],
++            hcBase1Local, rsqrtLocal, rowBrcbLocal0, hcBrcbLocal1, hcScale1,
++            curRowFactor, tilingData->hcMult);
++        postQue.EnQue(postLocal);
++        postLocal = postQue.template DeQue<float>();
++        // post的UB布局行距hcMultAlign(列4 pad到8), GM布局行距hcMult, 非整
++        // block倍数关系, 保留逐行CopyOut.
++        for (int64_t rowIdx = 0; rowIdx < curRowFactor; rowIdx++) {
++            int64_t rowOffset = globalRowOffset + rowIdx;
++            CopyOut(postLocal[rowIdx * tilingData->hcMultAlign],
++                postGm[rowOffset * tilingData->hcMult], 1, tilingData->hcMult);
++        }
++        postQue.FreeTensor(postLocal);
++    }
++
++    __aicore__ inline void ProcessPrePost(int64_t stage1UsedCoreNum, int64_t workspaceSize1,
++                                         int64_t workspaceSize2, int64_t mmLastAxisSize)
++    {
++        int64_t blockIdx = GetBlockIdx();
++        if (blockIdx >= tilingData->secondUsedCoreNum) {
++            return;
++        }
++        float hcScale0 = 0.0f;
++        float hcScale1 = 0.0f;
++        PrePostLoadBase(hcScale0, hcScale1);
++
++        int64_t rowOuterLoop = blockIdx == tilingData->secondUsedCoreNum - 1 ?
++            tilingData->prePostRowLoopOfTailBlock : tilingData->prePostRowLoopOfFormerBlock;
++        int64_t tailRowFactor = blockIdx == tilingData->secondUsedCoreNum - 1 ?
++            tilingData->prePostTailRowFactorOfTailBlock : tilingData->prePostTailRowFactorOfFormerBlock;
++
++        for (int64_t rowOuterIdx = 0; rowOuterIdx < rowOuterLoop; rowOuterIdx++) {
++            int64_t curRowFactor = rowOuterIdx == rowOuterLoop - 1 ?
++                tailRowFactor : tilingData->prePostRowFactor;
++            int64_t globalRowOffset = blockIdx * tilingData->prePostRowOfFormerBlock +
++                rowOuterIdx * tilingData->prePostRowFactor;
++            ProcessPrePostBatch(stage1UsedCoreNum, workspaceSize1, workspaceSize2,
++                mmLastAxisSize, globalRowOffset, curRowFactor, hcScale0, hcScale1);
++        }
++    }
++
++    // 连续 actualRow 行的一批 sinkhorn 处理(原 ProcessSinkhorn 行循环体原样抽出)
++    __aicore__ inline void ProcessSinkhornBatch(int64_t stage1UsedCoreNum, int64_t workspaceSize1,
++        int64_t workspaceSize2, int64_t mmLastAxisSize, int64_t globalRowOffset,
++        int64_t curRowFactor, float hcScale2)
++    {
++        CalcRsqrt(stage1UsedCoreNum, globalRowOffset, curRowFactor, workspaceSize1, workspaceSize2);
++
++        mixes2Local = mixesQue2.AllocTensor<float>();
++        CopyInPartialCombCompact(stage1UsedCoreNum, workspaceSize1, mmLastAxisSize,
++            globalRowOffset, curRowFactor);
++        mixesQue2.EnQue(mixes2Local);
++        mixes2Local = mixesQue2.DeQue<float>();
++        combFragLocal = combFragQue.AllocTensor<float>();
++
++        ReduceSumARAPerf(combFragLocal, mixes2Local, 1, stage1UsedCoreNum,
++            curRowFactor * COMPACT_MATRIX_SIZE);
++        GatherCompactToElementMajor(mixes02ReduceLocal, combFragLocal, curRowFactor);
++        ProcessCompactSinkhorn(mixes02ReduceLocal, curRowFactor, hcScale2);
++        GatherElementMajorToCompact(combFragLocal, mixes02ReduceLocal, curRowFactor);
++        mixesQue2.FreeTensor(mixes2Local);
++        squareSumQue.template FreeTensor(squareSumOutLocal);
++
++        combFragQue.EnQue(combFragLocal);
++        combFragLocal = combFragQue.DeQue<float>();
++        CopyOut(combFragLocal,
++            combFragGm[globalRowOffset * COMPACT_MATRIX_SIZE],
++            1, curRowFactor * COMPACT_MATRIX_SIZE);
++        combFragQue.FreeTensor(combFragLocal);
++    }
++
++    __aicore__ inline void ProcessSinkhorn(int64_t stage1UsedCoreNum, int64_t workspaceSize1,
++                                          int64_t workspaceSize2, int64_t mmLastAxisSize)
++    {
++        int64_t blockIdx = GetBlockIdx() - tilingData->prePostCoreNum;
++        if (blockIdx < 0 || blockIdx >= tilingData->sinkhornUsedCoreNum) {
++            return;
++        }
++        CopyIn(hcBaseGm[COMPACT_HC_MULT * NUM_TWO], hcBase2Local,
++            1, COMPACT_MATRIX_SIZE);
++        event_t eventId = static_cast<event_t>(GetTPipePtr()->FetchEventID(HardEvent::MTE2_V));
++        SetFlag<HardEvent::MTE2_V>(eventId);
++        WaitFlag<HardEvent::MTE2_V>(eventId);
++        float hcScale2 = hcScaleGm.GetValue(NUM_TWO);
++
++        int64_t rowOuterLoop = blockIdx == tilingData->sinkhornUsedCoreNum - 1 ?
++            tilingData->sinkhornRowLoopOfTailBlock : tilingData->sinkhornRowLoopOfFormerBlock;
++        int64_t tailRowFactor = blockIdx == tilingData->sinkhornUsedCoreNum - 1 ?
++            tilingData->sinkhornTailRowFactorOfTailBlock : tilingData->sinkhornTailRowFactorOfFormerBlock;
++
++        for (int64_t rowOuterIdx = 0; rowOuterIdx < rowOuterLoop; rowOuterIdx++) {
++            int64_t curRowFactor = rowOuterIdx == rowOuterLoop - 1 ?
++                tailRowFactor : tilingData->sinkhornRowFactor;
++            int64_t globalRowOffset = blockIdx * tilingData->sinkhornRowOfFormerBlock +
++                rowOuterIdx * tilingData->sinkhornRowFactor;
++            ProcessSinkhornBatch(stage1UsedCoreNum, workspaceSize1, workspaceSize2,
++                mmLastAxisSize, globalRowOffset, curRowFactor, hcScale2);
++        }
++    }
++
++    __aicore__ inline void ProcessOriginal()
++    {
++        if ASCEND_IS_AIC {
++            return;
++        }
++        int64_t blockIdx = GetBlockIdx();
++        if (blockIdx >= tilingData->secondUsedCoreNum) {
++            return;
++        }
++
++        int64_t stage1UsedCoreNum = tilingData->cubeBlockDimK;
++        int64_t mmLastAxisSize = CeilAlign(tilingData->hcMix, MM_CACHE_LINE_BYTES / sizeof(float));
++        int64_t xCastFp32BufSize = tilingData->mL1Size *
++            CeilAlign(tilingData->cvLoopKSize, MM_CACHE_LINE_BYTES / sizeof(float));
++        int64_t workspaceSize1 = tilingData->cubeCoreNum * DOUBLE_BUFFER * xCastFp32BufSize;
++        int64_t workspaceSize2 = CeilAlign(stage1UsedCoreNum * tilingData->bs *
++            mmLastAxisSize * sizeof(float), WORKSPACE_ALIGN_SIZE) / sizeof(float);
++
++        CopyIn(hcBaseGm, hcBase0Local, 1, tilingData->hcMult);
++        CopyIn(hcBaseGm[tilingData->hcMult], hcBase1Local, 1, tilingData->hcMult);
++        CopyIn(hcBaseGm[tilingData->hcMult * NUM_TWO], hcBase2Local,
++            tilingData->hcMult, tilingData->hcMult);
++        event_t eventId = static_cast<event_t>(GetTPipePtr()->FetchEventID(HardEvent::MTE2_V));
++        SetFlag<HardEvent::MTE2_V>(eventId);
++        WaitFlag<HardEvent::MTE2_V>(eventId);
++        float hcScale0 = hcScaleGm.GetValue(0);
++        float hcScale1 = hcScaleGm.GetValue(1);
++        float hcScale2 = hcScaleGm.GetValue(NUM_TWO);
++
++        int64_t rowOuterLoop = blockIdx == tilingData->secondUsedCoreNum - 1 ?
++            tilingData->rowLoopOfTailBlock : tilingData->rowLoopOfFormerBlock;
++        int64_t tailRowFactor = blockIdx == tilingData->secondUsedCoreNum - 1 ?
++            tilingData->tailRowFactorOfTailBlock : tilingData->tailRowFactorOfFormerBlock;
++
++        for (int64_t rowOuterIdx = 0; rowOuterIdx < rowOuterLoop; rowOuterIdx++) {
++            int64_t curRowFactor = rowOuterIdx == rowOuterLoop - 1 ?
++                tailRowFactor : tilingData->stage2RowFactor;
++            int64_t globalRowOffset = blockIdx * tilingData->rowOfFormerBlock +
++                rowOuterIdx * tilingData->stage2RowFactor;
++            CalcRsqrt(stage1UsedCoreNum, globalRowOffset, curRowFactor,
++                workspaceSize1, workspaceSize2);
++
++            mixes01Local = mixesQue01.AllocTensor<float>();
++            uint64_t mixBaseOffset = workspaceSize1 + globalRowOffset * mmLastAxisSize;
++            CopyInWithOuterFor(workspaceGm[mixBaseOffset], mixes01Local,
++                stage1UsedCoreNum, curRowFactor, tilingData->hcMult,
++                tilingData->bs, mmLastAxisSize);
++            CopyInWithOuterFor(workspaceGm[mixBaseOffset + tilingData->hcMult],
++                mixes01Local[stage1UsedCoreNum * tilingData->stage2RowFactor * tilingData->hcMultAlign],
++                stage1UsedCoreNum, curRowFactor, tilingData->hcMult,
++                tilingData->bs, mmLastAxisSize);
++            mixesQue01.EnQue(mixes01Local);
++            mixes01Local = mixesQue01.DeQue<float>();
++            ReduceSumARAPerf(mixes01ReduceLocal, mixes01Local, NUM_TWO,
++                stage1UsedCoreNum, curRowFactor * tilingData->hcMultAlign);
++
++            ProcessPre(mixes01ReduceLocal, mixes01ReduceLocal, hcBase0Local,
++                rsqrtLocal, rowBrcbLocal0, hcBrcbLocal1, hcScale0,
++                tilingData->hcEps, curRowFactor, tilingData->hcMult);
++            for (int64_t dLoopIdx = 0; dLoopIdx < tilingData->dLoop; dLoopIdx++) {
++                int64_t curDFactor = dLoopIdx == tilingData->dLoop - 1 ?
++                    tilingData->tailDFactor : tilingData->dFactor;
++                xLocal = xQue.template AllocTensor<T>();
++                CopyIn(xGm[globalRowOffset * tilingData->hcMult * tilingData->d +
++                    dLoopIdx * tilingData->dFactor], xLocal,
++                    curRowFactor * tilingData->hcMult, curDFactor,
++                    tilingData->d - curDFactor);
++                xQue.template EnQue(xLocal);
++                xLocal = xQue.template DeQue<T>();
++                yLocal = yQue.template AllocTensor<T>();
++                ProcessY(yLocal, xLocal, mixes01ReduceLocal, hcBrcbLocal1,
++                    xCastLocal, yCastLocal, curRowFactor, tilingData->hcMult, curDFactor);
++                xQue.template FreeTensor(xLocal);
++                yQue.template EnQue(yLocal);
++                yLocal = yQue.template DeQue<T>();
++                CopyOut(yLocal,
++                    yGm[globalRowOffset * tilingData->d + dLoopIdx * tilingData->dFactor],
++                    curRowFactor, curDFactor, tilingData->d - curDFactor);
++                yQue.template FreeTensor(yLocal);
++            }
++
++            postLocal = postQue.AllocTensor<float>();
++            ProcessPost(postLocal,
++                mixes01ReduceLocal[curRowFactor * tilingData->hcMultAlign],
++                hcBase1Local, rsqrtLocal, rowBrcbLocal0, hcBrcbLocal1,
++                hcScale1, curRowFactor, tilingData->hcMult);
++            mixesQue01.template FreeTensor(mixes01Local);
++            postQue.EnQue(postLocal);
++            postLocal = postQue.DeQue<float>();
++            CopyOut(postLocal, postGm[globalRowOffset * tilingData->hcMult],
++                curRowFactor, tilingData->hcMult);
++            postQue.FreeTensor(postLocal);
++
++            mixes2Local = mixesQue2.AllocTensor<float>();
++            for (int64_t kBlockIdx = 0; kBlockIdx < stage1UsedCoreNum; kBlockIdx++) {
++                for (int64_t rowIdx = 0; rowIdx < curRowFactor; rowIdx++) {
++                    int64_t gmOffset = workspaceSize1 +
++                        kBlockIdx * tilingData->bs * mmLastAxisSize +
++                        (globalRowOffset + rowIdx) * mmLastAxisSize + tilingData->hcMult * NUM_TWO;
++                    int64_t ubOffset = (kBlockIdx * curRowFactor + rowIdx) *
++                        tilingData->hcMult * tilingData->hcMultAlign;
++                    CopyIn(workspaceGm[gmOffset], mixes2Local[ubOffset],
++                        tilingData->hcMult, tilingData->hcMult);
++                }
++            }
++            mixesQue2.EnQue(mixes2Local);
++            mixes2Local = mixesQue2.DeQue<float>();
++            ReduceSumARAPerf(mixes02ReduceLocal, mixes2Local, 1,
++                stage1UsedCoreNum,
++                curRowFactor * tilingData->hcMult * tilingData->hcMultAlign);
++            combFragLocal = combFragQue.AllocTensor<float>();
++
++            MulABLastDimBrcInline<float, false>(mixes02ReduceLocal,
++                mixes02ReduceLocal, rsqrtLocal, rowBrcbLocal0, curRowFactor,
++                tilingData->hcMult * tilingData->hcMultAlign);
++            Muls(mixes02ReduceLocal, mixes02ReduceLocal, hcScale2,
++                curRowFactor * tilingData->hcMult * tilingData->hcMultAlign);
++            PipeBarrier<PIPE_V>();
++            AddBAFirstDimBrcInline<float>(mixes02ReduceLocal, mixes02ReduceLocal,
++                hcBase2Local, curRowFactor,
++                tilingData->hcMult * tilingData->hcMultAlign);
++            SoftmaxFP32Perf(mixes02ReduceLocal, mixes02ReduceLocal, reduceLocal,
++                hcBrcbLocal1, curRowFactor * tilingData->hcMult,
++                tilingData->hcMult, tilingData->hcEps);
++            ReduceSumARAPerf(reduceLocal, mixes02ReduceLocal, curRowFactor,
++                tilingData->hcMult, tilingData->hcMult);
++            Adds(reduceLocal, reduceLocal, tilingData->hcEps,
++                curRowFactor * tilingData->hcMult);
++            PipeBarrier<PIPE_V>();
++            DivABABrcInline(combFragLocal, mixes02ReduceLocal, reduceLocal,
++                curRowFactor, tilingData->hcMult, tilingData->hcMult);
++            for (int64_t iter = 0; iter < tilingData->iterTimes - 1; iter++) {
++                LastDimReduceSumPerf(reduceLocal, combFragLocal,
++                    curRowFactor * tilingData->hcMult, tilingData->hcMult);
++                Adds(reduceLocal, reduceLocal, tilingData->hcEps,
++                    curRowFactor * tilingData->hcMult);
++                PipeBarrier<PIPE_V>();
++                DivABLastDimBrcInline<float, true>(combFragLocal, combFragLocal,
++                    reduceLocal, hcBrcbLocal1, curRowFactor * tilingData->hcMult,
++                    tilingData->hcMult);
++                ReduceSumARAPerf(reduceLocal, combFragLocal, curRowFactor,
++                    tilingData->hcMult, tilingData->hcMult);
++                Adds(reduceLocal, reduceLocal, tilingData->hcEps,
++                    curRowFactor * tilingData->hcMult);
++                PipeBarrier<PIPE_V>();
++                DivABABrcInline(combFragLocal, combFragLocal, reduceLocal,
++                    curRowFactor, tilingData->hcMult, tilingData->hcMult);
++            }
++            mixesQue2.FreeTensor(mixes2Local);
++            squareSumQue.template FreeTensor(squareSumOutLocal);
++
++            combFragQue.EnQue(combFragLocal);
++            combFragLocal = combFragQue.DeQue<float>();
++            CopyOut(combFragLocal,
++                combFragGm[globalRowOffset * tilingData->hcMult * tilingData->hcMult],
++                curRowFactor * tilingData->hcMult, tilingData->hcMult);
++            combFragQue.FreeTensor(combFragLocal);
++        }
++    }
++
++    __aicore__ inline void Process()
++    {
++        if constexpr (useOriginal) {
++            ProcessOriginal();
++            return;
++        }
++        if ASCEND_IS_AIC {
++            return;
++        }
++        int64_t stage1UsedCoreNum = tilingData->cubeBlockDimK;
++        int64_t mmLastAxisSize = CeilAlign(tilingData->hcMix, MM_CACHE_LINE_BYTES / sizeof(float));
++        int64_t xCastFp32BufSize = tilingData->mL1Size *
++            CeilAlign(tilingData->cvLoopKSize, MM_CACHE_LINE_BYTES / sizeof(float));
++        int64_t workspaceSize1 = tilingData->cubeCoreNum * DOUBLE_BUFFER * xCastFp32BufSize;
++        int64_t workspaceSize2 = CeilAlign(stage1UsedCoreNum * tilingData->bs *
++            mmLastAxisSize * sizeof(float), WORKSPACE_ALIGN_SIZE) / sizeof(float);
++        if (GetBlockIdx() < tilingData->prePostCoreNum) {
++            ProcessPrePost(stage1UsedCoreNum, workspaceSize1, workspaceSize2, mmLastAxisSize);
++        } else {
++            ProcessSinkhorn(stage1UsedCoreNum, workspaceSize1, workspaceSize2, mmLastAxisSize);
++        }
++    }
++
++private:
++    static constexpr int64_t COMPACT_HC_MULT = 4;
++    static constexpr int64_t COMPACT_MATRIX_SIZE = COMPACT_HC_MULT * COMPACT_HC_MULT;
++
++    TPipe *pipe;
++    const HcPreTilingData *tilingData;
++    GlobalTensor<float> mixesGm;
++    GlobalTensor<float> rsqrtGm;
++    GlobalTensor<float> hcScaleGm;
++    GlobalTensor<float> hcBaseGm;
++    GlobalTensor<float> workspaceGm;
++    GlobalTensor<T> xGm;
++    GlobalTensor<T> yGm;
++    GlobalTensor<float> postGm;
++    GlobalTensor<float> combFragGm;
++
++    TQue<QuePosition::VECIN, 1> mixesQue01;
++    TQue<QuePosition::VECIN, 1> mixesQue2;
++    TQue<QuePosition::VECIN, 1> xQue;
++    TQue<QuePosition::VECOUT, 1> yQue;
++    TQue<QuePosition::VECOUT, 1> postQue;
++    TQue<QuePosition::VECOUT, 1> combFragQue;
++
++    TQue<QuePosition::VECIN, 1> squareSumQue;
++
++    TBuf<QuePosition::VECCALC> hcBaseBuf0;
++    TBuf<QuePosition::VECCALC> hcBaseBuf1;
++    TBuf<QuePosition::VECCALC> hcBaseBuf2;
++
++    TBuf<QuePosition::VECCALC> rowBrcbBuf0;
++    TBuf<QuePosition::VECCALC> hcBrcbBuf1;
++    TBuf<QuePosition::VECCALC> reduceBuf;
++
++    TBuf<QuePosition::VECCALC> rsqrtBuf;
++    TBuf<QuePosition::VECCALC> squareReduceBuf;
++    TBuf<QuePosition::VECCALC> mixes01ReduceBuf;
++    TBuf<QuePosition::VECCALC> mixes02ReduceBuf;
++
++    TBuf<QuePosition::VECCALC> xCastBuf;
++    TBuf<QuePosition::VECCALC> yCastBuf;
++    TBuf<QuePosition::VECCALC> maskPatternBuf;
++
++    LocalTensor<float> mixes01Local;
++    LocalTensor<float> mixes2Local;
++    LocalTensor<float> rsqrtLocal;
++    LocalTensor<T> xLocal;
++    LocalTensor<T> yLocal;
++    LocalTensor<float> postLocal;
++    LocalTensor<float> combFragLocal;
++    LocalTensor<float> hcBase0Local;
++    LocalTensor<float> hcBase1Local;
++    LocalTensor<float> hcBase2Local;
++    LocalTensor<float> rowBrcbLocal0;
++    LocalTensor<float> hcBrcbLocal1;
++    LocalTensor<float> reduceLocal;
++    LocalTensor<float> squareReduceLocal;
++    LocalTensor<float> mixes01ReduceLocal;
++    LocalTensor<float> mixes02ReduceLocal;
++    LocalTensor<float> xCastLocal;
++    LocalTensor<float> yCastLocal;
++    LocalTensor<float> squareSumOutLocal;
++    LocalTensor<uint32_t> maskPatternLocal;
++};
++
++// preMix 场景专用的 Part2 实现，对应 tilingKey=2。
++template <typename T>
++class HcPreMembaseKSplitCorePremixPart2 {
++public:
++    __aicore__ inline HcPreMembaseKSplitCorePremixPart2()
++    {
++    }
++
+     __aicore__ inline void InitGlobalBuffers(GM_ADDR x, GM_ADDR hcScale,
+         GM_ADDR hcBase, GM_ADDR y, GM_ADDR post, GM_ADDR combFrag,
+         GM_ADDR preMix, GM_ADDR pre, GM_ADDR workspace)
+@@ -239,8 +1111,6 @@ public:
+         pipe->InitBuffer(squareSumQue, NUM_TWO, stage1UsedCoreNum *
+         tilingData->stage2RowFactor * SQUARE_SUM_SIZE * sizeof(float));
+         pipe->InitBuffer(xQue, NUM_TWO, xQueNum2 * sizeof(T));
+-        pipe->InitBuffer(squareSumQue, NUM_TWO, stage1UsedCoreNum *
+-        tilingData->stage2RowFactor * SQUARE_SUM_SIZE * sizeof(float));
+         pipe->InitBuffer(yQue, NUM_TWO,
+             tilingData->stage2RowFactor * RoundUp<T>(tilingData->dFactor) * sizeof(T));
+         pipe->InitBuffer(postQue, NUM_TWO,
+@@ -275,7 +1145,7 @@ public:
+         pipe->InitBuffer(rsqrtBuf,
+             RoundUp<float>(tilingData->stage2RowFactor) * sizeof(float));
+         pipe->InitBuffer(maskPatternBuf,
+-            RoundUp<uint32_t>(MASK_PATTERN_BASE_SIZE * MASK_PATTERN_REPEAT_SIZE) *
++            RoundUp<uint32_t>(MASK_PATTERN_DIM_SIZE * MASK_PATTERN_REPEAT_SIZE) *
+             sizeof(uint32_t));
+         pipe->InitBuffer(preMixBuf,
+             tilingData->stage2RowFactor * tilingData->hcMultAlign * sizeof(float));
+@@ -297,7 +1167,7 @@ public:
+         rsqrtLocal = rsqrtBuf.Get<float>();
+         maskPatternLocal = maskPatternBuf.Get<uint32_t>();
+         preMixLocal = preMixBuf.Get<float>();
+-        SetGatherMaskPattern(maskPatternLocal);
++        SetGatherMaskPattern(maskPatternLocal, static_cast<uint16_t>(MASK_PATTERN_DIM_SIZE));
+     }
+ 
+     __aicore__ inline void Init(GM_ADDR x, GM_ADDR hcScale, GM_ADDR hcBase,
+@@ -318,7 +1188,7 @@ public:
+     __aicore__ inline void Process()
+     {
+         if ASCEND_IS_AIV {
+-            int64_t stage1UsedCoreNum = tilingData->cubeBlockDimK;// todo check 此处不应该写死32
++            int64_t stage1UsedCoreNum = tilingData->cubeBlockDimK;
+             int64_t stage2BlockIdx = GetBlockIdx();
+             int64_t stage2UsedCoreNum = tilingData->secondUsedCoreNum;
+             if (stage2BlockIdx >= stage2UsedCoreNum) {
+@@ -350,7 +1220,6 @@ public:
+                 tilingData->hcMult * tilingData->d;
+                 int64_t curRowFactor = (rowOuterIdx == rowOuterLoop - 1) ? tailRowFactor : tilingData->stage2RowFactor;
+                 squareSumOutLocal = squareSumQue.AllocTensor<float>();
+-                //todo
+                 CopyIn(workspaceGm[workspaceSize1 + workspaceSize2 +
+                        stage2BlockIdx * tilingData->rowOfFormerBlock * SQUARE_SUM_SIZE +
+                        rowOuterIdx * tilingData->stage2RowFactor * SQUARE_SUM_SIZE],
+@@ -361,10 +1230,10 @@ public:
+                 squareSumOutLocal = squareSumQue.DeQue<float>();
+                 ReduceSumARAPerf(squareReduceLocal, squareSumOutLocal, 1, stage1UsedCoreNum,
+                 curRowFactor * SQUARE_SUM_SIZE);
+-int64_t curBsIdxForAll = (stage2BlockIdx * tilingData->rowLoopOfFormerBlock +
++                int64_t curBsIdxForAll = (stage2BlockIdx * tilingData->rowLoopOfFormerBlock +
+                 rowOuterIdx) * tilingData->stage2RowFactor;
+-                GatherMaskByDiagonal(rsqrtLocal, squareReduceLocal,
+-                maskPatternLocal[(curBsIdxForAll % SQUARE_SUM_SIZE) * 8], curRowFactor);
++                GatherMaskByDiagonal(rsqrtLocal, squareReduceLocal, maskPatternLocal,
++                curRowFactor, static_cast<uint16_t>(curBsIdxForAll % SQUARE_SUM_SIZE));
+                 float coeff = 1.0f / static_cast<float>(tilingData->k);
+                 Muls(rsqrtLocal, rsqrtLocal, coeff, curRowFactor);
+                 PipeBarrier<PIPE_V>();

@@ -1,0 +1,280 @@
+commit 71a3755ac162a3c04f48386ecbbb0856e34aea61
+Author:     freyfwt <110148731+freyfwt@users.noreply.github.com>
+AuthorDate: Sun Oct 11 18:36:21 2026 +0800
+Commit:     GitHub <noreply@github.com>
+CommitDate: Sun Oct 11 18:36:21 2026 +0800
+
+    [BugFix][EPLB] Preserve NPU format for expert buffers (#18231)
+    
+    ### What this PR does / why we need it?
+    
+    Based on the NPU-format allocation fix from #18015 by @hust17yixuan.
+    
+    EPLB allocates receive buffers with `torch.empty_like` on
+    `EplbExpertTensorList`. On ACLNN-only devices, ordinary `empty_like` can
+    convert an internal NPU storage format to ND and leave the receive
+    buffer incompatible with its source expert tensor.
+    
+    Use `torch_npu.empty_with_format` with each source tensor's format,
+    dtype, layout, and device. Preserve the storage-offset and stride
+    checks, and support ND integer tensors such as encoded quantization
+    scales without misclassifying them as NZ-only weights.
+    
+    The tensor list supports the default EPLB allocation call;
+    tensor-property overrides are rejected. Non-NPU tensors use ordinary
+    `torch.empty_like` for CPU test coverage.
+    
+    ### Does this PR introduce _any_ user-facing change?
+    
+    No public API change. EPLB receive buffers preserve the source expert
+    tensor's NPU storage format.
+    
+    ### How was this patch tested?
+    
+    - CPU unit tests with a mocked NPU allocator: 24 passed across
+    `tests/ut/ops/test_routed_experts.py` and
+    `tests/ut/ops/test_eplb_v2_recording.py` on this branch. Coverage
+    includes ND/NZ format propagation, ND integer scales, property-override
+    rejection, nonzero storage offsets, and stride mismatches.
+    - `bash format.sh ci` and `git diff --check` passed.
+    - The full remote mypy gate could not start because fetching the pushed
+    source timed out.
+    - Real NPU smoke validation could not proceed because the available
+    runtime failed during device initialization; NPU allocation and
+    migration validation remain pending.
+    
+    - vLLM main:
+    https://github.com/vllm-project/vllm/commit/ced6857afa0ea7b2e3f0846a62e1394e90f15607
+    
+    ---------
+    
+    Signed-off-by: freyfwt <freytian1996@gmail.com>
+
+diff --git a/tests/ut/ops/test_routed_experts.py b/tests/ut/ops/test_routed_experts.py
+index 578a495e5..0a522a0da 100644
+--- a/tests/ut/ops/test_routed_experts.py
++++ b/tests/ut/ops/test_routed_experts.py
+@@ -6,9 +6,40 @@ from types import SimpleNamespace
+ import pytest
+ import torch
+ 
++import vllm_ascend.ops.fused_moe.routed_experts as routed_experts_module
+ from vllm_ascend.ops.fused_moe.routed_experts import AscendRoutedExperts, EplbExpertTensorList
+ 
+ 
++class _FakeNpuTensor:
++    """Minimal NPU tensor stub for CPU-only unit tests."""
++
++    def __init__(
++        self,
++        shape,
++        npu_format,
++        *,
++        dtype=torch.float16,
++        storage_offset=0,
++        stride=None,
++    ):
++        self.shape = torch.Size(shape)
++        self.dtype = dtype
++        self.layout = torch.strided
++        self.device = torch.device("npu")
++        self.npu_format = npu_format
++        self._storage_offset = storage_offset
++        self._stride = stride or torch.empty(shape).stride()
++
++    def size(self):
++        return self.shape
++
++    def storage_offset(self):
++        return self._storage_offset
++
++    def stride(self):
++        return self._stride
++
++
+ def _routed_experts(weight_views):
+     routed_experts = AscendRoutedExperts.__new__(AscendRoutedExperts)
+     routed_experts.local_num_experts = 2
+@@ -43,6 +74,131 @@ def test_get_expert_weights_preserves_independent_expert_tensors():
+     assert all(tensor.storage_offset() == 0 for tensor in buffer)
+ 
+ 
++@pytest.mark.parametrize(
++    "dtype,npu_formats",
++    [
++        pytest.param(torch.float16, (29, 50), id="nz-float-weight"),
++        pytest.param(torch.float16, (2, 2), id="nd-float-weight"),
++        pytest.param(torch.int8, (29, 50), id="nz-int8-weight"),
++        pytest.param(torch.int32, (29, 50), id="nz-packed-weight"),
++        pytest.param(torch.int64, (2, 2), id="nd-integer-scale"),
++    ],
++)
++def test_eplb_expert_buffers_preserve_each_source_npu_format(monkeypatch, dtype, npu_formats):
++    sources = EplbExpertTensorList(_FakeNpuTensor((3, 4), fmt, dtype=dtype) for fmt in npu_formats)
++    format_queries = []
++    allocations = []
++
++    def fake_get_npu_format(tensor):
++        format_queries.append(tensor)
++        return tensor.npu_format
++
++    def fake_empty_with_format(**kwargs):
++        allocations.append(kwargs)
++        # The CPU tensor stands in for the allocated NPU tensor.
++        return torch.empty(kwargs["size"], dtype=kwargs["dtype"])
++
++    monkeypatch.setattr(
++        routed_experts_module.torch_npu,
++        "get_npu_format",
++        fake_get_npu_format,
++        raising=False,
++    )
++    monkeypatch.setattr(
++        routed_experts_module.torch_npu,
++        "empty_with_format",
++        fake_empty_with_format,
++        raising=False,
++    )
++
++    buffers = torch.empty_like(sources)
++
++    assert isinstance(buffers, EplbExpertTensorList)
++    assert [buffer.shape for buffer in buffers] == [
++        torch.Size((3, 4)),
++        torch.Size((3, 4)),
++    ]
++    assert all(buffer.dtype == dtype and not buffer.requires_grad for buffer in buffers)
++    assert format_queries == list(sources)
++    assert allocations == [
++        {
++            "size": torch.Size((3, 4)),
++            "dtype": dtype,
++            "layout": torch.strided,
++            "device": torch.device("npu"),
++            "acl_format": fmt,
++        }
++        for fmt in npu_formats
++    ]
++
++
++@pytest.mark.parametrize(
++    "kwargs",
++    [
++        pytest.param({"dtype": torch.float32}, id="changed-dtype"),
++        pytest.param({"device": 0}, id="changed-device"),
++        pytest.param(
++            {"memory_format": torch.contiguous_format},
++            id="changed-memory-format",
++        ),
++        pytest.param({"requires_grad": True}, id="requires-grad"),
++    ],
++)
++def test_eplb_expert_buffer_rejects_property_overrides(kwargs):
++    sources = EplbExpertTensorList([_FakeNpuTensor((3, 4), 50)])
++
++    with pytest.raises(TypeError):
++        torch.empty_like(sources, **kwargs)
++
++
++def test_eplb_expert_buffer_rejects_nonzero_storage_offset(monkeypatch):
++    source = _FakeNpuTensor((3, 4), 50, storage_offset=1)
++
++    def fail_empty_with_format(**kwargs):
++        raise AssertionError("empty_with_format must not be called")
++
++    monkeypatch.setattr(
++        routed_experts_module.torch_npu,
++        "empty_with_format",
++        fail_empty_with_format,
++        raising=False,
++    )
++
++    with pytest.raises(AssertionError, match="storage_offset=1"):
++        routed_experts_module._empty_like_preserving_npu_format(
++            source,
++        )
++
++
++def test_eplb_expert_buffer_rejects_stride_mismatch(monkeypatch):
++    source = _FakeNpuTensor((3, 4), 50)
++
++    def fake_get_npu_format(tensor):
++        return tensor.npu_format
++
++    def fake_empty_with_format(**kwargs):
++        del kwargs
++        return torch.empty((4, 3)).t()
++
++    monkeypatch.setattr(
++        routed_experts_module.torch_npu,
++        "get_npu_format",
++        fake_get_npu_format,
++        raising=False,
++    )
++    monkeypatch.setattr(
++        routed_experts_module.torch_npu,
++        "empty_with_format",
++        fake_empty_with_format,
++        raising=False,
++    )
++
++    with pytest.raises(AssertionError, match="source=.*buffer="):
++        routed_experts_module._empty_like_preserving_npu_format(
++            source,
++        )
++
++
+ def test_get_expert_weights_rejects_unsupported_quantization():
+     with pytest.raises(NotImplementedError, match="weight views are not defined"):
+         list(_routed_experts([]).get_expert_weights())
+diff --git a/vllm_ascend/ops/fused_moe/routed_experts.py b/vllm_ascend/ops/fused_moe/routed_experts.py
+index 206c1609d..312554f5c 100644
+--- a/vllm_ascend/ops/fused_moe/routed_experts.py
++++ b/vllm_ascend/ops/fused_moe/routed_experts.py
+@@ -356,6 +356,34 @@ def _record_v2_eplb_load(router: FusedMoERouter, result: FusedExpertsResult) ->
+     )
+ 
+ 
++def _empty_like_preserving_npu_format(tensor: torch.Tensor) -> torch.Tensor:
++    """Allocate an EPLB buffer with the source tensor's NPU storage format."""
++    if tensor.device.type != "npu":
++        return torch.empty_like(tensor)
++
++    # ACLNN-only devices force allow_internal_format=False, so torch.empty_like
++    # silently converts internal formats such as FRACTAL_NZ_C0_16 to ND. Use
++    # the explicit NPU allocator to preserve the expert's storage format.
++    assert tensor.storage_offset() == 0, (
++        "EPLB expert buffer allocation requires an offset-0 source "
++        f"tensor, but got storage_offset={tensor.storage_offset()}"
++    )
++
++    result = torch_npu.empty_with_format(
++        size=tensor.size(),
++        dtype=tensor.dtype,
++        layout=tensor.layout,
++        device=tensor.device,
++        acl_format=int(torch_npu.get_npu_format(tensor)),
++    )
++
++    assert result.stride() == tensor.stride(), (
++        "EPLB expert buffer allocation must preserve the source stride, "
++        f"but got source={tensor.stride()} and buffer={result.stride()}"
++    )
++    return result
++
++
+ class EplbExpertTensorList(list[torch.Tensor]):
+     """Per-expert tensors exposed through the upstream EPLB weight contract."""
+ 
+@@ -365,9 +393,9 @@ class EplbExpertTensorList(list[torch.Tensor]):
+ 
+     @classmethod
+     def __torch_function__(cls, func, types, args=(), kwargs=None):
+-        if func is torch.empty_like:
++        if func is torch.empty_like and not kwargs:
+             source = args[0]
+-            return cls(torch.empty_like(tensor, **(kwargs or {})) for tensor in source)
++            return cls(_empty_like_preserving_npu_format(tensor) for tensor in source)
+         return NotImplemented
+ 
+ 

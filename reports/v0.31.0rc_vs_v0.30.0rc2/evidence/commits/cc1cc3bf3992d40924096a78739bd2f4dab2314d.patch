@@ -1,0 +1,553 @@
+commit cc1cc3bf3992d40924096a78739bd2f4dab2314d
+Author:     lijiahang226 <216526138+lijiahang226@users.noreply.github.com>
+AuthorDate: Sun Oct 11 17:16:04 2026 +0800
+Commit:     GitHub <noreply@github.com>
+CommitDate: Sun Oct 11 17:16:04 2026 +0800
+
+    [BugFix] Derive GLM-5.3-Flash SMLA plans from actual sparse indices (#18241)
+    
+    ### What this PR does / why we need it?
+    
+    GLM-5.3-Flash can reuse sparse selections while token positions advance.
+    Position-derived lengths can then claim 2049 valid entries for a row
+    that contains only 2048, or truncate a reused pool tail. The SMLA plan
+    can also use the indexer's logical width while the operator receives a
+    wider, aligned index buffer. The existing draft/trimmed-query rebuild
+    leaves equal-shaped target calls using the earlier plan.
+    
+    Count the valid prefix of the sorted indices on every A5 NoPE SMLA call
+    and build the plan from the same lengths, query offsets, and actual
+    index width passed to attention. Update the persistent length and plan
+    buffers in place. A builder-owned device mask tracks live rows across
+    graph replay without freezing the Python token count at capture time;
+    trimmed queries still clamp their query offsets. Remove the metadata
+    builder's indexer dependency and retain DSACP's full-head sinks
+    allocation.
+    
+    Refs #15665
+    
+    ### Does this PR introduce _any_ user-facing change?
+    
+    Yes. GLM-5.3-Flash A5 NoPE sparse attention uses lengths and a plan
+    consistent with the selected indices, including reused selections and
+    graph padding.
+    
+    ### How was this patch tested?
+    
+    - **282 related unit tests passed** against an isolated checkout of
+    upstream main `749370ba9` plus this patch, using the validation
+    container's existing vLLM and compiled extensions:
+    
+      ```bash
+    pytest -q tests/ut/attention/test_sfa_nope_metadata.py
+    tests/ut/attention/test_sfa_nope_forward.py
+    tests/ut/attention/test_sparse_flash_mla.py
+    tests/ut/attention/test_sfa_contract.py
+    pytest -q tests/ut/attention/test_sfa_v1.py
+    tests/ut/attention/test_sfa_cp.py
+      ```
+    
+    - The reused-index regression fails against the original mainline helper
+    because the supplied lengths disagree with the valid entries, and passes
+    with this patch.
+    - **16 real NPU graph replay cases passed** for the production helpers:
+    widths 2051/2176, full/trimmed query rows, changing valid prefixes and
+    live-row masks, and stable length/plan/mask buffer addresses. External
+    SMLA metadata and attention operators were replaced with device-only
+    stubs for these checks.
+    - Local lint, formatting, spelling, workflow and source checks passed.
+    Full local pre-commit could not complete on Windows because the
+    gitleaks/shellcheck environment was unavailable; the logger script and
+    long-function check passed separately.
+    - Actual A5 SMLA operator execution, model accuracy and performance have
+    not been validated.
+    - vLLM main:
+    https://github.com/vllm-project/vllm/commit/ced6857afa0ea7b2e3f0846a62e1394e90f15607
+    
+    Signed-off-by: Li Jiahang <216526138+lijiahang226@users.noreply.github.com>
+
+diff --git a/tests/ut/attention/test_sfa_nope_metadata.py b/tests/ut/attention/test_sfa_nope_metadata.py
+index 9e8a55108..182a9be37 100644
+--- a/tests/ut/attention/test_sfa_nope_metadata.py
++++ b/tests/ut/attention/test_sfa_nope_metadata.py
+@@ -17,10 +17,6 @@ from vllm_ascend.device.hardware_profile import DeviceAdaptorFamily
+ 
+ 
+ def _builder(block_size, a5, monkeypatch, rope_dim=0, builder_cls=sfa.AscendSFAMetadataBuilder, tp_size=1):
+-    indexer = SimpleNamespace(
+-        topk_output_width=17,
+-        get_topk_lengths=lambda positions: torch.where(positions == 0, 1, 7),
+-    )
+     config = SimpleNamespace(
+         cache_config=SimpleNamespace(block_size=block_size),
+         model_config=SimpleNamespace(
+@@ -32,9 +28,7 @@ def _builder(block_size, a5, monkeypatch, rope_dim=0, builder_cls=sfa.AscendSFAM
+         scheduler_config=SimpleNamespace(max_num_seqs=2, max_num_batched_tokens=4),
+         speculative_config=None,
+         compilation_config=SimpleNamespace(
+-            static_forward_context={
+-                "layer": SimpleNamespace(qk_rope_head_dim=rope_dim, impl=SimpleNamespace(indexer=indexer))
+-            }
++            static_forward_context={"layer": SimpleNamespace(qk_rope_head_dim=rope_dim)}
+         ),
+     )
+     monkeypatch.setattr(
+@@ -113,18 +107,22 @@ def test_dsacp_nope_plan_uses_local_queries_and_full_heads(monkeypatch, dummy_re
+         local.query_start_loc, torch.tensor([0, 0, 1, 2] if dummy_request else [0, 0, 1], dtype=torch.int32)
+     )
+     torch.testing.assert_close(local.seq_lens, torch.tensor([0, 1, 0] if dummy_request else [0, 1], dtype=torch.int32))
+-    torch.testing.assert_close(local.smla_topk_length, torch.tensor([[1], [0]], dtype=torch.int32))
++    assert not plans  # Planning runs after token-local indices are selected.
++    monkeypatch.setattr(sfa, "sparse_flash_mla", lambda q, **kwargs: (q,))
++    sfa.sparse_mla(torch.ones(2, 4, 8), torch.zeros(8, 128, 1, 8), torch.zeros(2, 1, 4, dtype=torch.int32), local, 0.5)
++    torch.testing.assert_close(local.smla_topk_length, torch.tensor([[4], [0]], dtype=torch.int32))
+     assert plans[0]["num_heads_q"] == 4
+     assert plans[0]["cu_seqlens_q"] is local.query_start_loc
+     second = builder.build(0, common).nope_metadata
+     assert second.query_start_loc.data_ptr() == local.query_start_loc.data_ptr()
+     assert second.smla_metadata.data_ptr() == local.smla_metadata.data_ptr()
+     assert second.smla_topk_length.data_ptr() == local.smla_topk_length.data_ptr()
++    assert second.smla_valid_mask.data_ptr() == local.smla_valid_mask.data_ptr()
+ 
+ 
+ @pytest.mark.parametrize("block_size", [128, 384, 640, 2304, 4352])
+ @pytest.mark.parametrize("a5", [False, True])
+-def test_shared_sfa_nope_metadata_pages_lengths_and_draft_buffers(monkeypatch, block_size, a5):
++def test_shared_sfa_nope_metadata_pages_and_draft_buffers(monkeypatch, block_size, a5):
+     builder = _builder(block_size, a5, monkeypatch)
+     seen = []
+ 
+@@ -155,10 +153,9 @@ def test_shared_sfa_nope_metadata_pages_lengths_and_draft_buffers(monkeypatch, b
+     draft = builder.build_for_drafting(common, 1)
+     assert draft.block_table.data_ptr() != address
+     if a5:
+-        torch.testing.assert_close(
+-            seen[0],
+-            torch.tensor([[1], [7], [7], [0]], dtype=torch.int32),
+-        )
++        assert not seen
++        assert second.smla_topk_length.data_ptr() == first.smla_topk_length.data_ptr()
++        assert second.smla_valid_mask.data_ptr() == first.smla_valid_mask.data_ptr()
+         assert second.smla_metadata.data_ptr() == first.smla_metadata.data_ptr()
+         assert draft.smla_metadata.data_ptr() != first.smla_metadata.data_ptr()
+         assert draft.smla_topk_length.data_ptr() != first.smla_topk_length.data_ptr()
+@@ -171,6 +168,12 @@ def test_shared_sfa_nope_metadata_pages_lengths_and_draft_buffers(monkeypatch, b
+     page_multiplier = builder.nope_states[None].split
+     assert first.block_table[0, 0] == 3 * page_multiplier
+     assert draft.block_table[0, 0] == 5 * page_multiplier
++    if a5:
++        common.num_actual_tokens = 1
++        smaller = builder.build(0, common)
++        assert smaller.smla_valid_mask.data_ptr() == first.smla_valid_mask.data_ptr()
++        torch.testing.assert_close(smaller.smla_valid_mask[:, 0], torch.tensor([True, False, False, False]))
++        torch.testing.assert_close(draft.smla_valid_mask[:, 0], torch.tensor([True, True, True, False]))
+ 
+ 
+ def test_a3_sparse_mla_preserves_storage_addresses(monkeypatch):
+@@ -309,6 +312,7 @@ def test_nope_operator_returns_kernel_output_with_unwritten_graph_rows(monkeypat
+     metadata = SimpleNamespace(
+         smla_metadata=torch.empty(1024, dtype=torch.int32) if a5 else None,
+         smla_topk_length=torch.tensor([[1], [1], [0]], dtype=torch.int32),
++        smla_valid_mask=torch.tensor([[True], [True], [False]]),
+         smla_sinks=torch.ones(2, dtype=torch.float32),
+         query_start_loc=torch.tensor([0, 1, 2], dtype=torch.int32),
+         seq_lens=torch.tensor([1, 1], dtype=torch.int32),
+@@ -317,6 +321,8 @@ def test_nope_operator_returns_kernel_output_with_unwritten_graph_rows(monkeypat
+         # Row 2 is graph padding. query_start_loc's terminator was extended to
+         # cover it, so only num_actual_tokens tells it apart from a real row.
+         num_actual_tokens=2,
++        max_query_len=1,
++        max_seq_len=1,
+     )
+ 
+     kernel_output = query * 2
+@@ -326,6 +332,7 @@ def test_nope_operator_returns_kernel_output_with_unwritten_graph_rows(monkeypat
+         return (kernel_output,)
+ 
+     if a5:
++        _stub_metadata_op(monkeypatch)
+         monkeypatch.setattr(sparse_mla, "sparse_flash_mla", op)
+     else:
+         monkeypatch.setattr(torch.ops._C_ascend, "npu_sparse_flash_attention", op, raising=False)
+@@ -345,6 +352,7 @@ def test_a5_smla_uses_original_cache_sorted_indices_and_stable_metadata(monkeypa
+         block_table=torch.tensor([[2], [1]], dtype=torch.int32),
+         smla_metadata=None,
+         smla_topk_length=torch.full((2, 1), 3, dtype=torch.int32),
++        smla_valid_mask=torch.ones(2, 1, dtype=torch.bool),
+         block_size=8,
+         smla_sinks=torch.ones(2, dtype=torch.float32),
+         num_actual_tokens=2,
+@@ -357,14 +365,14 @@ def test_a5_smla_uses_original_cache_sorted_indices_and_stable_metadata(monkeypa
+         # kernel skip its softmax initialisation on ordinary decode steps.
+         assert kwargs["ori_mask_mode"] == 0 and kwargs["cmp_mask_mode"] == 0
+         assert kwargs["ori_win_left"] == -1 and kwargs["ori_win_right"] == -1
+-        assert kwargs["ori_topk_length"] is metadata.smla_topk_length
++        assert kwargs["ori_topk_length"].data_ptr() == metadata.smla_topk_length.data_ptr()
+         return torch.full_like(buffer, metadata.max_seq_len)
+ 
+     monkeypatch.setattr(sparse_mla, "sparse_flash_mla_metadata", build)
+-    sparse_mla.build_smla_metadata(metadata, buffer, 2, 128, 7)
++    sparse_mla.build_smla_metadata(metadata, buffer, 2, 128, 7, metadata.query_start_loc, metadata.smla_topk_length)
+     address = metadata.smla_metadata.data_ptr()
+     metadata.max_seq_len = 12
+-    sparse_mla.build_smla_metadata(metadata, buffer, 2, 128, 7)
++    sparse_mla.build_smla_metadata(metadata, buffer, 2, 128, 7, metadata.query_start_loc, metadata.smla_topk_length)
+     assert metadata.smla_metadata.data_ptr() == address
+     assert (metadata.smla_metadata == 12).all()
+     query = torch.ones(2, 2, 128, dtype=torch.bfloat16)
+@@ -406,6 +414,7 @@ def test_a5_smla_rebuilds_plan_for_a_trimmed_query(monkeypatch):
+         smla_metadata=torch.zeros(sparse_mla.SMLA_METADATA_SIZE, dtype=torch.int32),
+         # Predicted for the padded batch: four rows, three entries each.
+         smla_topk_length=torch.full((4, 1), 3, dtype=torch.int32),
++        smla_valid_mask=torch.tensor([[True], [False], [False], [False]]),
+         smla_sinks=torch.ones(2, dtype=torch.float32),
+         block_size=8,
+         num_actual_tokens=1,
+@@ -420,8 +429,8 @@ def test_a5_smla_rebuilds_plan_for_a_trimmed_query(monkeypatch):
+         return regenerated
+ 
+     def smla(q, **kwargs):
+-        assert kwargs["metadata"] is regenerated
+-        assert kwargs["metadata"] is not metadata.smla_metadata
++        assert kwargs["metadata"] is metadata.smla_metadata
++        torch.testing.assert_close(kwargs["metadata"], regenerated)
+         torch.testing.assert_close(kwargs["cu_seqlens_q"], torch.tensor([0, 1, 1], dtype=torch.int32))
+         # Two non-negative entries survive the sort; the prediction said three.
+         torch.testing.assert_close(kwargs["ori_topk_length"], torch.tensor([[2]], dtype=torch.int32))
+@@ -454,6 +463,7 @@ def test_a5_smla_rebuilds_plan_for_the_draft_model(monkeypatch):
+         smla_metadata=torch.zeros(sparse_mla.SMLA_METADATA_SIZE, dtype=torch.int32),
+         # Prediction for the padded batch: two rows, three entries each.
+         smla_topk_length=torch.full((2, 1), 3, dtype=torch.int32),
++        smla_valid_mask=torch.ones(2, 1, dtype=torch.bool),
+         smla_sinks=torch.ones(2, dtype=torch.float32),
+         block_size=8,
+         num_actual_tokens=2,
+@@ -468,13 +478,12 @@ def test_a5_smla_rebuilds_plan_for_the_draft_model(monkeypatch):
+         return regenerated
+ 
+     def smla(q, **kwargs):
+-        assert kwargs["metadata"] is regenerated
+-        assert kwargs["metadata"] is not metadata.smla_metadata
++        assert kwargs["metadata"] is metadata.smla_metadata
++        torch.testing.assert_close(kwargs["metadata"], regenerated)
+         return q + 1, torch.empty(0)
+ 
+     monkeypatch.setattr(sparse_mla, "sparse_flash_mla_metadata", plan)
+     monkeypatch.setattr(sparse_mla, "sparse_flash_mla", smla)
+-    monkeypatch.setattr(sparse_mla, "is_forward_context_available", lambda: True)
+     monkeypatch.setattr(sparse_mla, "get_forward_context", lambda: SimpleNamespace(is_draft_model=True))
+     # query rows == topk_length rows: the shape check alone cannot detect the
+     # stale plan.
+@@ -484,41 +493,55 @@ def test_a5_smla_rebuilds_plan_for_the_draft_model(monkeypatch):
+     torch.testing.assert_close(sparse_mla.sparse_mla(query, cache, indices, metadata, 0.5), query + 1)
+ 
+ 
+-def test_a5_smla_keeps_the_built_plan_for_the_target(monkeypatch):
+-    """The target refreshes the plan from unpadded host values every step, so an
+-    equal-shaped call must keep using the plan written during metadata
+-    construction.
+-
+-    Also pins the no-forward-context case: ``sparse_mla`` is a module-level
+-    helper that unit tests call directly, so the draft check must not touch the
+-    forward context when none is set.
+-    """
++def test_a5_smla_plans_from_reused_indices_for_the_target(monkeypatch):
++    # A FULL target call must not retain an equal-shaped, position-based plan.
+     metadata = SimpleNamespace(
+-        query_start_loc=torch.tensor([0, 1, 2], dtype=torch.int32),
+-        seq_lens=torch.tensor([8, 0], dtype=torch.int32),
++        query_start_loc=torch.tensor([0, 1, 3], dtype=torch.int32),
++        seq_lens=torch.tensor([4097, 4100], dtype=torch.int32),
+         max_query_len=1,
+-        max_seq_len=8,
+-        block_table=torch.tensor([[2], [0]], dtype=torch.int32),
++        max_seq_len=4100,
++        block_table=torch.zeros(2, 33, dtype=torch.int32),
+         smla_metadata=torch.zeros(sparse_mla.SMLA_METADATA_SIZE, dtype=torch.int32),
+-        smla_topk_length=torch.full((2, 1), 3, dtype=torch.int32),
++        smla_topk_length=torch.tensor([[2049], [2048], [2051]], dtype=torch.int32),
++        smla_valid_mask=torch.tensor([[True], [True], [False]]),
+         smla_sinks=torch.ones(2, dtype=torch.float32),
+-        block_size=8,
++        block_size=128,
+         num_actual_tokens=2,
+     )
++    query = torch.ones(3, 2, 128, dtype=torch.bfloat16)
++    indices = torch.full((3, 1, 2176), -1, dtype=torch.int32)
++    indices[0, 0, :2048] = torch.arange(2048, dtype=torch.int32)
++    indices[1, 0, :2051] = torch.arange(2051, dtype=torch.int32)
++    indices[2] = 0  # Padding can contain stale non-negative indices.
++    addresses = metadata.smla_metadata.data_ptr(), metadata.smla_topk_length.data_ptr()
++    planned = []
+ 
+-    def smla(q, **kwargs):
+-        assert kwargs["metadata"] is metadata.smla_metadata
+-        assert kwargs["ori_topk_length"] is metadata.smla_topk_length
++    def plan(**kwargs):
++        assert kwargs["ori_topk"] == indices.shape[-1]
++        assert kwargs["ori_topk_length"].data_ptr() == addresses[1]
+         assert kwargs["cu_seqlens_q"] is metadata.query_start_loc
+-        return q + 1, torch.empty(0)
++        planned.append(kwargs["ori_topk_length"].clone())
++        return torch.full_like(metadata.smla_metadata, len(planned))
++
++    def attend(q, **kwargs):
++        valid_counts = (kwargs["ori_sparse_indices"] >= 0).sum(dim=-1, dtype=torch.int32)
++        valid_counts[-1] = 0
++        torch.testing.assert_close(kwargs["ori_topk_length"], valid_counts)
++        torch.testing.assert_close(kwargs["ori_topk_length"], planned[-1])
++        assert (kwargs["metadata"] == len(planned)).all()
++        assert kwargs["metadata"].data_ptr() == addresses[0]
++        assert kwargs["ori_topk_length"].data_ptr() == addresses[1]
++        return (q,)
+ 
+-    monkeypatch.setattr(sparse_mla, "sparse_flash_mla_metadata", lambda **_: pytest.fail("must not rebuild"))
+-    monkeypatch.setattr(sparse_mla, "sparse_flash_mla", smla)
+-    monkeypatch.setattr(sparse_mla, "get_forward_context", lambda: SimpleNamespace(is_draft_model=False))
+-    query = torch.ones(2, 2, 8, dtype=torch.bfloat16)
+-    cache = torch.zeros(3, 8, 1, 8, dtype=torch.bfloat16)
+-    indices = torch.tensor([[[5, 1, -1]], [[-1, -1, -1]]], dtype=torch.int32)
+-    torch.testing.assert_close(sparse_mla.sparse_mla(query, cache, indices, metadata, 0.5), query + 1)
++    monkeypatch.setattr(sparse_mla, "sparse_flash_mla_metadata", plan)
++    monkeypatch.setattr(sparse_mla, "sparse_flash_mla", attend)
++    monkeypatch.setattr(sparse_mla, "get_forward_context", lambda: pytest.fail("no forward context"))
++    cache = torch.zeros(1, 128, 1, 128, dtype=torch.bfloat16)
++    for expected in ([[2048], [2051], [0]], [[2049], [2048], [0]]):
++        torch.testing.assert_close(sparse_mla.sparse_mla(query, cache, indices, metadata, 0.5), query)
++        torch.testing.assert_close(planned[-1], torch.tensor(expected, dtype=torch.int32))
++        indices[0, 0, 2048] = 4096
++        indices[1, 0, 2048:] = -1
+ 
+ 
+ def test_build_smla_metadata_rejects_a_plan_of_the_wrong_size(monkeypatch):
+@@ -532,7 +555,7 @@ def test_build_smla_metadata_rejects_a_plan_of_the_wrong_size(monkeypatch):
+     monkeypatch.setattr(sparse_mla, "sparse_flash_mla_metadata", lambda **_: torch.zeros(8, dtype=torch.int32))
+     buffer = torch.empty(sparse_mla.SMLA_METADATA_SIZE, dtype=torch.int32)
+     with pytest.raises(ValueError, match="int32 values"):
+-        sparse_mla.build_smla_metadata(metadata, buffer, 2, 128, 7)
++        sparse_mla.build_smla_metadata(metadata, buffer, 2, 128, 7, metadata.query_start_loc, metadata.smla_topk_length)
+ 
+ 
+ def _sinks_owner(builder):
+diff --git a/vllm_ascend/attention/context_parallel/sfa_cp.py b/vllm_ascend/attention/context_parallel/sfa_cp.py
+index 53262690a..4654ef647 100644
+--- a/vllm_ascend/attention/context_parallel/sfa_cp.py
++++ b/vllm_ascend/attention/context_parallel/sfa_cp.py
+@@ -574,7 +574,6 @@ class AscendSFADSACPMetadataBuilder(AscendSFAMetadataBuilder):
+                 self.kv_cache_spec,
+                 self.vllm_config,
+                 self.device,
+-                self.nope_indexer,
+                 self.kernel_block_size,
+                 num_heads=self.model_config.hf_text_config.num_attention_heads,
+             )
+diff --git a/vllm_ascend/attention/sfa_v1.py b/vllm_ascend/attention/sfa_v1.py
+index 1c440d463..51234ff60 100644
+--- a/vllm_ascend/attention/sfa_v1.py
++++ b/vllm_ascend/attention/sfa_v1.py
+@@ -7,7 +7,7 @@ import torch_npu
+ from vllm.config import VllmConfig, get_current_vllm_config
+ from vllm.config.compilation import CUDAGraphMode
+ from vllm.distributed import get_pcp_group, get_tensor_model_parallel_world_size
+-from vllm.forward_context import get_forward_context, is_forward_context_available
++from vllm.forward_context import get_forward_context
+ from vllm.logger import logger
+ from vllm.model_executor.layers.attention.mla_attention import MLACommonMetadataBuilder
+ from vllm.model_executor.utils import replace_parameter
+@@ -138,10 +138,8 @@ def generate_smla_plan(metadata, num_heads, head_dim, topk, cu_seqlens_q, topk_l
+     )
+ 
+ 
+-def build_smla_metadata(metadata, buffer, num_heads, head_dim, topk):
+-    generated = generate_smla_plan(
+-        metadata, num_heads, head_dim, topk, metadata.query_start_loc, metadata.smla_topk_length
+-    )
++def build_smla_metadata(metadata, buffer, num_heads, head_dim, topk, cu_seqlens_q, topk_length):
++    generated = generate_smla_plan(metadata, num_heads, head_dim, topk, cu_seqlens_q, topk_length)
+     if generated.numel() != buffer.numel():
+         # The persistent buffer is sized by the operator's fixed [1024] contract.
+         # A generated plan of any other size means this build does not match the
+@@ -178,44 +176,28 @@ def sparse_mla(query, cache, indices, metadata, scale):
+         sorted_indices = torch.where(sorted_indices == sentinel, -1, sorted_indices)
+         if metadata.smla_sinks is None:
+             raise RuntimeError("Sparse MLA requires persistent sinks owned by SparseMLAMetadataState.")
+-        # Default to the very tensors the plan in metadata.smla_metadata was
+-        # generated from, so plan and call always describe the same work.
+-        topk_length = metadata.smla_topk_length
++        # MTP and shared indexers can reuse selections while positions advance.
++        # Count the actual left-aligned prefix on every call, including target
++        # FULL graphs whose query shape still matches the metadata capacity.
++        topk_length = metadata.smla_topk_length[: query.shape[0]]
++        metadata.smla_topk_length.zero_()
++        # The builder refreshes this persistent mask outside graph capture.
++        # A Python token count used here would freeze at the captured batch size.
++        valid = metadata.smla_valid_mask[: query.shape[0]]
++        topk_length.copy_((sorted_indices >= 0).sum(dim=-1, dtype=torch.int32).masked_fill(~valid, 0))
+         cu_seqlens_q = metadata.query_start_loc
+-        plan = metadata.smla_metadata
+-        # The plan has to be generated from the very tensors the operator call
+-        # receives: a plan built over different ones makes the kernel index past
+-        # what it was handed. The shape check below catches the eager case, where
+-        # the query is trimmed to the unpadded row count, but a replayed FULL
+-        # draft graph passes the padded count the plan was built for. The MTP
+-        # draft replays one captured graph per step, so its pre-built plan can
+-        # describe a different step's rows; rebuild from the indices actually
+-        # passed whenever the draft model is running.
+-        draft_model = is_forward_context_available() and getattr(get_forward_context(), "is_draft_model", False)
+-        if query.shape[0] != topk_length.shape[0] or draft_model:
+-            # Eager and piecewise steps trim the query to the unpadded token
+-            # count, while the plan built during metadata construction still
+-            # describes the padded one (graph capacity, and under data
+-            # parallelism the group-wide token count, which can be hundreds of
+-            # rows larger). cu_seqlens_q is padded for the same reason. Rebuild
+-            # for the rows actually being passed.
+-            #
+-            # Since this branch regenerates the plan anyway, take the top-k
+-            # lengths from the indices being passed rather than from the
+-            # prediction made before the indexer ran. The sort above left every
+-            # -1 at the tail of its row, so counting the non-negative entries
+-            # gives exactly the left-aligned prefix the operator contract asks
+-            # for, and unlike a prediction it cannot overshoot into the -1 tail.
+-            topk_length = (sorted_indices >= 0).sum(dim=-1, dtype=torch.int32).reshape(query.shape[0], -1)
++        if query.shape[0] != metadata.smla_topk_length.shape[0]:
++            # Eager and piecewise execution trim graph-padding query rows.
+             cu_seqlens_q = cu_seqlens_q.clamp(max=query.shape[0])
+-            plan = generate_smla_plan(
+-                metadata,
+-                query.shape[1],
+-                query.shape[2],
+-                sorted_indices.shape[-1],
+-                cu_seqlens_q,
+-                topk_length,
+-            )
++        build_smla_metadata(
++            metadata,
++            metadata.smla_metadata,
++            query.shape[1],
++            query.shape[2],
++            sorted_indices.shape[-1],
++            cu_seqlens_q,
++            topk_length,
++        )
+         result = sparse_flash_mla(
+             query.contiguous(),
+             ori_kv=cache,
+@@ -225,7 +207,7 @@ def sparse_mla(query, cache, indices, metadata, scale):
+             seqused_ori_kv=metadata.seq_lens,
+             ori_topk_length=topk_length,
+             sinks=metadata.smla_sinks,
+-            metadata=plan,
++            metadata=metadata.smla_metadata,
+             softmax_scale=scale,
+             cmp_ratio=1,
+             # Must match the mode the plan above was generated with.
+@@ -263,11 +245,11 @@ def sparse_mla(query, cache, indices, metadata, scale):
+ class SparseMLAMetadataState:
+     """Persistent operator buffers for NoPE within the shared SFA builder.
+ 
+-    Indexers supply their visible index counts. Pool construction and scoring
+-    remain entirely outside attention metadata and operator dispatch.
++    Sparse MLA fills lengths and the plan after receiving selected indices.
++    Pool construction and scoring remain outside operator dispatch.
+     """
+ 
+-    def __init__(self, kv_cache_spec, vllm_config, device, indexer, kernel_block_size=128, num_heads=None):
++    def __init__(self, kv_cache_spec, vllm_config, device, kernel_block_size=128, num_heads=None):
+         block_size = kv_cache_spec.block_size
+         if block_size <= 0 or block_size % kernel_block_size:
+             raise ValueError("Sparse MLA block size must be a positive multiple of the SFA kernel block size.")
+@@ -285,17 +267,13 @@ class SparseMLAMetadataState:
+             dtype=torch.int32,
+             device=device,
+         )
+-        self.indexer = indexer
+         if self.use_smla:
+-            if indexer is None:
+-                raise ValueError("A5 NoPE sparse MLA requires an indexer to supply visible top-k lengths.")
+             config = vllm_config.model_config.hf_text_config
+             self.num_heads = (
+                 config.num_attention_heads // vllm_config.parallel_config.tensor_parallel_size
+                 if num_heads is None
+                 else num_heads
+             )
+-            self.head_dim = config.kv_lora_rank
+             self.metadata_buffer = torch.empty(SMLA_METADATA_SIZE, dtype=torch.int32, device=device)
+             self.length_buffer = torch.empty(
+                 vllm_config.scheduler_config.max_num_batched_tokens,
+@@ -303,6 +281,7 @@ class SparseMLAMetadataState:
+                 dtype=torch.int32,
+                 device=device,
+             )
++            self.valid_mask_buffer = torch.empty_like(self.length_buffer, dtype=torch.bool)
+             # ACL Graph replay reads the addresses captured on the first run,
+             # so every tensor the operator consumes has to outlive the capture.
+             # Allocate the sinks once here, next to the other persistent
+@@ -329,21 +308,13 @@ class SparseMLAMetadataState:
+             positions = metadata.positions
+             if positions.numel() > self.length_buffer.shape[0]:
+                 raise ValueError("Sparse MLA token count exceeds its persistent top-k buffer.")
+-            lengths = self.length_buffer[: positions.numel()]
+-            counts = self.indexer.get_topk_lengths(positions)
+-            # ``query_start_loc``'s last entry is the PADDED token count: the
+-            # runner extends it so the TND layout constraint holds. It cannot
+-            # separate real rows from padding, and padding rows still carry
+-            # positions left behind by an earlier, larger batch while their
+-            # sequence lengths are zero. Bound the mask by the unpadded token
+-            # count, so padding never claims a top-k length with no KV behind it.
+             valid = torch.arange(positions.numel(), device=positions.device) < metadata.num_actual_tokens
+-            lengths[:, 0].copy_(counts.masked_fill(~valid, 0))
+-            metadata.smla_topk_length = lengths
++            mask = self.valid_mask_buffer[: positions.numel()]
++            mask[:, 0].copy_(valid)
++            metadata.smla_valid_mask = mask
++            metadata.smla_topk_length = self.length_buffer[: positions.numel()]
++            metadata.smla_metadata = self.metadata_buffer
+             metadata.smla_sinks = self.sinks
+-            build_smla_metadata(
+-                metadata, self.metadata_buffer, self.num_heads, self.head_dim, self.indexer.topk_output_width
+-            )
+         return metadata
+ 
+ 
+@@ -468,6 +439,7 @@ class AscendSFAMetadata:
+     max_seq_len: int = 0
+     smla_metadata: torch.Tensor | None = None
+     smla_topk_length: torch.Tensor | None = None
++    smla_valid_mask: torch.Tensor | None = None
+     smla_sinks: torch.Tensor | None = None
+ 
+ 
+@@ -543,9 +515,6 @@ class AscendSFAMetadataBuilder(MLACommonMetadataBuilder[AscendSFAMetadata]):
+         layer = vllm_config.compilation_config.static_forward_context[layer_names[0]]
+         self.nope = layer.qk_rope_head_dim == 0
+         self.nope_states: dict[int | None, SparseMLAMetadataState] = {}
+-        self.nope_indexer = None
+-        if self.nope:
+-            self.nope_indexer = layer.impl.indexer
+ 
+         self.use_pcp = vllm_config.parallel_config.prefill_context_parallel_size > 1
+         self.is_pcp_decode_sharded = is_pcp_decode_sharding_enabled(vllm_config)
+@@ -754,7 +723,7 @@ class AscendSFAMetadataBuilder(MLACommonMetadataBuilder[AscendSFAMetadata]):
+     def _prepare_nope_metadata(self, metadata: AscendSFAMetadata, draft_index: int | None) -> None:
+         if draft_index not in self.nope_states:
+             self.nope_states[draft_index] = SparseMLAMetadataState(
+-                self.kv_cache_spec, self.vllm_config, self.device, self.nope_indexer, self.kernel_block_size
++                self.kv_cache_spec, self.vllm_config, self.device, self.kernel_block_size
+             )
+         self.nope_states[draft_index].prepare(metadata)
+ 
+diff --git a/vllm_ascend/worker/model_runner_v1.py b/vllm_ascend/worker/model_runner_v1.py
+index 3d193190a..473f7a0c4 100644
+--- a/vllm_ascend/worker/model_runner_v1.py
++++ b/vllm_ascend/worker/model_runner_v1.py
+@@ -539,8 +539,8 @@ class NPUModelRunner(GPUModelRunner):
+         self.use_sparse = enable_sfa(vllm_config)
+         # Backends that derive per-token visible history from self.positions
+         # rather than from seq_lens: the LightningIndexer SFA family and the
+-        # GLM-Next kpool indexer. Both reach SparseMLAMetadataState.prepare(),
+-        # which calls indexer.get_topk_lengths(positions).
++        # GLM-Next kpool indexer. Both need real positions to select causally
++        # valid sparse indices.
+         self.uses_positions_for_attention = self.use_sparse or model_uses_kpool_indexer(
+             getattr(vllm_config, "model_config", None)
+         )

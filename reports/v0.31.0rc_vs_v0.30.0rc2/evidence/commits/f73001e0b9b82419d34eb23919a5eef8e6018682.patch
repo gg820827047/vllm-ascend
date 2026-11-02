@@ -1,0 +1,272 @@
+commit f73001e0b9b82419d34eb23919a5eef8e6018682
+Author:     Feng Liu <46866849+ader47@users.noreply.github.com>
+AuthorDate: Thu Oct 15 17:27:37 2026 +0800
+Commit:     GitHub <noreply@github.com>
+CommitDate: Thu Oct 15 17:27:37 2026 +0800
+
+    [BugFix][KVPool] Recover ordinary layerwise pool transfer failures (#18812)
+    
+    ### What this PR does / why we need it?
+    
+    GVA layerwise transfer threads currently raise on nonzero
+    copy/write-completion return codes even when the pool is only an
+    optional cache. A transient pool failure can therefore become a fatal
+    worker error.
+    
+    - Make ordinary layerwise pool saves best-effort while preserving failed
+    copy results in `batch_write_finish` and completing the existing
+    request/event bookkeeping.
+    - Report failed ordinary single-group pool loads through the existing
+    invalid-block recovery path.
+    - Keep strict errors for layer-reused offload and multi-group loads.
+    Backend-raised exceptions and malformed write-completion responses
+    remain strict.
+    
+    The existing metadata guard disables saving a request in the same
+    forward pass that loads its pool KV; this change keeps that guard
+    unchanged.
+    
+    ### Does this PR introduce _any_ user-facing change?
+    
+    Yes. Nonzero GVA transfer return codes no longer terminate ordinary
+    layerwise pool workers. Failed loads still follow the configured
+    `kv_load_failure_policy` (for example, recomputation when configured).
+    Layerwise offload behavior is unchanged. No configuration or environment
+    variables are added.
+    
+    ### How was this patch tested?
+    
+    Added regression tests for recoverable versus strict load/save failures,
+    copy/write-completion failures, invalid-block reporting, and
+    queue/event/request completion. Existing metadata tests cover load/save
+    suppression.
+    
+    ```bash
+    pytest -q tests/ut/distributed/ascend_store/test_kv_transfer.py \
+      tests/ut/distributed/ascend_store/test_metadata.py \
+      --confcutdir=tests/ut/distributed/ascend_store
+    # 128 passed, 47 subtests passed
+    
+    bash format.sh ci
+    # All checks passed
+    ```
+    
+    Tests ran with the repository's mocked dependencies on CPU. Full
+    runtime/NPU integration tests and performance benchmarks were not run;
+    hardware validation remains outstanding.
+    
+    ---
+    
+    ### Checklist
+    
+    #### Testing
+    
+    - [x] **Boundary / edge-case coverage**: Reviewed failure/success and
+    strict/recoverable policy boundaries; no tensor-shape or sequence-length
+    logic changes.
+    - [x] **Regression test**: Added tests that fail without this fix.
+    - [x] **Error / failure path coverage**: Covered nonzero copy and
+    write-completion results.
+    - [x] **Meaningful & reliable tests**: Assert invalid blocks, backend
+    completion inputs, queue accounting, events, and finished requests.
+    - [ ] **Performance impact**: No NPU benchmark available; no new device
+    synchronization or copy operation is introduced.
+    
+    - vLLM main:
+    https://github.com/vllm-project/vllm/commit/c4df37dfcc7f72ca41cd43801a468526ecf99a2b
+    
+    Signed-off-by: F.Liu <1661888967@qq.com>
+
+diff --git a/tests/ut/distributed/ascend_store/test_kv_transfer.py b/tests/ut/distributed/ascend_store/test_kv_transfer.py
+index dcd40e356..143fba890 100644
+--- a/tests/ut/distributed/ascend_store/test_kv_transfer.py
++++ b/tests/ut/distributed/ascend_store/test_kv_transfer.py
+@@ -266,7 +266,7 @@ class TestLayerStoreRequestTracking(unittest.TestCase):
+ 
+ 
+ class TestGVALayerTransferFailures(unittest.TestCase):
+-    def _make_sending_thread(self):
++    def _make_sending_thread(self, raise_on_transfer_failure=True):
+         # Plain mock store: the layerwise threads are backend-agnostic.
+         # `.store` is attached explicitly to pin batch_copy's return value.
+         store = MagicMock()
+@@ -295,6 +295,7 @@ class TestGVALayerTransferFailures(unittest.TestCase):
+             layer_save_finished_events=[save_finished],
+             sync_save_events=[MagicMock()],
+             group_builders=[builder],
++            raise_on_transfer_failure=raise_on_transfer_failure,
+         )
+         task = LayerTransferTask(
+             layer_id=0,
+@@ -330,9 +331,32 @@ class TestGVALayerTransferFailures(unittest.TestCase):
+ 
+         store.batch_write_finish.assert_called_once_with(["k0"], [0])
+ 
++    def test_gva_save_failure_policy(self):
++        for strict in (False, True):
++            for copy_result, finish_result in ((-1, 0), (0, 1)):
++                with self.subTest(strict=strict, copy_result=copy_result, finish_result=finish_result):
++                    thread, store, save_finished, task = self._make_sending_thread(strict)
++                    store.store.batch_copy.return_value = copy_result
++                    store.batch_write_finish.return_value = [finish_result]
++
++                    if strict:
++                        with self.assertRaises(RuntimeError):
++                            thread._handle_request([task])
++                        self.assertFalse(save_finished.is_set())
++                        self.assertEqual(thread.get_and_clear_finished_requests(), set())
++                    else:
++                        thread._handle_request([task])
++                        store.batch_write_finish.assert_called_once_with(["k0"], [copy_result])
++                        self.assertTrue(save_finished.is_set())
++                        self.assertEqual(thread.request_queue.unfinished_tasks, 0)
++                        self.assertEqual(thread.get_and_clear_finished_requests(), {"r1"})
++                        thread.raise_if_failed()
++
+ 
+ class TestGVALayerReceivingTaskOwnership(unittest.TestCase):
+-    def _make_thread(self, external_slot_release_waiter=None, save_failure_checker=None):
++    def _make_thread(
++        self, external_slot_release_waiter=None, save_failure_checker=None, raise_on_transfer_failure=True
++    ):
+         # Plain mock store: the layerwise threads are backend-agnostic.
+         # `.store` is attached explicitly to pin batch_copy's return value.
+         store = MagicMock()
+@@ -366,9 +390,41 @@ class TestGVALayerReceivingTaskOwnership(unittest.TestCase):
+             group_builders=[builder],
+             external_slot_release_waiter=external_slot_release_waiter,
+             save_failure_checker=save_failure_checker,
++            raise_on_transfer_failure=raise_on_transfer_failure,
+         )
+         return thread, load_finished, save_finished, sync_events
+ 
++    def test_gva_load_failure_policy(self):
++        for strict in (False, True):
++            with self.subTest(strict=strict):
++                thread, load_finished, _, _ = self._make_thread(raise_on_transfer_failure=strict)
++                thread.m_store.store.batch_copy.return_value = -1
++                request = ReqMeta("r1", block_ids=[7, 8], block_hashes=[])
++                task = LayerTransferTask(
++                    layer_id=1,
++                    block_ranges=[LayerBlockRange(request, 0, 2)],
++                    shared_block_data=SharedBlockData(
++                        block_ids_arr=np.asarray([7, 8]),
++                        block_gvas_arr=np.asarray([100, 200]),
++                        req_ids=["r1"],
++                        is_last_chunks=[False],
++                    ),
++                )
++                load_task = LayerLoadTask(wait_for_save_layer=None, transfer_tasks=[task], layer_id=1)
++                thread.request_queue.put(load_task)
++
++                if strict:
++                    with self.assertRaises(RuntimeError):
++                        thread._handle_request(load_task)
++                    self.assertFalse(load_finished[1].is_set())
++                    self.assertEqual(thread._invalid_block_ids, set())
++                else:
++                    thread._handle_request(load_task)
++                    self.assertEqual(thread._invalid_block_ids, {7, 8})
++                    self.assertTrue(load_finished[1].is_set())
++                    self.assertEqual(thread.request_queue.unfinished_tasks, 0)
++                    thread.raise_if_failed()
++
+     def test_handle_request_does_not_clear_worker_owned_tasks(self):
+         thread, _, _, _ = self._make_thread()
+         task = LayerTransferTask(
+diff --git a/vllm_ascend/distributed/kv_transfer/kv_pool/ascend_store/kv_transfer.py b/vllm_ascend/distributed/kv_transfer/kv_pool/ascend_store/kv_transfer.py
+index eb85a33b9..82cb084a5 100644
+--- a/vllm_ascend/distributed/kv_transfer/kv_pool/ascend_store/kv_transfer.py
++++ b/vllm_ascend/distributed/kv_transfer/kv_pool/ascend_store/kv_transfer.py
+@@ -1918,6 +1918,7 @@ class KVCacheStoreLayerSendingThread(KVCacheStoreLayerSendingThreadBase):
+         put_started_keys: set[str] | None = None,
+         put_started_keys_lock: threading.Lock | None = None,
+         session_tracker: LayerwiseSessionTracker | None = None,
++        raise_on_transfer_failure: bool = True,
+     ):
+         super().__init__(
+             m_store,
+@@ -1938,6 +1939,7 @@ class KVCacheStoreLayerSendingThread(KVCacheStoreLayerSendingThreadBase):
+         self._put_started_keys = put_started_keys if put_started_keys is not None else set()
+         self._put_started_keys_lock = put_started_keys_lock or threading.Lock()
+         self._session_tracker = session_tracker
++        self.raise_on_transfer_failure = raise_on_transfer_failure
+         self._active_put_keys: set[str] | None = None
+         self._group_put_keys: dict[int, set[str] | None] = {}
+         self.group_builders: list[LayerBatchBuilder] | None = group_builders
+@@ -2135,7 +2137,9 @@ class KVCacheStoreLayerSendingThread(KVCacheStoreLayerSendingThreadBase):
+                 self.max_transfer_bytes,
+             )
+             if res != 0:
+-                raise RuntimeError(f"Layerwise {physical_layer} save batch_copy failed with return code {res}")
++                if self.raise_on_transfer_failure:
++                    raise RuntimeError(f"Layerwise {physical_layer} save batch_copy failed with return code {res}")
++                logger.error("Layerwise %d pool save batch_copy failed with return code %d", physical_layer, res)
+             if all_save_keys:
+                 save_keys = list(dict.fromkeys(all_save_keys))
+                 for key in save_keys:
+@@ -2145,10 +2149,12 @@ class KVCacheStoreLayerSendingThread(KVCacheStoreLayerSendingThreadBase):
+                 results = [self.write_results.pop(key) for key in finish_keys]
+                 finish_results = self.m_store.batch_write_finish(finish_keys, results)
+                 if len(finish_results) != len(finish_keys) or any(result != 0 for result in finish_results):
+-                    raise RuntimeError(
+-                        f"Layerwise save batch_write_finish failed: "
+-                        f"expected={len(finish_keys)}, results={finish_results}"
+-                    )
++                    if self.raise_on_transfer_failure or len(finish_results) != len(finish_keys):
++                        raise RuntimeError(
++                            f"Layerwise save batch_write_finish failed: "
++                            f"expected={len(finish_keys)}, results={finish_results}"
++                        )
++                    logger.error("Layerwise %d pool batch_write_finish failed: %s", physical_layer, finish_results)
+             for req_id in all_req_ids:
+                 if self.try_finish_and_delete_stored_request(req_id):
+                     self.set_finished_request(req_id)
+@@ -2193,6 +2199,7 @@ class KVCacheStoreLayerRecvingThread(KVTransferThread):
+         invalid_block_ids: set[int] | None = None,
+         invalid_block_ids_lock: threading.Lock | None = None,
+         load_abort_event: threading.Event | None = None,
++        raise_on_transfer_failure: bool = True,
+     ):
+         super().__init__(
+             m_store,
+@@ -2214,6 +2221,7 @@ class KVCacheStoreLayerRecvingThread(KVTransferThread):
+         self.max_transfer_bytes = max_transfer_bytes
+         self.external_slot_release_waiter = external_slot_release_waiter
+         self.save_failure_checker = save_failure_checker
++        self.raise_on_transfer_failure = raise_on_transfer_failure
+         self._invalid_block_ids = invalid_block_ids if invalid_block_ids is not None else set()
+         self._invalid_block_ids_lock = invalid_block_ids_lock or threading.Lock()
+         self._load_abort_event = load_abort_event or threading.Event()
+@@ -2470,7 +2478,10 @@ class KVCacheStoreLayerRecvingThread(KVTransferThread):
+                 res,
+             )
+         if res != 0:
+-            raise RuntimeError(f"Layerwise {layer_id} load batch_copy failed with return code {res}")
++            if self.raise_on_transfer_failure:
++                raise RuntimeError(f"Layerwise {layer_id} load batch_copy failed with return code {res}")
++            self._mark_invalid_transfer_task_blocks(transfer_tasks)
++            logger.error("Layerwise %d pool load failed; reporting blocks for scheduler recovery", layer_id)
+ 
+         if layer_id == self.final_layer_id and all_load_keys:
+             unique_load_keys = list(dict.fromkeys(all_load_keys))
+diff --git a/vllm_ascend/distributed/kv_transfer/kv_pool/ascend_store/pool_worker.py b/vllm_ascend/distributed/kv_transfer/kv_pool/ascend_store/pool_worker.py
+index a9b85507d..02c30dc8e 100644
+--- a/vllm_ascend/distributed/kv_transfer/kv_pool/ascend_store/pool_worker.py
++++ b/vllm_ascend/distributed/kv_transfer/kv_pool/ascend_store/pool_worker.py
+@@ -770,6 +770,7 @@ class KVPoolWorker:
+                     put_started_keys=self._put_started_keys,
+                     put_started_keys_lock=self._put_started_keys_lock,
+                     session_tracker=self._layerwise_session_tracker if self.use_block_key_layerwise else None,
++                    raise_on_transfer_failure=self.layerwise_offload,
+                 )
+                 self.kv_send_thread.start()
+                 ready_event_sending.wait()
+@@ -818,6 +819,7 @@ class KVPoolWorker:
+                     invalid_block_ids=self._invalid_block_ids,
+                     invalid_block_ids_lock=self._invalid_block_ids_lock,
+                     load_abort_event=self._layer_load_aborted,
++                    raise_on_transfer_failure=self.layerwise_offload or self.num_kv_cache_groups > 1,
+                 )
+             else:
+                 self.kv_recv_thread = KVCacheStoreKeyLayerRecvingThread(

@@ -1,0 +1,234 @@
+commit 4897f55bd2bae08d90a6f856dc15f83ce9b8ed3f
+Author:     recky-c <ruiqicheng510@gmail.com>
+AuthorDate: Sun Oct 11 15:45:34 2026 +0800
+Commit:     GitHub <noreply@github.com>
+CommitDate: Sun Oct 11 15:45:34 2026 +0800
+
+    [Feature][KVPP] Support speculative decoding via cache capabilities (#17817)
+    
+    ### What this PR does / why we need it?
+    
+    KVPP restricts speculation by method name, although its cache ownership
+    depends on whether the proposer allocates independent draft KV caches.
+    Remove the KVPP method whitelist and use the existing
+    `uses_draft_kv_cache()` capability for draft ownership and
+    sliding-window allocation normalization. Methods without draft KV keep
+    the target KVPP path; methods with caches retain loader-discovered
+    ownership, independent allocation, and full per-rank memory accounting.
+    
+    Read the V1 cache-only proposer's loader names and preserve hidden-state
+    caches as a single page buffer. Unwrap that buffer for V1's existing
+    Tensor reshape path, avoiding K/V split-factor division by zero and a
+    tuple/Tensor mismatch.
+    
+    Remove the KVPP-specific fixed-length, confidence-based dynamic-length,
+    and adaptive-verification gates. The selected runner/backend still
+    decides which methods and dynamic mechanisms it implements. Existing
+    target non-hybrid MLA/SFA, cache-layout, and eager/PIECEWISE
+    requirements remain.
+    
+    ### Does this PR introduce _any_ user-facing change?
+    
+    Yes. KVPP no longer restricts speculative decoding by method name or
+    adds a fixed-K restriction. Independent draft caches remain outside
+    target partitioning, scratch reuse, and broadcasts. The feature guide
+    documents the capability-based behavior and existing runner/graph
+    requirements.
+    
+    ### How was this patch tested?
+    
+    - No new tests were added. Existing configuration assertions and a
+    cache-configuration fixture were updated for the new behavior and
+    capability interface.
+    - Existing repository CPU unit tests: **76 passed**, covering KVPP
+    placement, allocation, prefetch, cache specs, distributed helpers,
+    configuration, worker budgeting, and existing hidden-state cache
+    reshape/dispatch paths. Tested commit
+    `37fc24f8856a261ab1d46fdfdeb7259c89dd95d6` with Python 3.12, Torch 2.10
+    CPU, and vLLM `ced6857afa0ea7b2e3f0846a62e1394e90f15607` (`0.30.0`),
+    using the repository CI setting `TORCH_DEVICE_BACKEND_AUTOLOAD=0`.
+    - One-off CPU allocation/reshape check: hidden-state caches use one
+    complete page buffer; V1 returned a Tensor and reshaped two blocks to
+    `[2, 2, 2, 3]`. This check used repository CPU fixtures and did not run
+    NPU kernels.
+    - Ruff check/format, Markdown lint, spelling checks, relevant Python
+    hooks, and `git diff --check` passed. `bash format.sh ci` was attempted
+    but did **not** pass completely on Windows: Gitleaks/logger hook shebang
+    invocation and missing Shellcheck blocked those checks. The logger
+    script passed when invoked directly through Git Bash.
+    
+    NPU validation is **incomplete**, and this PR remains a draft. The
+    following results use public commit
+    `37fc24f8856a261ab1d46fdfdeb7259c89dd95d6`, vLLM
+    `ced6857afa0ea7b2e3f0846a62e1394e90f15607`, full matching checkpoints on
+    Ascend A3, TP16, EP, asynchronous scheduling, V1 eager, and 256 cache
+    blocks:
+    
+    - KVPP-off baselines completed for GLM-5.2 + DSpark (K7), Kimi-K2.5 +
+    DFlash (K7), and Kimi-K2.6 + EAGLE3 (K3). Each completed 86
+    pressure/text, 31 natural-language, and 26 edge/text responses, with
+    finite logprobs and 23/23 objective-answer checks. DFlash also completed
+    cancellation/idle boundary requests. These are execution and fixture
+    checks, not a model accuracy benchmark.
+    - EAGLE3 with KVPP on completed the same 143-response execution suite.
+    All 16 ranks recorded independent draft backing, 61 target layers
+    participating in broadcasts, and no draft broadcasts. Actual cache
+    storage per rank decreased from 2,369,781,760 bytes to
+    268,435,456–308,281,344 bytes, including allocation alignment overhead.
+    - **Numerical equivalence has not been established.** The locally
+    available EAGLE3 pressure snapshot contains 85 paired responses: 60 have
+    identical token IDs and 25 differ, with maximum shared-prefix logprob
+    delta 0.620904. One final text response is absent from this intermediate
+    snapshot. Some divergences have appreciable top-two margins. The
+    KVPP-off DFlash baseline itself also differs on all seven repeated pad7
+    requests; this does not prove off/on equivalence. Controlled single-HTTP
+    batch and cold/warm cache comparisons are still required.
+    - DSpark with KVPP on reached all-rank cache initialization, with
+    independent draft backing and actual cache storage reduced from 3 GiB to
+    354–408 MiB per rank. Its inference suite has not completed. The DFlash
+    KVPP-on run has not completed model loading.
+    - Further validation was interrupted by shared NFS I/O waits across the
+    three hosts, followed by SSH timeouts/resets. EAGLE3's API process was
+    observed waiting on `nfs_wait_on_request`; DFlash workers were in I/O
+    wait. These observations do not establish a product defect. Completed
+    baseline artifacts and the EAGLE3 intermediate comparison are preserved
+    locally.
+    
+    Batch-size dynamic K (including K=0), actual confidence-driven
+    verification lengths, hidden-state/cache-free methods, V2 inference, and
+    PIECEWISE replay remain unvalidated on NPU. Current source also shows
+    that ordinary asynchronous V1 completion scheduling skips the
+    `take_draft_token_ids()` path that consumes confidence verification
+    budgets; enabling the configuration alone is insufficient evidence that
+    verification length changes. DSpark adaptive verification requires FULL
+    graphs upstream, while KVPP still supports eager/PIECEWISE only.
+    
+    GitHub CPU UT (both the pinned main commit and v0.30.0) and pre-commit
+    passed. The CI gate is waiting for a maintainer's precision-test label;
+    NPU CI jobs were skipped.
+    
+    - vLLM main:
+    https://github.com/vllm-project/vllm/commit/ced6857afa0ea7b2e3f0846a62e1394e90f15607
+    
+    ---------
+    
+    Signed-off-by: recky-c <ruiqicheng510@gmail.com>
+    Co-authored-by: Cursor <cursoragent@cursor.com>
+
+diff --git a/tests/ut/kvpp_utils.py b/tests/ut/kvpp_utils.py
+index 331603dc9..6edb3efb5 100644
+--- a/tests/ut/kvpp_utils.py
++++ b/tests/ut/kvpp_utils.py
+@@ -26,6 +26,11 @@ def indexer_name(index):
+ 
+ 
+ def make_kvpp_config(tp=3, pcp=1):
++    speculative_config = SimpleNamespace(
++        method="mtp",
++        num_speculative_tokens_per_batch_size=None,
++    )
++    speculative_config.use_eagle = lambda: speculative_config.method in ("eagle", "eagle3", "mtp", "dflash", "dspark")
+     return SimpleNamespace(
+         use_v2_model_runner=False,
+         compilation_config=SimpleNamespace(
+@@ -46,7 +51,7 @@ def make_kvpp_config(tp=3, pcp=1):
+             use_mla=True,
+             is_hybrid=False,
+         ),
+-        speculative_config=SimpleNamespace(method="mtp", num_speculative_tokens_per_batch_size=None),
++        speculative_config=speculative_config,
+         kv_transfer_config=None,
+         quant_config=None,
+         cache_config=SimpleNamespace(cache_dtype="auto"),
+diff --git a/tests/ut/test_ascend_config.py b/tests/ut/test_ascend_config.py
+index 06f278073..7e5845a2c 100644
+--- a/tests/ut/test_ascend_config.py
++++ b/tests/ut/test_ascend_config.py
+@@ -2050,8 +2050,6 @@ class TestKVPPConfig(TestBase):
+             ("parallel_config", "decode_context_parallel_size", 2, "DCP"),
+             ("model_config", "use_mla", False, "MLA"),
+             ("model_config", "is_hybrid", True, "MLA"),
+-            ("speculative_config", "method", "eagle3", "mtp"),
+-            ("speculative_config", "num_speculative_tokens_per_batch_size", {1: 2}, "fixed"),
+         )
+         for section, field, value, message in restrictions:
+             with self.subTest(field=field):
+@@ -2062,17 +2060,15 @@ class TestKVPPConfig(TestBase):
+                 with self.assertRaisesRegex(ValueError, message):
+                     _validate_parallel_config(config)
+ 
+-    def test_dspark_accepts_fixed_length_and_rejects_dynamic_verification(self):
++    def test_dspark_accepts_fixed_length_and_dynamic_verification(self):
+         config = make_kvpp_config()
+         config.speculative_config.method = "dspark"
+         KVPPConfig.from_vllm_config(config).validate(config)
+         config.speculative_config.enable_adaptive_verification = True
+-        with self.assertRaisesRegex(ValueError, "adaptive verification"):
+-            KVPPConfig.from_vllm_config(config).validate(config)
++        KVPPConfig.from_vllm_config(config).validate(config)
+         config.speculative_config.enable_adaptive_verification = False
+         config.additional_config["dynamic_spec_config"] = {"method": "dspark"}
+-        with self.assertRaisesRegex(ValueError, "dynamic speculative lengths"):
+-            KVPPConfig.from_vllm_config(config).validate(config)
++        KVPPConfig.from_vllm_config(config).validate(config)
+ 
+     @patch("vllm_ascend.platform.NPUPlatform.check_and_update_config")
+     def test_config_factory_keeps_kvpp_enabled(self, _check_config):
+diff --git a/vllm_ascend/ascend_config.py b/vllm_ascend/ascend_config.py
+index 6b6bf74f0..6c821bb6f 100644
+--- a/vllm_ascend/ascend_config.py
++++ b/vllm_ascend/ascend_config.py
+@@ -97,18 +97,6 @@ class KVPPConfig:
+                 raise ValueError("KVPP supports eager execution or PIECEWISE only.")
+         if not model_config.use_mla or model_config.is_hybrid:
+             raise ValueError("KVPP currently supports only non-hybrid MLA models.")
+-        speculative_config = vllm_config.speculative_config
+-        if speculative_config is not None:
+-            if speculative_config.method not in ("mtp", "dspark"):
+-                raise ValueError("KVPP supports speculative decoding only with method='mtp' or method='dspark'.")
+-            if speculative_config.num_speculative_tokens_per_batch_size:
+-                raise ValueError("KVPP currently supports only a fixed number of speculative tokens.")
+-            if speculative_config.method == "dspark":
+-                if getattr(speculative_config, "enable_adaptive_verification", False):
+-                    raise ValueError("KVPP does not support DSpark adaptive verification.")
+-                dynamic_spec = (vllm_config.additional_config or {}).get("dynamic_spec_config") or {}
+-                if dynamic_spec.get("method") is not None:
+-                    raise ValueError("KVPP does not support dynamic speculative lengths.")
+ 
+ 
+ @config
+diff --git a/vllm_ascend/core/kv_cache_placement.py b/vllm_ascend/core/kv_cache_placement.py
+index 6393cf5bd..abb558c4a 100644
+--- a/vllm_ascend/core/kv_cache_placement.py
++++ b/vllm_ascend/core/kv_cache_placement.py
+@@ -116,7 +116,7 @@ def register_kvpp_draft_layers(
+ ) -> None:
+     """Record loader-discovered ownership on this worker's cache modules."""
+     spec = vllm_config.speculative_config
+-    if spec is None or spec.method not in ("mtp", "dspark"):
++    if spec is None or not spec.use_eagle():
+         return
+     if not is_last_pp_rank:
+         draft_names = set()
+@@ -143,7 +143,7 @@ def register_kvpp_draft_layers(
+ def find_draft_layers(vllm_config: VllmConfig, local_layer_names: Iterable[str]) -> set[str]:
+     """Read exact worker-local ownership, never infer it from layer indices."""
+     spec = vllm_config.speculative_config
+-    if spec is None or spec.method not in ("mtp", "dspark"):
++    if spec is None or not spec.use_eagle():
+         return set()
+     context = vllm_config.compilation_config.static_forward_context
+     result = set()
+diff --git a/vllm_ascend/worker/worker.py b/vllm_ascend/worker/worker.py
+index dd451fe55..7f0c1de09 100644
+--- a/vllm_ascend/worker/worker.py
++++ b/vllm_ascend/worker/worker.py
+@@ -1130,7 +1130,7 @@ class NPUWorker(WorkerBase):
+             speculative_config = self.vllm_config.speculative_config
+             if (
+                 speculative_config is not None
+-                and speculative_config.method == "dspark"
++                and speculative_config.use_eagle()
+                 and any(isinstance(spec, SlidingWindowSpec) for spec in kv_cache_spec.values())
+             ):
+                 # Use the same full-allocation specs for KVPP budgeting and

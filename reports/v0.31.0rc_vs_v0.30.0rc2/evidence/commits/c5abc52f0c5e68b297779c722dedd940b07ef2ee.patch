@@ -1,0 +1,224 @@
+commit c5abc52f0c5e68b297779c722dedd940b07ef2ee
+Author:     yFeng-dev <yfeng.github@gmail.com>
+AuthorDate: Thu Oct 15 18:48:52 2026 +0800
+Commit:     GitHub <noreply@github.com>
+CommitDate: Thu Oct 15 10:48:52 2026 +0000
+
+    [BugFix][KV Transfer] Require full page coverage for Mooncake merging (#18747)
+    
+    ### What this PR does / why we need it?
+    
+    Mooncake can publish different tensor counts for the same layer when its
+    cache views occupy only part of a shared physical page. The existing
+    merge check accepts the views when the backing storage has enough spare
+    capacity to cover a full-page transfer. A peer with less spare capacity
+    falls back to individual tensors, causing `Mooncake KV tensor count
+    mismatch` (observed as `local=1, remote=2` for a DeepSeek-V4.1 indexer
+    K/scale cache).
+    
+    Require each block view to be internally contiguous and the union of its
+    byte ranges to cover the entire page stride before publishing a merged
+    descriptor. Reject gaps, trailing padding, and partial-page views; allow
+    overlapping aliases that cover the full page. Keep the existing storage
+    bounds check and use the existing per-tensor fallback for rejected
+    layouts. This is a layout check with no model-name exception.
+    
+    ### Does this PR introduce _any_ user-facing change?
+    
+    Partial-page MLA cache layouts publish one descriptor per tensor,
+    preventing the storage-capacity-dependent tensor count mismatch. Fully
+    covered packed pages retain merged transfers. There are no new settings
+    or protocol fields.
+    
+    ### How was this patch tested?
+    
+    - Validation reported in the supplied handoff package, using the
+    original branch source and tests:
+      ```bash
+    python -m pytest -q tests/ut/kv_offload/mooncake_v2/test_base_worker.py
+      # 58 passed
+      ```
+    - Regression coverage varies storage spare capacity and tensor order for
+    full pages, shared-page subregions, trailing padding, interior gaps, and
+    overlapping ranges. Additional cases cover noncontiguous blocks and
+    mixed-dtype views.
+    - Pinned Ruff check/format, codespell, typos, and `git diff --check`
+    passed for both changed files. The full `bash format.sh ci` command
+    stalled while installing the actionlint environment and was interrupted;
+    the full repository lint run is not verified locally.
+    - The same helper implementation was deployed to an existing two-node
+    DSV4.1 W8A8 PD service (prefill DP4/TP4, decode DP8/TP2, dspark with 5
+    speculative tokens). AISBench ran 8 warmup requests followed by all 1319
+    original GSM8K test examples through the PD proxy, with concurrency 8,
+    temperature 0, max output 2048, and thinking disabled:
+      ```text
+      POST=1319  RECV=1319  FAIL=0  FINISH=1319
+      Api infer task time elapsed: 746.87s
+      gsm8k accuracy: 96.89% (1278/1319)
+      ```
+    Both nodes published two descriptors for every indexer layer. Service
+    logs contained no tensor-count mismatch, exception, or HTTP 5xx; decode
+    recorded 1327 KV receives including warmup. The previous model-specific
+    bypass scored 1279/1319 under the same benchmark configuration; this
+    single comparison does not establish the cause of the one-answer net
+    difference. This end-to-end result is from the existing deployment with
+    the helper patch, not a fresh installation of this branch.
+    
+    ### Submission validation
+    
+    - Applied the supplied patch cleanly to the latest target branch on
+    2026-10-14, preserving its author and Signed-off-by trailer.
+    - Ruff 0.14.0 check and format check, codespell 2.4.1, and git diff
+    --check passed for both changed files.
+    - Searched open PRs for Mooncake full-page coverage, tensor count
+    mismatch, and the shared-page helper; no duplicate of this fix was
+    found.
+    - AI assistance was used to inspect, apply, and validate the supplied
+    patch and prepare this PR.
+    - Full repository lint was attempted again during submission but stalled
+    while installing the markdownlint environment and was interrupted; full
+    lint remains unverified.
+    
+    - vLLM main:
+    https://github.com/vllm-project/vllm/commit/c4df37dfcc7f72ca41cd43801a468526ecf99a2b
+    
+    Signed-off-by: yFeng-dev <yfeng.github@gmail.com>
+
+diff --git a/tests/ut/kv_offload/mooncake_v2/test_base_worker.py b/tests/ut/kv_offload/mooncake_v2/test_base_worker.py
+index ff3ee6719..fc4e6821d 100644
+--- a/tests/ut/kv_offload/mooncake_v2/test_base_worker.py
++++ b/tests/ut/kv_offload/mooncake_v2/test_base_worker.py
+@@ -133,11 +133,31 @@ def test_register_kv_caches_uses_config_order_and_publishes_tensor_metadata(monk
+     transfer_engine.register_buffer.assert_called_once()
+ 
+ 
+-def test_register_kv_caches_collapses_views_packed_in_one_page(monkeypatch) -> None:
++@pytest.mark.parametrize("spare", [0, 64, 256])
++@pytest.mark.parametrize("reverse", [False, True])
++@pytest.mark.parametrize(
++    ("page_stride", "k_offset", "scale_offset", "scale_len", "merged"),
++    [
++        pytest.param(40, 0, 32, 8, True, id="full-page"),
++        pytest.param(64, 0, 32, 8, False, id="trailing-padding"),
++        pytest.param(64, 16, 48, 8, False, id="shared-page-subregion"),
++        pytest.param(64, 0, 40, 24, False, id="interior-gap"),
++        pytest.param(64, 0, 16, 32, False, id="overlap-hides-gap"),
++        pytest.param(64, 0, 24, 40, True, id="overlapping-full-page"),
++    ],
++)
++def test_register_kv_caches_merges_only_full_pages(
++    monkeypatch, spare, reverse, page_stride, k_offset, scale_offset, scale_len, merged
++) -> None:
+     spec = MLAAttentionSpec(block_size=16, num_kv_heads=1, head_size=32, dtype=torch.float16)
+-    raw_cache = torch.empty(4 * 64, dtype=torch.float16)
+-    k_cache = torch.as_strided(raw_cache, size=(4, 32), stride=(64, 1), storage_offset=0)
+-    scale_cache = torch.as_strided(raw_cache, size=(4, 8), stride=(64, 1), storage_offset=32)
++    # The same tensor views must publish the same number of descriptors even
++    # when one peer's backing storage has spare capacity after the last block.
++    required = 3 * page_stride + max(k_offset + 32, scale_offset + scale_len)
++    raw_cache = torch.empty(required + spare, dtype=torch.float16)
++    k_cache = torch.as_strided(raw_cache, size=(4, 32), stride=(page_stride, 1), storage_offset=k_offset)
++    scale_cache = torch.as_strided(raw_cache, size=(4, scale_len), stride=(page_stride, 1), storage_offset=scale_offset)
++    caches = [scale_cache, k_cache] if reverse else [k_cache, scale_cache]
++    page_bytes = page_stride * raw_cache.element_size()
+     config = KVCacheConfig(
+         num_blocks=4,
+         kv_cache_tensors=[
+@@ -145,7 +165,7 @@ def test_register_kv_caches_collapses_views_packed_in_one_page(monkeypatch) -> N
+                 size=raw_cache.nbytes,
+                 layers=["layer.0"],
+                 layer_stride=raw_cache.nbytes,
+-                block_stride=128,
++                block_stride=page_bytes,
+             )
+         ],
+         kv_cache_groups=[KVCacheGroupSpec(layer_names=["layer.0"], kv_cache_spec=spec)],
+@@ -171,15 +191,44 @@ def test_register_kv_caches_collapses_views_packed_in_one_page(monkeypatch) -> N
+         MagicMock(),
+     )
+ 
+-    worker.register_kv_caches({"layer.0": [k_cache, scale_cache]})
++    worker.register_kv_caches({"layer.0": caches})
+ 
+     metadata = worker.xfer_handshake_metadata
+     assert metadata is not None
+-    assert metadata.kv_caches_base_addr == [[raw_cache.data_ptr()]]
+-    assert metadata.block_strides == [[128]]
+-    assert metadata.block_lens == [[128]]
+-    assert metadata.block_shapes == [[(32,)]]
+-    assert metadata.block_size_scales == [[1]]
++    if merged:
++        assert metadata.kv_caches_base_addr == [[raw_cache.data_ptr()]]
++        assert metadata.block_strides == [[page_bytes]]
++        assert metadata.block_lens == [[page_bytes]]
++        assert metadata.block_shapes == [[(max(32, scale_len),)]]
++        assert metadata.block_size_scales == [[1]]
++    else:
++        assert metadata.kv_caches_base_addr == [[cache.data_ptr() for cache in caches]]
++        assert metadata.block_strides == [[page_bytes, page_bytes]]
++        assert metadata.block_lens == [[cache[0].nbytes for cache in caches]]
++        assert metadata.block_shapes == [[tuple(cache.shape[1:]) for cache in caches]]
++        assert metadata.block_size_scales == [[1, 1]]
++
++
++def test_shared_page_rejects_noncontiguous_blocks() -> None:
++    raw_cache = torch.empty(4 * 64, dtype=torch.uint8)
++    caches = (
++        raw_cache.as_strided((4, 16), (64, 2)),
++        raw_cache.as_strided((4, 48), (64, 1), 16),
++    )
++    worker = MooncakeBaseConnectorWorker.__new__(MooncakeBaseConnectorWorker)
++    worker.num_blocks = 4
++
++    assert worker._get_shared_page_metadata(caches) is None
++
++
++def test_shared_page_handles_mixed_dtype_views() -> None:
++    raw_cache = torch.empty(4 * 64, dtype=torch.uint8)
++    k_cache = raw_cache.as_strided((4, 48), (64, 1))
++    scale_cache = raw_cache.view(torch.float32).as_strided((4, 4), (16, 1), 12)
++    worker = MooncakeBaseConnectorWorker.__new__(MooncakeBaseConnectorWorker)
++    worker.num_blocks = 4
++
++    assert worker._get_shared_page_metadata((k_cache, scale_cache)) == (raw_cache.data_ptr(), 64, (48,), 1)
+ 
+ 
+ def test_register_kv_caches_publishes_raw_slot_for_component_major_mla_views(monkeypatch) -> None:
+diff --git a/vllm_ascend/distributed/kv_transfer/kv_p2p/mooncake/base_worker.py b/vllm_ascend/distributed/kv_transfer/kv_p2p/mooncake/base_worker.py
+index 63622f128..0371db247 100644
+--- a/vllm_ascend/distributed/kv_transfer/kv_p2p/mooncake/base_worker.py
++++ b/vllm_ascend/distributed/kv_transfer/kv_p2p/mooncake/base_worker.py
+@@ -203,6 +203,7 @@ class MooncakeBaseConnectorWorker:
+         views can share one allocation while their first blocks are many pages
+         apart. A packed layout must place every view's first block inside one
+         common page stride and use the same physical block count and stride.
++        Their contiguous block spans must cover that entire stride.
+         """
+         if not caches or len({tensor_storage_key(cache) for cache in caches}) != 1:
+             return None
+@@ -219,9 +220,22 @@ class MooncakeBaseConnectorWorker:
+ 
+         page_base_addr = min(cache.data_ptr() for cache in caches)
+         block_lens = [math.prod(cache.shape[1:]) * cache.element_size() for cache in caches]
+-        if any(
+-            cache.data_ptr() - page_base_addr + block_len > page_stride for cache, block_len in zip(caches, block_lens)
+-        ):
++        # Storage capacity does not prove that this layer owns a whole page:
++        # its views may occupy only a subregion of a larger shared allocation.
++        # Merge only internally contiguous blocks whose union covers the full
++        # stride. Overlapping aliases are allowed, but holes and padding are not.
++        if any(block_len == 0 or not cache[0].is_contiguous() for cache, block_len in zip(caches, block_lens)):
++            return None
++        block_ranges = sorted(
++            (cache.data_ptr() - page_base_addr, cache.data_ptr() - page_base_addr + block_len)
++            for cache, block_len in zip(caches, block_lens)
++        )
++        covered_end = 0
++        for start, end in block_ranges:
++            if start > covered_end or end > page_stride:
++                return None
++            covered_end = max(covered_end, end)
++        if covered_end != page_stride:
+             return None
+ 
+         storage = caches[0].untyped_storage()

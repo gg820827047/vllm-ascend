@@ -1,0 +1,512 @@
+commit 896bc092a0f4ff601763f2a1faf5276ece9cbb92
+Author:     weiguihua2 <weiguihua2@huawei.com>
+AuthorDate: Sun Oct 11 16:52:57 2026 +0800
+Commit:     GitHub <noreply@github.com>
+CommitDate: Sun Oct 11 16:52:57 2026 +0800
+
+    [BugFix][v0.30.0][SFA] Preserve PCP decode ownership and KV-copy kernel reuse (#18266)
+    
+    ### What this PR does / why we need it?
+    
+    When PCP shards decode token rows, the feature-sharded O-proj previously
+    all-reduced projections of different tokens at matching row offsets.
+    Gather decode rows before the local feature-sharded GEMM, then
+    reduce-scatter the summed projections to their owning PCP ranks.
+    Replicated decode keeps its existing all-reduce, and prefill keeps its
+    full-weight path.
+    
+    Allocate the collective buffers in `AscendSFAPCPImpl.__init__`, using
+    activation dtype and the O-proj weight's actual device. Compatible
+    layers reuse the same four graph-stable AG/RS buffers through
+    `o_proj_full_pools`; buffer roles, devices, dtypes and shapes have
+    separate pool keys. Size them for the larger of the decode token budget
+    (`max_num_seqs * (1 + num_speculative_tokens)`) and graph capture sizes,
+    including padded rows. This prepares buffer capacity for speculative
+    tokens without changing the existing gate that disables sharded decode
+    when speculative decoding is configured.
+    
+    Also mark `slots` as `do_not_specialize` in the PCP KV-copy Triton
+    kernel so contiguous slot slices with different pointer alignments reuse
+    the same compilation. Preserve specialization of the inner strides
+    required by Ascend lowering.
+    
+    pick-from: https://github.com/vllm-project/vllm-ascend/pull/18265
+    
+    ### Does this PR introduce _any_ user-facing change?
+    
+    Fixes SFA PCP sharded-decode O-proj token ownership and avoids redundant
+    PCP KV-copy compilation for slot slices. No configuration or API
+    changes. The combinations of unsliced O-proj with sharded decode, and
+    sliced O-proj with replicated decode, retain their existing projection
+    behavior.
+    
+    ### How was this patch tested?
+    
+    Validated the updated source files on an Ascend NPU container with the
+    installed vLLM 0.30.0 runtime:
+    
+    - `pytest -q tests/ut/attention/test_sfa_cp.py`: **189 passed**.
+    Includes row ownership, quantized weights, TP reduction, activation
+    dtype, speculative-token capacity, graph padding, cross-layer buffer
+    sharing, dtype/capacity isolation, and weight-device isolation cases.
+    - `pytest -q
+    --confcutdir=tests/e2e/nightly/single_node/ops/singlecard_ops/triton
+    tests/e2e/nightly/single_node/ops/singlecard_ops/triton/test_pcp_kv_cache.py`:
+    **34 passed on a real NPU**. Checks exact KV bytes and a single JIT
+    cache entry across slot offsets, lengths, dtypes, and C8/non-C8 layouts.
+    - Ruff, formatting, spelling, repository Python checks, actionlint and
+    staged gitleaks checks passed. Windows-incompatible hook entrypoints
+    were executed through native tools/Git Bash; all 114 shell scripts
+    across both target branches passed ShellCheck after CRLF normalization
+    in scratch files, without editing tracked scripts.
+    
+    The O-proj unit tests mock distributed collectives; they do not
+    establish full-service MTP support or real multi-rank HCCL graph
+    performance.
+    
+    - vLLM main:
+    https://github.com/vllm-project/vllm/commit/ced6857afa0ea7b2e3f0846a62e1394e90f15607
+    
+    ---------
+    
+    Signed-off-by: weiguihua2 <weiguihua2@huawei.com>
+
+diff --git a/tests/e2e/nightly/single_node/ops/singlecard_ops/triton/test_pcp_kv_cache.py b/tests/e2e/nightly/single_node/ops/singlecard_ops/triton/test_pcp_kv_cache.py
+index fbfceaad0..e409c6fe6 100644
+--- a/tests/e2e/nightly/single_node/ops/singlecard_ops/triton/test_pcp_kv_cache.py
++++ b/tests/e2e/nightly/single_node/ops/singlecard_ops/triton/test_pcp_kv_cache.py
+@@ -1,11 +1,13 @@
+ # SPDX-License-Identifier: Apache-2.0
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+ 
++from unittest.mock import patch
++
+ import pytest
+ import torch
+ import torch_npu  # noqa: F401
+ 
+-from vllm_ascend.ops.triton.pcp_kv_cache import copy_pcp_kv_cache
++from vllm_ascend.ops.triton.pcp_kv_cache import _copy_pcp_kv_cache_kernel, copy_pcp_kv_cache
+ 
+ 
+ @pytest.mark.parametrize("dtype", [torch.int8, torch.float8_e4m3fn])
+@@ -41,6 +43,36 @@ def test_c8_cache_preserves_packed_bytes(dtype, case, strided):
+     assert torch.equal(packed.cpu(), expected)
+ 
+ 
++@pytest.mark.parametrize("c8", [False, True])
++@pytest.mark.parametrize("num_slots", [5, 128, 257])
++@pytest.mark.parametrize("slot_dtype", [torch.int32, torch.int64])
++def test_contiguous_slot_slices_reuse_kernel(c8, num_slots, slot_dtype):
++    dtype = torch.int8 if c8 else torch.bfloat16
++    dims = (656,) if c8 else (512, 64)
++    cache = tuple(
++        (torch.arange(20 * 32 * dim, dtype=torch.int32) % 127).to(dtype).reshape(20, 32, 1, dim).to("npu")
++        for dim in dims
++    )
++    gold = torch.cat([tensor.cpu().reshape(-1, dim) for tensor, dim in zip(cache, dims)], dim=-1)
++    indices = torch.arange(num_slots + 4, dtype=slot_dtype) % (20 * 32)
++    indices[1::5] = -1
++    slot_storage = indices.to("npu")
++    device = torch.npu.current_device()
++    # Isolate the in-memory cache so an existing unaligned variant cannot hide
++    # an extra specialization. Compiled disk artifacts can still be reused.
++    with patch.dict(_copy_pcp_kv_cache_kernel.cache, {device: {}}):
++        for offset in range(5):
++            slots = slot_storage[offset : offset + num_slots]
++            assert slots.is_contiguous()
++            assert slots.data_ptr() == slot_storage.data_ptr() + offset * slots.element_size()
++            actual = copy_pcp_kv_cache(cache, slots).cpu()
++            selected = indices[offset : offset + num_slots].long()
++            expected = gold[selected.clamp_min(0)].clone()
++            expected[selected < 0] = 0
++            assert torch.equal(actual, expected)
++            assert len(_copy_pcp_kv_cache_kernel.cache[device]) == 1
++
++
+ @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+ @pytest.mark.parametrize("num_slots", [5, 257, 513])
+ @pytest.mark.parametrize("strided", [False, True])
+diff --git a/tests/ut/attention/test_sfa_cp.py b/tests/ut/attention/test_sfa_cp.py
+index f050dfb78..ac819d212 100644
+--- a/tests/ut/attention/test_sfa_cp.py
++++ b/tests/ut/attention/test_sfa_cp.py
+@@ -33,7 +33,7 @@ from vllm_ascend.attention.sfa_v1 import (
+     PreprocessType,
+     SFAForwardContext,
+ )
+-from vllm_ascend.quantization.methods import AscendW8A8DynamicLinearMethod
++from vllm_ascend.quantization.methods import AscendLinearScheme, AscendW8A8DynamicLinearMethod
+ from vllm_ascend.weight_switch import (
+     WeightSwitchConfig,
+     WeightSwitchGatherSpec,
+@@ -158,8 +158,27 @@ class _PCPOProjLinearMethod(WeightSwitchMixin):
+         return torch.nn.functional.linear(x, layer.weight, bias)
+ 
+ 
+-def _make_pcp_o_proj_impl():
++def _make_pcp_o_proj_impl(
++    *,
++    sharded_decode=False,
++    activation_dtype=torch.float32,
++    weight_dtype=torch.float32,
++    num_speculative_tokens=0,
++    max_capture_size=4,
++    capture_sizes=(1, 2, 4),
++):
+     impl = AscendSFAPCPImpl.__new__(AscendSFAPCPImpl)
++    impl.is_pcp_decode_sharded = sharded_decode
++    impl.vllm_config = SimpleNamespace(
++        num_speculative_tokens=num_speculative_tokens,
++        model_config=SimpleNamespace(dtype=activation_dtype),
++        device_config=SimpleNamespace(device=torch.device("cpu")),
++        scheduler_config=SimpleNamespace(max_num_seqs=4),
++        compilation_config=SimpleNamespace(
++            max_cudagraph_capture_size=max_capture_size,
++            cudagraph_capture_sizes=capture_sizes,
++        ),
++    )
+     impl._o_proj_weight_switch_enabled = False
+     pcp_group = SimpleNamespace(world_size=2, rank_in_group=1)
+     impl.o_proj_weight_switch_config = WeightSwitchConfig.from_group(pcp_group, shard_axis="input")
+@@ -172,7 +191,9 @@ def _make_pcp_o_proj_impl():
+         input_size_per_partition=2,
+         output_size=3,
+         output_size_per_partition=3,
+-        weight=torch.nn.Parameter(torch.tensor([[2.0, 3.0], [6.0, 7.0], [10.0, 11.0]]), requires_grad=False),
++        weight=torch.nn.Parameter(
++            torch.tensor([[2.0, 3.0], [6.0, 7.0], [10.0, 11.0]], dtype=weight_dtype), requires_grad=False
++        ),
+         bias=torch.nn.Parameter(torch.tensor([1.0, 2.0, 3.0]), requires_grad=False),
+         quant_method=_PCPOProjLinearMethod(),
+         reduce_results=True,
+@@ -180,9 +201,130 @@ def _make_pcp_o_proj_impl():
+         tp_rank=0,
+         skip_bias_add=False,
+     )
++    load_state = impl.o_proj_weight_load_state
++    with (
++        patch.object(AscendSFAImpl, "__init__", return_value=None),
++        patch("vllm_ascend.attention.context_parallel.sfa_cp.enable_pcp_o_proj_weight_sharding", return_value=True),
++        patch("vllm_ascend.attention.context_parallel.sfa_cp.get_pcp_group", return_value=pcp_group),
++        patch(
++            "vllm_ascend.attention.context_parallel.sfa_cp.get_tp_group",
++            return_value=SimpleNamespace(world_size=2, rank_in_group=0),
++        ),
++        patch.object(impl.o_proj.quant_method, "prepare_layer_for_parallel_weight_load", return_value=load_state),
++    ):
++        AscendSFAPCPImpl.__init__(impl)
+     return impl
+ 
+ 
++@pytest.mark.parametrize("activation_dtype", [torch.float32, torch.bfloat16])
++def test_sfa_pcp_decode_buffers_exist_before_forward_with_activation_dtype(activation_dtype):
++    impl = _make_pcp_o_proj_impl(sharded_decode=True, activation_dtype=activation_dtype, weight_dtype=torch.int8)
++    assert impl.o_proj.weight.dtype == torch.int8
++    expected_shapes = {
++        "_pcp_o_proj_ag_in_buf": (4, 4),
++        "_pcp_o_proj_ag_out_buf": (8, 4),
++        "_pcp_o_proj_rs_in_buf": (8, 3),
++        "_pcp_o_proj_rs_out_buf": (4, 3),
++    }
++    for name, shape in expected_shapes.items():
++        buffer = getattr(impl, name)
++        assert buffer.shape == shape
++        assert buffer.dtype == activation_dtype
++        assert buffer.device.type == "cpu"
++
++
++@pytest.mark.parametrize(
++    "num_speculative_tokens,max_capture_size,capture_sizes,expected_capacity",
++    [
++        (0, 0, [], 4),
++        (2, 0, [], 12),
++        (2, 16, [4, 8, 16], 16),
++        (2, 4, [4, 8, 32], 32),
++        (2, None, None, 12),
++    ],
++)
++def test_sfa_pcp_decode_buffers_cover_verification_tokens_and_graph_padding(
++    num_speculative_tokens, max_capture_size, capture_sizes, expected_capacity
++):
++    impl = _make_pcp_o_proj_impl(
++        sharded_decode=True,
++        num_speculative_tokens=num_speculative_tokens,
++        max_capture_size=max_capture_size,
++        capture_sizes=capture_sizes,
++    )
++    assert impl._pcp_o_proj_token_capacity == expected_capacity
++    assert impl._pcp_o_proj_ag_in_buf.shape == (expected_capacity, 4)
++    assert impl._pcp_o_proj_ag_out_buf.shape == (2 * expected_capacity, 4)
++    assert impl._pcp_o_proj_rs_in_buf.shape == (2 * expected_capacity, 3)
++    assert impl._pcp_o_proj_rs_out_buf.shape == (expected_capacity, 3)
++
++
++def test_sfa_pcp_decode_buffers_are_shared_across_compatible_layers():
++    with (
++        patch.object(AscendSFAPCPImpl, "o_proj_full_pools", {}),
++        patch("vllm_ascend.attention.context_parallel.sfa_cp.torch.empty", wraps=torch.empty) as allocate,
++    ):
++        first = _make_pcp_o_proj_impl(sharded_decode=True)
++        second = _make_pcp_o_proj_impl(sharded_decode=True)
++
++        assert allocate.call_count == 4
++        buffers = [
++            value for name, value in vars(first).items() if name.startswith("_pcp_o_proj_") and name.endswith("_buf")
++        ]
++        assert len({buffer.data_ptr() for buffer in buffers}) == 4
++        for name, buffer in vars(first).items():
++            if name.startswith("_pcp_o_proj_") and name.endswith("_buf"):
++                assert getattr(second, name) is buffer
++
++        first._enable_o_proj_full_weight_switch()
++        second._enable_o_proj_full_weight_switch()
++        assert first.o_proj_weight_state.gather_parts["weight"].full_tensor.data_ptr() == (
++            second.o_proj_weight_state.gather_parts["weight"].full_tensor.data_ptr()
++        )
++        assert first.o_proj_weight_state.gather_parts["weight"].full_tensor.data_ptr() not in {
++            buffer.data_ptr() for buffer in buffers
++        }
++
++
++@pytest.mark.parametrize("changed_config", [{"activation_dtype": torch.bfloat16}, {"max_capture_size": 8}])
++def test_sfa_pcp_decode_buffer_pool_separates_dtype_and_shape(changed_config):
++    with patch.object(AscendSFAPCPImpl, "o_proj_full_pools", {}):
++        first = _make_pcp_o_proj_impl(sharded_decode=True)
++        second = _make_pcp_o_proj_impl(sharded_decode=True, **changed_config)
++
++        for name, buffer in vars(first).items():
++            if name.startswith("_pcp_o_proj_") and name.endswith("_buf"):
++                assert getattr(second, name).data_ptr() != buffer.data_ptr()
++
++
++def test_sfa_pcp_decode_buffer_pool_uses_weight_device():
++    allocate_cpu = torch.empty
++
++    def allocate(shape, *, dtype, device):
++        return allocate_cpu(shape, dtype=dtype, device="cpu")
++
++    with (
++        patch.object(AscendSFAPCPImpl, "o_proj_full_pools", {}),
++        patch("vllm_ascend.attention.context_parallel.sfa_cp.torch.empty", side_effect=allocate) as allocate_mock,
++        patch("torch.nn.Parameter") as parameter,
++    ):
++        parameter.return_value = SimpleNamespace(device=torch.device("npu:0"))
++        first = _make_pcp_o_proj_impl(sharded_decode=True)
++        parameter.return_value = SimpleNamespace(device=torch.device("npu:1"))
++        second = _make_pcp_o_proj_impl(sharded_decode=True)
++        parameter.return_value = SimpleNamespace(device=torch.device("npu:0"))
++        same_device = _make_pcp_o_proj_impl(sharded_decode=True)
++
++        assert allocate_mock.call_count == 8
++        assert [call.kwargs["device"] for call in allocate_mock.call_args_list] == (
++            [torch.device("npu:0")] * 4 + [torch.device("npu:1")] * 4
++        )
++        for name, buffer in vars(first).items():
++            if name.startswith("_pcp_o_proj_") and name.endswith("_buf"):
++                assert getattr(second, name) is not buffer
++                assert getattr(same_device, name) is buffer
++
++
+ def test_sfa_pcp_weight_switch_does_not_install_loader_when_disabled() -> None:
+     pcp_group = SimpleNamespace(world_size=2, rank_in_group=0)
+     with (
+@@ -624,6 +766,74 @@ def test_sfa_pcp_decode_projects_local_weight_then_reduces_pcp_and_tp() -> None:
+     torch.testing.assert_close(result, expected)
+ 
+ 
++@pytest.mark.parametrize("rank", [0, 1])
++@pytest.mark.parametrize("tp_size", [1, 2])
++@pytest.mark.parametrize("padding", [False, True])
++@pytest.mark.parametrize("quantized", [False, True])
++@pytest.mark.parametrize("num_speculative_tokens", [0, 2])
++def test_sfa_pcp_sharded_decode_preserves_token_owners(rank, tp_size, padding, quantized, num_speculative_tokens):
++    group = SimpleNamespace(world_size=2, rank_in_group=rank, device_group=object(), all_reduce=Mock())
++    impl = _make_pcp_o_proj_impl(sharded_decode=True, num_speculative_tokens=num_speculative_tokens)
++    impl.o_proj_weight_switch_config = WeightSwitchConfig.from_group(group, shard_axis="input")
++    weight = torch.arange(12, dtype=torch.float32).view(3, 4)
++    impl.o_proj.weight = torch.nn.Parameter(weight[:, rank * 2 : (rank + 1) * 2].clone(), requires_grad=False)
++    impl._enable_o_proj_full_weight_switch()
++    quant_bias = torch.tensor([0.25, 0.5, 0.75]) if quantized else torch.zeros(3)
++    if quantized:
++        method = MagicMock(spec=AscendLinearScheme)
++
++        def apply(layer, x, bias=None, tp_rank=0):
++            return torch.nn.functional.linear(x, layer.weight) + (quant_bias if tp_rank == 0 else 0)
++
++        method.apply.side_effect = apply
++        impl._get_o_proj_weight_switch_method = Mock(return_value=method)
++    buffer_names = (
++        "_pcp_o_proj_ag_in_buf",
++        "_pcp_o_proj_ag_out_buf",
++        "_pcp_o_proj_rs_in_buf",
++        "_pcp_o_proj_rs_out_buf",
++    )
++    buffer_ptrs = tuple(getattr(impl, name).data_ptr() for name in buffer_names)
++    for num_rows in [1, 2, impl._pcp_o_proj_token_capacity]:
++        inputs = [torch.arange(num_rows * 4, dtype=torch.float32).view(num_rows, 4) + 1 + i * 20 for i in range(2)]
++        if padding:
++            inputs[1][-1].zero_()
++        global_input = torch.cat(inputs, dim=0)
++        full_projection = torch.nn.functional.linear(global_input, weight) + quant_bias
++
++        def gather(destination, source, group, inputs=inputs, global_input=global_input):
++            torch.testing.assert_close(source, inputs[rank])
++            destination.copy_(global_input)
++
++        def scatter(
++            destination, source, group, global_input=global_input, full_projection=full_projection, num_rows=num_rows
++        ):
++            expected_partial = torch.nn.functional.linear(
++                global_input[:, rank * 2 : (rank + 1) * 2], impl.o_proj.weight
++            )
++            if quantized and rank == 0:
++                expected_partial += quant_bias
++            torch.testing.assert_close(source, expected_partial)
++            destination.copy_(full_projection[rank * num_rows : (rank + 1) * num_rows])
++
++        tp_group = SimpleNamespace(world_size=tp_size, rank_in_group=0, all_reduce=Mock(side_effect=lambda x: x + 3))
++        expected = full_projection[rank * num_rows : (rank + 1) * num_rows] + impl.o_proj.bias
++        if tp_size > 1:
++            expected += 3
++        with (
++            patch("vllm_ascend.attention.context_parallel.sfa_cp.dist.all_gather_into_tensor", side_effect=gather),
++            patch("vllm_ascend.attention.context_parallel.sfa_cp.dist.reduce_scatter_tensor", side_effect=scatter),
++            patch("vllm_ascend.attention.context_parallel.sfa_cp.get_tp_group", return_value=tp_group),
++        ):
++            actual = impl._finalize_o_proj(inputs[rank], torch.empty_like(expected), gather_full_o_proj=False)
++        torch.testing.assert_close(actual, expected)
++        assert tuple(getattr(impl, name).data_ptr() for name in buffer_names) == buffer_ptrs
++        group.all_reduce.assert_not_called()
++        assert tp_group.all_reduce.call_count == int(tp_size > 1)
++        if quantized:
++            assert method.apply.call_args.kwargs["tp_rank"] == (0 if rank == 0 else 1)
++
++
+ @pytest.mark.parametrize(
+     "attn_state,global_has_prefill,weight_switch_enabled,expected_gather",
+     [
+diff --git a/vllm_ascend/attention/context_parallel/sfa_cp.py b/vllm_ascend/attention/context_parallel/sfa_cp.py
+index 873294256..53262690a 100644
+--- a/vllm_ascend/attention/context_parallel/sfa_cp.py
++++ b/vllm_ascend/attention/context_parallel/sfa_cp.py
+@@ -4,6 +4,7 @@ from functools import partial
+ from typing import Any, NamedTuple, TypeVar, cast
+ 
+ import torch
++import torch.distributed as dist
+ import torch_npu
+ from torch import nn
+ from vllm.config import VllmConfig
+@@ -106,6 +107,35 @@ class AscendSFAPCPImpl(OProjWeightSwitchMixin, AscendSFAImpl):
+             self.o_proj_weight_switch_config,
+             self.o_proj_weight_load_partition,
+         )
++        if self.is_pcp_decode_sharded:
++            compilation_config = self.vllm_config.compilation_config
++            decode_query_len = 1 + self.vllm_config.num_speculative_tokens
++            max_decode_tokens = self.vllm_config.scheduler_config.max_num_seqs * decode_query_len
++            self._pcp_o_proj_token_capacity = max(
++                max_decode_tokens,
++                compilation_config.max_cudagraph_capture_size or 0,
++                max(compilation_config.cudagraph_capture_sizes or [0]),
++            )
++            capacity = self._pcp_o_proj_token_capacity
++            input_size = self.o_proj_weight_load_state.input_size_per_partition_before
++            output_size = self.o_proj.output_size_per_partition
++            dtype = self.vllm_config.model_config.dtype
++            device = self.o_proj.weight.device
++            # Layers execute O-proj collectives sequentially, so compatible
++            # layers can reuse these graph-stable buffers from the weight pool.
++            buffer_shapes = {
++                "_pcp_o_proj_ag_in_buf": (capacity, input_size),
++                "_pcp_o_proj_ag_out_buf": (pcp_size * capacity, input_size),
++                "_pcp_o_proj_rs_in_buf": (pcp_size * capacity, output_size),
++                "_pcp_o_proj_rs_out_buf": (capacity, output_size),
++            }
++            for name, shape in buffer_shapes.items():
++                pool_key = (self.o_proj_weight_switch_pool_key, "decode", name, device, dtype, shape)
++                buffer = self.o_proj_full_pools.get(pool_key)
++                if buffer is None:
++                    buffer = torch.empty(shape, dtype=dtype, device=device)
++                    self.o_proj_full_pools[pool_key] = buffer
++                setattr(self, name, buffer)
+ 
+     def process_weights_after_loading(self, act_dtype: torch.dtype):
+         result = super().process_weights_after_loading(act_dtype)
+@@ -138,6 +168,18 @@ class AscendSFAPCPImpl(OProjWeightSwitchMixin, AscendSFAImpl):
+             self._all_gather_o_proj_full_weight()
+         return context
+ 
++    def _gather_o_proj_decode_tokens(self, attn_output: torch.Tensor) -> torch.Tensor:
++        """Exchange rank-local decode rows using graph-stable buffers."""
++        group = self.o_proj_weight_switch_config.group
++        num_tokens = attn_output.shape[0]
++        if num_tokens > self._pcp_o_proj_token_capacity:
++            raise ValueError("PCP O-proj decode rows exceed the configured token/graph capacity.")
++        local_rows = self._pcp_o_proj_ag_in_buf[:num_tokens]
++        local_rows.copy_(attn_output)
++        global_rows = self._pcp_o_proj_ag_out_buf[: group.world_size * num_tokens]
++        dist.all_gather_into_tensor(global_rows, local_rows, group=group.device_group)
++        return global_rows
++
+     def _finalize_o_proj(
+         self,
+         attn_output: torch.Tensor,
+@@ -150,10 +192,9 @@ class AscendSFAPCPImpl(OProjWeightSwitchMixin, AscendSFAImpl):
+             with self._use_full_o_proj_weights():
+                 return super()._finalize_o_proj(attn_output, output, gather_full_o_proj)
+ 
+-        # Decode tokens are replicated on PCP ranks. Each rank projects only
+-        # its PCP input slice; PCP all-reduce reconstructs the pre-existing
+-        # TP-local result, then the normal row-parallel TP reduction completes
+-        # the output when TP is enabled.
++        # Feature-sharded weights must project the same token rows on every
++        # PCP rank. Sharded decode exchanges rows first and scatters the summed
++        # projection back to each owner; replicated decode only needs a sum.
+         linear_method = self._get_o_proj_weight_switch_method()
+         weight_part = self._get_o_proj_weight_switch_state().gather_parts.get("weight")
+         if weight_part is None:
+@@ -167,6 +208,9 @@ class AscendSFAPCPImpl(OProjWeightSwitchMixin, AscendSFAImpl):
+                 "SFA PCP O-proj input does not match the reconstructed TP-local weight: "
+                 f"input_shape={tuple(attn_output.shape)}, expected_last_dim={full_input_size}."
+             )
++        num_local_tokens = attn_output.shape[0]
++        if self.is_pcp_decode_sharded:
++            attn_output = self._gather_o_proj_decode_tokens(attn_output)
+         local_input = WeightSwitchMixin.split_tensor_for_parallel(
+             attn_output,
+             self.o_proj_weight_switch_config.world_size,
+@@ -180,7 +224,15 @@ class AscendSFAPCPImpl(OProjWeightSwitchMixin, AscendSFAImpl):
+             partial_output = linear_method.apply(self.o_proj, local_input, bias=None, tp_rank=bias_rank)
+         else:
+             partial_output = linear_method.apply(self.o_proj, local_input, bias=None)
+-        partial_output = self.o_proj_weight_switch_config.group.all_reduce(partial_output)
++        group = self.o_proj_weight_switch_config.group
++        if self.is_pcp_decode_sharded:
++            scatter_input = self._pcp_o_proj_rs_in_buf[: group.world_size * num_local_tokens]
++            scatter_input.copy_(partial_output)
++            local_output = self._pcp_o_proj_rs_out_buf[:num_local_tokens]
++            dist.reduce_scatter_tensor(local_output, scatter_input, group=group.device_group)
++            partial_output = local_output
++        else:
++            partial_output = group.all_reduce(partial_output)
+ 
+         if self.o_proj.reduce_results and get_tp_group().world_size > 1:
+             if not self.o_proj.skip_bias_add and get_tp_group().rank_in_group == 0 and self.o_proj.bias is not None:
+diff --git a/vllm_ascend/ops/triton/pcp_kv_cache.py b/vllm_ascend/ops/triton/pcp_kv_cache.py
+index f35138062..08d776a65 100644
+--- a/vllm_ascend/ops/triton/pcp_kv_cache.py
++++ b/vllm_ascend/ops/triton/pcp_kv_cache.py
+@@ -9,8 +9,11 @@ from vllm_ascend.ops.triton.triton_utils import get_ub_size_bytes, get_vectorcor
+ # Tile sizes and RoPE presence change the static IR. Keep default specialization
+ # for innermost strides: Ascend needs unit-stride information to lower multi-row
+ # loads within UB. Other scalars only affect bounds, masks, or addresses.
++# Replicated decode tokens can leave contiguous slot slices unaligned. Reuse
++# the same kernel for those slices without copying slots to realign them.
+ @triton.jit(
+     do_not_specialize=[
++        "slots",
+         "num_tokens",
+         "cache_block_size",
+         "k_stride_block",

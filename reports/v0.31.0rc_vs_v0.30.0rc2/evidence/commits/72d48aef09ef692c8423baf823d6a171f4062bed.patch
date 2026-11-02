@@ -1,0 +1,120 @@
+commit 72d48aef09ef692c8423baf823d6a171f4062bed
+Author:     diaochengxi <65224225+diaochengxi@users.noreply.github.com>
+AuthorDate: Sat Oct 10 09:48:56 2026 +0800
+Commit:     GitHub <noreply@github.com>
+CommitDate: Sat Oct 10 09:48:56 2026 +0800
+
+    [Performance][Quantization] Release dead W8A8 fp32 MoE scales under MegaMoe (#17105)
+    
+    Title: [Performance][Quantization] Release dead W8A8 fp32 MoE scales
+    under MegaMoe
+    
+    ---
+    ### What this PR does / why we need it?
+    
+    Part 2 of 2 (quantization side). In
+    `AscendW8A8DynamicFusedMoEMethod.process_weights_after_loading`, the
+    `use_cann_megamoe` branch switches consumers over to
+    `cann_mega_moe_fused_w*_scale_list` (unbind views), but the dense
+    `w13/w2_weight_scale_fp32` fp32 blocks allocated earlier stay resident
+    and are never read on this path — dead memory. The EPLB branch in the
+    same function already follows the `del + torch.npu.empty_cache()`
+    pattern; `routed_experts.py` has the same precedent for the weights
+    themselves.
+    
+    This PR releases the dead fp32 scale blocks in the MegaMoe branch (gated
+    to non-EPLB, which is structurally mutually exclusive with the MegaMoe
+    branch via the existing if/elif). Frees ~0.15–0.4 GiB per card on W8A8
+    MoE deployments, on top of part 1 (attention side).
+    
+    Known follow-up (out of scope): the `del` lacks an activation guard for
+    the MiniMax-M3 `swigluoai_uninterleave` + `enable_fused_mc2=2`
+    combination, which has no in-tree e2e config today.
+    
+    ### How was this patch tested?
+    
+    - `tests/ut/quantization/methods/w8a8/test_w8a8_dynamic.py`: new case
+    asserting the dead attributes are released on the MegaMoe path and
+    retained otherwise
+    - Full w8a8 quantization suite locally; ruff clean
+    - NPU memory before/after to be confirmed on CI
+    
+    - vLLM main:
+    https://github.com/vllm-project/vllm/commit/ced6857afa0ea7b2e3f0846a62e1394e90f15607
+    
+    ---------
+    
+    Signed-off-by: abc <2301174943@qq.com>
+
+diff --git a/tests/ut/quantization/methods/w8a8/test_w8a8_dynamic.py b/tests/ut/quantization/methods/w8a8/test_w8a8_dynamic.py
+index a0f68105a..42159c524 100644
+--- a/tests/ut/quantization/methods/w8a8/test_w8a8_dynamic.py
++++ b/tests/ut/quantization/methods/w8a8/test_w8a8_dynamic.py
+@@ -239,3 +239,48 @@ class TestAscendW8A8FusedMoEMethod(TestBase):
+         self.assertIs(weight_views[1], layer.w2_weight_list)
+         self.assertIs(weight_views[-2], layer.fused_w1_scale_list)
+         self.assertIs(weight_views[-1], layer.fused_w2_scale_list)
++
++    @patch("vllm_ascend.quantization.methods.w8a8.w8a8_dynamic.use_cann_megamoe", return_value=True)
++    @patch("vllm_ascend.quantization.methods.w8a8.w8a8_dynamic.get_current_vllm_config")
++    @patch("vllm_ascend.quantization.methods.w8a8.w8a8_dynamic.get_ascend_config")
++    def test_process_weights_after_loading_megamoe_frees_fp32_scale(
++        self, mock_get_config, mock_vllm_config, mock_megamoe
++    ):
++        mock_config = MagicMock()
++        mock_config.enable_fused_mc2 = 1
++        mock_get_config.return_value = mock_config
++        self.quant_method.use_expert_weight_list = False
++        layer = create_moe_layer(
++            num_experts=self.num_experts, hidden_size=self.hidden_size, intermediate_size=self.intermediate_size
++        )
++        with patch("vllm_ascend.quantization.methods.w8a8.w8a8_dynamic.maybe_trans_nz", side_effect=lambda x: x):
++            self.quant_method.process_weights_after_loading(layer)
++
++        # Per-expert MegaMoe lists are built from the fused int64 scales.
++        self.assertEqual(len(layer.cann_mega_moe_w13_weight_list), self.num_experts)
++        self.assertEqual(len(layer.cann_mega_moe_w2_weight_list), self.num_experts)
++        self.assertEqual(len(layer.cann_mega_moe_fused_w1_scale_list), self.num_experts)
++        self.assertEqual(len(layer.cann_mega_moe_fused_w2_scale_list), self.num_experts)
++        self.assertTrue(all(scale.dtype == torch.int64 for scale in layer.cann_mega_moe_fused_w1_scale_list))
++        # The float32 scale copy is dead under MegaMoe and must be released.
++        self.assertFalse(hasattr(layer, "w13_weight_scale_fp32"))
++
++    @patch("vllm_ascend.quantization.methods.w8a8.w8a8_dynamic.use_cann_megamoe", return_value=True)
++    @patch("vllm_ascend.quantization.methods.w8a8.w8a8_dynamic.get_current_vllm_config")
++    @patch("vllm_ascend.quantization.methods.w8a8.w8a8_dynamic.get_ascend_config")
++    def test_process_weights_after_loading_megamoe_keeps_swigluoai_scale(
++        self, mock_get_config, mock_vllm_config, mock_megamoe
++    ):
++        mock_config = MagicMock()
++        mock_config.enable_fused_mc2 = 1
++        mock_get_config.return_value = mock_config
++        self.quant_method.use_expert_weight_list = False
++        layer = create_moe_layer(
++            num_experts=self.num_experts, hidden_size=self.hidden_size, intermediate_size=self.intermediate_size
++        )
++        layer.activation = "swigluoai_uninterleave"
++        with patch("vllm_ascend.quantization.methods.w8a8.w8a8_dynamic.maybe_trans_nz", side_effect=lambda x: x):
++            self.quant_method.process_weights_after_loading(layer)
++
++        # The non-fused activation path still consumes the fp32 scale copy.
++        self.assertTrue(hasattr(layer, "w13_weight_scale_fp32"))
+diff --git a/vllm_ascend/quantization/methods/w8a8/w8a8_dynamic.py b/vllm_ascend/quantization/methods/w8a8/w8a8_dynamic.py
+index 2822c7ee6..a4a09cf2f 100644
+--- a/vllm_ascend/quantization/methods/w8a8/w8a8_dynamic.py
++++ b/vllm_ascend/quantization/methods/w8a8/w8a8_dynamic.py
+@@ -313,6 +313,14 @@ class AscendW8A8DynamicFusedMoEMethod(AscendMoEScheme):
+             layer.cann_mega_moe_fused_w2_scale_list = list(
+                 layer.fused_w2_scale.view(layer.w2_weight.shape[0], -1).data.unbind(dim=0)
+             )
++            # MegaMoe reads the fused int64 scale lists above exclusively for
++            # activations whose fused MC2 path supports the scale layout.
++            # swigluoai_uninterleave still uses the standard GMM path, which
++            # reads the fp32 scale copy during forward.
++            activation = getattr(layer, "activation", "silu")
++            activation = getattr(activation, "value", activation)
++            if activation != "swigluoai_uninterleave":
++                del layer.w13_weight_scale_fp32
+ 
+     def _get_mlp_weights(self, layer: torch.nn.Module) -> tuple:
+         """Return (w1, w1_scale, w2, w2_scale) in the standard MLP layout."""

@@ -1,0 +1,284 @@
+commit 4f00748442020c0b59cd69450e0a3359a8c53fd1
+Author:     Q1uqh <129839262+Q1uqh@users.noreply.github.com>
+AuthorDate: Fri Oct 16 17:49:59 2026 +0800
+Commit:     GitHub <noreply@github.com>
+CommitDate: Fri Oct 16 09:49:59 2026 +0000
+
+    [Feature][KV Pool] Prefetch layerwise loads on a global layer window (#18647)
+    
+    ## What this PR does / why we need it?
+    
+    Layerwise pooling prefetches a layer's pool load
+    `layerwise_prefetch_layers` (`P`) model layers ahead of the layer that
+    consumes it. Its window was written for the layout where every rank owns
+    every layer: the cursor that decides which layers may be submitted
+    advanced by *local* submissions - it walked the layer cursor and stopped
+    after `P` successful submissions, skipping the layers this rank does not
+    own.
+    
+    KVPP changes that layout: a rank owns only a contiguous share of the
+    layers. Keeping the same prefetch schedule on the owner-sharded layout
+    means the window has to advance in model-layer units instead of counting
+    local submissions. Counting local submissions has two consequences:
+    
+    1. **The window did not follow the model layers under KVPP.** A rank
+    owning a late shard skipped every layer before its partition and
+    submitted its whole partition during the first model layers, so those
+    loads were issued at the front of the forward instead of at model layer
+    `max(0, L - P)`.
+    2. **The configured prefetch distance was not honored.** After the first
+    model layer the loop submitted exactly one layer per model layer, so
+    `load(L)` was issued at model layer `L-1` regardless of
+    `layerwise_prefetch_layers`; `P` was only effective at layer 0.
+    
+    This PR adapts the window to the owner-sharded layout by expressing it
+    in model-layer units: `window_end = min(current_layer + P, num_layers -
+    1)`. `load(L)` is then submitted at model layer `max(0, L - P)`, which
+    is the schedule `layerwise_prefetch_layers` describes. Layers a rank
+    does not own are still skipped inside `submit_layer_load()`, and
+    `block_key_hybrid` already used this window, so its separate count is
+    removed.
+    
+    This PR also carries the layer index fix that KVPP + layerwise pooling
+    needs to run on main at all:
+    
+    - Layerwise transfer tasks carry a group-local layer index that indexes
+    the per-group address tables (`group_layer_cache_entry_offsets`). Under
+    KVPP those tables are built from the layers this rank registered, while
+    the map that produced the index was built from the full model layer
+    list. Every rank that does not own the first shard then looks past the
+    registered entries:
+    
+      ```text
+      IndexError: index 10 is out of bounds for axis 0 with size 10
+    at kv_transfer.py build_addrs ->
+    self._layer_cache_entry_offsets_np[layer_id + 1]
+      ```
+    
+    - Rebuilding that map from the owner-filtered layer list keeps the index
+    owner-relative (`0..registered-1`), consistent with the address tables,
+    `group_num_layers` and `final_group_layer`; layers this rank does not
+    own produce no group entry, which is what the transfer loop expects.
+    
+    ## Does this PR introduce _any_ user-facing change?
+    
+    The layer-to-owner mapping, the KVPP broadcast and the loaded data are
+    unchanged; only the model layer at which a layerwise load is submitted
+    now follows `layerwise_prefetch_layers`. The documentation lists
+    Mooncake layerwise pooling as supported with KVPP (it previously stated
+    the opposite) and documents `use_layerwise=true` with
+    `load_async=false`.
+    
+    ## How was this patch tested?
+    
+    - New unit test
+    `test_layerwise_prefetch_window_advances_with_model_layer` in
+    `tests/ut/distributed/ascend_store/test_pool_worker.py`. It pins the
+    model layer at which each owned layer is submitted for a full partition,
+    a first shard and a late shard, with `P = 2`. It fails on the previous
+    loop: a late shard (`[5, 6, 7]`) was submitted at model layers `0, 0, 1`
+    instead of `3, 4, 5`.
+    - `python -m pytest -q
+    tests/ut/distributed/ascend_store/test_pool_worker.py`
+    - Local check of the index change: simulating the address tables and
+    both index sources (78 layers, 8 ranks, single group and two groups)
+    yields 0 out-of-bounds lookups after the change versus 68 before it.
+    - End-to-end on GLM-5.2, TP8, Model Runner V2 with `--enforce-eager`,
+    `AscendStoreConnector` with `backend="mooncake"`, `use_layerwise=true`,
+    `load_async=false`: the pool load of layer `L` was observed to complete
+    before its KVPP broadcast and `load_ready` never timed out. That run
+    used a separate opt-in instrumentation build, which is not part of this
+    PR.
+    
+    ### End-to-end measurements (GLM-5.2)
+    
+    Measured TTFT (mean over 128 requests) in three configurations. All
+    three rows come from the same instance, the same workload and the same
+    service settings in one test batch; only `enable_kvpp` and
+    `use_layerwise` differ. The last row is the configuration this PR
+    concerns.
+    
+    | Devices | Model | Input | Output | Prefix hit rate | Deployment |
+    Concurrency | Requests | TTFT (ms) | KVPP | Layerwise |
+    | ---: | --- | ---: | ---: | ---: | --- | ---: | ---: | ---: | :---: |
+    :---: |
+    | 8 | GLM-5.2-W4A8C8 | 128K | 1 | 90% | P/D mixed, TP8 | 32 | 128 |
+    132.8 | Yes | No |
+    | 8 | GLM-5.2-W4A8C8 | 128K | 1 | 90% | P/D mixed, TP8 | 32 | 128 |
+    125.6 | No | Yes |
+    | 8 | GLM-5.2-W4A8C8 | 128K | 1 | 90% | P/D mixed, TP8 | 32 | 128 |
+    135.6 | Yes | Yes |
+    
+    The third row is higher because two per-layer effects stack and are not
+    fully hidden behind compute:
+    
+    1. **The KVPP broadcast is already the dominant per-layer cost, and most
+    of it stays exposed.** Measured on the same configuration with an opt-in
+    instrumentation build (not part of this PR): one layer broadcasts about
+    2 GiB (`num_blocks=14216`) in ~98 ms on the device (~22 GB/s), while the
+    compute window of that layer is only ~4.3 ms, so attention waits ~103 ms
+    per layer and the broadcast is on the critical path. This cost exists
+    with KVPP alone as well.
+    2. **Layerwise pooling adds one pool load per layer with almost no
+    slack, on the same interconnect.** It requires `load_async=false`, so
+    each owner rank issues one H2D per layer during the forward (~22-50 ms
+    per layer, ~10 layers per rank) instead of a single bulk asynchronous
+    load. That traffic shares the interconnect with the broadcast, and the
+    load has to complete before its layer runs: the measured margin is ~1
+    ms, so any extra delay caused by that sharing is exposed instead of
+    being absorbed by compute.
+    
+    Combining these two mechanisms leaves part of their cost uncovered,
+    which is what the +2.8 ms (+2.1%) over the KVPP-only row reflects;
+    without KVPP (second row) there is no per-layer broadcast to compete
+    with, and without layerwise the pool load is one bulk asynchronous
+    transfer.
+    
+    - vLLM main:
+    https://github.com/vllm-project/vllm/commit/c4df37dfcc7f72ca41cd43801a468526ecf99a2b
+    
+    ---------
+    
+    Signed-off-by: recky-c <ruiqicheng510@gmail.com>
+    Co-authored-by: recky-c <ruiqicheng510@gmail.com>
+
+diff --git a/docs/source/user_guide/feature_guide/kvpp.md b/docs/source/user_guide/feature_guide/kvpp.md
+index 10038ad82..54fd1713b 100644
+--- a/docs/source/user_guide/feature_guide/kvpp.md
++++ b/docs/source/user_guide/feature_guide/kvpp.md
+@@ -46,6 +46,7 @@ The following table lists individual feature combinations with KVPP. It does not
+ | DCP | ❌ Not supported | Cannot currently be combined with KVPP. |
+ | P/D disaggregation | ✅ Supported | Uses `MooncakeConnectorV2` (Experimental); enable KVPP only on the prefill node. |
+ | KV pooling | ✅ Supported | Memcache with `AscendStoreConnector`, `kv_producer` or `kv_both`, and whole-block loading. |
++| Mooncake layerwise KV pooling | ✅ Supported | `AscendStoreConnector` with `backend="mooncake"`, `use_layerwise=true`, and `load_async=false`. GLM-5.2 validation pending. |
+ 
+ - ✅ **Supported**: The feature combination is supported under the stated conditions.
+ - ❌ **Not supported**: The combination is not currently supported.
+@@ -124,7 +125,19 @@ Configure the memcache SDK and MetaService as described in [KV Cache Pool (Ascen
+ --kv-transfer-config '{"kv_connector":"AscendStoreConnector","kv_role":"kv_producer","kv_connector_extra_config":{"lookup_rpc_port":"0","backend":"memcache","use_layerwise":false,"load_async":true}}'
+ ```
+ 
+-The example uses `kv_producer`; you can also set `kv_role` to `kv_both`. Both roles save and load prefixes in this pooling configuration. Keep `use_layerwise=false` and `discard_partial_chunks=true` (the default). Layerwise pooling, KV events, and consumer write-back are not supported with KVPP.
++The example uses `kv_producer`; you can also set `kv_role` to `kv_both`. Both roles save and load prefixes in this pooling configuration. Keep `use_layerwise=false` and `discard_partial_chunks=true` (the default). KV events and consumer write-back are not supported with KVPP.
++
++### Mooncake Layerwise Pooling
++
++Layerwise pooling is supported with KVPP for the Mooncake block-key data plane. Each TP rank owns a contiguous share of the layers, loads only those layers from the pool, and the KVPP broadcast supplies the other ranks when a layer executes. `layerwise_prefetch_layers` sets the prefetch distance: the load of layer `L` is submitted at model layer `max(0, L - layerwise_prefetch_layers)`.
++
++Configure Mooncake as described in the [Mooncake layerwise guide](mooncake_layerwise_adaptation_and_optimization.md), then add:
++
++```bash
++--kv-transfer-config '{"kv_connector":"AscendStoreConnector","kv_role":"kv_both","kv_connector_extra_config":{"backend":"mooncake","use_layerwise":true,"load_async":false}}'
++```
++
++Mooncake layerwise pooling requires `load_async=false` (loads are submitted layer by layer) and does not enable cross-layer reuse of persistent owner caches. It was validated on a single node with TP8, Model Runner V2, and eager execution; PP, PCP, and DCP were not part of that validation.
+ 
+ ### Combining Connectors
+ 
+diff --git a/tests/ut/distributed/ascend_store/test_pool_worker.py b/tests/ut/distributed/ascend_store/test_pool_worker.py
+index c06f16395..1ee7810d5 100644
+--- a/tests/ut/distributed/ascend_store/test_pool_worker.py
++++ b/tests/ut/distributed/ascend_store/test_pool_worker.py
+@@ -1773,6 +1773,46 @@ class TestKVPoolWorkerProcessLayerData(unittest.TestCase):
+         for layer_tasks in worker.layer_load_tasks:
+             self.assertEqual(layer_tasks, [])
+ 
++    def test_layerwise_prefetch_window_advances_with_model_layer(self):
++        """load(L) is submitted at model layer max(0, L - P), for every shard.
++
++        A rank owns only part of the layers under KVPP. A window counted in
++        local submissions skips the layers a rank does not own, so a rank that
++        owns a late shard requests its whole partition during the first model
++        layers: the transfer then runs at the front of the forward and competes
++        with compute instead of overlapping the P layers before its consumer.
++        """
++        prefetch = 2
++        for owned in ([0, 1, 2, 3, 4, 5, 6, 7], [5, 6, 7], [0, 1, 2]):
++            with self.subTest(owned=owned):
++                worker = make_worker(self, use_layerwise=True)
++                worker.num_layers = 8
++                worker.num_prefetch_layers = prefetch
++                worker.current_layer = 0
++                worker.next_layer_to_submit = 0
++                worker.prefetch_layer_map = {}
++                worker.layer_load_tasks = [[object()] if layer in owned else [] for layer in range(8)]
++                recv_thread = MagicMock()
++                worker.kv_recv_thread = recv_thread
++
++                submitted_at: dict[int, int] = {}
++                for model_layer in range(8):
++                    worker.current_layer = model_layer
++                    first_new = recv_thread.add_request.call_count
++                    worker._submit_ready_layer_loads()
++                    for call_index in range(first_new, recv_thread.add_request.call_count):
++                        task = recv_thread.add_request.call_args_list[call_index].args[0]
++                        self.assertNotIn(task.layer_id, submitted_at, "layer submitted twice")
++                        submitted_at[task.layer_id] = model_layer
++
++                self.assertEqual(set(submitted_at), set(owned))
++                for layer_id in owned:
++                    self.assertEqual(
++                        submitted_at[layer_id],
++                        max(0, layer_id - prefetch),
++                        f"layer {layer_id} submitted at the wrong model layer",
++                    )
++
+     def test_empty_layerwise_step_reowns_task_lists(self):
+         worker = self._make_worker()
+         worker.use_layerwise = True
+diff --git a/vllm_ascend/distributed/kv_transfer/kv_pool/ascend_store/pool_worker.py b/vllm_ascend/distributed/kv_transfer/kv_pool/ascend_store/pool_worker.py
+index aaa096c32..a6ca783ee 100644
+--- a/vllm_ascend/distributed/kv_transfer/kv_pool/ascend_store/pool_worker.py
++++ b/vllm_ascend/distributed/kv_transfer/kv_pool/ascend_store/pool_worker.py
+@@ -1010,6 +1010,10 @@ class KVPoolWorker:
+ 
+         layer_cache_entry_offsets = [0]
+         for phys in sorted(layer_names_by_physical):
++            if getattr(self, "use_kvpp", False):
++                self.physical_layer_to_group_layers.setdefault(phys, []).append(
++                    (group_id, len(layer_cache_entry_offsets) - 1)
++                )
+             for layer_name in sorted(layer_names_by_physical[phys]):
+                 cache_or_caches = self.kv_caches[layer_name]
+                 for cache in self._as_cache_tuple(cache_or_caches):
+@@ -1126,6 +1130,7 @@ class KVPoolWorker:
+         self.group_layer_cache_entry_offsets: dict[int, list[int]] = {}
+         self.kv_caches = kv_caches
+         if self.use_kvpp:
++            self.physical_layer_to_group_layers.clear()
+             owners = map_kvpp_layers_to_owners(self.vllm_config, kv_caches.keys())
+             kv_caches = {
+                 name: caches for name, caches in kv_caches.items() if owners.get(name) in (None, self.kvpp_rank)
+@@ -2182,10 +2187,12 @@ class KVPoolWorker:
+         if self.use_block_key_layerwise:
+             # The map and buffer builders both use stage-local physical layer
+             # indices. A group's dense layer index is a third, distinct axis.
+-            if self.num_kv_cache_groups == 1:
++            if self.num_kv_cache_groups == 1 and not getattr(self, "use_kvpp", False):
+                 return [(0, local_layer)]
+             groups = self.physical_layer_to_group_layers.get(local_layer)
+             if groups is None:
++                if getattr(self, "use_kvpp", False):
++                    return []
+                 raise RuntimeError(f"Mooncake layerwise: no KV cache group for local layer {local_layer}")
+             return [(group_id, layer_idx) for group_id, layer_idx in groups if group_id in self.cacheable_group_ids]
+         # GVA groups use stage-local indices too; PP offsets apply to pool keys and remote addresses.
+@@ -2834,15 +2841,11 @@ class KVPoolWorker:
+             )
+             return True
+ 
+-        submit_count = self.num_prefetch_layers if self.current_layer == 0 else 1
+-        if getattr(self, "block_key_hybrid", False):
+-            submit_count = max(0, self.current_layer + self.num_prefetch_layers + 1 - self.next_layer_to_submit)
+-        submitted_layers = 0
+-        while submitted_layers < submit_count and self.next_layer_to_submit < self.num_layers:
++        window_end = min(self.current_layer + self.num_prefetch_layers, self.num_layers - 1)
++        while self.next_layer_to_submit <= window_end:
+             layer_id = self.next_layer_to_submit
+             self.next_layer_to_submit += 1
+-            if submit_layer_load(layer_id):
+-                submitted_layers += 1
++            submit_layer_load(layer_id)
+ 
+     def wait_for_layer_load(self) -> None:
+         if self.current_layer >= self.num_layers:
