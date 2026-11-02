@@ -1,0 +1,319 @@
+commit 90cd631625a569dc420f8235ed9d525b8c9eaede
+Author:     Yunxiao Ning <73625538+foraxe@users.noreply.github.com>
+AuthorDate: Tue Oct 27 10:41:51 2026 +0800
+Commit:     GitHub <noreply@github.com>
+CommitDate: Tue Oct 27 10:41:51 2026 +0800
+
+    [BugFix][Engram] Align private Host-UVA payloads for correct device reads (#19695)
+    
+    ### What this PR does / why we need it?
+    
+    Fix incorrect device reads from small private Engram `HostUvaBuffer`
+    allocations observed on A3 with CANN 9.2.0. The current community
+    implementation can publish correct CPU data while the NPU reads
+    different bytes through the returned device alias.
+    
+    Reserve at most 65,535 extra bytes per buffer and use a 64 KiB-aligned
+    payload for the CPU tensor, host registration and device-pointer query.
+    Retain the original allocation for `aclrtFreeHost` on normal close and
+    initialization rollback. Registration flags and lookup kernels stay
+    unchanged; there is no additional hot-path copy. This change is limited
+    to private `HostUvaBuffer`; it does not change `SharedUvaBuffer` or a
+    VMM allocator.
+    
+    Observed on a 16,384-row INT8/FP32 table (4 MiB codes, 512 KiB scales):
+    
+    | Check | Original private buffer | Aligned payload |
+    | --- | --- | --- |
+    | CPU publication | Exact | Exact |
+    | NPU raw codes | Exact | Exact |
+    | NPU raw scales | 122,850 byte mismatches | Exact |
+    | Indexed scales | 25/32 mismatches | Exact |
+    | Native and grouped gather/dequant | Incorrect | Exact |
+    
+    The original scales host pointer had low 16 bits `0x1000`; the returned
+    alias lacked those low bits, and a source prefix fingerprint appeared at
+    byte offset 4096 in the NPU-read stream. Aligning the registered payload
+    removed the mismatch. This establishes a reproducible user-visible
+    failure and a tested workaround on this stack; it does not establish
+    which vendor layer is responsible or a universal 64 KiB API requirement.
+    Switching to MAPPED-only flags or grouped scale loads did not fix it.
+    Manual alias-offset experiments faulted and are INVALID, so they are not
+    the fix or correctness evidence.
+    
+    Reproduction outline (pseudocode; compare through a device kernel, not
+    `aclrtMemcpy` on a registered alias):
+    
+    ```text
+    allocate private codes[16384, 256] as INT8
+    allocate private scales[16384, 8] as FP32
+    fill CPU views with deterministic codes and nonconstant power-of-two scales
+    record host_pointer % 65536 for each buffer
+    register each CPU payload and query its device alias
+    NPU kernel: read raw alias bytes into ordinary device output
+    compare output.cpu() with CPU payload bytes
+    NPU kernel: gather/dequant selected rows; compare with CPU reference
+    repeat with 64 KiB-aligned payloads inside the original allocations
+    ```
+    
+    Earlier #16689 design of the host-backed Engram has been ported to
+    current main. Related sharing work: #19528. This PR independently fixes
+    the current private Host-UVA implementation; it makes no claim that
+    those VMM or sharing designs are defective.
+    
+    ### Does this PR introduce _any_ user-facing change?
+    
+    Yes. Private host-offloaded Engram lookups avoid the observed
+    small-buffer mapping corruption on A3/CANN 9.2. Each private buffer
+    reserves up to 65,535 additional host bytes. Release note:
+    `release_notes/fragments/19695.yaml` (bugfix).
+    
+    ### How was this patch tested?
+    
+    - Added
+    `tests/ut/models/test_engram.py::test_host_uva_aligns_registration_and_frees_original_allocation`:
+    deliberately unaligned original allocation, aligned CPU/register/query
+    address, payload bounds and CPU alias writes, original-allocation free,
+    repeated close, and rollback on registration/device-pointer-query
+    failures.
+    - Local isolated-source CPU validation: all 45 cases PASS (5
+    allocation/registration outcomes x 3 dtypes x 3 alignment offsets). It
+    extracts the actual class and added test from source, supplies the CANN
+    mock and CPU tensors, and checks success, allocation error, successful
+    allocation with NULL output, registration failure and pointer-query
+    failure across UINT8/BF16/FP32 and offsets 0/4096/65535. This is **not**
+    a full pytest run or full vLLM import environment. Negative controls:
+    unfixed `origin/main` fails the alignment test; the previous PR head
+    fails all nine NULL-output cases with `TypeError`, while the updated
+    source raises a clear `RuntimeError` before registration or pointer
+    arithmetic.
+    - `bash format.sh ci` and `git diff --check`: PASS. Focused mypy 1.11.1
+    on the two affected files passes for Linux/Python 3.10, 3.11 and 3.12
+    (local missing imports ignored; full repository mypy is left to CI).
+    - Reused hardware evidence from A3/CANN 9.2.0: the actual fixed `npu.py`
+    loaded as a component overlay gives exact raw NPU bytes, indexed scales,
+    and native/grouped gather outputs against CPU data. Ten existing
+    component cases using Host-UVA lookup, real BF16 WKV projection weights,
+    gate outputs, eager execution and multistream graph replay report
+    correctness PASS. These are component checks, not a rebuilt full wheel
+    or full-model E2E, and imply no WKV performance claim. No new
+    accelerator job was started for this PR.
+    - Completed full-environment CPU CI on the current head: [run
+    40068579976](https://github.com/vllm-project/vllm-ascend/actions/runs/40068579976),
+    verified vLLM main: **12,348 passed / 82 skipped**; v0.31.0: **12,342
+    passed / 88 skipped**. All **45 added Host-UVA regression cases passed
+    in each lane**. Full repository pre-commit/mypy and DCO pass.
+    - Not validated: full-model E2E, other CANN versions/A5, or
+    shared-buffer small allocations. The remaining `ci-gate` failure is the
+    missing `ready-precise` label; pre-commit and both CPU UT lanes
+    succeeded. A [maintainer
+    request](https://github.com/vllm-project/vllm-ascend/pull/19695#issuecomment-6380798181)
+    is posted because the author account cannot add labels.
+    
+    To repeat the isolated CPU check from the repository root (requires CPU
+    PyTorch and pytest):
+    
+    ```bash
+    python3 - <<'PYTEST'
+    import ast
+    import ctypes
+    from pathlib import Path
+    from types import ModuleType, SimpleNamespace
+    
+    import pytest
+    import torch
+    
+    source = Path("vllm_ascend/models/deepseek_v41/engram/npu.py")
+    tests = Path("tests/ut/models/test_engram.py")
+    module = ModuleType("isolated_host_uva")
+    module.__dict__.update(
+        ctypes=ctypes, torch=torch, CHUNK_ROWS=1 << 22,
+        _host_library=lambda: None,
+        DeviceOperator=SimpleNamespace(host_register_flags=lambda: 0x10000002),
+    )
+    cls = next(n for n in ast.parse(source.read_text()).body
+               if isinstance(n, ast.ClassDef) and n.name == "HostUvaBuffer")
+    exec(compile(ast.Module(body=[cls], type_ignores=[]), str(source), "exec"), module.__dict__)
+    name = "test_host_uva_aligns_registration_and_frees_original_allocation"
+    test = next(n for n in ast.parse(tests.read_text()).body
+                if isinstance(n, ast.FunctionDef) and n.name == name)
+    test.decorator_list = []
+    namespace = dict(ctypes=ctypes, torch=torch, pytest=pytest, npu=module)
+    exec(compile(ast.Module(body=[test], type_ignores=[]), str(tests), "exec"), namespace)
+    for failure in (None, "malloc", "null", "register", "device_pointer"):
+        for dtype in (torch.uint8, torch.bfloat16, torch.float32):
+            for offset in (0, 4096, 65535):
+                with pytest.MonkeyPatch.context() as patch:
+                    namespace[name](patch, failure, dtype, offset)
+    print("PASS: 45 isolated CPU lifecycle/rollback cases")
+    PYTEST
+    ```
+    
+    ---
+    
+    ### Checklist
+    
+    #### Testing
+    
+    - [x] **Boundary / edge-case coverage**: deliberately unaligned base and
+    payload bounds.
+    - [x] **Regression test**: unfixed source fails the added test.
+    - [x] **Error / failure path coverage**: registration and pointer-query
+    rollback.
+    - [x] **Meaningful & reliable tests**: CPU alias writes, address
+    ownership and lifecycle.
+    - [ ] **Performance impact**: allocation-only correctness fix; no
+    performance claim or full-model performance regression run.
+    
+    
+    - vLLM main:
+    https://github.com/vllm-project/vllm/commit/c0b6f74bee518aeaf5d72b200a0216e72fbb5e7c
+    
+    ---------
+    
+    Signed-off-by: yunzhi <ningyunxiao.nyx@antgroup.com>
+
+diff --git a/release_notes/fragments/19695.yaml b/release_notes/fragments/19695.yaml
+new file mode 100644
+index 000000000..effed4bf8
+--- /dev/null
++++ b/release_notes/fragments/19695.yaml
+@@ -0,0 +1,7 @@
++pr: 19695
++entries:
++  - category: bugfix
++    text: >-
++      Fixed incorrect device reads observed with small private host-offloaded
++      Engram buffers on A3 with CANN 9.2 by aligning the registered host payload
++      to 64 KiB while preserving the original allocation for cleanup.
+diff --git a/tests/ut/models/test_engram.py b/tests/ut/models/test_engram.py
+index 403256e68..d1f4a9da0 100644
+--- a/tests/ut/models/test_engram.py
++++ b/tests/ut/models/test_engram.py
+@@ -3,6 +3,7 @@
+ # ruff: noqa: E402
+ """Focused tests for the Ascend Engram configuration and storage path."""
+ 
++import ctypes
+ import json
+ import threading
+ from concurrent.futures import ThreadPoolExecutor
+@@ -37,6 +38,76 @@ from vllm_ascend.models.deepseek_v41.engram.hash_state import DEAD_ID, AscendNgr
+ from vllm_ascend.models.deepseek_v41.engram.parallel import resolve_dp_shared_memory
+ 
+ 
++@pytest.mark.parametrize("failure", [None, "malloc", "null", "register", "device_pointer"])
++@pytest.mark.parametrize("dtype", [torch.uint8, torch.bfloat16, torch.float32])
++@pytest.mark.parametrize("offset", [0, 4096, 65535])
++def test_host_uva_aligns_registration_and_frees_original_allocation(monkeypatch, failure, dtype, offset):
++    alignment, size = 65536, 4096
++
++    class Library:
++        def __init__(self):
++            self.storage = ctypes.create_string_buffer(size + 4 * alignment)
++            base = ctypes.addressof(self.storage)
++            self.original = (base + alignment - 1) // alignment * alignment + offset
++            self.registered = self.unregistered = self.freed = None
++            self.free_count = self.unregister_count = 0
++
++        def aclrtMallocHost(self, output, count, flags):
++            assert count == size + alignment - 1
++            if failure == "malloc":
++                return 1
++            ctypes.cast(output, ctypes.POINTER(ctypes.c_void_p)).contents.value = (
++                None if failure == "null" else self.original
++            )
++            return 0
++
++        def aclrtHostRegisterV2(self, pointer, count, flags):
++            assert count == size and pointer.value % alignment == 0
++            self.registered = pointer.value
++            return 1 if failure == "register" else 0
++
++        def aclrtHostGetDevicePointer(self, pointer, output, flags):
++            assert pointer.value == self.registered
++            ctypes.cast(output, ctypes.POINTER(ctypes.c_void_p)).contents.value = 0x100000000
++            return 1 if failure == "device_pointer" else 0
++
++        def aclrtHostUnregister(self, pointer):
++            self.unregistered = pointer.value
++            self.unregister_count += 1
++            return 0
++
++        def aclrtFreeHost(self, pointer):
++            self.freed = pointer.value
++            self.free_count += 1
++            return 0
++
++    lib = Library()
++    monkeypatch.setattr(npu, "_host_library", lambda: lib)
++    shape = (size // torch.empty((), dtype=dtype).element_size(),)
++    if failure:
++        message = "NULL pointer" if failure == "null" else "failed: rc=1"
++        with pytest.raises(RuntimeError, match=message):
++            npu.HostUvaBuffer(shape, dtype, "cpu")
++    else:
++        buffer = npu.HostUvaBuffer(shape, dtype, "cpu")
++        assert buffer.tensor.data_ptr() == lib.registered
++        assert lib.original <= lib.registered and lib.registered + size <= lib.original + size + alignment - 1
++        buffer.tensor.fill_(17)
++        value = torch.frombuffer(
++            lib.storage, dtype=dtype, count=1, offset=lib.registered - ctypes.addressof(lib.storage)
++        )
++        assert value.item() == 17
++        buffer.close()
++        buffer.close()
++    if failure in ("malloc", "null"):
++        assert lib.registered is lib.unregistered is lib.freed is None
++        assert lib.free_count == lib.unregister_count == 0
++    else:
++        assert lib.unregistered == lib.registered
++        assert lib.freed == lib.original
++        assert lib.free_count == lib.unregister_count == 1
++
++
+ def test_shared_memory_needs_a_local_dp_peer(monkeypatch):
+     from vllm_ascend.models.deepseek_v41.engram import parallel
+ 
+diff --git a/vllm_ascend/models/deepseek_v41/engram/npu.py b/vllm_ascend/models/deepseek_v41/engram/npu.py
+index 0c398f463..042b7799a 100644
+--- a/vllm_ascend/models/deepseek_v41/engram/npu.py
++++ b/vllm_ascend/models/deepseek_v41/engram/npu.py
+@@ -151,10 +151,17 @@ class HostUvaBuffer:
+         row_elements = int(torch.Size(shape[1:]).numel())
+         self.row_bytes = row_elements * torch.empty((), dtype=dtype).element_size()
+         size = rows * self.row_bytes
+-        self.pointer = ctypes.c_void_p()
+-        rc = self.lib.aclrtMallocHost(ctypes.byref(self.pointer), size, 0)
++        # Align the payload to avoid incorrect device reads observed on A3/CANN 9.2;
++        # retain the original allocation for free.
++        alignment = 64 * 1024
++        self._allocation_pointer = ctypes.c_void_p()
++        rc = self.lib.aclrtMallocHost(ctypes.byref(self._allocation_pointer), size + alignment - 1, 0)
+         if rc:
+             raise RuntimeError(f"aclrtMallocHost failed: rc={rc} size={size}")
++        allocation_address = self._allocation_pointer.value
++        if allocation_address is None:
++            raise RuntimeError("aclrtMallocHost returned a NULL pointer")
++        self.pointer = ctypes.c_void_p((allocation_address + alignment - 1) // alignment * alignment)
+         self.buffer = (ctypes.c_char * size).from_address(self.pointer.value)
+         self.tensor = torch.frombuffer(self.buffer, dtype=dtype).reshape(shape)
+         try:
+@@ -174,7 +181,7 @@ class HostUvaBuffer:
+             # A half-built buffer must not leave the host range registered: the
+             # caller only sees the exception, so nothing else can release it.
+             self.lib.aclrtHostUnregister(self.pointer)
+-            self.lib.aclrtFreeHost(self.pointer)
++            self.lib.aclrtFreeHost(self._allocation_pointer)
+             self.tensor = None
+             self.buffer = None
+             self.pointer = ctypes.c_void_p()
+@@ -197,7 +204,7 @@ class HostUvaBuffer:
+         self.tensor = None
+         self.buffer = None
+         self.ptrs = None
+-        rc = self.lib.aclrtFreeHost(self.pointer)
++        rc = self.lib.aclrtFreeHost(self._allocation_pointer)
+         if rc:
+             raise RuntimeError(f"aclrtFreeHost failed: rc={rc}")
+         self.pointer = ctypes.c_void_p()

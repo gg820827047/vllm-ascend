@@ -1,0 +1,503 @@
+commit 99a8e0a0e7f1507f20cfccbbeaaef33a7efd6f1f
+Author:     Bonan Wang <bryanwang20@gmail.com>
+AuthorDate: Thu Oct 29 12:27:21 2026 +0800
+Commit:     GitHub <noreply@github.com>
+CommitDate: Thu Oct 29 12:27:21 2026 +0800
+
+    [Feature][GLM-5.3-Flash] Enable torch.compile for GLM-5.3-Flash backbone and MTP (#19076)
+    
+    ### What this PR does / why we need it?
+    
+    Enable `torch.compile` for the GLM-5.3-Flash text backbone and MTP draft
+    model.
+    
+    - Keep KDA state updates and Triton-based normalization behind custom-op
+    boundaries so serialized FX/AOT artifacts remain reusable across
+    processes.
+    - Register KDA as a PIECEWISE splitting op and normalize into a
+    caller-owned output buffer. This prevents capture of the metadata-free
+    profiling path and stale-output reads during graph replay.
+    
+    ### Does this PR introduce _any_ user-facing change?
+    
+    Yes. Compilation settings now take effect for the backbone and MTP, and
+    PIECEWISE prefill produces correct outputs for the previously failing
+    requests.
+    
+    Draft compilation requires `"enforce_eager": false` in the speculative
+    config. Explicit eager mode remains supported.
+    
+    ### How was this patch tested?
+    
+    - **CPU:** 95 related tests passed, covering runtime metadata, stable
+    output buffers, and FULL graph compatibility.
+    - **A3:** W8A8, V1, MTP5, P DP2/TP8 + D DP8/TP2, PIECEWISE prefill and
+    FULL decode. Cold and hot compilation-cache runs each passed 32
+    concurrent PD requests across all eight D instances.
+    - **A3 runtime:** CANN 9.2.0, PyTorch 2.10.0, torch-npu 2.10.0.post7,
+    vLLM 0.31.0 (`db9527a4`).
+    - **950DT:** TP8 + EP MXFP8 validation with V1, FULL_DECODE_ONLY and
+    three-token compiled MTP.
+    - **AIME2026:** Default-sampling evaluation is running; final accuracy
+    is pending.
+    
+    
+    - vLLM main:
+    https://github.com/vllm-project/vllm/commit/544f182d9f0c9bfe8bd7645525951d5e3692a542
+    
+    ---------
+    
+    Signed-off-by: Bonan Wang <bryanwang20@gmail.com>
+
+diff --git a/tests/ut/models/test_glm5next_kda_dispatch.py b/tests/ut/models/test_glm5next_kda_dispatch.py
+index 33eed57a5..1ea5ac30d 100644
+--- a/tests/ut/models/test_glm5next_kda_dispatch.py
++++ b/tests/ut/models/test_glm5next_kda_dispatch.py
+@@ -35,7 +35,8 @@ def test_kda_pcp_restores_prefill_and_skips_decode_gather(monkeypatch, pcp_rank,
+     layer.in_proj_qkvbfg_a = project
+     layer.f_b_proj = lambda x: (torch.zeros(x.shape[0], 2), None)
+     layer.g_b_proj = lambda x: (torch.zeros(x.shape[0], 2), None)
+-    layer.o_norm = lambda x, gate: x
++    # The gated norm now runs inside the KDA custom op, which writes into `out`.
++    layer.o_norm = SimpleNamespace(forward_oot=lambda output, gate, *, out: out)
+     layer.o_proj = lambda x: (x, None)
+     seen = []
+ 
+@@ -51,7 +52,11 @@ def test_kda_pcp_restores_prefill_and_skips_decode_gather(monkeypatch, pcp_rank,
+         padded_gather_idx=torch.tensor([0, 1, 6, 0, 2, 3, 4, 5]),
+     )
+     metadata = SimpleNamespace(pcp_context=pcp_context)
+-    monkeypatch.setattr(model_kda, "get_forward_context", lambda: SimpleNamespace(attn_metadata={"layer": metadata}))
++    monkeypatch.setattr(
++        model_kda,
++        "get_forward_context",
++        lambda: SimpleNamespace(attn_metadata={"layer": metadata}, no_compile_layers={"layer": layer}),
++    )
+     gathered = torch.tensor([[0.0], [1.0], [6.0], [-1.0], [2.0], [3.0], [4.0], [5.0]])
+     pcp_group = SimpleNamespace(
+         world_size=2,
+@@ -62,6 +67,10 @@ def test_kda_pcp_restores_prefill_and_skips_decode_gather(monkeypatch, pcp_rank,
+     layer.pcp_size = pcp_group.world_size
+     layer.pcp_rank = pcp_group.rank_in_group
+ 
++    # The KDA custom op is registered against the NPU dispatch key, so a CPU
++    # runner cannot dispatch it. Call its implementation directly instead.
++    monkeypatch.setattr(torch.ops.vllm, "glm5next_kda_forward", model_kda.glm5next_kda_forward)
++
+     local_input = gathered[pcp_rank * 4 : (pcp_rank + 1) * 4]
+     output = layer(local_input, torch.arange(4))
+ 
+@@ -263,6 +272,13 @@ def test_decode_and_prefill_use_their_own_metadata_and_merge_outputs(
+         assert kwargs.get("output_buffer") is None
+         assert q.shape[1] == (2 if speculative else 1)
+         torch.testing.assert_close(starts, torch.tensor([0, q.shape[1]]))
++        torch.testing.assert_close(k, q + 8, rtol=0, atol=0)
++        torch.testing.assert_close(v, q + 16, rtol=0, atol=0)
++        assert state is layer.kv_cache[1]
++        expected_indices = metadata.spec_state_indices_tensor if speculative else metadata.non_spec_state_indices_tensor
++        assert indices is expected_indices
++        state_slots = indices[: starts.numel() - 1].reshape(-1)
++        state.index_fill_(0, state_slots, 2.0)
+         return q * 2
+ 
+     def prefill(q, k, v, gate, beta, state, indices, initial, chunk, *args):
+@@ -271,6 +287,10 @@ def test_decode_and_prefill_use_their_own_metadata_and_merge_outputs(
+         assert q.shape[1] == 3
+         assert chunk is metadata.non_spec_prefill_metadata.chunk
+         torch.testing.assert_close(indices, metadata.prefill_state_indices)
++        torch.testing.assert_close(k, q + 8, rtol=0, atol=0)
++        torch.testing.assert_close(v, q + 16, rtol=0, atol=0)
++        assert state is layer.kv_cache[1]
++        state.index_fill_(0, indices, 3.0)
+         return q * 3
+ 
+     monkeypatch.setattr(model_kda, "recurrent_kda", recurrent)
+@@ -283,14 +303,28 @@ def test_decode_and_prefill_use_their_own_metadata_and_merge_outputs(
+ 
+     monkeypatch.setattr(model_kda, "kda_recoverssm_verify", verify)
+     monkeypatch.setattr(model_kda, "chunk_kda", prefill)
+-    qkv = torch.arange(1, tokens + 1, dtype=torch.bfloat16)[:, None].expand(tokens, 384).clone()
++    # Distinguish tokens, channels and Q/K/V so swaps and partial writes fail.
++    query = torch.arange(1, tokens + 1, dtype=torch.bfloat16)[:, None]
++    query = query + torch.arange(128, dtype=torch.bfloat16)[None, :] / 128
++    qkv = torch.cat((query, query + 8, query + 16), dim=-1)
+     out = torch.full((1, tokens + 1, 1, 128), float("nan"), dtype=torch.bfloat16)
+     layer._forward(qkv, torch.zeros(1, tokens, 1, 128), torch.zeros(1, tokens, 1), out)
+-    expected = torch.arange(1, tokens + 1, dtype=torch.bfloat16) * 3
+-    expected[: 2 if speculative else 1] = torch.arange(1, 3 if speculative else 2) * 2
+-    torch.testing.assert_close(out[0, :tokens, 0, 0], expected)
++    expected = query * 3
++    recurrent_tokens = 2 if speculative else 1
++    expected[:recurrent_tokens] = query[:recurrent_tokens] * 2
++    torch.testing.assert_close(out[:, :tokens], expected[None, :, None, :], rtol=0, atol=0)
+     # Rows outside the scheduled token groups are left untouched.
+     assert torch.isnan(out[:, tokens:]).all()
++    expected_state = torch.zeros_like(layer.kv_cache[1])
++    recurrent_slots = (
++        metadata.spec_state_indices_tensor.reshape(-1)
++        if speculative
++        else metadata.non_spec_state_indices_tensor[: metadata.num_decodes]
++    )
++    expected_state.index_fill_(0, recurrent_slots, 2.0)
++    if not spec_only:
++        expected_state.index_fill_(0, metadata.prefill_state_indices, 3.0)
++    torch.testing.assert_close(layer.kv_cache[1], expected_state, rtol=0, atol=0)
+     assert calls == (["recurrent"] if spec_only else ["recurrent", "prefill"])
+     assert conv_calls == ([1] if spec_only else ([1, 0] if speculative else [0]))
+     assert events == [("load", "layer"), "compute", *(["state_write"] * len(calls)), "save"]
+diff --git a/tests/ut/models/test_glm5next_mtp_rotation.py b/tests/ut/models/test_glm5next_mtp_rotation.py
+index 04131e0cf..8a837c08c 100644
+--- a/tests/ut/models/test_glm5next_mtp_rotation.py
++++ b/tests/ut/models/test_glm5next_mtp_rotation.py
+@@ -6,6 +6,7 @@ from unittest.mock import patch
+ import pytest
+ import torch
+ from torch import nn
++from vllm.config import CompilationMode
+ 
+ import vllm_ascend.models.glm5next.mtp as mtp_module
+ import vllm_ascend.utils as ascend_utils
+@@ -15,6 +16,7 @@ from vllm_ascend.models.glm5next.mtp import Glm5NextMTP
+ def make_mtp(use_rotation):
+     model = Glm5NextMTP.__new__(Glm5NextMTP)
+     nn.Module.__init__(model)
++    model.do_not_compile = True
+     model.config = SimpleNamespace(num_hidden_layers=45, num_nextn_predict_layers=1, n_routed_experts=0)
+     model.is_rot_weight_used = use_rotation
+     if use_rotation:
+@@ -86,7 +88,11 @@ def test_mtp_transforms_target_and_recycled_hidden_states(use_rotation):
+ def test_rotation_is_gated_by_checkpoint(quant_description, expected):
+     config = SimpleNamespace(hidden_size=4)
+     quant_config = SimpleNamespace(quant_description=quant_description) if quant_description is not None else None
+-    vllm_config = SimpleNamespace(model_config=SimpleNamespace(hf_text_config=config), quant_config=quant_config)
++    vllm_config = SimpleNamespace(
++        model_config=SimpleNamespace(hf_text_config=config),
++        quant_config=quant_config,
++        compilation_config=SimpleNamespace(mode=CompilationMode.NONE),
++    )
+     with (
+         patch.object(mtp_module, "Glm5NextMultiTokenPredictor", return_value=nn.Module()),
+         patch.object(Glm5NextMTP, "set_moe_parameters"),
+diff --git a/tests/ut/models/test_glm5next_pp.py b/tests/ut/models/test_glm5next_pp.py
+index 840908b08..7d472b1f5 100644
+--- a/tests/ut/models/test_glm5next_pp.py
++++ b/tests/ut/models/test_glm5next_pp.py
+@@ -28,6 +28,7 @@ def _stub_model(*, mhc: bool) -> Glm5NextModel:
+     # stub avoids building the NPU-bound attention / MoE stack.
+     model = Glm5NextModel.__new__(Glm5NextModel)
+     nn.Module.__init__(model)
++    model.do_not_compile = True
+     model.config = SimpleNamespace(
+         hidden_size=HIDDEN_SIZE,
+         mhc=mhc,
+diff --git a/tests/ut/test_platform.py b/tests/ut/test_platform.py
+index afc0ed7cd..a7f5ba982 100644
+--- a/tests/ut/test_platform.py
++++ b/tests/ut/test_platform.py
+@@ -312,6 +312,44 @@ def test_visible_device_id_to_physical_device_id():
+         load_extension.assert_called_once_with("vllm_ascend.vllm_ascend_C")
+ 
+ 
++@pytest.mark.parametrize(
++    "mode",
++    [
++        CUDAGraphMode.PIECEWISE,
++        CUDAGraphMode.FULL_AND_PIECEWISE,
++        CUDAGraphMode.FULL,
++        CUDAGraphMode.FULL_DECODE_ONLY,
++        CUDAGraphMode.NONE,
++    ],
++)
++def test_setup_compile_backend_scopes_kda_splitting_to_piecewise(mode):
++    compilation_config = CompilationConfig(
++        mode=CompilationMode.VLLM_COMPILE,
++        cudagraph_mode=mode,
++        splitting_ops=["vllm::mla_forward"],
++        cudagraph_capture_sizes=[8, 16],
++    )
++    config = SimpleNamespace(
++        compilation_config=compilation_config,
++        additional_config={"ascend_compilation_config": {}},
++        model_config=SimpleNamespace(enforce_eager=False),
++        parallel_config=SimpleNamespace(
++            tensor_parallel_size=1,
++            data_parallel_size=1,
++            all2all_backend="allgather_reducescatter",
++            use_sequence_parallel_moe=False,
++        ),
++        _set_cudagraph_sizes=lambda: None,
++    )
++
++    _setup_compile_backend(config, compile_backend="test_backend")
++
++    expected_count = int(mode in (CUDAGraphMode.PIECEWISE, CUDAGraphMode.FULL_AND_PIECEWISE))
++    assert compilation_config.splitting_ops.count("vllm::glm5next_kda_forward") == expected_count
++    if mode in (CUDAGraphMode.FULL, CUDAGraphMode.FULL_DECODE_ONLY):
++        assert compilation_config.splitting_ops == []
++
++
+ class TestNPUPlatform(TestBase):
+     @staticmethod
+     def mock_vllm_config():
+diff --git a/tests/ut/test_utils.py b/tests/ut/test_utils.py
+index a9fb4da3c..6ece8a4c1 100644
+--- a/tests/ut/test_utils.py
++++ b/tests/ut/test_utils.py
+@@ -232,6 +232,23 @@ class TestUtils(TestBase):
+         )
+         self.assertFalse(utils.enable_sp(no_sequence_parallel_config))
+ 
++    def test_pad_sequence_parallel_tokens_pads_unconditionally(self):
++        with mock.patch("vllm.distributed.get_tensor_model_parallel_world_size", return_value=4):
++            padded = utils.pad_sequence_parallel_tokens(torch.zeros(6, 3))
++        self.assertEqual(padded.shape, (8, 3))
++
++        aligned = torch.zeros(8, 3)
++        with (
++            mock.patch("vllm.distributed.get_tensor_model_parallel_world_size", return_value=4),
++            mock.patch("torch.nn.functional.pad", wraps=torch.nn.functional.pad) as mock_pad,
++        ):
++            padded = utils.pad_sequence_parallel_tokens(aligned)
++
++        # An aligned tracing input must still record the pad, otherwise the
++        # replayed graph drops padding for non-aligned token counts.
++        mock_pad.assert_called_once_with(aligned, (0, 0, 0, 0))
++        self.assertEqual(padded.shape, (8, 3))
++
+     def test_enable_dsa_cp_is_independent_from_moe_sequence_parallel(self):
+         ascend_config = SimpleNamespace(enable_dsa_cp=True)
+ 
+diff --git a/vllm_ascend/models/glm5next/kda.py b/vllm_ascend/models/glm5next/kda.py
+index ff7f65047..1e59975fb 100644
+--- a/vllm_ascend/models/glm5next/kda.py
++++ b/vllm_ascend/models/glm5next/kda.py
+@@ -22,6 +22,7 @@ from vllm.model_executor.layers.mamba.mamba_utils import (
+ )
+ from vllm.model_executor.model_loader.weight_utils import default_weight_loader
+ from vllm.model_executor.utils import set_weight_attrs
++from vllm.utils.torch_utils import direct_register_custom_op
+ from vllm.v1.attention.backends.gdn_attn import GDNAttentionMetadata
+ 
+ from vllm_ascend.attention.utils import (
+@@ -450,14 +451,16 @@ class Glm5NextLinearAttention(GatedDeltaNetAttention):
+             dtype=hidden_states.dtype,
+             device=hidden_states.device,
+         )
+-        # Keep the layer's dispatch outside piecewise graph compilation.
+-        self._forward(
++        # Metadata and recurrent cache updates must execute on every invocation,
++        # including when Dynamo traces a profiling run without metadata.
++        torch.ops.vllm.glm5next_kda_forward(
+             qkv_proj_states=qkv,
+             g1=g1,
+             beta=beta,
++            g2=g2,
+             core_attn_out=core_attn_out,
++            layer_name=self.prefix,
+         )
+-        core_attn_out = self.o_norm(core_attn_out, g2)
+         core_attn_out = core_attn_out.reshape(core_attn_out.size(1), -1)
+         output = self.o_proj(core_attn_out)[0]
+         if has_pcp_prefill:
+@@ -714,3 +717,40 @@ class Glm5NextLinearAttention(GatedDeltaNetAttention):
+         else:
+             core_attn_out[0, : output.shape[1]].copy_(output[0])
+         maybe_save_kv_layer_to_connector("", [])
++
++
++def glm5next_kda_forward(
++    qkv_proj_states: torch.Tensor,
++    g1: torch.Tensor,
++    beta: torch.Tensor,
++    g2: torch.Tensor,
++    core_attn_out: torch.Tensor,
++    layer_name: str,
++) -> None:
++    layer = get_forward_context().no_compile_layers[layer_name]
++    layer._forward(qkv_proj_states, g1, beta, core_attn_out)
++    # Triton kernel_side_table indices belong to this process. Keep the gated
++    # norm inside the custom op so serialized FX/AOT graphs do not retain them.
++    # Piecewise replay retains the address of this caller-owned buffer. A
++    # newly allocated norm result would leave the next captured segment
++    # reading the profile run's output instead of this invocation's values.
++    layer.o_norm.forward_oot(core_attn_out, g2, out=core_attn_out)
++
++
++def glm5next_kda_forward_fake(
++    qkv_proj_states: torch.Tensor,
++    g1: torch.Tensor,
++    beta: torch.Tensor,
++    g2: torch.Tensor,
++    core_attn_out: torch.Tensor,
++    layer_name: str,
++) -> None:
++    return
++
++
++direct_register_custom_op(
++    op_name="glm5next_kda_forward",
++    op_func=glm5next_kda_forward,
++    mutates_args=["core_attn_out"],
++    fake_impl=glm5next_kda_forward_fake,
++)
+diff --git a/vllm_ascend/models/glm5next/model.py b/vllm_ascend/models/glm5next/model.py
+index 6db266f17..9148d4582 100644
+--- a/vllm_ascend/models/glm5next/model.py
++++ b/vllm_ascend/models/glm5next/model.py
+@@ -8,6 +8,7 @@ import torch
+ import torch_npu
+ from torch import nn
+ from transformers import Glm5NextTextConfig
++from vllm.compilation.decorators import support_torch_compile
+ from vllm.config import ParallelConfig, VllmConfig
+ from vllm.distributed import (
+     get_ep_group,
+@@ -77,6 +78,8 @@ from vllm.multimodal import MULTIMODAL_REGISTRY
+ from vllm.platforms import current_platform
+ from vllm.sequence import IntermediateTensors
+ 
++from vllm_ascend.utils import pad_sequence_parallel_tokens
++
+ from .attention import Glm5NextMLAAttention
+ from .kda import Glm5NextLinearAttention, get_kda_parallel_size
+ from .multimodal import (
+@@ -481,7 +484,7 @@ class Glm5NextDecoderLayer(nn.Module):
+         )
+ 
+         if self.is_sequence_parallel:
+-            x = sp_reduce_scatter(x)
++            x = sp_reduce_scatter(pad_sequence_parallel_tokens(x))
+ 
+         # Apply post-attention mixing, pre-FFN mixing, then input RMSNorm.
+         residual, post, comb, x = self.hc_post_pre(
+@@ -573,6 +576,7 @@ class Glm5NextDecoderLayer(nn.Module):
+         return residual, post, comb, layer_input
+ 
+ 
++@support_torch_compile
+ class Glm5NextModel(nn.Module):
+     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
+         super().__init__()
+@@ -713,7 +717,7 @@ class Glm5NextModel(nn.Module):
+ 
+         full_num_tokens = positions.shape[0]
+         if self.is_sequence_parallel:
+-            hidden_states = sp_shard(hidden_states)
++            hidden_states = sp_shard(pad_sequence_parallel_tokens(hidden_states))
+ 
+         for layer in self._active_layers:
+             hidden_states, residual, post, comb = layer(positions, hidden_states, residual, post, comb)
+diff --git a/vllm_ascend/models/glm5next/mtp.py b/vllm_ascend/models/glm5next/mtp.py
+index 2733511db..7d0ed48a4 100644
+--- a/vllm_ascend/models/glm5next/mtp.py
++++ b/vllm_ascend/models/glm5next/mtp.py
+@@ -5,6 +5,7 @@ from collections.abc import Callable, Iterable
+ 
+ import torch
+ import torch.nn as nn
++from vllm.compilation.decorators import support_torch_compile
+ from vllm.config import VllmConfig
+ from vllm.model_executor.layers.fused_moe import (
+     fused_moe_make_expert_params_mapping,
+@@ -23,6 +24,7 @@ from vllm.model_executor.models.deepseek_v2 import DeepseekV2MixtureOfExperts
+ from vllm.model_executor.models.utils import maybe_prefix
+ from vllm.platforms import current_platform
+ from vllm.sequence import IntermediateTensors
++from vllm.utils.torch_utils import direct_register_custom_op
+ 
+ from vllm_ascend.ops.triton.linearnorm.fused_eh_norm import fused_eh_norm
+ from vllm_ascend.utils import is_rot_weight_used
+@@ -36,6 +38,39 @@ from .model import (
+ )
+ 
+ 
++def glm5next_mtp_eh_norm(
++    positions: torch.Tensor,
++    inputs_embeds: torch.Tensor,
++    previous_hidden: torch.Tensor,
++    enorm_weight: torch.Tensor,
++    hnorm_weight: torch.Tensor,
++    eps: float,
++) -> torch.Tensor:
++    # Keep the Triton launch opaque to Dynamo. The current Ascend generated-code
++    # cache can retain process-local kernel_side_table indices for directly
++    # captured launches, which cannot be replayed in a fresh process.
++    return fused_eh_norm(positions, inputs_embeds, previous_hidden, enorm_weight, hnorm_weight, eps)
++
++
++def glm5next_mtp_eh_norm_fake(
++    positions: torch.Tensor,
++    inputs_embeds: torch.Tensor,
++    previous_hidden: torch.Tensor,
++    enorm_weight: torch.Tensor,
++    hnorm_weight: torch.Tensor,
++    eps: float,
++) -> torch.Tensor:
++    return inputs_embeds.new_empty((inputs_embeds.shape[0], 2 * inputs_embeds.shape[1]))
++
++
++direct_register_custom_op(
++    op_name="glm5next_mtp_eh_norm",
++    op_func=glm5next_mtp_eh_norm,
++    mutates_args=[],
++    fake_impl=glm5next_mtp_eh_norm_fake,
++)
++
++
+ class Glm5NextMultiTokenPredictorLayer(nn.Module):
+     def __init__(self, vllm_config: VllmConfig, prefix: str) -> None:
+         super().__init__()
+@@ -87,7 +122,7 @@ class Glm5NextMultiTokenPredictorLayer(nn.Module):
+     ) -> torch.Tensor:
+         assert inputs_embeds is not None
+         # Fused: zero pos-0 embeds + enorm(embeds) + hnorm(prev) + cat -> [N, 2H].
+-        eh_input = fused_eh_norm(
++        eh_input = torch.ops.vllm.glm5next_mtp_eh_norm(
+             positions,
+             inputs_embeds,
+             previous_hidden_states,
+@@ -197,6 +232,7 @@ class Glm5NextMultiTokenPredictor(nn.Module):
+         return self.logits_processor.get_top_tokens(mtp_layer.shared_head.head, hidden_states)
+ 
+ 
++@support_torch_compile
+ class Glm5NextMTP(nn.Module, DeepseekV2MixtureOfExperts):
+     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
+         super().__init__()
+diff --git a/vllm_ascend/platform.py b/vllm_ascend/platform.py
+index 1b631bfee..2bb1e3a7a 100644
+--- a/vllm_ascend/platform.py
++++ b/vllm_ascend/platform.py
+@@ -1439,6 +1439,7 @@ def _setup_compile_backend(
+                 "vllm::mla_forward",
+                 "vllm::dsa_forward",
+                 "vllm::minimax_m3_fused_sparse_forward",
++                "vllm::glm5next_kda_forward",
+             ]
+         )
+         additional_config["ascend_compilation_config"]["enable_npugraph_ex"] = False
+diff --git a/vllm_ascend/utils.py b/vllm_ascend/utils.py
+index c6777d3d2..42974597a 100644
+--- a/vllm_ascend/utils.py
++++ b/vllm_ascend/utils.py
+@@ -1024,6 +1024,20 @@ def enable_sp(vllm_config=None) -> bool:
+     return bool(vllm_config.parallel_config.use_sequence_parallel_moe)
+ 
+ 
++def pad_sequence_parallel_tokens(hidden_states: torch.Tensor) -> torch.Tensor:
++    """Pad the token dim of ``hidden_states`` up to the TP size.
++
++    Always call pad(), even with zero padding, to avoid specializing the
++    padding branch during tracing.
++    """
++    from vllm.distributed import get_tensor_model_parallel_world_size
++
++    tp_size = get_tensor_model_parallel_world_size()
++    padding = (-hidden_states.shape[0]) % tp_size
++    pad = (0, 0) * (hidden_states.ndim - 1) + (0, padding)
++    return torch.nn.functional.pad(hidden_states, pad)
++
++
+ # TODO remove it after vllm has this func
+ def shared_expert_dp_enabled() -> bool:
+     return get_ascend_config().enable_shared_expert_dp

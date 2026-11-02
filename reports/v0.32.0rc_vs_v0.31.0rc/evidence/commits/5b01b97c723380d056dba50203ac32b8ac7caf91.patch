@@ -1,0 +1,2823 @@
+commit 5b01b97c723380d056dba50203ac32b8ac7caf91
+Author:     Zhaocen <zhaocen309@163.com>
+AuthorDate: Tue Oct 27 09:40:22 2026 +0800
+Commit:     GitHub <noreply@github.com>
+CommitDate: Tue Oct 27 09:40:22 2026 +0800
+
+    [Feature][Model] Support GLM-5.3-Flash with PCP (#18511)
+    
+    ### What this PR does / why we need it?
+    
+    Enable prefill context parallelism (PCP) for GLM-5.3-Flash on Ascend.
+    KPool compression and cache writes consume global causal token order
+    while sparse queries remain local to each PCP rank.
+    
+    For KPool configurations using packed SFA C8 main KV cache, this PR
+    depends on #19079 for cache layout selection, allocation, reshaping, and
+    associated regression coverage.
+    
+    - Read PCP context and cache-group indices from
+    `AscendCommonAttentionMetadata` after rebasing. Keep metadata buffers
+    independent across MTP draft steps and graph replay.
+    - Gather and restore KPool inputs before compression. Keep NoPE SFA KV
+    and cache slots in matching rank-gather order, removing redundant
+    `index_select` operations and cache-write metadata.
+    - Restore causal token order for KDA recurrent updates and use global
+    request metadata for Runner V2 Mamba state handling.
+    - Shard KDA projections, gates, convolution weights, and recurrent state
+    across PCP ranks when TP=1, and reduce the output over PCP. Retain TP
+    head sharding when TP>1.
+    - Remove the leftover rank-based convolution initial-state override from
+    the shared GDN builder. Fresh requests and continuations retain their
+    actual initial-state masks without a GLM-specific builder.
+    - Add multimodal padding/EVS regression coverage for the existing Runner
+    V2 preparation flow. `vllm_ascend/worker/v2/model_states/default.py`
+    matches the PR base and has no diff.
+    - Keep the main KPool capture adapter for capture-specific state-table
+    allocation; remove obsolete PCP kwargs forwarding and the redundant tail
+    capture override.
+    
+    - Reuse the shared PCP cache-input gather for NoPE, preserving padded
+    rank strides and using the returned slot mapping to avoid duplicate
+    replicated decode writes.
+    - Separate Mamba PCP padding selection from context propagation, cache
+    PCP group information in KDA layers, and document remaining head/decode
+    sharding work with TODOs.
+    
+    ### Does this PR introduce _any_ user-facing change?
+    
+    Yes. GLM-5.3-Flash can use PCP on supported Ascend hardware through the
+    existing `--prefill-context-parallel-size` option. No new environment
+    variable or CLI option is introduced.
+    
+    ### How was this patch tested?
+    
+    Current head: `98d23a27e06ef3b5ee64812bd885c78388bdf508`, one commit
+    based on Ascend main `7ec720c5f8a542e08729d3a785f365cd967da418`.
+    
+    - **42 focused isolated CPU checks passed on `5d2d605f4`** (this head
+    only removes the release-note fragment; Python sources are unchanged),
+    executing methods and test functions from the current sources with
+    runtime imports and NPU/distributed boundaries mocked. Coverage includes
+    the NoPE shared-gather path with mixed decode/prefill, padded and empty
+    local inputs, KDA gather/output mapping, Mamba padding independent of
+    PCP context, GDN context propagation, and parallelism policy. This is
+    source-level isolated testing, not a normal full-module pytest or NPU
+    run.
+    - Regression tests updated in `tests/ut/attention/test_sfa_cp.py`,
+    `tests/ut/models/test_glm5next_kda_dispatch.py`,
+    `tests/ut/models/test_glm5next_kda_pcp.py`,
+    `tests/ut/ops/test_gdn_attn_builder.py`, and
+    `tests/ut/worker/test_model_runner_v2_mamba.py`.
+    - All-file `pre-commit run ruff-check --all-files --hook-stage manual`
+    and `pre-commit run ruff-format --all-files --hook-stage manual` passed.
+    - Python syntax checks passed for all 20 PR Python files; `git diff
+    --check` passed.
+    - Normal pytest for the five affected test modules could not load the
+    shared conftest on the local Windows CPU environment: vLLM is not
+    installed, and pointing PYTHONPATH at the local upstream checkout then
+    encounters the missing `uvloop` dependency.
+    - Full `bash format.sh ci` was attempted again but was interrupted after
+    the Markdown lint Node environment installation stalled during
+    dependency download. Full pre-commit/CI, NPU correctness/performance,
+    E2E, and PCP PIECEWISE capture/replay validation remain required before
+    merge.
+    - The earlier head `8851b761` previously passed 76 isolated CPU
+    regression cases; that broader isolated set was not rerun on this head.
+    
+    - vLLM main:
+    https://github.com/vllm-project/vllm/commit/c0b6f74bee518aeaf5d72b200a0216e72fbb5e7c
+    
+    Signed-off-by: QiuChunshuo <qiuchunshuo@huawei.com>
+    Signed-off-by: Zhaocen <zhaocen309@163.com>
+    Signed-off-by: Zhaocen <zhaocen@huawei.com>
+    Co-authored-by: QiuChunshuo <qiuchunshuo@huawei.com>
+
+diff --git a/tests/ut/attention/test_sfa_cp.py b/tests/ut/attention/test_sfa_cp.py
+index 76a2cb692..1217e46e8 100644
+--- a/tests/ut/attention/test_sfa_cp.py
++++ b/tests/ut/attention/test_sfa_cp.py
+@@ -6,6 +6,7 @@ from unittest.mock import MagicMock, Mock, patch
+ 
+ import pytest
+ import torch
++from vllm.v1.attention.ops.pcp import _gather_prefill_cache_inputs
+ 
+ from vllm_ascend.attention.attention_v1 import AscendAttentionState
+ from vllm_ascend.attention.context_parallel.common_cp import DCPMetadataBuilderMixin
+@@ -682,6 +683,7 @@ def test_sfa_pcp_dcp_only_overrides_main_cache_slot_mapping() -> None:
+ def test_sfa_pcp_gathers_main_kv_before_base_cache_write() -> None:
+     impl = AscendSFAPCPImpl.__new__(AscendSFAPCPImpl)
+     impl.is_pcp_decode_sharded = False
++    impl.qk_rope_head_dim = 64
+     attn_metadata = SimpleNamespace(num_decode_tokens=1, num_prefills=1)
+     kv_no_split = torch.arange(6, dtype=torch.float32).view(2, 3)
+     cos = torch.arange(2, dtype=torch.float32).view(2, 1)
+@@ -715,6 +717,148 @@ def test_sfa_pcp_gathers_main_kv_before_base_cache_write() -> None:
+     )
+ 
+ 
++def test_sfa_pcp_gathers_nope_kv_without_rope() -> None:
++    impl = AscendSFAPCPImpl.__new__(AscendSFAPCPImpl)
++    impl.is_pcp_decode_sharded = False
++    impl.qk_rope_head_dim = 0
++    attn_metadata = SimpleNamespace(num_decode_tokens=1, num_prefills=1, num_input_tokens=2)
++    kv_no_split = torch.arange(6, dtype=torch.float32).view(2, 3)
++    slots = torch.tensor([0, 1, 0, 5], dtype=torch.int64)
++    gathered_prefill_kv = torch.tensor([[3.0, 4.0, 5.0], [9.0, 10.0, 11.0]])
++    gathered_kv = torch.cat((kv_no_split[:1], gathered_prefill_kv))
++    gathered_slots = torch.tensor([0, 1, 5])
++    kv_cache = (torch.empty(1),)
++
++    with (
++        patch(
++            "vllm.v1.attention.ops.pcp.get_pcp_group",
++            return_value=SimpleNamespace(world_size=2, all_gather=Mock(return_value=gathered_prefill_kv)),
++        ) as group,
++        patch(
++            "vllm_ascend.attention.context_parallel.sfa_cp._gather_prefill_cache_inputs",
++            wraps=_gather_prefill_cache_inputs,
++        ) as gather,
++        patch.object(AscendSFAImpl, "exec_kv", autospec=True, return_value="written") as base_exec_kv,
++    ):
++        result = impl.exec_kv(kv_no_split, None, None, kv_cache, slots, attn_metadata)
++
++    assert result == "written"
++    gather.assert_called_once_with((kv_no_split,), slots, 1)
++    group.return_value.all_gather.assert_called_once()
++    torch.testing.assert_close(group.return_value.all_gather.call_args.args[0], kv_no_split[1:])
++    base_exec_kv.assert_called_once()
++    args = base_exec_kv.call_args.args
++    assert args[0] is impl and args[3] is None and args[2] is None
++    assert args[4] is kv_cache and args[6] is attn_metadata
++    torch.testing.assert_close(args[1], gathered_kv)
++    torch.testing.assert_close(args[5], gathered_slots)
++
++
++@pytest.mark.parametrize("packed_cache", [False, True])
++@pytest.mark.parametrize("num_decode_tokens", [0, 1])
++def test_sfa_pcp_gathers_nope_kv_with_padded_rank_slots(packed_cache: bool, num_decode_tokens: int) -> None:
++    impl = AscendSFAPCPImpl.__new__(AscendSFAPCPImpl)
++    impl.is_pcp_decode_sharded = False
++    impl.qk_rope_head_dim = 0
++    impl.enable_sparse_sfa_c8 = packed_cache
++    impl.enable_sparse_sfa_turboquant = False
++    attn_metadata = SimpleNamespace(
++        num_decode_tokens=num_decode_tokens,
++        num_prefills=1,
++        num_input_tokens=8,
++    )
++    kv_no_split = torch.arange(5, dtype=torch.float32).view(5, 1)
++    # Slot mapping keeps eight positions per PCP rank, while NoPE KV has five.
++    slots = torch.tensor([0, 1, 2, 3, 4, -1, -1, -1, 8, 9, 10, 11, 12, -1, -1, -1])
++    slots[8 : 8 + num_decode_tokens] = slots[:num_decode_tokens]
++    kv_cache = (torch.empty(1),)
++
++    def all_gather(tensor: torch.Tensor, dim: int = 0) -> torch.Tensor:
++        padded_kv = torch.tensor([0, 1, 2, 3, 4, 0, 0, 0]).view(8, 1).float()
++        torch.testing.assert_close(tensor, padded_kv[num_decode_tokens:])
++        remote_kv = torch.arange(10 + num_decode_tokens, 18, dtype=torch.float32).view(-1, 1)
++        return torch.cat((tensor, remote_kv), dim=dim)
++
++    group = SimpleNamespace(
++        world_size=2,
++        all_gather=all_gather,
++    )
++
++    with (
++        patch("vllm.v1.attention.ops.pcp.get_pcp_group", return_value=group),
++        patch.object(AscendSFAImpl, "exec_kv", autospec=True, return_value="written") as base_exec_kv,
++    ):
++        result = impl.exec_kv(kv_no_split, None, None, kv_cache, slots, attn_metadata)
++
++    assert result == "written"
++    gathered_kv = base_exec_kv.call_args.args[1]
++    gathered_slots = base_exec_kv.call_args.args[5]
++    expected_kv = torch.tensor([0, 1, 2, 3, 4, 0, 0, 0, *range(10 + num_decode_tokens, 18)]).view(-1, 1).float()
++    torch.testing.assert_close(gathered_kv, expected_kv)
++    torch.testing.assert_close(gathered_slots, torch.cat((slots[:8], slots[8 + num_decode_tokens :])))
++
++
++def test_sfa_pcp_packed_kv_writes_gather_order_slots() -> None:
++    impl = AscendSFAPCPImpl.__new__(AscendSFAPCPImpl)
++    impl.enable_sparse_sfa_c8 = True
++    impl.enable_sparse_sfa_turboquant = False
++    impl.sfa_qsfa_packed_kv_head_dim = 4
++    metadata = SimpleNamespace(num_actual_tokens=1)
++    k_pe = torch.ones(2, 1, 1)
++    k_nope = torch.ones(2, 1, 2)
++    knope_scale = torch.ones(2, 1, 1)
++    kv_cache = (torch.empty(1, 1, 1, 4),)
++
++    with patch("vllm_ascend.attention.sfa_v1.DeviceOperator.scatter_cache") as scatter:
++        impl._store_parallel_kv(
++            k_pe,
++            k_nope,
++            knope_scale,
++            None,
++            [],
++            kv_cache,
++            torch.tensor([4, 8]),
++            metadata,
++            False,
++        )
++
++    scatter.assert_called_once()
++    torch.testing.assert_close(scatter.call_args.args[1], torch.tensor([[4], [8]]))
++    assert scatter.call_args.args[2].shape[0] == 2
++
++
++def test_sfa_pcp_gathers_nope_kv_when_local_rank_has_no_prefill() -> None:
++    impl = AscendSFAPCPImpl.__new__(AscendSFAPCPImpl)
++    impl.is_pcp_decode_sharded = False
++    impl.qk_rope_head_dim = 0
++    impl.enable_sparse_sfa_c8 = False
++    impl.enable_sparse_sfa_turboquant = False
++    metadata = SimpleNamespace(
++        num_decode_tokens=0,
++        num_prefills=0,
++        num_input_tokens=8,
++        pcp_has_global_prefill=True,
++    )
++    slots = torch.tensor([-1] * 8 + [8, 9, 10, -1, -1, -1, -1, -1])
++    group = SimpleNamespace(
++        world_size=2,
++        all_gather=lambda tensor, dim=0: torch.cat((tensor, torch.arange(10, 18).view(8, 1).float()), dim=dim),
++    )
++
++    with (
++        patch("vllm.v1.attention.ops.pcp.get_pcp_group", return_value=group),
++        patch.object(AscendSFAImpl, "exec_kv", autospec=True, return_value="written") as base_exec_kv,
++    ):
++        result = impl.exec_kv(torch.empty(0, 1), None, None, (torch.empty(1),), slots, metadata)
++
++    assert result == "written"
++    gathered_kv = base_exec_kv.call_args.args[1]
++    gathered_slots = base_exec_kv.call_args.args[5]
++    assert gathered_kv.shape == (16, 1)
++    torch.testing.assert_close(gathered_slots, slots)
++    torch.testing.assert_close(gathered_kv[gathered_slots >= 0], torch.tensor([[10.0], [11.0], [12.0]]))
++
++
+ def test_sfa_pcp_o_proj_switch_slices_the_tp_local_weight_by_pcp_rank() -> None:
+     AscendSFAPCPImpl.o_proj_full_pools.clear()
+     impl = _make_pcp_o_proj_impl()
+@@ -1498,7 +1642,9 @@ def test_sfa_pcp_metadata_keeps_global_prefill_when_local_rank_is_empty(global_h
+     builder = _make_sfa_split_builder(use_pcp=True)
+     common = _make_sfa_split_common([1], [False], 1, 1, padded_tokens=2)
+     common.slot_mapping = torch.tensor([0, -1, -1, -1])
+-    context = SimpleNamespace(global_batch=SimpleNamespace(is_prefilling_np=torch.tensor([global_has_prefill])))
++    context = SimpleNamespace(
++        global_batch=SimpleNamespace(is_prefilling_np=torch.tensor([global_has_prefill])),
++    )
+     group = SimpleNamespace(world_size=2, rank_in_group=1)
+     with (
+         patch(
+@@ -1544,6 +1690,7 @@ def test_sfa_pcp_builder_prepares_local_prolog_slots():
+ def test_sfa_pcp_empty_local_prefill_joins_kv_gathers():
+     impl = AscendSFAPCPImpl.__new__(AscendSFAPCPImpl)
+     impl.is_pcp_decode_sharded = False
++    impl.qk_rope_head_dim = 64
+     impl.enable_sparse_sfa_c8 = False
+     impl.enable_sparse_sfa_turboquant = False
+     metadata = SimpleNamespace(
+diff --git a/tests/ut/attention/test_sfa_v1.py b/tests/ut/attention/test_sfa_v1.py
+index 1dc89a794..18b1142ad 100644
+--- a/tests/ut/attention/test_sfa_v1.py
++++ b/tests/ut/attention/test_sfa_v1.py
+@@ -178,6 +178,44 @@ class TestAscendSFADeviceOperator(TestBase):
+         self.assertIs(actual_softmax_sum, softmax_sum)
+         self.assertTrue(mock_sfa.call_args.kwargs["return_softmax_lse"])
+ 
++    def test_execute_sparse_flash_attention_nope_single_cache_returns_lse(self):
++        (
++            impl,
++            ql_nope,
++            _,
++            topk_indices,
++            attn_metadata,
++            actual_seq_lengths_query,
++            actual_seq_lengths_key,
++        ) = self._make_common_inputs()
++        impl.qk_rope_head_dim = 0
++        kv_cache = (torch.randn(4, 1, 1, 8),)
++        result = (torch.randn(3, 4, 8), torch.zeros(1, 3, 4), torch.ones(1, 3, 4))
++
++        with patch.object(
++            torch.ops._C_ascend,
++            "npu_sparse_flash_attention",
++            create=True,
++            return_value=result,
++        ) as mock_sfa:
++            actual = DeviceOperator.execute_sparse_flash_attention_process(
++                impl,
++                ql_nope,
++                torch.empty(3, 4, 0),
++                kv_cache,
++                topk_indices,
++                attn_metadata,
++                actual_seq_lengths_query,
++                actual_seq_lengths_key,
++                sparse_mode=0,
++                return_lse=True,
++            )
++
++        self.assertIs(actual, result)
++        self.assertIsNone(mock_sfa.call_args.kwargs["query_rope"])
++        self.assertIsNone(mock_sfa.call_args.kwargs["key_rope"])
++        self.assertTrue(mock_sfa.call_args.kwargs["return_softmax_lse"])
++
+     def test_execute_sparse_flash_attention_c8_returns_softmax_components(self):
+         (
+             impl,
+diff --git a/tests/ut/models/test_glm5next_kda_dispatch.py b/tests/ut/models/test_glm5next_kda_dispatch.py
+index 745f515d1..a5fe33343 100644
+--- a/tests/ut/models/test_glm5next_kda_dispatch.py
++++ b/tests/ut/models/test_glm5next_kda_dispatch.py
+@@ -9,6 +9,67 @@ import torch
+ import vllm_ascend.models.glm5next.kda as model_kda
+ 
+ 
++def test_glm_kda_backend_declares_pcp_support() -> None:
++    backend = model_kda.Glm5NextLinearAttention.get_attn_backend(None)
++
++    assert backend.supports_pcp()
++    assert not model_kda.AscendGDNHostMetadataBackend.supports_pcp()
++    assert backend.get_builder_cls() is model_kda.AscendGDNHostMetadataBackend.get_builder_cls()
++
++
++@pytest.mark.parametrize("pcp_rank", [0, 1])
++@pytest.mark.parametrize("has_prefill", [False, True])
++def test_kda_pcp_restores_prefill_and_skips_decode_gather(monkeypatch, pcp_rank, has_prefill):
++    layer = model_kda.Glm5NextLinearAttention.__new__(model_kda.Glm5NextLinearAttention)
++    torch.nn.Module.__init__(layer)
++    layer.prefix = "layer"
++    layer.local_projection_size = 2
++    layer.local_num_heads = 1
++    layer.head_dim = 2
++
++    def project(x):
++        projected = torch.zeros(x.shape[0], 11)
++        projected[:, 0] = x[:, 0]
++        return projected, None
++
++    layer.in_proj_qkvbfg_a = project
++    layer.f_b_proj = lambda x: (torch.zeros(x.shape[0], 2), None)
++    layer.g_b_proj = lambda x: (torch.zeros(x.shape[0], 2), None)
++    layer.o_norm = lambda x, gate: x
++    layer.o_proj = lambda x: (x, None)
++    seen = []
++
++    def run_kda(qkv_proj_states, g1, beta, core_attn_out):
++        seen.extend(qkv_proj_states[:, 0].tolist())
++        core_attn_out[0, :, 0, 0] = qkv_proj_states[:, 0]
++        core_attn_out[0, :, 0, 1].zero_()
++
++    layer._forward = run_kda
++    pcp_context = SimpleNamespace(
++        global_batch=SimpleNamespace(is_prefilling_np=torch.tensor([has_prefill])),
++        hidden_restore_idx=torch.tensor([0, 1, 4, 5, 6, 7, 2]),
++        padded_gather_idx=torch.tensor([0, 1, 6, 0, 2, 3, 4, 5]),
++    )
++    metadata = SimpleNamespace(pcp_context=pcp_context)
++    monkeypatch.setattr(model_kda, "get_forward_context", lambda: SimpleNamespace(attn_metadata={"layer": metadata}))
++    gathered = torch.tensor([[0.0], [1.0], [6.0], [-1.0], [2.0], [3.0], [4.0], [5.0]])
++    pcp_group = SimpleNamespace(
++        world_size=2,
++        rank_in_group=pcp_rank,
++        all_gather=lambda x, dim: gathered if has_prefill else pytest.fail("decode must not gather PCP tokens"),
++    )
++    layer.pcp_group = pcp_group
++    layer.pcp_size = pcp_group.world_size
++    layer.pcp_rank = pcp_group.rank_in_group
++
++    local_input = gathered[pcp_rank * 4 : (pcp_rank + 1) * 4]
++    output = layer(local_input, torch.arange(4))
++
++    assert seen == (list(range(7)) if has_prefill else local_input[:, 0].tolist())
++    expected = ([0.0, 1.0, 6.0, 0.0] if pcp_rank == 0 else [2.0, 3.0, 4.0, 5.0]) if has_prefill else seen
++    assert output[:, 0].tolist() == expected
++
++
+ @pytest.mark.parametrize(("speculative", "spec_only"), [(False, False), (True, False), (True, True)])
+ @pytest.mark.parametrize("dim_first", [False, True])
+ def test_decode_and_prefill_use_their_own_metadata_and_merge_outputs(monkeypatch, speculative, spec_only, dim_first):
+diff --git a/tests/ut/models/test_glm5next_kda_pcp.py b/tests/ut/models/test_glm5next_kda_pcp.py
+new file mode 100644
+index 000000000..01f2932e5
+--- /dev/null
++++ b/tests/ut/models/test_glm5next_kda_pcp.py
+@@ -0,0 +1,176 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++
++from types import SimpleNamespace
++from unittest.mock import Mock
++
++import pytest
++import torch
++from vllm.model_executor import custom_op, parameter
++from vllm.model_executor.layers import linear
++
++import vllm_ascend.models.glm5next.kda as model_kda
++from vllm_ascend.models.glm5next.model import Glm5NextForCausalLM
++
++
++@pytest.fixture
++def parallel_groups(monkeypatch):
++    # Exercise inherited vLLM loaders without Ascend's OOT class replacement.
++    for name in ("ColumnParallelLinear", "RowParallelLinear"):
++        monkeypatch.delitem(custom_op.op_registry_oot, name, raising=False)
++    monkeypatch.setattr(linear, "get_tensor_model_parallel_world_size", lambda: 1)
++    monkeypatch.setattr(linear, "get_tensor_model_parallel_rank", lambda: 0)
++    monkeypatch.setattr(
++        parameter, "get_tensor_model_parallel_world_size", lambda: linear.get_tensor_model_parallel_world_size()
++    )
++    monkeypatch.setattr(parameter, "get_tensor_model_parallel_rank", lambda: linear.get_tensor_model_parallel_rank())
++    # Exercise shard loaders and collectives without platform GEMM setup.
++    monkeypatch.setattr(
++        linear,
++        "dispatch_unquantized_gemm",
++        lambda backend: lambda layer, x, weight, bias: torch.nn.functional.linear(x, weight, bias),
++    )
++    group = SimpleNamespace(world_size=4, rank_in_group=2, all_gather=Mock(), all_reduce=Mock())
++    monkeypatch.setattr(model_kda, "get_pcp_group", lambda: group)
++    return group
++
++
++@pytest.mark.parametrize("loader_name", ["weight_loader", "weight_loader_v2"])
++@pytest.mark.parametrize("rank", [0, 1, 2, 3])
++def test_pcp_merged_projection_loads_heads_and_replicates_low_rank_shards(parallel_groups, loader_name, rank):
++    parallel_groups.rank_in_group = rank
++    sizes = [8, 8, 8, 4, 2, 2]
++    layer = model_kda.PCPGlm5NextMergedColumnParallelLinear(
++        3, sizes, replicated_shard_ids=(4, 5), tp_size=4, bias=False, params_dtype=torch.float32
++    )
++    weights = [
++        torch.arange(size * 3, dtype=torch.float32).reshape(size, 3) + 100 * sid for sid, size in enumerate(sizes)
++    ]
++    expected = []
++    for sid, weight in enumerate(weights):
++        getattr(layer, loader_name)(layer.weight, weight, sid)
++        expected.append(weight if sid in (4, 5) else weight.chunk(4)[rank])
++        assert layer.tp_rank == layer.weight.tp_rank == rank
++    x = torch.tensor([[1.0, 2.0, 3.0]])
++    torch.testing.assert_close(layer(x)[0], x @ torch.cat(expected).T)
++    assert layer.tp_size == layer.weight.tp_size == 4
++    assert sizes == [8, 8, 8, 4, 2, 2]
++    parallel_groups.all_gather.assert_not_called()
++
++
++@pytest.mark.parametrize("loader_name", ["weight_loader", "weight_loader_v2"])
++@pytest.mark.parametrize("gather_output", [False, True])
++def test_pcp_column_projection_gathers_with_pcp_group(parallel_groups, loader_name, gather_output):
++    layer = model_kda.PCPColumnParallelLinear(3, 8, bias=False, gather_output=gather_output, params_dtype=torch.float32)
++    weight = torch.arange(24, dtype=torch.float32).reshape(8, 3)
++    getattr(layer, loader_name)(layer.weight, weight)
++    x = torch.tensor([[1.0, 2.0, 3.0]])
++    local = x @ weight[4:6].T
++    gathered = x @ weight.T
++    parallel_groups.all_gather.return_value = gathered
++    torch.testing.assert_close(layer(x)[0], gathered if gather_output else local)
++    if gather_output:
++        torch.testing.assert_close(parallel_groups.all_gather.call_args.args[0], local)
++        assert parallel_groups.all_gather.call_args.kwargs == {"dim": -1}
++    else:
++        parallel_groups.all_gather.assert_not_called()
++
++
++@pytest.mark.parametrize("loader_name", ["weight_loader", "weight_loader_v2"])
++@pytest.mark.parametrize("input_is_parallel", [False, True])
++@pytest.mark.parametrize("reduce_results", [False, True])
++def test_pcp_output_projection_loads_input_heads_and_reduces_over_pcp(
++    parallel_groups, loader_name, input_is_parallel, reduce_results
++):
++    layer = model_kda.PCPRowParallelLinear(
++        8, 3, bias=False, input_is_parallel=input_is_parallel, reduce_results=reduce_results, params_dtype=torch.float32
++    )
++    weight = torch.arange(24, dtype=torch.float32).reshape(3, 8)
++    getattr(layer, loader_name)(layer.weight, weight)
++    torch.testing.assert_close(layer.weight, weight[:, 4:6])
++    assert layer.tp_rank == layer.weight.tp_rank == 2
++    assert layer.tp_size == layer.weight.tp_size == 4
++    x = torch.arange(8, dtype=torch.float32).reshape(1, 8)
++    local = x[:, 4:6] @ weight[:, 4:6].T
++    full = x @ weight.T
++    parallel_groups.all_reduce.return_value = full
++    output = layer(x[:, 4:6] if input_is_parallel else x)[0]
++    torch.testing.assert_close(output, full if reduce_results else local)
++    if reduce_results:
++        torch.testing.assert_close(parallel_groups.all_reduce.call_args.args[0], local)
++    else:
++        parallel_groups.all_reduce.assert_not_called()
++
++
++@pytest.mark.parametrize(("tp_size", "pcp_size"), [(1, 1), (1, 2), (1, 4), (2, 1), (2, 4), (4, 2)])
++def test_kda_projection_and_state_sharding_follow_pcp_only_with_tp_one(monkeypatch, parallel_groups, tp_size, pcp_size):
++    # Construct the complete KDA layer to catch mismatched projection, gate,
++    # convolution, and cache dimensions, including the TP>1 fallback.
++    monkeypatch.setattr(linear, "get_tensor_model_parallel_world_size", lambda: tp_size)
++    monkeypatch.setattr(linear, "get_tensor_model_parallel_rank", lambda: tp_size - 1)
++    parallel_groups.world_size = pcp_size
++    parallel_groups.rank_in_group = pcp_size - 1
++    config = SimpleNamespace(
++        hidden_size=16,
++        linear_head_dim=128,
++        linear_num_heads=8,
++        linear_conv_kernel_dim=4,
++        linear_lower_bound=-4,
++    )
++    vllm_config = SimpleNamespace(
++        parallel_config=SimpleNamespace(tensor_parallel_size=tp_size, prefill_context_parallel_size=pcp_size),
++        model_config=SimpleNamespace(dtype=torch.bfloat16, hf_config=config),
++        cache_config=SimpleNamespace(mamba_cache_dtype="auto"),
++        speculative_config=None,
++        quant_config=None,
++        compilation_config=SimpleNamespace(static_forward_context={}),
++    )
++
++    def init_base(self, config, vllm_config, prefix):
++        torch.nn.Module.__init__(self)
++        self.tp_size, self.tp_rank = tp_size, tp_size - 1
++        self.hidden_size = config.hidden_size
++        self.quant_config = vllm_config.quant_config
++        self.num_spec = 0
++
++    monkeypatch.setattr(model_kda.GatedDeltaNetAttention, "__init__", init_base)
++    monkeypatch.setattr(model_kda, "get_current_vllm_config", lambda: vllm_config)
++    monkeypatch.setattr("vllm_ascend.utils.register_ascend_fla_customop", lambda: None)
++    monkeypatch.setattr(
++        "vllm.third_party.flash_linear_attention.ops.kda.FusedRMSNormGated", lambda *args, **kwargs: torch.nn.Identity()
++    )
++    layer = model_kda.Glm5NextLinearAttention(config, vllm_config, prefix="model.layers.0.linear_attn")
++    assert layer.pcp_group is parallel_groups
++    assert layer.pcp_size == pcp_size
++    assert layer.pcp_rank == pcp_size - 1
++    size = pcp_size if tp_size == 1 else tp_size
++    rank = pcp_size - 1 if tp_size == 1 else tp_size - 1
++    assert layer.tp_size == size and layer.tp_rank == rank
++    assert layer.local_num_heads == 8 // size
++    assert layer.local_projection_size == 1024 // size
++    assert layer.use_pcp_head_sharding == (tp_size == 1 and pcp_size > 1)
++    assert (
++        isinstance(layer.in_proj_qkvbfg_a, model_kda.PCPGlm5NextMergedColumnParallelLinear)
++        == layer.use_pcp_head_sharding
++    )
++    assert isinstance(layer.o_proj, model_kda.PCPRowParallelLinear) == layer.use_pcp_head_sharding
++    for name in ("f_b_proj", "g_b_proj", "q_conv1d", "k_conv1d", "v_conv1d"):
++        projection = getattr(layer, name)
++        assert isinstance(projection, model_kda.PCPColumnParallelLinear) == layer.use_pcp_head_sharding
++        assert projection.weight.shape[0] == 1024 // size
++    assert layer.in_proj_qkvbfg_a.weight.shape[0] == 3 * 1024 // size + 8 // size + 2 * 128
++    assert layer.o_proj.weight.shape == (16, 1024 // size)
++    assert layer.get_state_shape() == Glm5NextForCausalLM.get_mamba_state_shape_from_config(vllm_config)
++    assert layer.get_state_shape()[1] == (8 // size, 128, 128)
++
++    dt_bias = torch.arange(1024, dtype=torch.float32)
++    layer.dt_bias.weight_loader(layer.dt_bias, dt_bias)
++    torch.testing.assert_close(layer.dt_bias, dt_bias.chunk(size)[rank])
++    a_log = torch.arange(8, dtype=torch.float32)
++    layer.A_log.weight_loader(layer.A_log, a_log)
++    torch.testing.assert_close(layer.A_log.flatten(), a_log.chunk(size)[rank])
++
++
++def test_pcp_head_count_must_be_divisible(monkeypatch, parallel_groups):
++    with pytest.raises(AssertionError):
++        model_kda.PCPColumnParallelLinear(3, 6, bias=False)
+diff --git a/tests/ut/models/test_glm5next_kpool_model_backend.py b/tests/ut/models/test_glm5next_kpool_model_backend.py
+index 330ac7931..bd9036cee 100644
+--- a/tests/ut/models/test_glm5next_kpool_model_backend.py
++++ b/tests/ut/models/test_glm5next_kpool_model_backend.py
+@@ -2,6 +2,7 @@
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+ 
+ import importlib.util
++from dataclasses import replace
+ from types import SimpleNamespace
+ from unittest.mock import MagicMock, patch
+ 
+@@ -151,22 +152,9 @@ def test_triton_indexer_updates_both_caches_and_masks_padding(monkeypatch, compu
+         select.assert_not_called()
+ 
+ 
+-@pytest.mark.parametrize(
+-    ("pcp_size", "dcp_size"),
+-    [(2, 1), (1, 2)],
+-)
+-def test_kpool_backend_rejects_context_parallelism(pcp_size: int, dcp_size: int) -> None:
+-    source = SimpleNamespace(
+-        vllm_config=SimpleNamespace(
+-            parallel_config=SimpleNamespace(
+-                prefill_context_parallel_size=pcp_size,
+-                decode_context_parallel_size=dcp_size,
+-            )
+-        )
+-    )
+-
+-    with pytest.raises(NotImplementedError, match="PCP or DCP"):
+-        Glm5NextKPoolIndexerBackend(source, qk_rope_head_dim=0)
++def test_kpool_cache_backends_support_pcp() -> None:
++    assert backend_module.AscendIndexerKPoolBackend.supports_pcp()
++    assert backend_module.AscendIndexerKPoolTailBackend.supports_pcp()
+ 
+ 
+ @pytest.mark.parametrize("compute_topk", [False, True])
+@@ -198,6 +186,59 @@ def test_backend_zero_token_batch_does_not_launch_operators(monkeypatch, compute
+     select.assert_not_called()
+ 
+ 
++def test_kpool_operator_uses_global_pcp_write_view(monkeypatch) -> None:
++    metadata = _indexer_metadata(num_tokens=2)
++    metadata.cum_query_lens = torch.tensor([2], dtype=torch.int32)
++    metadata.raw_seq_lens = torch.tensor([2], dtype=torch.int32)
++    tail_metadata = _tail_metadata()
++    write_k = torch.arange(8, dtype=torch.float32).view(4, 2)
++    write_gate = write_k + 20
++    write_positions = torch.arange(4)
++    write_query_ends = torch.tensor([4], dtype=torch.int32)
++    write_seq_lens = torch.tensor([4], dtype=torch.int32)
++    write_indexer_slots = torch.tensor([-1, -1, -1, 0])
++    write_tail_slots = torch.arange(4)
++    write_tail_table = torch.tensor([[1]], dtype=torch.int32)
++
++    def compress(state, cache, k, gate, ape, positions, query_ends, seq_lens, tail_slots, table, slots, pool):
++        assert k is write_k
++        assert gate is write_gate
++        assert positions is write_positions
++        assert query_ends is write_query_ends
++        assert seq_lens is write_seq_lens
++        torch.testing.assert_close(tail_slots, write_tail_slots)
++        assert table is write_tail_table
++        torch.testing.assert_close(slots, write_indexer_slots)
++        assert pool == 4
++
++    monkeypatch.setattr(kpool_module, "glm5_next_kpool_tail_compress_and_write_cache_triton", compress)
++    result = SparseAttnIndexerKpool(4, 2)(
++        torch.zeros(2, 2),
++        None,
++        None,
++        metadata.positions,
++        torch.zeros(2, 2, 1, 2, dtype=torch.bfloat16),
++        torch.zeros(2, 2, 4, 2),
++        metadata,
++        tail_metadata,
++        gate_score=torch.zeros(2, 2),
++        compress_ape=torch.zeros(4, 2),
++        index_kpool=4,
++        max_pool_seq_len=1,
++        compute_topk=False,
++        write_k=write_k,
++        write_gate_score=write_gate,
++        write_positions=write_positions,
++        write_cum_query_lens=write_query_ends,
++        write_raw_seq_lens=write_seq_lens,
++        write_indexer_slot_mapping=write_indexer_slots,
++        write_tail_slot_mapping=write_tail_slots,
++        write_tail_block_table=write_tail_table,
++    )
++
++    assert result is None
++
++
+ class _Projection(nn.Module):
+     def forward(self, q_c):
+         return q_c.repeat(1, 2), None
+@@ -367,19 +408,22 @@ def test_cann_backend_reports_missing_operator_dependencies(monkeypatch, missing
+ 
+ @pytest.mark.parametrize("compute_topk", [False, True])
+ @pytest.mark.parametrize(
+-    "dsa_cp,actual_query_tokens,runtime_mode",
++    "dsa_cp,actual_query_tokens,runtime_mode,query_rows",
+     [
+-        (False, 8, CUDAGraphMode.NONE),
+-        (True, 4, CUDAGraphMode.NONE),
+-        (True, 3, CUDAGraphMode.NONE),
+-        (True, 0, CUDAGraphMode.NONE),
+-        (True, 0, CUDAGraphMode.PIECEWISE),
+-        (True, 0, CUDAGraphMode.FULL),
++        (False, 8, CUDAGraphMode.NONE, 8),
++        (True, 4, CUDAGraphMode.NONE, 4),
++        (True, 3, CUDAGraphMode.NONE, 4),
++        (True, 0, CUDAGraphMode.NONE, 4),
++        (True, 0, CUDAGraphMode.PIECEWISE, 4),
++        (True, 0, CUDAGraphMode.FULL, 4),
++        (True, 0, CUDAGraphMode.NONE, 0),
++        (True, 0, CUDAGraphMode.FULL, 0),
+     ],
+ )
+ @pytest.mark.parametrize("reuse_output", [False, True])
++@pytest.mark.parametrize("pcp", [False, True])
+ def test_cann_indexer_writes_caches_before_optional_selection(
+-    monkeypatch, compute_topk, dsa_cp, actual_query_tokens, runtime_mode, reuse_output
++    monkeypatch, compute_topk, dsa_cp, actual_query_tokens, runtime_mode, query_rows, reuse_output, pcp
+ ):
+     monkeypatch.setattr(
+         backend_module, "get_forward_context", lambda: SimpleNamespace(cudagraph_runtime_mode=runtime_mode)
+@@ -396,7 +440,6 @@ def test_cann_indexer_writes_caches_before_optional_selection(
+     op.topk_indices_buffer = storage[::2, :11] if reuse_output else None
+     pooled = torch.empty(2, 2, dtype=torch.bfloat16)
+     state = torch.empty(5, 4, 4)
+-    query_rows = 4 if dsa_cp else 8
+     packed = torch.empty(query_rows, 1, 7, dtype=torch.int32)
+     calls = MagicMock()
+     for name, result in (
+@@ -416,9 +459,17 @@ def test_cann_indexer_writes_caches_before_optional_selection(
+     metadata.pooled_slot_mapping = torch.tensor([0, 2], dtype=torch.int64)
+     metadata.keypool_state_table = torch.empty(2, 2, dtype=torch.int32)
+     metadata.keypool_start_offsets = torch.empty(2, dtype=torch.int32)
++    if pcp:
++        metadata.write_metadata = replace(
++            metadata,
++            query_start_loc=torch.tensor([0, 8], dtype=torch.int32),
++            start_pos=torch.zeros(1, dtype=torch.int32),
++            keypool_state_table=torch.empty(1, 3, dtype=torch.int32),
++        )
++    cache_metadata = metadata.write_metadata or metadata
+     if dsa_cp:
+         metadata.query_metadata = AscendIndexerKPoolQueryMetadata(
+-            positions=metadata.positions[4:],
++            positions=metadata.positions[4 : 4 + query_rows],
+             cum_query_lens=torch.tensor([0, actual_query_tokens], dtype=torch.int64),
+             num_actual_tokens=actual_query_tokens,
+             seq_lens=torch.tensor([0, int(actual_query_tokens > 0)], dtype=torch.int64),
+@@ -443,10 +494,13 @@ def test_cann_indexer_writes_caches_before_optional_selection(
+     names = [call[0] for call in calls.mock_calls]
+     assert names[:3] == ["prepare_keypool_state", "key_pool", "write_keypool_caches"]
+     assert op._key_pool.call_args.args[1:3] == (op._key_weight, op._gate_weight)
+-    assert op._key_pool.call_args.kwargs["cu_seqlens"] is metadata.query_start_loc
++    assert op._key_pool.call_args.kwargs["cu_seqlens"] is cache_metadata.query_start_loc
++    assert op._key_pool.call_args.args[5] is cache_metadata.keypool_state_table
++    assert op._prepare_keypool_state.call_args.args[1] is cache_metadata.start_pos
+     assert op._write_keypool_caches.call_args.args[:2] == (tail, cache)
+     assert op._write_keypool_caches.call_args.args[4] is pooled
+-    skip_empty_query = actual_query_tokens == 0 and runtime_mode != CUDAGraphMode.FULL
++    assert op._write_keypool_caches.call_args.args[5] is cache_metadata
++    skip_empty_query = query_rows == 0 or (actual_query_tokens == 0 and runtime_mode != CUDAGraphMode.FULL)
+     if compute_topk and skip_empty_query:
+         assert result.shape == (query_rows, 1, 7)
+         assert result.dtype == torch.int32
+@@ -455,7 +509,7 @@ def test_cann_indexer_writes_caches_before_optional_selection(
+         op._pool_key_indexer.assert_not_called()
+         op._pack_keypool_indices.assert_not_called()
+         if reuse_output:
+-            assert result.data_ptr() == storage.data_ptr()
++            assert result.untyped_storage().data_ptr() == storage.untyped_storage().data_ptr()
+             assert torch.all(op.topk_indices_buffer[:query_rows] == -1)
+             assert torch.all(op.topk_indices_buffer[query_rows:] == 77)
+             assert torch.all(storage[1::2] == 77)
+@@ -473,3 +527,83 @@ def test_cann_indexer_writes_caches_before_optional_selection(
+         assert result is None
+         op._pool_key_indexer.assert_not_called()
+         op._pack_keypool_indices.assert_not_called()
++
++
++@pytest.mark.parametrize("pcp_local_token_count", [2, 4])
++@pytest.mark.parametrize("actual_tokens", [0, 2])
++def test_backend_restores_pcp_keys_before_kpool_cache_write(monkeypatch, pcp_local_token_count, actual_tokens) -> None:
++    backend = Glm5NextKPoolIndexerBackend.__new__(Glm5NextKPoolIndexerBackend)
++    nn.Module.__init__(backend)
++    backend.n_head = 2
++    backend.head_dim = 2
++    backend.topk_tokens = 2
++    backend.index_kpool = 4
++    backend.wq_b = _Projection()
++    backend.wk_weights_proj = nn.Linear(3, 4, bias=False)
++    backend.k_norm = nn.LayerNorm(2)
++    backend.index_kpool_compress_ape = nn.Parameter(torch.zeros(4, 2))
++    backend.index_kpool_compress_gate = nn.Parameter(torch.zeros(2, 3))
++    backend.k_cache = SimpleNamespace(
++        prefix="indexer.k_cache",
++        kv_cache=torch.zeros(2, 2, 1, 2, dtype=torch.bfloat16),
++    )
++    backend.tail_cache = SimpleNamespace(
++        prefix="indexer.tail",
++        kv_cache=torch.zeros(2, 4, 4, dtype=torch.float32),
++    )
++    backend.topk_indices_buffer = None
++    backend.softmax_scale = 0.5
++    backend._key_weight = None
++    recorder = _RecordingKPool()
++    backend._forward_cann = recorder.forward
++    tail_metadata = _tail_metadata()
++    metadata = _indexer_metadata(num_tokens=2)
++    metadata.num_actual_tokens = actual_tokens
++    metadata.cum_query_lens = torch.tensor([actual_tokens], dtype=torch.int32)
++    metadata.raw_seq_lens = torch.tensor([4], dtype=torch.int32)
++    metadata.seq_lens = torch.tensor([1], dtype=torch.int32)
++    metadata.positions = torch.tensor([0, 2])
++    metadata.slot_mapping = torch.tensor([-1, -1])
++    metadata.pcp_local_token_count = pcp_local_token_count
++    metadata.pcp_hidden_restore_indices = torch.tensor([0, pcp_local_token_count, 1, pcp_local_token_count + 1])
++    metadata.write_metadata = _indexer_metadata(num_tokens=4)
++    tail_metadata.write_slot_mapping = torch.arange(4)
++
++    pcp_group = MagicMock()
++    pcp_group.all_gather.side_effect = lambda tensor, dim: torch.cat((tensor, tensor + 10), dim=dim)
++    monkeypatch.setattr(backend_module, "get_pcp_group", lambda: pcp_group)
++    monkeypatch.setattr(
++        backend_module,
++        "get_forward_context",
++        lambda: SimpleNamespace(
++            attn_metadata={"indexer.tail": tail_metadata},
++            cudagraph_runtime_mode=None,
++            virtual_engine=0,
++        ),
++    )
++
++    result = backend.forward(
++        torch.ones(2, 3),
++        torch.ones(2, 2),
++        torch.full((2, 3), 2.0),
++        metadata,
++        compute_topk=True,
++    )
++
++    pcp_group.all_gather.assert_called_once()
++    recorded_args = recorder.args
++    recorded_kwargs = recorder.kwargs
++    assert recorded_args is not None
++    assert recorded_kwargs is not None
++    local_hidden = torch.full((actual_tokens, 3), 2.0)
++    padding = pcp_local_token_count - actual_tokens
++    padded_hidden = torch.nn.functional.pad(local_hidden, (0, 0, 0, padding))
++    restore = metadata.pcp_hidden_restore_indices
++    assert restore is not None
++    assert pcp_group.all_gather.call_args_list[0].args[0].shape[0] == pcp_local_token_count
++    torch.testing.assert_close(
++        recorded_args[0],
++        torch.cat((padded_hidden, padded_hidden + 10), dim=0)[restore],
++    )
++    assert recorded_args[-2] is metadata
++    assert result.shape[0] == recorded_args[1].shape[0] == actual_tokens
+diff --git a/tests/ut/models/test_glm5next_kv_cache.py b/tests/ut/models/test_glm5next_kv_cache.py
+index 228ab6bac..0c15665c6 100644
+--- a/tests/ut/models/test_glm5next_kv_cache.py
++++ b/tests/ut/models/test_glm5next_kv_cache.py
+@@ -7,12 +7,14 @@ from dataclasses import replace
+ from types import SimpleNamespace
+ from unittest.mock import MagicMock, patch
+ 
++import numpy as np
+ import pytest
+ import torch
+ from vllm.v1.core.block_pool import BlockPool
+ from vllm.v1.kv_cache_spec_registry import KVCacheSpecRegistry
+ 
+ import vllm_ascend.attention.indexer_kpool as backend_module
++from vllm_ascend.attention.attention_v1 import AscendCommonAttentionMetadata
+ from vllm_ascend.attention.indexer_kpool import (
+     AscendIndexerKPoolBackend,
+     AscendIndexerKPoolMetadataBuilder,
+@@ -210,6 +212,10 @@ def test_indexer_metadata_addresses_complete_storage_pages(storage_block_size):
+         cache_config=SimpleNamespace(block_size=logical_size),
+         scheduler_config=SimpleNamespace(max_num_batched_tokens=4, max_num_seqs=1),
+         model_config=SimpleNamespace(max_model_len=logical_size * 3),
++        parallel_config=SimpleNamespace(
++            decode_context_parallel_size=1,
++            prefill_context_parallel_size=1,
++        ),
+     )
+     spec = AscendMLAAttentionSpec(
+         block_size=logical_size,
+@@ -227,6 +233,8 @@ def test_indexer_metadata_addresses_complete_storage_pages(storage_block_size):
+     expanded = (pages.unsqueeze(-1) * split + torch.arange(split)).reshape(1, -1).int()
+     expanded[:, -split:] = -1
+     common = SimpleNamespace(
++        pcp_context=None,
++        pcp_cache_group_idx=None,
+         num_reqs=1,
+         num_input_tokens=4,
+         num_actual_tokens=3,
+@@ -256,6 +264,73 @@ def test_indexer_metadata_addresses_complete_storage_pages(storage_block_size):
+     torch.testing.assert_close(draft.block_table, common.block_table_tensor[:1])
+ 
+ 
++def test_dsacp_indexer_shards_queries_and_keeps_global_cache_metadata(monkeypatch, keypool_kernels):
++    monkeypatch.setattr("vllm_ascend.attention.indexer_kpool.enable_dsa_cp", lambda: True)
++    monkeypatch.setattr(
++        "vllm_ascend.attention.indexer_kpool.get_tp_group",
++        lambda: SimpleNamespace(world_size=2, rank_in_group=1),
++    )
++    config = SimpleNamespace(
++        cache_config=SimpleNamespace(block_size=128),
++        scheduler_config=SimpleNamespace(max_num_batched_tokens=5, max_num_seqs=2),
++        model_config=SimpleNamespace(max_model_len=256),
++        parallel_config=SimpleNamespace(decode_context_parallel_size=1, prefill_context_parallel_size=1),
++    )
++    spec = AscendMLAAttentionSpec(
++        block_size=128,
++        num_kv_heads=1,
++        head_size=128,
++        dtype=torch.bfloat16,
++        tokens_per_state=4,
++        model_version="glm5_next",
++    )
++    tail_spec = AscendIndexerKPoolTailSpec(
++        block_size=4,
++        sliding_window=4,
++        compress_ratio=4,
++        num_kv_heads=1,
++        head_size=128,
++        dtype=torch.float32,
++    )
++    builder = AscendIndexerKPoolMetadataBuilder(spec, ["layer.indexer.k_cache"], config, torch.device("cpu"))
++    tail_builder = AscendIndexerKPoolTailMetadataBuilder(
++        tail_spec, ["layer.indexer.tail_cache"], config, torch.device("cpu")
++    )
++    common = SimpleNamespace(
++        pcp_context=None,
++        pcp_cache_group_idx=None,
++        num_reqs=2,
++        num_input_tokens=5,
++        num_actual_tokens=5,
++        query_start_loc=torch.tensor([0, 4, 5], dtype=torch.int32),
++        seq_lens=torch.tensor([4, 1], dtype=torch.int32),
++        _seq_lens_cpu=None,
++        seq_lens_cpu=None,
++        positions=torch.tensor([0, 1, 2, 3, 0]),
++        slot_mapping=torch.tensor([0, 1, 2, 3, 128]),
++        block_table_tensor=torch.tensor([[0], [1]], dtype=torch.int32),
++    )
++    metadata = builder.build(0, common)
++    tail = tail_builder.build(0, common)
++    assert keypool_kernels.build_keypool_metadata.call_args.args[:4] == (
++        common,
++        builder._metadata_buffers[common.slot_mapping.data_ptr()],
++        6,
++        5,
++    )
++    assert metadata.positions.shape == metadata.slot_mapping.shape == (6,)
++    query = metadata.query_metadata
++    assert query.num_actual_tokens == 2
++    assert query.positions.data_ptr() == metadata.positions[3:].data_ptr()
++    assert query.cum_query_lens.shape == (2,)
++    assert keypool_kernels.build_keypool_metadata.call_args.kwargs["local_start"] == 3
++    torch.testing.assert_close(tail.slot_mapping, common.slot_mapping)
++    refreshed = builder.build(0, common).query_metadata
++    assert refreshed.cum_query_lens.data_ptr() == query.cum_query_lens.data_ptr()
++    assert refreshed.positions.data_ptr() == query.positions.data_ptr()
++    assert tail_builder.build(0, common).slot_mapping.data_ptr() == tail.slot_mapping.data_ptr()
++
++
+ def test_model_cache_layers_publish_source_compatible_specs():
+     current_config = SimpleNamespace(
+         parallel_config=SimpleNamespace(pipeline_parallel_size=2),
+@@ -303,6 +378,182 @@ def test_model_cache_layers_publish_source_compatible_specs():
+     }
+ 
+ 
++def test_indexer_metadata_preserves_raw_request_boundaries(keypool_kernels):
++    config = SimpleNamespace(
++        cache_config=SimpleNamespace(block_size=256),
++        scheduler_config=SimpleNamespace(
++            max_num_batched_tokens=16,
++            max_num_seqs=2,
++        ),
++        model_config=SimpleNamespace(max_model_len=512),
++        parallel_config=SimpleNamespace(
++            decode_context_parallel_size=1,
++            prefill_context_parallel_size=1,
++        ),
++    )
++    builder = AscendIndexerKPoolMetadataBuilder(
++        AscendMLAAttentionSpec(
++            block_size=256,
++            num_kv_heads=1,
++            head_size=128,
++            dtype=torch.bfloat16,
++            model_version="glm5_next",
++            **_ratio_kwargs(16),
++        ),
++        ["model.layers.0.indexer.k_cache"],
++        config,
++        torch.device("cpu"),
++    )
++    common = AscendCommonAttentionMetadata(
++        query_start_loc=torch.tensor([0, 2, 5], dtype=torch.int32),
++        query_start_loc_cpu=torch.tensor([0, 2, 5], dtype=torch.int32),
++        seq_lens=torch.tensor([18, 35], dtype=torch.int32),
++        _seq_lens_cpu=torch.tensor([18, 35], dtype=torch.int32),
++        num_reqs=2,
++        num_actual_tokens=5,
++        max_query_len=3,
++        num_input_tokens=5,
++        max_seq_len=35,
++        block_table_tensor=torch.tensor([[0, -1], [1, 2]], dtype=torch.int32),
++        slot_mapping=torch.tensor([16, 17, 32, 33, 34]),
++        positions=torch.tensor([16, 17, 32, 33, 34]),
++    )
++
++    metadata = builder.build(0, common)
++
++    source = keypool_kernels.build_keypool_metadata.call_args.args[0]
++    assert source is common
++    assert source.query_start_loc.tolist() == [0, 2, 5]
++    assert source.seq_lens.tolist() == [18, 35]
++    assert metadata.cum_query_lens.shape == metadata.raw_seq_lens.shape == metadata.seq_lens.shape == (2,)
++    assert metadata.num_actual_tokens == 5
++
++
++@pytest.mark.parametrize("capture", [False, True])
++@pytest.mark.parametrize("invalid", [None, "group", "layout", "capacity"])
++def test_pcp_kpool_metadata_writes_global_token_order(keypool_kernels, capture, invalid):
++    """Keep one global CANN write request for two PCP-local query chunks."""
++    config = SimpleNamespace(
++        cache_config=SimpleNamespace(block_size=128),
++        scheduler_config=SimpleNamespace(max_num_batched_tokens=8, max_num_seqs=2),
++        model_config=SimpleNamespace(max_model_len=512),
++        parallel_config=SimpleNamespace(
++            decode_context_parallel_size=1,
++            prefill_context_parallel_size=2,
++        ),
++    )
++    builder = AscendIndexerKPoolMetadataBuilder(
++        AscendMLAAttentionSpec(
++            block_size=128,
++            num_kv_heads=1,
++            head_size=128,
++            dtype=torch.bfloat16,
++            model_version="glm5_next",
++            **_ratio_kwargs(4),
++        ),
++        ["model.layers.0.indexer.k_cache"],
++        config,
++        torch.device("cpu"),
++    )
++    common = AscendCommonAttentionMetadata(
++        query_start_loc=torch.tensor([0, 2, 4], dtype=torch.int32),
++        query_start_loc_cpu=torch.tensor([0, 2, 4], dtype=torch.int32),
++        seq_lens=torch.tensor([2, 8], dtype=torch.int32),
++        _seq_lens_cpu=torch.tensor([2, 8], dtype=torch.int32),
++        num_reqs=2,
++        num_actual_tokens=4,
++        max_query_len=2,
++        num_input_tokens=4,
++        max_seq_len=8,
++        block_table_tensor=torch.tensor([[5, 6], [5, 6]], dtype=torch.int32),
++        slot_mapping=5 * 128 + torch.tensor([0, 1, 6, 7]),
++        positions=torch.tensor([0, 1, 6, 7]),
++    )
++    global_positions = torch.arange(8)
++    global_slots = 5 * 128 + global_positions
++    restore = torch.tensor([0, 1, 4, 5, 6, 7, 2, 3])
++    pcp_context = SimpleNamespace(
++        global_batch=SimpleNamespace(
++            num_reqs=1,
++            num_tokens=8,
++            query_start_loc=torch.tensor([0, 8], dtype=torch.int32),
++            query_start_loc_np=np.array([0, 8], dtype=np.int32),
++            seq_lens=torch.tensor([8], dtype=torch.int32),
++            positions=global_positions,
++            is_prefilling_np=np.array([True]),
++        ),
++        global_block_tables=(torch.tensor([[5, 6]], dtype=torch.int32),),
++        global_slot_mappings=global_slots.unsqueeze(0),
++        hidden_restore_idx=restore,
++        padded_gather_idx=torch.arange(8),
++    )
++
++    if invalid == "layout":
++        pcp_context.padded_gather_idx = None
++    elif invalid == "capacity":
++        builder._max_num_write_tokens = 4
++
++    common.pcp_context = pcp_context
++    common.pcp_cache_group_idx = None if invalid == "group" else 0
++
++    def build(local_common=common):
++        if capture:
++            return builder.build_for_cudagraph_capture(local_common)
++        return builder.build(0, local_common)
++
++    if invalid is not None:
++        match = {"group": "cache-group index", "layout": "gathered-token layout", "capacity": "buffer capacity"}
++        with pytest.raises(RuntimeError, match=match[invalid]):
++            build()
++        return
++
++    metadata = build()
++
++    assert metadata.block_table.tolist() == [[5, 6], [5, 6]]
++    write = metadata.write_metadata
++    assert write.block_table.tolist() == [[5, 6]]
++    assert write.keypool_state_table.shape == (1, 3)
++    assert metadata.keypool_state_table.shape == (2, 2)
++    assert write.positions.data_ptr() != metadata.positions.data_ptr()
++    local_call, global_call = keypool_kernels.build_keypool_metadata.call_args_list
++    assert local_call.args[0] is common
++    global_common = global_call.args[0]
++    torch.testing.assert_close(global_common.positions, global_positions)
++    torch.testing.assert_close(global_common.slot_mapping, global_slots)
++    assert global_common.query_start_loc.tolist() == [0, 8]
++    assert global_common.seq_lens.tolist() == [8]
++    assert global_common.max_query_len == 8
++    torch.testing.assert_close(metadata.pcp_hidden_restore_indices, restore)
++    assert metadata.pcp_local_token_count == 4
++    refreshed = build()
++    assert refreshed.write_metadata.positions.data_ptr() == write.positions.data_ptr()
++    assert refreshed.write_metadata.keypool_state_table.data_ptr() == write.keypool_state_table.data_ptr()
++    other_step = build(common.replace(slot_mapping=common.slot_mapping.clone()))
++    assert other_step.write_metadata.positions.data_ptr() != write.positions.data_ptr()
++    assert other_step.write_metadata.keypool_state_table.data_ptr() != write.keypool_state_table.data_ptr()
++
++    tail_builder = AscendIndexerKPoolTailMetadataBuilder(
++        AscendIndexerKPoolTailSpec(
++            block_size=4,
++            sliding_window=4,
++            compress_ratio=4,
++            num_kv_heads=1,
++            head_size=128,
++            dtype=torch.float32,
++        ),
++        ["model.layers.0.indexer.tail_cache"],
++        config,
++        torch.device("cpu"),
++    )
++    tail_metadata = tail_builder.build_for_cudagraph_capture(common) if capture else tail_builder.build(0, common)
++    torch.testing.assert_close(tail_metadata.write_block_table, pcp_context.global_block_tables[0][:, :1])
++    torch.testing.assert_close(tail_metadata.write_slot_mapping, global_slots)
++    tail_common = keypool_kernels.build_tail_inputs.call_args.args[0]
++    assert tail_common.num_reqs == 1
++    assert tail_common.query_start_loc.tolist() == [0, 8]
++    torch.testing.assert_close(tail_common.slot_mapping, global_slots)
++
++
+ def test_indexer_metadata_request_buffers_cover_graph_token_padding():
+     config = SimpleNamespace(
+         cache_config=SimpleNamespace(block_size=256),
+@@ -311,6 +562,10 @@ def test_indexer_metadata_request_buffers_cover_graph_token_padding():
+             max_num_seqs=2,
+         ),
+         model_config=SimpleNamespace(max_model_len=512),
++        parallel_config=SimpleNamespace(
++            decode_context_parallel_size=1,
++            prefill_context_parallel_size=1,
++        ),
+     )
+     builder = AscendIndexerKPoolMetadataBuilder(
+         AscendMLAAttentionSpec(
+@@ -326,6 +581,8 @@ def test_indexer_metadata_request_buffers_cover_graph_token_padding():
+         torch.device("cpu"),
+     )
+     common = SimpleNamespace(
++        pcp_context=None,
++        pcp_cache_group_idx=None,
+         num_reqs=4,
+         num_input_tokens=4,
+         num_actual_tokens=2,
+@@ -353,6 +610,10 @@ def test_indexer_metadata_buffers_are_stable_per_draft_step():
+             max_num_seqs=2,
+         ),
+         model_config=SimpleNamespace(max_model_len=512),
++        parallel_config=SimpleNamespace(
++            decode_context_parallel_size=1,
++            prefill_context_parallel_size=1,
++        ),
+     )
+     builder = AscendIndexerKPoolMetadataBuilder(
+         AscendMLAAttentionSpec(
+@@ -368,6 +629,8 @@ def test_indexer_metadata_buffers_are_stable_per_draft_step():
+         torch.device("cpu"),
+     )
+     common = SimpleNamespace(
++        pcp_context=None,
++        pcp_cache_group_idx=None,
+         num_reqs=1,
+         num_input_tokens=2,
+         num_actual_tokens=2,
+@@ -428,6 +691,7 @@ def test_indexer_metadata_buffers_are_stable_per_draft_step():
+ 
+ def _config():
+     return SimpleNamespace(
++        parallel_config=SimpleNamespace(prefill_context_parallel_size=1),
+         cache_config=SimpleNamespace(block_size=128),
+         scheduler_config=SimpleNamespace(max_num_batched_tokens=16, max_num_seqs=2),
+         model_config=SimpleNamespace(max_model_len=8192),
+@@ -454,6 +718,8 @@ class _Common(SimpleNamespace):
+ 
+ def _common():
+     return _Common(
++        pcp_context=None,
++        pcp_cache_group_idx=None,
+         num_reqs=2,
+         num_input_tokens=10,
+         num_actual_tokens=8,
+diff --git a/tests/ut/models/test_glm5next_sfa_routing.py b/tests/ut/models/test_glm5next_sfa_routing.py
+index 93db7a429..4bedf1f0a 100644
+--- a/tests/ut/models/test_glm5next_sfa_routing.py
++++ b/tests/ut/models/test_glm5next_sfa_routing.py
+@@ -53,7 +53,7 @@ def test_kpool_without_sparse_main_attention_is_not_sfa(has_index_topk, has_comp
+     assert not enable_sfa(vllm_config)
+ 
+ 
+-@pytest.mark.parametrize("mode", ["310p", "pcp", "dcp"])
++@pytest.mark.parametrize("mode", ["310p", "dcp", "pcp_dcp"])
+ def test_kpool_unsupported_routes_fail_explicitly(monkeypatch, mode):
+     monkeypatch.setattr(
+         backend_module,
+@@ -67,12 +67,12 @@ def test_kpool_unsupported_routes_fail_explicitly(monkeypatch, mode):
+     source = SimpleNamespace(
+         vllm_config=SimpleNamespace(
+             parallel_config=SimpleNamespace(
+-                prefill_context_parallel_size=2 if mode == "pcp" else 1,
+-                decode_context_parallel_size=2 if mode == "dcp" else 1,
++                prefill_context_parallel_size=2 if mode == "pcp_dcp" else 1,
++                decode_context_parallel_size=2 if mode in {"dcp", "pcp_dcp"} else 1,
+             )
+         )
+     )
+-    with pytest.raises(NotImplementedError, match="requires Ascend|PCP or DCP"):
++    with pytest.raises(NotImplementedError, match="requires Ascend|does not support DCP"):
+         Glm5NextKPoolIndexerBackend(source, qk_rope_head_dim=0)
+ 
+ 
+diff --git a/tests/ut/ops/test_gdn_attn_builder.py b/tests/ut/ops/test_gdn_attn_builder.py
+index 1d321573b..bd4ff1b49 100644
+--- a/tests/ut/ops/test_gdn_attn_builder.py
++++ b/tests/ut/ops/test_gdn_attn_builder.py
+@@ -39,6 +39,32 @@ from vllm_ascend.ops.triton.fla.utils import (
+ )
+ 
+ 
++@pytest.mark.parametrize("builder_cls", [AscendGDNAttentionMetadataBuilder, AscendGDNHostMetadataBuilder])
++@pytest.mark.parametrize("pcp_size,pcp_rank", [(1, 0), (2, 0), (2, 1)])
++@pytest.mark.parametrize("has_initial", [[False], [True], [False, False], [True, False, True]])
++def test_prefill_preserves_request_convolution_history(monkeypatch, builder_cls, pcp_size, pcp_rank, has_initial):
++    builder = builder_cls.__new__(builder_cls)
++    builder.vllm_config = SimpleNamespace(parallel_config=SimpleNamespace(prefill_context_parallel_size=pcp_size))
++    monkeypatch.setattr(ascend_gdn_attn_builder, "get_pcp_group", lambda: SimpleNamespace(rank_in_group=pcp_rank))
++    num_decodes = int(len(has_initial) == 3)
++    starts = torch.arange(len(has_initial) + 1, dtype=torch.int32) * 4
++    initial = torch.tensor(has_initial)
++    metadata = SimpleNamespace(
++        num_prefills=len(has_initial) - num_decodes,
++        non_spec_query_start_loc=starts,
++        prefill_query_start_loc=starts[num_decodes:] - starts[num_decodes],
++        has_initial_state=initial,
++    )
++
++    builder._attach_non_spec_prefill_metadata(metadata, object(), torch.arange(len(has_initial)))
++
++    # Fresh requests ignore reused cache blocks on every rank. Continuations
++    # and mixed decode rows must retain their actual request history.
++    conv = metadata.non_spec_prefill_metadata.causal_conv1d
++    torch.testing.assert_close(conv.initial_state_mode, torch.tensor(has_initial))
++    torch.testing.assert_close(initial, torch.tensor(has_initial))
++
++
+ @pytest.mark.parametrize(
+     "values",
+     [[], [False], [True], [False] * 8, [True] * 8, [True, False, True, False, False, True]],
+@@ -337,12 +363,12 @@ def test_kimi_chunk_metadata_uses_linear_attention_head_count() -> None:
+ 
+ 
+ def test_ascend_gdn_attention_uses_ascend_backend():
+-    from vllm_ascend.models.glm5next.kda import Glm5NextLinearAttention
++    from vllm_ascend.models.glm5next.kda import Glm5NextGDNHostMetadataBackend, Glm5NextLinearAttention
+     from vllm_ascend.ops.kimi_kda import AscendKimiK3DeltaAttention
+ 
+     assert AscendGatedDeltaNetAttention.get_attn_backend(object()) is AscendGDNFusedAttentionBackend
+     assert AscendKimiK3DeltaAttention.get_attn_backend(object()) is AscendGDNHostMetadataBackend
+-    assert Glm5NextLinearAttention.get_attn_backend(object()) is AscendGDNHostMetadataBackend
++    assert Glm5NextLinearAttention.get_attn_backend(object()) is Glm5NextGDNHostMetadataBackend
+     assert Glm5NextLinearAttention.use_contiguous_conv_indices
+     assert AscendGDNAttentionBackend.get_builder_cls() is AscendGDNAttentionMetadataBuilder
+ 
+@@ -435,7 +461,8 @@ def test_host_metadata_skips_unused_chunk_helpers(monkeypatch):
+     assert chunk_meta.chunk_indices_chunk64_host == tuple(expected.to(torch.int64).flatten().tolist())
+ 
+ 
+-def test_host_builder_exposes_host_descriptors_without_device_chunks():
++@pytest.mark.parametrize("has_pcp_context", [False, True])
++def test_host_builder_exposes_host_descriptors_without_device_chunks(has_pcp_context):
+     builder = _make_builder(
+         device=torch.device("cpu"),
+         num_heads=32,
+@@ -447,7 +474,10 @@ def test_host_builder_exposes_host_descriptors_without_device_chunks():
+         block_size=16,
+         device=torch.device("cpu"),
+     )
++    context = object() if has_pcp_context else None
++    common_attn_metadata.pcp_context = context
+     attn_metadata = builder.build(0, common_attn_metadata)
++    assert attn_metadata.pcp_context is context
+     chunk_meta = attn_metadata.non_spec_prefill_metadata.chunk
+     assert chunk_meta.chunk_indices_chunk64 is None
+     assert chunk_meta.chunk_offsets_chunk64 is None
+diff --git a/tests/ut/worker/test_model_runner_v2_mamba.py b/tests/ut/worker/test_model_runner_v2_mamba.py
+index 7d7072758..f71b7aa8a 100644
+--- a/tests/ut/worker/test_model_runner_v2_mamba.py
++++ b/tests/ut/worker/test_model_runner_v2_mamba.py
+@@ -392,11 +392,11 @@ def test_prepare_attn_keeps_actual_counts_separate_from_padding(mock_build_attn_
+         num_reqs_after_padding=4,
+         num_tokens=2 * (num_spec + 1),
+         num_tokens_after_padding=4 * (num_spec + 1),
+-        is_prefilling_np=np.array([False, False]),
+-        prefill_runs_as_decode_np=None,
+-        idx_mapping=torch.tensor([0, 1]),
+-        num_draft_tokens_per_req=np.full(2, num_spec, dtype=np.int32),
+-        num_scheduled_tokens=np.full(2, num_spec + 1, dtype=np.int32),
++        is_prefilling_np=np.array([False, False, False, False]),
++        prefill_runs_as_decode_np=np.array([False, False, False, False]),
++        idx_mapping=torch.tensor([0, 1, 99, 99]),
++        num_draft_tokens_per_req=np.full(4, num_spec, dtype=np.int32),
++        num_scheduled_tokens=np.full(4, num_spec + 1, dtype=np.int32),
+         query_start_loc=torch.arange(5, dtype=torch.int32) * (num_spec + 1),
+         query_start_loc_np=np.arange(5, dtype=np.int32) * (num_spec + 1),
+         seq_lens=None,
+@@ -484,7 +484,9 @@ def test_prepare_attn_propagates_actual_request_count_to_metadata_builder():
+     )
+     module = ast.parse(model_state_path.read_text(encoding="utf-8"))
+     prepare_attn = next(
+-        node for node in ast.walk(module) if isinstance(node, ast.FunctionDef) and node.name == "prepare_attn"
++        node
++        for node in ast.walk(module)
++        if isinstance(node, ast.FunctionDef) and node.name == "_build_attn_metadata_for_batch"
+     )
+     build_call = next(
+         node
+@@ -497,6 +499,140 @@ def test_prepare_attn_propagates_actual_request_count_to_metadata_builder():
+     assert ast.unparse(keywords["num_actual_reqs"]) == "input_batch.num_reqs"
+ 
+ 
++@patch("vllm_ascend.worker.v2.model_states.mamba_hybrid.build_attn_metadata")
++@pytest.mark.parametrize("graph_mode", [CUDAGraphMode.NONE, CUDAGraphMode.PIECEWISE, CUDAGraphMode.FULL])
++@pytest.mark.parametrize("use_pcp_padding", [False, True])
++@pytest.mark.parametrize("has_pcp_context", [False, True])
++def test_mamba_padding_is_independent_of_pcp_context(
++    mock_build_attn_metadata, graph_mode, use_pcp_padding, has_pcp_context
++):
++    state = SimpleNamespace(
++        vllm_config=SimpleNamespace(num_speculative_tokens=0, parallel_config=SimpleNamespace()),
++        max_model_len=1024,
++    )
++    batch = SimpleNamespace(
++        num_reqs=1,
++        num_reqs_after_padding=2,
++        num_tokens=3,
++        num_tokens_after_padding=8,
++        is_dummy=False,
++        is_prefilling_np=np.array([True]),
++        prefill_runs_as_decode_np=None,
++        query_start_loc=torch.tensor([0, 3], dtype=torch.int32),
++        query_start_loc_np=np.array([0, 3], dtype=np.int32),
++        num_scheduled_tokens=np.array([3], dtype=np.int32),
++        seq_lens=None,
++        dcp_local_seq_lens=None,
++        seq_lens_np=np.array([3], dtype=np.int32),
++        positions=None,
++        attn_state=None,
++    )
++    context = object() if has_pcp_context else None
++    AscendMambaHybridModelState._build_attn_metadata_for_batch(
++        state,
++        batch,
++        graph_mode,
++        (),
++        torch.empty(0, dtype=torch.int64),
++        [],
++        MagicMock(),
++        False,
++        use_pcp_padding=use_pcp_padding,
++        pcp_context=context,
++    )
++
++    kwargs = mock_build_attn_metadata.call_args.kwargs
++    assert kwargs["num_tokens"] == (8 if graph_mode == CUDAGraphMode.FULL or use_pcp_padding else 3)
++    assert kwargs["num_input_tokens"] == kwargs["num_tokens"]
++    assert kwargs["num_actual_tokens"] == 3
++    assert kwargs["num_reqs"] == (2 if graph_mode == CUDAGraphMode.FULL else 1)
++    assert kwargs["pcp_context"] is context
++
++
++def test_glm_kpool_pcp_builds_mamba_metadata_from_global_requests():
++    local_batch = SimpleNamespace(is_dummy=False)
++    global_batch = SimpleNamespace(num_reqs=1)
++    pcp_context = SimpleNamespace(
++        global_batch=global_batch,
++        global_block_tables=("global_table",),
++        global_slot_mappings="global_slots",
++    )
++    pcp_manager = SimpleNamespace(build_attention_context=MagicMock(return_value=pcp_context))
++    state = SimpleNamespace(
++        pcp_manager=pcp_manager,
++        vllm_config=SimpleNamespace(model_config=SimpleNamespace(hf_text_config=SimpleNamespace(index_kpool=4))),
++    )
++    mamba_spec = _mamba_spec()
++    attn_groups = [[SimpleNamespace(kv_cache_spec=object())], [_group(mamba_spec)]]
++    local_metadata = {"sfa": object()}
++    mamba_metadata = SimpleNamespace(pcp_context=pcp_context)
++    with patch.object(
++        AscendMambaHybridModelState,
++        "_build_attn_metadata_for_batch",
++        side_effect=[local_metadata, {"linear_attn": mamba_metadata}],
++    ) as build_batch:
++        metadata = AscendMambaHybridModelState.prepare_attn(
++            state,
++            input_batch=local_batch,
++            cudagraph_mode=CUDAGraphMode.NONE,
++            block_tables=("local_table",),
++            slot_mappings="local_slots",
++            attn_groups=attn_groups,
++            kv_cache_config=MagicMock(),
++        )
++
++    assert metadata == {"sfa": local_metadata["sfa"], "linear_attn": mamba_metadata}
++    assert mamba_metadata.pcp_context is pcp_context
++    assert build_batch.call_args_list[0].args[1] is local_batch
++    assert build_batch.call_args_list[0].args[5][0][0] is attn_groups[0][0]
++    assert build_batch.call_args_list[0].args[5][1] == []
++    assert build_batch.call_args_list[1].args[1] is global_batch
++    assert build_batch.call_args_list[1].args[2] == CUDAGraphMode.NONE
++    assert build_batch.call_args_list[1].args[3] == ("global_table",)
++    assert build_batch.call_args_list[1].args[4] == "global_slots"
++    assert build_batch.call_args_list[1].args[5][0] == []
++    assert build_batch.call_args_list[1].args[5][1][0] is attn_groups[1][0]
++    assert build_batch.call_args_list[0].kwargs == {"use_pcp_padding": True, "pcp_context": pcp_context}
++    assert build_batch.call_args_list[1].kwargs == {"use_pcp_padding": False, "pcp_context": pcp_context}
++
++
++@patch("vllm_ascend.worker.v2.model_states.mamba_hybrid.preprocess_mamba_align_fused_kernel")
++def test_glm_kpool_pcp_advances_mamba_align_state_once_per_global_request(mock_kernel):
++    global_batch = SimpleNamespace(
++        num_reqs=1,
++        idx_mapping=torch.tensor([3], dtype=torch.int32),
++        query_start_loc=torch.tensor([0, 8], dtype=torch.int32),
++    )
++    global_tables = (torch.zeros(1, 2, dtype=torch.int32),)
++    pcp_context = SimpleNamespace(global_batch=global_batch, global_block_tables=global_tables)
++    pcp_manager = SimpleNamespace(build_attention_context=MagicMock(return_value=pcp_context))
++    spec = _mamba_spec()
++    state = SimpleNamespace(
++        _align_mode=True,
++        pcp_manager=pcp_manager,
++        vllm_config=SimpleNamespace(model_config=SimpleNamespace(hf_text_config=SimpleNamespace(index_kpool=4))),
++        _finish_previous_layerwise_mamba_copy=MagicMock(),
++        _get_mamba_group_info=MagicMock(return_value=([0], spec)),
++        _ensure_align_ctx=MagicMock(return_value=MagicMock()),
++        _prepare_layerwise_mamba_copy=MagicMock(return_value=True),
++        _mamba_state_idx_gpu=torch.zeros(4, dtype=torch.int32),
++        num_accepted_tokens_gpu=torch.ones(4, dtype=torch.int32),
++        _mamba_src_col_gpu=torch.zeros(4, dtype=torch.int32),
++        _mamba_src_off_gpu=torch.zeros(4, dtype=torch.int32),
++    )
++    local_batch = SimpleNamespace(num_reqs=2)
++    num_computed_tokens = torch.zeros(4, dtype=torch.int32)
++
++    AscendMambaHybridModelState.preprocess_state(
++        state, local_batch, (torch.ones(2, 2, dtype=torch.int32),), MagicMock(), num_computed_tokens
++    )
++
++    assert state._ensure_align_ctx.call_args.args[2] is global_tables
++    assert mock_kernel.__getitem__.return_value.call_args.args[0] is global_batch.idx_mapping
++    assert mock_kernel.__getitem__.return_value.call_args.args[3] is global_batch.query_start_loc
++    assert mock_kernel.__getitem__.return_value.call_args.kwargs["MAMBA_BLOCK_SIZE"] == spec.block_size
++
++
+ @patch(
+     "vllm_ascend.worker.v2.attn_utils.get_current_vllm_config",
+     return_value=SimpleNamespace(kv_transfer_config=None, additional_config={}),
+diff --git a/tests/ut/worker/test_pcp_manager_v2.py b/tests/ut/worker/test_pcp_manager_v2.py
+index 4dd9381ef..dea1c1602 100644
+--- a/tests/ut/worker/test_pcp_manager_v2.py
++++ b/tests/ut/worker/test_pcp_manager_v2.py
+@@ -160,6 +160,21 @@ def test_decode_sharding_does_not_add_a_parallel_config_field():
+     assert is_pcp_decode_sharding_enabled(config) is True
+ 
+ 
++@pytest.mark.parametrize("speculative", [False, True])
++def test_kpool_decode_keeps_replicated_pcp_state(speculative: bool):
++    config = _make_pcp_config(CUDAGraphMode.NONE)
++    config.model_config.hf_text_config.index_kpool = 4
++    config.speculative_config = SimpleNamespace(method="mtp") if speculative else None
++    manager = AscendPCPManager(2, 1, torch.device("cpu"))
++    manager.vllm_config = config
++    counts = np.array([1, 1], dtype=np.int32)
++    prefilling = np.array([False, False])
++
++    assert not is_pcp_decode_sharding_enabled(config)
++    np.testing.assert_array_equal(manager.replicated_requests(counts, prefilling), [True, True])
++    assert list(manager._iter_rank_chunks(1, counts, prefilling)) == [(0, 0, 1), (1, 0, 1)]
++
++
+ def test_validate_config_allows_sparse_mla_full_decode_only():
+     vllm_config = _make_pcp_config(CUDAGraphMode.FULL_DECODE_ONLY)
+ 
+@@ -190,6 +205,13 @@ def test_validate_config_allows_pipeline_parallelism():
+     AscendPCPManager.validate_config(vllm_config, supports_mm_inputs=False)
+ 
+ 
++def test_validate_config_allows_kpool_model_registered_as_multimodal():
++    vllm_config = _make_pcp_config(CUDAGraphMode.NONE)
++    vllm_config.model_config.hf_text_config.index_kpool = 4
++
++    AscendPCPManager.validate_config(vllm_config, supports_mm_inputs=True)
++
++
+ @pytest.mark.parametrize(
+     "cudagraph_mode",
+     [CUDAGraphMode.PIECEWISE, CUDAGraphMode.FULL_AND_PIECEWISE],
+diff --git a/tests/ut/worker/v2/test_pcp_multimodal_embedding_padding.py b/tests/ut/worker/v2/test_pcp_multimodal_embedding_padding.py
+new file mode 100644
+index 000000000..841052c92
+--- /dev/null
++++ b/tests/ut/worker/v2/test_pcp_multimodal_embedding_padding.py
+@@ -0,0 +1,227 @@
++from types import SimpleNamespace
++from unittest.mock import Mock, patch
++
++import pytest
++import torch
++from vllm.v1.worker.gpu.mm.encoder_runner import EncoderRunner
++from vllm.v1.worker.gpu.model_states.default import DefaultModelState
++from vllm.v1.worker.gpu.model_states.interface import ModelState
++
++import vllm_ascend.ops.vocab_parallel_embedding as vocab_embedding
++from vllm_ascend.worker.v2.model_states.default import AscendModelState
++
++
++@pytest.mark.parametrize(
++    ("actual_tokens", "padded_tokens", "mm_positions"),
++    [(10, 12, ()), (8, 10, (2,))],
++)
++def test_pcp_multimodal_embedding_keeps_unpadded_merge_inputs(actual_tokens, padded_tokens, mm_positions):
++    state = AscendModelState.__new__(AscendModelState)
++    state.model = SimpleNamespace(set_embedding_num_tokens_padded=Mock())
++    state.pcp_manager = object()
++    state.supports_mm_inputs = True
++    state.mm_pruner = None
++    state.prompt_embeds_state = None
++    state.execute_mm_encoder = Mock()
++    embeddings = torch.arange(padded_tokens * 4).reshape(padded_tokens, 4)
++    state.encoder_runner = SimpleNamespace(get_inputs_embeds=Mock(return_value=embeddings))
++
++    input_ids = torch.arange(1, actual_tokens + 1)
++    input_ids = torch.nn.functional.pad(input_ids, (0, padded_tokens - actual_tokens))
++    input_batch = SimpleNamespace(
++        input_ids=input_ids,
++        num_tokens=actual_tokens,
++        num_tokens_after_padding=padded_tokens,
++    )
++    is_mm_embed = torch.zeros(actual_tokens, dtype=torch.bool)
++    is_mm_embed[list(mm_positions)] = True
++    mm_embeds = [torch.ones((len(mm_positions), 4))] if mm_positions else []
++
++    with patch.object(ModelState, "gather_mm_embeddings", return_value=(mm_embeds, is_mm_embed)):
++        result = state.prepare_inputs_embeds({}, input_batch, req_states=None)
++
++    state.execute_mm_encoder.assert_called_once_with({})
++    passed_ids, passed_mm_embeds, passed_mask = state.encoder_runner.get_inputs_embeds.call_args.args
++    assert torch.equal(passed_ids, input_ids[:actual_tokens])
++    assert passed_mm_embeds is mm_embeds
++    assert torch.equal(passed_mask[:actual_tokens], is_mm_embed)
++    assert passed_mask.shape == (actual_tokens,)
++    assert torch.equal(result, embeddings)
++    state.model.set_embedding_num_tokens_padded.assert_called_once_with(padded_tokens)
++
++
++@pytest.mark.parametrize("publish_span", [False, True])
++@pytest.mark.parametrize("rank", [0, 1])
++def test_unpadded_multimodal_inputs_use_equal_pcp_collectives(monkeypatch, publish_span, rank):
++    # Exercise the embedding implementation with unequal local MM batches.
++    # Communication is mocked; vocabulary lookup and MM merging run on CPU.
++    weight = torch.arange(32, dtype=torch.float32).view(8, 4)
++    rank_ids = [torch.tensor([1, 2]), torch.tensor([5, 6, 7])]
++    padded_tokens = 4
++    capacity = 8
++    span = padded_tokens if publish_span else capacity
++    gathered_ids = torch.zeros(2, span, dtype=torch.long)
++    for peer, peer_ids in enumerate(rank_ids):
++        gathered_ids[peer, : peer_ids.numel()] = peer_ids
++    monkeypatch.setattr(vocab_embedding, "is_forward_context_available", lambda: False)
++    ids = rank_ids[rank]
++    layer = vocab_embedding.AscendVocabParallelEmbedding.__new__(vocab_embedding.AscendVocabParallelEmbedding)
++    torch.nn.Module.__init__(layer)
++    layer.parallel_mode = vocab_embedding.VocabParallelMode.PCP_X_TP
++    layer.token_exchange_group = SimpleNamespace(world_size=2)
++    layer.output_reduce_group = None
++    layer.embedding_tp_capacity = capacity
++    layer._embedding_num_tokens_padded = None
++    layer.embedding_dim = 4
++    layer.params_dtype = torch.float32
++    layer.shard_indices = SimpleNamespace(
++        org_vocab_start_index=rank * 4,
++        org_vocab_end_index=(rank + 1) * 4,
++        num_org_vocab_padding=0,
++        added_vocab_start_index=8,
++        added_vocab_end_index=8,
++    )
++    local_weight = weight[rank * 4 : (rank + 1) * 4]
++    layer.quant_method = SimpleNamespace(embedding=lambda _, x: local_weight[x])
++    events = []
++
++    def gather(input_, dim):
++        events.append("gather")
++        assert dim == 0
++        torch.testing.assert_close(input_, gathered_ids[rank])
++        return gathered_ids.flatten()
++
++    def scatter(input_, dim):
++        events.append("scatter")
++        assert dim == 0
++        local_mask = (gathered_ids.flatten() // 4 == rank).unsqueeze(-1)
++        torch.testing.assert_close(input_, weight[gathered_ids.flatten()] * local_mask)
++        return weight[gathered_ids[rank]]
++
++    monkeypatch.setattr(layer.token_exchange_group, "all_gather", gather, raising=False)
++    monkeypatch.setattr(layer.token_exchange_group, "reduce_scatter", scatter, raising=False)
++    mm_mask = torch.zeros(ids.numel(), dtype=torch.bool)
++    mm_mask[1] = True
++    mm_embeds = [torch.full((1, 4), 99.0)]
++
++    def embed(input_ids, multimodal_embeddings, is_multimodal):
++        output = layer(input_ids).clone()
++        assert output.shape[0] == is_multimodal.numel() == ids.numel()
++        output[is_multimodal] = torch.cat(multimodal_embeddings)
++        return output
++
++    state = AscendModelState.__new__(AscendModelState)
++    state.model = SimpleNamespace(embed_input_ids=embed)
++    if publish_span:
++        state.model.set_embedding_num_tokens_padded = layer.set_embedding_num_tokens_padded
++    state.supports_mm_inputs = True
++    state.mm_pruner = None
++    state.prompt_embeds_state = None
++    state.execute_mm_encoder = Mock()
++    encoder = EncoderRunner.__new__(EncoderRunner)
++    encoder.model = state.model
++    encoder.inputs_embeds = torch.zeros(padded_tokens, 4)
++    state.encoder_runner = encoder
++    batch = SimpleNamespace(
++        input_ids=torch.nn.functional.pad(ids, (0, padded_tokens - ids.numel())),
++        num_tokens=ids.numel(),
++        num_tokens_after_padding=padded_tokens,
++    )
++    with patch.object(ModelState, "gather_mm_embeddings", return_value=(mm_embeds, mm_mask)):
++        output = state.prepare_inputs_embeds({}, batch, req_states=None)
++    expected = weight[ids].clone()
++    expected[1] = 99.0
++    torch.testing.assert_close(output[: ids.numel()], expected)
++    assert output.shape == (padded_tokens, 4)
++    assert events == ["gather", "scatter"]
++
++
++@pytest.mark.parametrize(
++    ("actual_tokens", "padded_tokens", "mm_positions"),
++    [(3, 4, (1,)), (5, 8, (1, 3)), (3, 4, ())],
++)
++def test_pcp_padding_preserves_evs_position_channels_until_recompute(actual_tokens, padded_tokens, mm_positions):
++    hidden_size = 8
++    num_position_channels = 5
++    num_mm_tokens = len(mm_positions)
++    clean_embeddings = torch.arange(num_mm_tokens * hidden_size, dtype=torch.float32).reshape(-1, hidden_size)
++    positions = torch.arange(num_mm_tokens * num_position_channels, dtype=torch.float32).reshape(
++        -1, num_position_channels
++    )
++    raw_embeddings = [torch.cat((clean_embeddings, positions), dim=-1)] if mm_positions else []
++    is_mm_embed = torch.zeros(actual_tokens, dtype=torch.bool)
++    is_mm_embed[list(mm_positions)] = True
++    input_batch = SimpleNamespace(
++        input_ids=torch.arange(padded_tokens), num_tokens=actual_tokens, num_tokens_after_padding=padded_tokens
++    )
++    req_states = object()
++    events: list[str] = []
++
++    def recompute(embeddings, batch, requests):
++        events.append("recompute")
++        assert batch is input_batch and requests is req_states
++        assert embeddings[0].shape[-1] == hidden_size + num_position_channels
++        torch.testing.assert_close(embeddings[0][:, -num_position_channels:], positions)
++        return [embeddings[0][:, :-num_position_channels]]
++
++    def merge(input_ids, embeddings, mask):
++        events.append("merge")
++        torch.testing.assert_close(input_ids, input_batch.input_ids[:actual_tokens])
++        torch.testing.assert_close(mask[:actual_tokens], is_mm_embed)
++        assert mask.shape == (actual_tokens,)
++        output = torch.zeros(padded_tokens, hidden_size)
++        if embeddings:
++            output[:actual_tokens][mask] = torch.cat(embeddings)
++        return output
++
++    state = AscendModelState.__new__(AscendModelState)
++    state.model = SimpleNamespace(set_embedding_num_tokens_padded=Mock())
++    state.pcp_manager = object()
++    state.supports_mm_inputs = True
++    state.prompt_embeds_state = None
++    state.execute_mm_encoder = Mock()
++    state.apply_staged_writes = Mock(side_effect=lambda: events.append("flush"))
++    state.mm_pruner = SimpleNamespace(
++        strip=Mock(side_effect=lambda embeddings: [mm[:, :hidden_size] for mm in embeddings]),
++        recompute=Mock(side_effect=recompute),
++    )
++    state.encoder_runner = SimpleNamespace(get_inputs_embeds=Mock(side_effect=merge))
++
++    with patch.object(ModelState, "gather_mm_embeddings", return_value=(raw_embeddings, is_mm_embed)):
++        result = state.prepare_inputs_embeds({}, input_batch, req_states)
++
++    expected = torch.zeros(padded_tokens, hidden_size)
++    expected[list(mm_positions)] = clean_embeddings
++    torch.testing.assert_close(result, expected)
++    assert events == (["recompute", "flush", "merge"] if mm_positions else ["merge"])
++    state.mm_pruner.strip.assert_not_called()
++    assert state.mm_pruner.recompute.call_count == int(bool(mm_positions))
++    assert state.apply_staged_writes.call_count == int(bool(mm_positions))
++    state.execute_mm_encoder.assert_called_once_with({})
++    state.model.set_embedding_num_tokens_padded.assert_called_once_with(padded_tokens)
++
++
++def test_non_pcp_embedding_keeps_upstream_behavior():
++    state = AscendModelState.__new__(AscendModelState)
++    state.model = SimpleNamespace()
++    state.pcp_manager = None
++    sentinel = object()
++    with patch.object(DefaultModelState, "prepare_inputs_embeds", return_value=sentinel) as upstream:
++        result = state.prepare_inputs_embeds({}, object(), req_states=None)
++
++    assert result is sentinel
++    upstream.assert_called_once()
++
++
++def test_pcp_embedding_without_padding_keeps_upstream_behavior():
++    state = AscendModelState.__new__(AscendModelState)
++    state.model = SimpleNamespace()
++    state.pcp_manager = object()
++    state.supports_mm_inputs = True
++    input_batch = SimpleNamespace(num_tokens=12, num_tokens_after_padding=12)
++    sentinel = object()
++    with patch.object(DefaultModelState, "prepare_inputs_embeds", return_value=sentinel) as upstream:
++        result = state.prepare_inputs_embeds({}, input_batch, req_states=None)
++
++    assert result is sentinel
++    upstream.assert_called_once()
+diff --git a/vllm_ascend/attention/context_parallel/common_cp.py b/vllm_ascend/attention/context_parallel/common_cp.py
+index 0156fbff6..425abbb1c 100644
+--- a/vllm_ascend/attention/context_parallel/common_cp.py
++++ b/vllm_ascend/attention/context_parallel/common_cp.py
+@@ -8,14 +8,21 @@ from vllm.distributed import get_dcp_group, get_pcp_group, get_tp_group
+ 
+ import vllm_ascend.ops.triton.dcp.dcp_a2a  # noqa: F401
+ from vllm_ascend.distributed.utils import get_decode_context_model_parallel_world_size
++from vllm_ascend.utils import model_uses_kpool_indexer
+ 
+ 
+ def is_pcp_decode_sharding_enabled(vllm_config) -> bool:
+     """Shard PCP decode requests, including speculative target verification.
+ 
+     The decision uses declared vLLM fields so cloning a draft
+-    ``ParallelConfig`` with ``replace()`` remains supported.
++    ``ParallelConfig`` with ``replace()`` remains supported. KPool models
++    keep replicated decodes so every PCP rank advances its head-sharded
++    Mamba state in the same request order.
+     """
++    if model_uses_kpool_indexer(getattr(vllm_config, "model_config", None)):
++        # TODO: Adapt PCP decode request sharding for GLM-5.3-Flash, including
++        # recurrent-state ownership and request ordering across PCP ranks.
++        return False
+     parallel_config = vllm_config.parallel_config
+     return parallel_config.prefill_context_parallel_size > 1 and parallel_config.decode_context_parallel_size == 1
+ 
+diff --git a/vllm_ascend/attention/context_parallel/sfa_cp.py b/vllm_ascend/attention/context_parallel/sfa_cp.py
+index bd8d4351d..2de60f51e 100644
+--- a/vllm_ascend/attention/context_parallel/sfa_cp.py
++++ b/vllm_ascend/attention/context_parallel/sfa_cp.py
+@@ -369,9 +369,20 @@ class AscendSFAPCPImpl(OProjWeightSwitchMixin, AscendSFAImpl):
+         num_replicated_tokens = get_pcp_num_replicated_tokens(
+             attn_metadata.num_decode_tokens or 0, self.is_pcp_decode_sharded
+         )
+-        (kv_no_split, cos, sin), slots = _gather_prefill_cache_inputs(
+-            (kv_no_split, cos, sin), slots, num_replicated_tokens
+-        )
++        if self.qk_rope_head_dim == 0:
++            # NoPE projects only the actual local tokens, while PCP slots keep
++            # the padded rank stride. Keep KV and slots in the same gather
++            # order: scatter writes do not require causal token order.
++            pad_tokens = attn_metadata.num_input_tokens - kv_no_split.shape[0]
++            if pad_tokens < 0:
++                raise ValueError("SFA PCP KV exceeds the rank-local padded token count.")
++            if pad_tokens:
++                kv_no_split = nn.functional.pad(kv_no_split, (0, 0, 0, pad_tokens))
++            (kv_no_split,), slots = _gather_prefill_cache_inputs((kv_no_split,), slots, num_replicated_tokens)
++        else:
++            (kv_no_split, cos, sin), slots = _gather_prefill_cache_inputs(
++                (kv_no_split, cos, sin), slots, num_replicated_tokens
++            )
+         assert slots.numel() == kv_no_split.shape[0], (
+             "SFA PCP cache write requires one slot per gathered token: "
+             f"tokens={kv_no_split.shape[0]}, slots={slots.numel()}."
+diff --git a/vllm_ascend/attention/indexer_kpool.py b/vllm_ascend/attention/indexer_kpool.py
+index 4a82c9a7d..3c3d8d57f 100644
+--- a/vllm_ascend/attention/indexer_kpool.py
++++ b/vllm_ascend/attention/indexer_kpool.py
+@@ -12,7 +12,7 @@ import torch.nn.functional as F
+ from torch import nn
+ from vllm.config import VllmConfig
+ from vllm.config.compilation import CUDAGraphMode
+-from vllm.distributed import get_tp_group
++from vllm.distributed import get_pcp_group, get_tp_group
+ from vllm.forward_context import get_forward_context
+ from vllm.v1.attention.backend import (
+     AttentionBackend,
+@@ -23,6 +23,8 @@ from vllm.v1.attention.backend import (
+ )
+ from vllm.v1.kv_cache_interface import MLAAttentionSpec
+ 
++from vllm_ascend.attention.context_parallel.sfa_dcp_utils import get_sfa_pcp_global_metadata
++from vllm_ascend.attention.utils import AscendCommonAttentionMetadata
+ from vllm_ascend.core.kv_cache_interface import (
+     AscendIndexerKPoolTailSpec,
+     get_kv_cache_compression_ratio,
+@@ -34,9 +36,21 @@ from vllm_ascend.utils import _round_up, enable_dsa_cp, vllm_version_is
+ GLM5_NEXT_SFA_KERNEL_BLOCK_SIZE = 128
+ 
+ 
++def _get_kpool_pcp_global_metadata(
++    common: CommonAttentionMetadata, pcp_context: Any, cache_group_idx: int
++) -> CommonAttentionMetadata:
++    global_batch = pcp_context.global_batch
++    num_reqs = global_batch.num_reqs
++    query_lens = global_batch.query_start_loc_np[1 : num_reqs + 1] - global_batch.query_start_loc_np[:num_reqs]
++    return get_sfa_pcp_global_metadata(common, pcp_context, cache_group_idx).replace(
++        slot_mapping=pcp_context.global_slot_mappings[cache_group_idx, : global_batch.num_tokens],
++        max_query_len=int(max(query_lens, default=0)),
++    )
++
++
+ @dataclass
+ class AscendIndexerKPoolQueryMetadata:
+-    """Token-local query addressing over the replicated pool cache."""
++    """Token-local query addressing over the pool cache."""
+ 
+     positions: torch.Tensor
+     cum_query_lens: torch.Tensor
+@@ -67,6 +81,9 @@ class AscendIndexerKPoolMetadata:
+     keypool_state_table: torch.Tensor | None = None
+     keypool_start_offsets: torch.Tensor | None = None
+     pooled_slot_mapping: torch.Tensor | None = None
++    write_metadata: "AscendIndexerKPoolMetadata | None" = None
++    pcp_hidden_restore_indices: torch.Tensor | None = None
++    pcp_local_token_count: int = 0
+ 
+ 
+ @dataclass
+@@ -120,6 +137,7 @@ class AscendIndexerKPoolMetadataBuilder(AttentionMetadataBuilder):
+         if self.storage_block_size <= 0:
+             raise ValueError(f"Indexer KPool storage block size must be positive, got {self.storage_block_size}.")
+         self.compress_ratio = compress_ratio
++        self.pcp_size = vllm_config.parallel_config.prefill_context_parallel_size
+         if self.logical_block_size % GLM5_NEXT_SFA_KERNEL_BLOCK_SIZE:
+             raise ValueError(
+                 "GLM-Next logical block size must be divisible by the SFA "
+@@ -136,8 +154,10 @@ class AscendIndexerKPoolMetadataBuilder(AttentionMetadataBuilder):
+         self._max_num_batched_tokens = _round_up(scheduler_config.max_num_batched_tokens, self.dsa_cp_size)
+         # FULL draft graphs can pad requests beyond max_num_seqs.
+         self._max_num_metadata_reqs = max(scheduler_config.max_num_seqs, self._max_num_batched_tokens)
++        self._max_num_write_tokens = self._max_num_batched_tokens * self.pcp_size
+         # Keep captured storage isolated between MTP draft steps.
+         self._metadata_buffers: dict[int, _KPoolMetadataBuffers] = {}
++        self._write_metadata_buffers: dict[int, _KPoolMetadataBuffers] = {}
+         self._dsa_cp_query_buffers: dict[int, torch.Tensor] = {}
+         self._captured_state_tables: dict[tuple[int, int, int], torch.Tensor] = {}
+         self._state_table_scratch: dict[int, torch.Tensor] = {}
+@@ -165,11 +185,15 @@ class AscendIndexerKPoolMetadataBuilder(AttentionMetadataBuilder):
+             pool_tail=pool_tail,
+         )
+ 
+-    def _get_metadata_buffers(self, common_attn_metadata: CommonAttentionMetadata) -> _KPoolMetadataBuffers:
+-        key = common_attn_metadata.slot_mapping.data_ptr()
+-        buffers = self._metadata_buffers.get(key)
++    def _get_metadata_buffers(
++        self, common_attn_metadata: CommonAttentionMetadata, *, write: bool = False, step_key: int | None = None
++    ) -> _KPoolMetadataBuffers:
++        key = common_attn_metadata.slot_mapping.data_ptr() if step_key is None else step_key
++        metadata_buffers = self._write_metadata_buffers if write else self._metadata_buffers
++        buffers = metadata_buffers.get(key)
+         if buffers is None:
+-            reqs, tokens = self._max_num_metadata_reqs, self._max_num_batched_tokens
++            reqs = self._max_num_metadata_reqs
++            tokens = self._max_num_write_tokens if write else self._max_num_batched_tokens
+             buffers = _KPoolMetadataBuffers(
+                 slot_mapping=torch.empty(tokens, dtype=torch.int64, device=self.device),
+                 seq_lens=torch.empty(reqs, dtype=torch.int64, device=self.device),
+@@ -183,12 +207,11 @@ class AscendIndexerKPoolMetadataBuilder(AttentionMetadataBuilder):
+                 token_indices=torch.arange(tokens, dtype=torch.int32, device=self.device),
+                 pooled_slot_mapping=torch.empty(tokens + 1, dtype=torch.int64, device=self.device),
+             )
+-            self._metadata_buffers[key] = buffers
++            metadata_buffers[key] = buffers
+         return buffers
+ 
+-    def _get_state_table(self, common: CommonAttentionMetadata, graph_capture: bool) -> torch.Tensor:
++    def _get_state_table(self, common: CommonAttentionMetadata, graph_capture: bool, step: int) -> torch.Tensor:
+         # Capture owns each table; eager shapes reuse one growing allocation.
+-        step = common.slot_mapping.data_ptr()
+         width = getattr(common, "max_query_len", common.num_input_tokens)
+         cols = 1 + (width + self.compress_ratio - 1) // self.compress_ratio
+         shape = (common.num_reqs, cols)
+@@ -220,16 +243,45 @@ class AscendIndexerKPoolMetadataBuilder(AttentionMetadataBuilder):
+     def build(
+         self,
+         common_prefix_len: int,
+-        common_attn_metadata: CommonAttentionMetadata,
++        common_attn_metadata: AscendCommonAttentionMetadata,
+         fast_build: bool = False,
+         **kwargs,
+     ) -> AscendIndexerKPoolMetadata:
+         graph_capture = kwargs.pop("_graph_capture", False)
+-        del common_prefix_len, fast_build, kwargs
++        del common_prefix_len, fast_build
++        metadata = self._build_metadata(common_attn_metadata, graph_capture)
++        pcp_context = common_attn_metadata.pcp_context
++        if pcp_context is not None and bool(pcp_context.global_batch.is_prefilling_np.any()):
++            cache_group_idx = common_attn_metadata.pcp_cache_group_idx
++            if cache_group_idx is None:
++                raise RuntimeError("KPool PCP metadata requires the PCP cache-group index.")
++            global_common = _get_kpool_pcp_global_metadata(common_attn_metadata, pcp_context, cache_group_idx)
++            # PCP-local requests already describe separate contiguous chunks.
++            # CANN compresses the original requests in causal order, while
++            # selection retains the local chunk boundaries and block tables.
++            metadata.write_metadata = self._build_metadata(
++                global_common, graph_capture, write=True, step_key=common_attn_metadata.slot_mapping.data_ptr()
++            )
++            metadata.pcp_hidden_restore_indices = pcp_context.hidden_restore_idx[: global_common.num_input_tokens]
++            if pcp_context.padded_gather_idx is None:
++                raise RuntimeError("KPool PCP prefill requires the gathered-token layout.")
++            metadata.pcp_local_token_count = pcp_context.padded_gather_idx.numel() // self.pcp_size
++        return metadata
++
++    def _build_metadata(
++        self,
++        common_attn_metadata: CommonAttentionMetadata,
++        graph_capture: bool,
++        *,
++        write: bool = False,
++        step_key: int | None = None,
++    ) -> AscendIndexerKPoolMetadata:
+         num_reqs = common_attn_metadata.num_reqs
+         num_input_tokens = common_attn_metadata.num_input_tokens
+-        buffers = self._get_metadata_buffers(common_attn_metadata)
++        buffers = self._get_metadata_buffers(common_attn_metadata, write=write, step_key=step_key)
+         num_cache_tokens = _round_up(num_input_tokens, self.dsa_cp_size)
++        if num_cache_tokens > buffers.positions.numel():
++            raise RuntimeError("KPool metadata token count exceeds its persistent buffer capacity.")
+         num_source_tokens = min(
+             num_input_tokens, common_attn_metadata.positions.shape[0], common_attn_metadata.slot_mapping.shape[0]
+         )
+@@ -237,8 +289,10 @@ class AscendIndexerKPoolMetadataBuilder(AttentionMetadataBuilder):
+             raise ValueError("KPool positions and slot mapping must cover every actual token.")
+         from vllm_ascend.ops.triton.glm5_next_cann_keypool import build_keypool_metadata  # type: ignore[import-untyped]
+ 
+-        state_table = self._get_state_table(common_attn_metadata, graph_capture)
+-        query_metadata = self._build_query_metadata(common_attn_metadata, buffers.positions[:num_cache_tokens])
++        state_table = self._get_state_table(common_attn_metadata, graph_capture, buffers.slot_mapping.data_ptr())
++        query_metadata = (
++            None if write else self._build_query_metadata(common_attn_metadata, buffers.positions[:num_cache_tokens])
++        )
+         (
+             positions,
+             slot_mapping,
+@@ -319,6 +373,10 @@ class AscendIndexerKPoolBackend(AttentionBackend):
+         # `init_attn_backend` on main; the v0.31.0 lane has no such check.
+         return not vllm_version_is("0.31.0")
+ 
++    @classmethod
++    def supports_pcp(cls) -> bool:
++        return True
++
+     @staticmethod
+     def get_supported_kernel_block_sizes(kv_cache_spec=None) -> list[int | MultipleOf]:
+         return [MultipleOf(1)]
+@@ -350,6 +408,8 @@ class AscendIndexerKPoolTailMetadata:
+     slot_mapping: torch.Tensor
+     block_size: int
+     cann_inputs: Any = None
++    write_block_table: torch.Tensor | None = None
++    write_slot_mapping: torch.Tensor | None = None
+ 
+ 
+ class AscendIndexerKPoolTailMetadataBuilder(AttentionMetadataBuilder):
+@@ -392,16 +452,23 @@ class AscendIndexerKPoolTailMetadataBuilder(AttentionMetadataBuilder):
+     def build(
+         self,
+         common_prefix_len: int,
+-        common_attn_metadata: CommonAttentionMetadata,
++        common_attn_metadata: AscendCommonAttentionMetadata,
+         fast_build: bool = False,
+         **kwargs,
+     ) -> AscendIndexerKPoolTailMetadata:
+-        del common_prefix_len, fast_build, kwargs
++        del common_prefix_len, fast_build
+         num_reqs = common_attn_metadata.num_reqs
+         num_input_tokens = common_attn_metadata.num_input_tokens
+         key = common_attn_metadata.slot_mapping.data_ptr()
+         block_table = common_attn_metadata.block_table_tensor[:num_reqs, :1]
+         slot_mapping = common_attn_metadata.slot_mapping[:num_input_tokens]
++        pcp_context = common_attn_metadata.pcp_context
++        write_common = common_attn_metadata
++        if pcp_context is not None and bool(pcp_context.global_batch.is_prefilling_np.any()):
++            cache_group_idx = common_attn_metadata.pcp_cache_group_idx
++            if cache_group_idx is None:
++                raise RuntimeError("KPool tail PCP metadata requires the PCP cache-group index.")
++            write_common = _get_kpool_pcp_global_metadata(common_attn_metadata, pcp_context, cache_group_idx)
+         from vllm_ascend.ops.triton.glm5_next_cann_keypool import build_tail_inputs  # type: ignore[import-untyped]
+ 
+         if key not in self._tail_inputs:
+@@ -414,12 +481,10 @@ class AscendIndexerKPoolTailMetadataBuilder(AttentionMetadataBuilder):
+                 },
+             }
+         retained_width = (
+-            min(self.block_size, getattr(common_attn_metadata, "max_query_len", self.block_size))
+-            if self._lookahead
+-            else 0
++            min(self.block_size, getattr(write_common, "max_query_len", self.block_size)) if self._lookahead else 0
+         )
+         cann_inputs = build_tail_inputs(
+-            common_attn_metadata,
++            write_common,
+             self._pool_size,
+             self.block_size,
+             self._page_rows,
+@@ -431,6 +496,8 @@ class AscendIndexerKPoolTailMetadataBuilder(AttentionMetadataBuilder):
+             slot_mapping=slot_mapping,
+             block_size=self.block_size,
+             cann_inputs=cann_inputs,
++            write_block_table=write_common.block_table_tensor[: write_common.num_reqs, :1],
++            write_slot_mapping=write_common.slot_mapping[: write_common.num_input_tokens],
+         )
+ 
+     def build_for_graph_capture(
+@@ -469,6 +536,10 @@ class AscendIndexerKPoolTailBackend(AttentionBackend):
+         # `init_attn_backend` on main; the v0.31.0 lane has no such check.
+         return not vllm_version_is("0.31.0")
+ 
++    @classmethod
++    def supports_pcp(cls) -> bool:
++        return True
++
+     @staticmethod
+     def get_supported_kernel_block_sizes(kv_cache_spec=None) -> list[int | MultipleOf]:
+         # Ring capacity is independent of the pool size and SFA C128.
+@@ -507,8 +578,8 @@ class Glm5NextKPoolIndexerBackend(nn.Module):
+                 f"GLM-Next KPool indexing supports NoPE queries only, got qk_rope_head_dim={qk_rope_head_dim}."
+             )
+         parallel_config = vllm_indexer.vllm_config.parallel_config
+-        if parallel_config.prefill_context_parallel_size > 1 or parallel_config.decode_context_parallel_size > 1:
+-            raise NotImplementedError("GLM-Next KPool indexing does not support PCP or DCP.")
++        if parallel_config.decode_context_parallel_size > 1:
++            raise NotImplementedError("GLM-Next KPool indexing does not support DCP.")
+ 
+         if get_current_hardware_profile().attention_backend_family is AttentionBackendFamily.COMPATIBILITY:
+             raise NotImplementedError("KPool sparse attention requires Ascend A2, A3 or A5.")
+@@ -613,6 +684,15 @@ class Glm5NextKPoolIndexerBackend(nn.Module):
+         tail_cache = self._bound_cache(self.tail_cache)
+         if indexer_metadata.query_metadata is not None:
+             k_hidden = get_tp_group().all_gather(k_hidden, dim=0)
++        restore_indices = indexer_metadata.pcp_hidden_restore_indices
++        if restore_indices is not None:
++            padding = indexer_metadata.pcp_local_token_count - k_hidden.shape[0]
++            if padding < 0:
++                raise ValueError("KPool PCP keys exceed the rank-local padded token count.")
++            if padding:
++                k_hidden = F.pad(k_hidden, (0, 0, 0, padding))
++            gathered_hidden = get_pcp_group().all_gather(k_hidden.contiguous(), dim=0)
++            k_hidden = torch.index_select(gathered_hidden, 0, restore_indices)
+         return self._forward_cann(
+             k_hidden,
+             q_values,
+@@ -657,9 +737,8 @@ class Glm5NextKPoolIndexerBackend(nn.Module):
+         compute_topk: bool,
+     ) -> torch.Tensor | None:
+         query_metadata = indexer_metadata.query_metadata or indexer_metadata
+-        num_tokens = (
+-            query_metadata.positions.shape[0] if indexer_metadata.query_metadata is not None else hidden_states.shape[0]
+-        )
++        cache_metadata = indexer_metadata.write_metadata or indexer_metadata
++        num_tokens = q_values.shape[0] if q_values is not None else query_metadata.positions.shape[0]
+         output_width = self.topk_tokens + self.index_kpool - 1
+         if compute_topk and self.topk_indices_buffer is not None:
+             if (
+@@ -674,18 +753,18 @@ class Glm5NextKPoolIndexerBackend(nn.Module):
+                 raise ValueError("GLM KPool output buffer must cover the token rows and top-k width.")
+         if self.index_kpool <= 0 or self.topk_tokens <= 0 or self.topk_tokens % self.index_kpool:
+             raise ValueError("KPool top-k must be divisible by its positive pool size.")
+-        if num_tokens == 0:
++        if hidden_states.shape[0] == 0:
+             if not compute_topk:
+                 return None
+             if self.topk_indices_buffer is not None:
+                 return self.topk_indices_buffer[:0, :output_width].unsqueeze(1)
+             return torch.empty((0, 1, output_width), dtype=torch.int32, device=hidden_states.device)
+         if (
+-            indexer_metadata.cum_query_lens is None
+-            or indexer_metadata.query_start_loc is None
+-            or indexer_metadata.start_pos is None
+-            or indexer_metadata.pool_tail is None
+-            or indexer_metadata.pooled_slot_mapping is None
++            cache_metadata.cum_query_lens is None
++            or cache_metadata.query_start_loc is None
++            or cache_metadata.start_pos is None
++            or cache_metadata.pool_tail is None
++            or cache_metadata.pooled_slot_mapping is None
+             or tail_metadata.cann_inputs is None
+         ):
+             raise ValueError("GLM KPool metadata requires CANN request boundaries and pooled-key row indices.")
+@@ -709,18 +788,18 @@ class Glm5NextKPoolIndexerBackend(nn.Module):
+         # Keep history separate: CANN can save the tail before other cores
+         # finish reading history. Whole-pool shifts preserve the pooling result.
+         norm_eps = getattr(self.k_norm, "eps", getattr(self.k_norm, "variance_epsilon", 1e-6))
+-        state = self._prepare_keypool_state(tail_cache, indexer_metadata.start_pos, tail_metadata, self.index_kpool)
++        state = self._prepare_keypool_state(tail_cache, cache_metadata.start_pos, tail_metadata, self.index_kpool)
+         pooled_key = self._key_pool(
+             hidden_states,
+             self._key_weight,
+             self._gate_weight,
+             self.index_kpool_compress_ape,
+             state,
+-            indexer_metadata.keypool_state_table,
+-            indexer_metadata.keypool_start_offsets,
++            cache_metadata.keypool_state_table,
++            cache_metadata.keypool_start_offsets,
+             norm_weight=self._norm_weight_f32,
+             norm_bias=self._norm_bias_f32,
+-            cu_seqlens=indexer_metadata.query_start_loc,
++            cu_seqlens=cache_metadata.query_start_loc,
+             cmp_ratio=self.index_kpool,
+             norm_eps=norm_eps,
+         )
+@@ -740,7 +819,7 @@ class Glm5NextKPoolIndexerBackend(nn.Module):
+             tail_key,
+             tail_gate,
+             pooled_key,
+-            indexer_metadata,
++            cache_metadata,
+             tail_metadata,
+             state,
+         )
+@@ -749,7 +828,9 @@ class Glm5NextKPoolIndexerBackend(nn.Module):
+             return None
+         # Empty DSA-CP shards must update caches but skip CANN's unsafe no-work path.
+         # FULL capture retains selection because replay may have live queries.
+-        if query_metadata.num_actual_tokens == 0 and get_forward_context().cudagraph_runtime_mode != CUDAGraphMode.FULL:
++        if num_tokens == 0 or (
++            query_metadata.num_actual_tokens == 0 and get_forward_context().cudagraph_runtime_mode != CUDAGraphMode.FULL
++        ):
+             if self.topk_indices_buffer is not None:
+                 output = self.topk_indices_buffer[:num_tokens]
+                 output.fill_(-1)
+diff --git a/vllm_ascend/device/device_op.py b/vllm_ascend/device/device_op.py
+index 95471f8c3..d9e643ad1 100644
+--- a/vllm_ascend/device/device_op.py
++++ b/vllm_ascend/device/device_op.py
+@@ -560,7 +560,9 @@ class BaseDeviceAdaptor:
+                 return_lse=return_lse,
+             )
+         else:
+-            key_rope = kv_cache[1]
++            # NoPE sparse MLA has one latent KV cache and no RoPE inputs.
++            nope = sfa_impl.qk_rope_head_dim == 0
++            key_rope = None if nope else kv_cache[1]
+             result = torch.ops._C_ascend.npu_sparse_flash_attention(
+                 query=ql_nope,
+                 key=kv,
+@@ -571,7 +573,7 @@ class BaseDeviceAdaptor:
+                 block_table=block_table,
+                 actual_seq_lengths_query=actual_seq_lengths_query,
+                 actual_seq_lengths_kv=actual_seq_lengths_key,
+-                query_rope=q_pe,
++                query_rope=None if nope else q_pe,
+                 key_rope=key_rope,
+                 layout_query="TND",
+                 layout_kv="PA_BSND",
+diff --git a/vllm_ascend/models/glm5next/kda.py b/vllm_ascend/models/glm5next/kda.py
+index d9810326f..e6c5265ae 100644
+--- a/vllm_ascend/models/glm5next/kda.py
++++ b/vllm_ascend/models/glm5next/kda.py
+@@ -5,8 +5,8 @@
+ import torch
+ from torch import nn
+ from vllm.compilation.breakable_cudagraph import eager_break_during_capture
+-from vllm.config import VllmConfig, get_current_vllm_config
+-from vllm.distributed import divide
++from vllm.config import ParallelConfig, VllmConfig, get_current_vllm_config
++from vllm.distributed import divide, get_pcp_group
+ from vllm.forward_context import get_forward_context
+ from vllm.model_executor.layers.linear import (
+     ColumnParallelLinear,
+@@ -19,7 +19,7 @@ from vllm.model_executor.layers.mamba.mamba_utils import (
+     MambaStateShapeCalculator,
+     is_conv_state_dim_first,
+ )
+-from vllm.model_executor.model_loader.weight_utils import sharded_weight_loader
++from vllm.model_executor.model_loader.weight_utils import default_weight_loader
+ from vllm.model_executor.utils import set_weight_attrs
+ from vllm.v1.attention.backends.gdn_attn import GDNAttentionMetadata
+ 
+@@ -42,6 +42,75 @@ else:
+     from transformers import Glm5NextConfig
+ 
+ 
++class Glm5NextGDNHostMetadataBackend(AscendGDNHostMetadataBackend):
++    @classmethod
++    def supports_pcp(cls) -> bool:
++        # The GLM KDA layer gathers PCP prefill tokens before its head-sharded
++        # recurrent update and restores the PCP-local output afterward.
++        return True
++
++
++def get_kda_parallel_size(parallel_config: ParallelConfig) -> int:
++    """Use PCP head sharding only when tensor parallelism is disabled."""
++    # TODO: Support joint TP * PCP head partitioning for projections and state.
++    if parallel_config.tensor_parallel_size == 1:
++        return parallel_config.prefill_context_parallel_size
++    return parallel_config.tensor_parallel_size
++
++
++class PCPColumnParallelLinear(ColumnParallelLinear):
++    """Column-parallel projection using PCP ranks and collectives."""
++
++    def __init__(self, input_size: int, output_size: int, **kwargs) -> None:
++        pcp_group = get_pcp_group()
++        super().__init__(
++            input_size,
++            output_size,
++            tp_rank=pcp_group.rank_in_group,
++            tp_size=pcp_group.world_size,
++            **kwargs,
++        )
++        self.tp_group = pcp_group
++
++    def forward(self, input_):
++        bias = self.bias if not self.skip_bias_add else None
++        output = self.quant_method.apply(self, input_, bias)
++        if self.gather_output and self.tp_size > 1:
++            output = self.tp_group.all_gather(output, dim=-1)
++        if not self.return_bias:
++            return output
++        return output, self.bias if self.skip_bias_add else None
++
++
++class PCPRowParallelLinear(RowParallelLinear):
++    """Row-parallel projection reducing head contributions over PCP."""
++
++    def __init__(self, input_size: int, output_size: int, **kwargs) -> None:
++        pcp_group = get_pcp_group()
++        # The pinned RowParallelLinear has no rank/size overrides. Allocate
++        # the local input shard, then bind its inherited weight loaders to PCP.
++        super().__init__(divide(input_size, pcp_group.world_size), output_size, disable_tp=True, **kwargs)
++        self.input_size = input_size
++        self.disable_tp = False
++        self.tp_size = pcp_group.world_size
++        self.tp_rank = pcp_group.rank_in_group
++        self.tp_group = pcp_group
++        self.update_param_tp_status()
++
++    def forward(self, input_):
++        if self.input_is_parallel:
++            input_parallel = input_
++        else:
++            input_parallel = input_.chunk(self.tp_size, dim=-1)[self.tp_rank].contiguous()
++        bias = None if self.tp_rank > 0 or self.skip_bias_add else self.bias
++        output = self.quant_method.apply(self, input_parallel, bias)
++        if self.reduce_results and self.tp_size > 1:
++            output = self.tp_group.all_reduce(output)
++        if not self.return_bias:
++            return output
++        return output, self.bias if self.skip_bias_add else None
++
++
+ class _Glm5NextMergedColumnParallelLinear(MergedColumnParallelLinear):
+     """Merged projection with multiple replicated output shards.
+ 
+@@ -109,10 +178,31 @@ class _Glm5NextMergedColumnParallelLinear(MergedColumnParallelLinear):
+                 param.tp_rank = param_tp_rank
+ 
+ 
++class PCPGlm5NextMergedColumnParallelLinear(_Glm5NextMergedColumnParallelLinear, PCPColumnParallelLinear):
++    """PCP-sharded Q/K/V/b with replicated low-rank f_a/g_a shards."""
++
++    def __init__(
++        self,
++        input_size: int,
++        output_sizes: list[int],
++        replicated_shard_ids: tuple[int, ...],
++        tp_size: int,
++        **kwargs,
++    ) -> None:
++        self.replicated_shard_ids = set(replicated_shard_ids)
++        self.output_sizes = output_sizes.copy()
++        for sid in self.replicated_shard_ids:
++            self.output_sizes[sid] *= tp_size
++        # MergedColumnParallelLinear's constructor hardcodes the TP group.
++        # Retain its shard loaders while allocating through the PCP column layer.
++        PCPColumnParallelLinear.__init__(self, input_size, sum(self.output_sizes), **kwargs)
++
++
+ class Glm5NextLinearAttention(GatedDeltaNetAttention):
+     use_contiguous_conv_indices = True
+     use_shared_conv_output = True
+ 
++    tp_size: int
+     head_dim: int
+     num_heads: int
+     conv_size: int
+@@ -164,6 +254,20 @@ class Glm5NextLinearAttention(GatedDeltaNetAttention):
+             raise ValueError("GLM AscendC causal-conv requires kernel width=4 for MTP.")
+         if not -5 <= config.linear_lower_bound < 0:
+             raise ValueError("GLM AscendC KDA requires linear_lower_bound in [-5, 0).")
++        self.pcp_group = get_pcp_group()
++        self.pcp_size = self.pcp_group.world_size
++        self.pcp_rank = self.pcp_group.rank_in_group
++        self.use_pcp_head_sharding = self.tp_size == 1 and self.pcp_size > 1
++        column_linear = ColumnParallelLinear
++        merged_linear = _Glm5NextMergedColumnParallelLinear
++        row_linear = RowParallelLinear
++        if self.use_pcp_head_sharding:
++            self.tp_size = get_kda_parallel_size(vllm_config.parallel_config)
++            self.tp_rank = self.pcp_rank
++            column_linear = PCPColumnParallelLinear
++            merged_linear = PCPGlm5NextMergedColumnParallelLinear
++            row_linear = PCPRowParallelLinear
++
+         self.head_dim = config.linear_head_dim
+         self.num_heads = config.linear_num_heads
+         self.conv_size = config.linear_conv_kernel_dim
+@@ -175,8 +279,8 @@ class Glm5NextLinearAttention(GatedDeltaNetAttention):
+ 
+         # Merge q, k, v, b, f_a, g_a projections into one GEMM (6→1 launches).
+         # Order matches checkpoint's fused_qkvbfg_a_proj convention.
+-        # Shards 4 (f_a) and 5 (g_a) are replicated across TP ranks.
+-        self.in_proj_qkvbfg_a = _Glm5NextMergedColumnParallelLinear(
++        # Shards 4 (f_a) and 5 (g_a) are replicated across head-sharding ranks.
++        self.in_proj_qkvbfg_a = merged_linear(
+             self.hidden_size,
+             [
+                 projection_size,  # q (shard 0)
+@@ -193,7 +297,7 @@ class Glm5NextLinearAttention(GatedDeltaNetAttention):
+             prefix=f"{prefix}.in_proj_qkvbfg_a",
+         )
+ 
+-        self.f_b_proj = ColumnParallelLinear(
++        self.f_b_proj = column_linear(
+             self.head_dim,
+             projection_size,
+             bias=False,
+@@ -202,23 +306,23 @@ class Glm5NextLinearAttention(GatedDeltaNetAttention):
+         )
+         self.dt_bias = nn.Parameter(torch.empty(divide(projection_size, self.tp_size), dtype=torch.float32))
+ 
+-        set_weight_attrs(self.dt_bias, {"weight_loader": sharded_weight_loader(0)})
++        set_weight_attrs(self.dt_bias, {"weight_loader": self._dt_bias_weight_loader})
+ 
+-        self.q_conv1d = ColumnParallelLinear(
++        self.q_conv1d = column_linear(
+             input_size=self.conv_size,
+             output_size=projection_size,
+             bias=False,
+             params_dtype=torch.float32,
+             prefix=f"{prefix}.q_conv1d",
+         )
+-        self.k_conv1d = ColumnParallelLinear(
++        self.k_conv1d = column_linear(
+             input_size=self.conv_size,
+             output_size=projection_size,
+             bias=False,
+             params_dtype=torch.float32,
+             prefix=f"{prefix}.k_conv1d",
+         )
+-        self.v_conv1d = ColumnParallelLinear(
++        self.v_conv1d = column_linear(
+             input_size=self.conv_size,
+             output_size=projection_size,
+             bias=False,
+@@ -237,9 +341,9 @@ class Glm5NextLinearAttention(GatedDeltaNetAttention):
+         self._merged_conv_weight: torch.Tensor | None = None
+ 
+         self.A_log = nn.Parameter(torch.empty(1, 1, self.local_num_heads, 1, dtype=torch.float32))
+-        set_weight_attrs(self.A_log, {"weight_loader": sharded_weight_loader(2)})
++        set_weight_attrs(self.A_log, {"weight_loader": self._a_log_weight_loader})
+ 
+-        self.g_b_proj = ColumnParallelLinear(
++        self.g_b_proj = column_linear(
+             self.head_dim,
+             projection_size,
+             bias=False,
+@@ -256,7 +360,7 @@ class Glm5NextLinearAttention(GatedDeltaNetAttention):
+         from vllm.third_party.flash_linear_attention.ops.kda import FusedRMSNormGated
+ 
+         self.o_norm = FusedRMSNormGated(self.head_dim, activation="sigmoid")
+-        self.o_proj = RowParallelLinear(
++        self.o_proj = row_linear(
+             projection_size,
+             self.hidden_size,
+             bias=False,
+@@ -269,14 +373,6 @@ class Glm5NextLinearAttention(GatedDeltaNetAttention):
+             raise ValueError(f"Duplicate layer name: {prefix}")
+         compilation_config.static_forward_context[prefix] = self
+ 
+-        # Checkpoints store A_log as 1-D; the model parameter is 4-D.
+-        def _a_log_weight_loader(param, loaded_weight):
+-            if loaded_weight.dim() == 1:
+-                loaded_weight = loaded_weight.view([1, 1, -1, 1])
+-            return sharded_weight_loader(2)(param, loaded_weight)
+-
+-        self.A_log.weight_loader = _a_log_weight_loader
+-
+         # GLM-5.3-Flash uses a bounded sigmoid gate instead of the default
+         # unbounded softplus gate.
+         self.kda_lower_bound = config.linear_lower_bound
+@@ -284,14 +380,37 @@ class Glm5NextLinearAttention(GatedDeltaNetAttention):
+         # every _forward call (it reads an env-derived flag each time).
+         self._conv_state_dim_first = is_conv_state_dim_first()
+ 
++    def _dt_bias_weight_loader(self, param, loaded_weight):
++        shard_size = param.shape[0]
++        default_weight_loader(param, loaded_weight.narrow(0, self.tp_rank * shard_size, shard_size))
++
++    def _a_log_weight_loader(self, param, loaded_weight):
++        # Checkpoints store A_log as 1-D; the model parameter is 4-D.
++        if loaded_weight.dim() == 1:
++            loaded_weight = loaded_weight.view(1, 1, -1, 1)
++        shard_size = param.shape[2]
++        default_weight_loader(param, loaded_weight.narrow(2, self.tp_rank * shard_size, shard_size))
++
+     def get_attn_backend(self):
+-        return AscendGDNHostMetadataBackend
++        return Glm5NextGDNHostMetadataBackend
+ 
+     def forward(
+         self,
+         hidden_states: torch.Tensor,
+         positions: torch.Tensor,
+     ) -> torch.Tensor:
++        attn_metadata_raw = get_forward_context().attn_metadata
++        attn_metadata = attn_metadata_raw.get(self.prefix) if isinstance(attn_metadata_raw, dict) else None
++        pcp_context = getattr(attn_metadata, "pcp_context", None)
++        has_pcp_prefill = pcp_context is not None and bool(pcp_context.global_batch.is_prefilling_np.any())
++        local_num_tokens = hidden_states.size(0)
++        if has_pcp_prefill:
++            assert pcp_context is not None
++            assert pcp_context.padded_gather_idx is not None
++            # PCP assigns the first and last chunks of a prefill to the same
++            # rank. Reconstruct causal order before advancing the head-sharded
++            # recurrent state. With TP=1 each PCP rank owns different heads.
++            hidden_states = self.pcp_group.all_gather(hidden_states, dim=0)[pcp_context.hidden_restore_idx]
+         num_tokens = hidden_states.size(0)
+         # One merged GEMM for q, k, v, b, f_a, g_a (replaces 6 separate GEMMs).
+         projected = self.in_proj_qkvbfg_a(hidden_states)[0]
+@@ -332,7 +451,15 @@ class Glm5NextLinearAttention(GatedDeltaNetAttention):
+         )
+         core_attn_out = self.o_norm(core_attn_out, g2)
+         core_attn_out = core_attn_out.reshape(core_attn_out.size(1), -1)
+-        return self.o_proj(core_attn_out)[0]
++        output = self.o_proj(core_attn_out)[0]
++        if has_pcp_prefill:
++            assert pcp_context is not None
++            if pcp_context.padded_gather_idx.numel() != self.pcp_size * local_num_tokens:
++                raise RuntimeError("KDA PCP token mapping does not match the rank-local model input.")
++            local_start = self.pcp_rank * local_num_tokens
++            local_indices = pcp_context.padded_gather_idx[local_start : local_start + local_num_tokens]
++            output = output[local_indices]
++        return output
+ 
+     @eager_break_during_capture
+     def _forward(
+diff --git a/vllm_ascend/models/glm5next/model.py b/vllm_ascend/models/glm5next/model.py
+index 47d33c2ab..e07a56cd0 100644
+--- a/vllm_ascend/models/glm5next/model.py
++++ b/vllm_ascend/models/glm5next/model.py
+@@ -87,7 +87,7 @@ else:
+     from transformers import Glm5NextConfig
+ 
+ from .attention import Glm5NextMLAAttention
+-from .kda import Glm5NextLinearAttention
++from .kda import Glm5NextLinearAttention, get_kda_parallel_size
+ from .multimodal import (
+     Glm5NextMultiModalProcessor,
+     Glm5NextProcessingInfo,
+@@ -895,7 +895,7 @@ class Glm5NextForCausalLM(nn.Module, HasInnerState, SupportsPP, MixtureOfExperts
+     ) -> tuple[tuple[int, int], tuple[int, int, int]]:
+         parallel_config = vllm_config.parallel_config
+         hf_config = vllm_config.model_config.hf_config
+-        tp_size = parallel_config.tensor_parallel_size
++        tp_size = get_kda_parallel_size(parallel_config)
+         num_spec = vllm_config.speculative_config.num_speculative_tokens if vllm_config.speculative_config else 0
+         return MambaStateShapeCalculator.kda_state_shape(
+             tp_size,
+diff --git a/vllm_ascend/models/glm5next/sparse_attn_indexer_kpool.py b/vllm_ascend/models/glm5next/sparse_attn_indexer_kpool.py
+index 711c94443..eebdcb48c 100644
+--- a/vllm_ascend/models/glm5next/sparse_attn_indexer_kpool.py
++++ b/vllm_ascend/models/glm5next/sparse_attn_indexer_kpool.py
+@@ -83,21 +83,48 @@ class SparseAttnIndexerKpool(nn.Module):
+         output_buffer: torch.Tensor | None = None,
+         allow_cache_packing: bool = True,
+         query_metadata: AscendIndexerKPoolQueryMetadata | None = None,
++        write_k: torch.Tensor | None = None,
++        write_gate_score: torch.Tensor | None = None,
++        write_positions: torch.Tensor | None = None,
++        write_cum_query_lens: torch.Tensor | None = None,
++        write_raw_seq_lens: torch.Tensor | None = None,
++        write_indexer_slot_mapping: torch.Tensor | None = None,
++        write_tail_slot_mapping: torch.Tensor | None = None,
++        write_tail_block_table: torch.Tensor | None = None,
+     ) -> torch.Tensor | None:
+         num_tokens = k.shape[0]
+         if index_kpool <= 0 or self.topk_tokens % index_kpool:
+             raise ValueError("KPool top-k must be divisible by its positive pool size.")
+-        if num_tokens == 0:
++        if indexer_metadata.cum_query_lens is None or indexer_metadata.raw_seq_lens is None:
++            raise ValueError("GLM KPool metadata requires cum_query_lens and raw_seq_lens.")
++        if indexer_cache.dtype != torch.bfloat16:
++            raise TypeError("GLM KPool compressed cache must be bfloat16.")
++        write_k = k if write_k is None else write_k
++        write_gate_score = gate_score if write_gate_score is None else write_gate_score
++        write_positions = positions if write_positions is None else write_positions
++        write_cum_query_lens = indexer_metadata.cum_query_lens if write_cum_query_lens is None else write_cum_query_lens
++        write_raw_seq_lens = indexer_metadata.raw_seq_lens if write_raw_seq_lens is None else write_raw_seq_lens
++        write_indexer_slot_mapping = (
++            indexer_metadata.slot_mapping if write_indexer_slot_mapping is None else write_indexer_slot_mapping
++        )
++        write_tail_slot_mapping = (
++            tail_metadata.slot_mapping if write_tail_slot_mapping is None else write_tail_slot_mapping
++        )
++        write_tail_block_table = tail_metadata.block_table if write_tail_block_table is None else write_tail_block_table
++        assert write_cum_query_lens is not None and write_raw_seq_lens is not None
++        if write_k.shape[0] == 0:
+             return (
+                 None
+                 if not compute_topk
+                 else torch.empty((0, 1, self.topk_tokens + index_kpool - 1), dtype=torch.int32, device=k.device)
+             )
+-        if indexer_metadata.cum_query_lens is None or indexer_metadata.raw_seq_lens is None:
+-            raise ValueError("GLM KPool metadata requires cum_query_lens and raw_seq_lens.")
+-        if indexer_cache.dtype != torch.bfloat16:
+-            raise TypeError("GLM KPool compressed cache must be bfloat16.")
+-        if tail_cache.dtype != torch.float32 or k.dtype != torch.float32 or gate_score.dtype != torch.float32:
++        if (
++            tail_cache.dtype != torch.float32
++            or k.dtype != torch.float32
++            or gate_score.dtype != torch.float32
++            or write_k.dtype != torch.float32
++            or write_gate_score.dtype != torch.float32
++        ):
+             raise TypeError("GLM KPool keys, gates and compressor tail must be float32.")
+         if (
+             tail_cache.ndim != 4
+@@ -105,6 +132,7 @@ class SparseAttnIndexerKpool(nn.Module):
+             or tail_cache.shape[2] < index_kpool
+             or tail_cache.shape[3] != self.head_dim
+             or gate_score.shape != k.shape
++            or write_gate_score.shape != write_k.shape
+         ):
+             raise ValueError("GLM KPool tail requires [blocks, 2, capacity, head_dim] K/gate storage.")
+         if tail_metadata.block_size != tail_cache.shape[2]:
+@@ -115,17 +143,23 @@ class SparseAttnIndexerKpool(nn.Module):
+         glm5_next_kpool_tail_compress_and_write_cache_triton(
+             tail_cache,
+             indexer_cache,
+-            k,
+-            gate_score,
++            write_k,
++            write_gate_score,
+             compress_ape,
+-            positions,
+-            indexer_metadata.cum_query_lens,
+-            indexer_metadata.raw_seq_lens,
+-            tail_metadata.slot_mapping[:num_tokens],
+-            tail_metadata.block_table,
+-            indexer_metadata.slot_mapping[:num_tokens],
++            write_positions,
++            write_cum_query_lens,
++            write_raw_seq_lens,
++            write_tail_slot_mapping[: write_k.shape[0]],
++            write_tail_block_table,
++            write_indexer_slot_mapping[: write_k.shape[0]],
+             index_kpool,
+         )
++        if num_tokens == 0:
++            return (
++                None
++                if not compute_topk
++                else torch.empty((0, 1, self.topk_tokens + index_kpool - 1), dtype=torch.int32, device=k.device)
++            )
+         # Sharing top-k still advances the compressed cache and raw tail.
+         if not compute_topk:
+             return None
+diff --git a/vllm_ascend/ops/gdn_attn_builder.py b/vllm_ascend/ops/gdn_attn_builder.py
+index ced8f5c8f..a6b86fdbf 100644
+--- a/vllm_ascend/ops/gdn_attn_builder.py
++++ b/vllm_ascend/ops/gdn_attn_builder.py
+@@ -470,12 +470,8 @@ class AscendGDNAttentionMetadataBuilder(GDNAttentionMetadataBuilder):
+         if non_spec_cache_indices is None:
+             raise RuntimeError("Expected non_spec_cache_indices for Ascend GDN prefill conv1d path.")
+         prefill_num_rows = attn_metadata.non_spec_query_start_loc.size(0) - 1
+-        pcp_size = getattr(self.vllm_config.parallel_config, "prefill_context_parallel_size", 1)
+-        pcp_rank = get_pcp_group().rank_in_group if pcp_size > 1 else 0
+-        if pcp_rank > 0 and attn_metadata.num_prefills > 0:
+-            prefill_seq_offset = max(0, prefill_num_rows - attn_metadata.num_prefills)
+-            initial_state_mode = initial_state_mode.clone()
+-            initial_state_mode[prefill_seq_offset:] = True
++        # MRV2 builds complete request metadata for recurrent attention.
++        # Fresh requests must ignore reused convolution state on every rank.
+         attn_metadata.non_spec_prefill_metadata = GDNPrefillMetadata(
+             causal_conv1d=GDNCausalConv1dMetadata(
+                 query_start_loc=attn_metadata.non_spec_query_start_loc,
+@@ -1100,6 +1096,7 @@ class AscendGDNHostMetadataBuilder(AscendGDNAttentionMetadataBuilder):
+             fast_build=fast_build,
+             num_actual_reqs=num_actual_reqs,
+         )
++        metadata.pcp_context = getattr(common_attn_metadata, "pcp_context", None)
+         if self._conv_output_buffer is not None:
+             # Layers in this group consume the same decode rows in sequence.
+             # Clear once per step, including inactive captured branches: rows
+diff --git a/vllm_ascend/worker/v2/model_states/mamba_hybrid.py b/vllm_ascend/worker/v2/model_states/mamba_hybrid.py
+index ebb11f0ac..5f50789b8 100644
+--- a/vllm_ascend/worker/v2/model_states/mamba_hybrid.py
++++ b/vllm_ascend/worker/v2/model_states/mamba_hybrid.py
+@@ -17,14 +17,14 @@
+ # This file is a part of the vllm-ascend project.
+ 
+ from dataclasses import dataclass
+-from typing import Any
++from typing import TYPE_CHECKING, Any
+ 
+ import numpy as np
+ import torch
+ from vllm.config.compilation import CUDAGraphMode
+ from vllm.distributed.kv_transfer import get_kv_transfer_group, has_kv_transfer_group
+ from vllm.model_executor.layers.mamba.mamba_utils import is_conv_state_dim_first
+-from vllm.v1.kv_cache_interface import KVCacheConfig
++from vllm.v1.kv_cache_interface import KVCacheConfig, MambaSpec
+ from vllm.v1.utils import CpuGpuBuffer
+ from vllm.v1.worker import mamba_utils
+ from vllm.v1.worker.gpu.model_states.interface import ModelSpecificAttnMetadata
+@@ -40,11 +40,14 @@ from vllm.v1.worker.mamba_utils import (
+ )
+ from vllm.v1.worker.utils import AttentionGroup
+ 
+-from vllm_ascend.utils import vllm_version_is
++from vllm_ascend.utils import model_uses_kpool_indexer, vllm_version_is
+ from vllm_ascend.worker.v2.attn_utils import build_attn_metadata
+ from vllm_ascend.worker.v2.input_batch import AscendInputBatch
+ from vllm_ascend.worker.v2.model_states.default import AscendModelState
+ 
++if TYPE_CHECKING:
++    from vllm_ascend.worker.v2.pcp_manager import AscendPCPAttentionContext
++
+ # Copy block size used by the upstream fused mamba kernels.
+ _COPY_BLOCK_SIZE = 1024
+ _PREPROCESS_BLOCK_SIZE = 256
+@@ -273,6 +276,11 @@ class AscendMambaHybridModelState(MambaHybridModelState, AscendModelState):
+         """
+         if not self._align_mode:
+             return
++        pcp_manager = getattr(self, "pcp_manager", None)
++        if pcp_manager is not None and model_uses_kpool_indexer(self.vllm_config.model_config):
++            pcp_context = pcp_manager.build_attention_context(input_batch, block_tables)
++            input_batch = pcp_context.global_batch
++            block_tables = pcp_context.global_block_tables
+         num_reqs = input_batch.num_reqs
+         if num_reqs == 0:
+             return
+@@ -350,12 +358,82 @@ class AscendMambaHybridModelState(MambaHybridModelState, AscendModelState):
+     ) -> dict[str, Any]:
+         # Match the upstream Mamba contract without enabling DBO.
+         assert ubatch_idx == 0, "DBO is not supported on Ascend"
++        pcp_manager = getattr(self, "pcp_manager", None)
++        pcp_context = None
++        if pcp_manager is not None and model_uses_kpool_indexer(self.vllm_config.model_config):
++            pcp_context = pcp_manager.build_attention_context(input_batch, block_tables, slot_mappings)
++        if pcp_context is not None and not input_batch.is_dummy:
++            # PCP turns one prefill request into two rank-local segments. The
++            # recurrent state must advance once in original request order.
++            local_groups = [
++                [group for group in groups if not isinstance(group.kv_cache_spec, MambaSpec)] for groups in attn_groups
++            ]
++            mamba_groups = [
++                [group for group in groups if isinstance(group.kv_cache_spec, MambaSpec)] for groups in attn_groups
++            ]
++            local_metadata = AscendMambaHybridModelState._build_attn_metadata_for_batch(
++                self,
++                input_batch,
++                cudagraph_mode,
++                block_tables,
++                slot_mappings,
++                local_groups,
++                kv_cache_config,
++                for_capture,
++                use_pcp_padding=True,
++                pcp_context=pcp_context,
++            )
++            global_metadata = AscendMambaHybridModelState._build_attn_metadata_for_batch(
++                self,
++                pcp_context.global_batch,
++                cudagraph_mode,
++                pcp_context.global_block_tables,
++                pcp_context.global_slot_mappings,
++                mamba_groups,
++                kv_cache_config,
++                for_capture,
++                use_pcp_padding=False,
++                pcp_context=pcp_context,
++            )
++            local_metadata.update(global_metadata)
++            self.attn_metadata = local_metadata
++            return local_metadata
++
++        self.attn_metadata = AscendMambaHybridModelState._build_attn_metadata_for_batch(
++            self,
++            input_batch,
++            cudagraph_mode,
++            block_tables,
++            slot_mappings,
++            attn_groups,
++            kv_cache_config,
++            for_capture,
++            use_pcp_padding=pcp_context is not None,
++            pcp_context=pcp_context,
++        )
++        return self.attn_metadata
++
++    def _build_attn_metadata_for_batch(
++        self,
++        input_batch: AscendInputBatch,
++        cudagraph_mode: CUDAGraphMode,
++        block_tables: tuple[torch.Tensor, ...],
++        slot_mappings: torch.Tensor,
++        attn_groups: list[list[AttentionGroup]],
++        kv_cache_config: KVCacheConfig,
++        for_capture: bool,
++        *,
++        use_pcp_padding: bool,
++        pcp_context: "AscendPCPAttentionContext | None" = None,
++    ) -> dict[str, Any]:
+         if cudagraph_mode == CUDAGraphMode.FULL:
+             num_reqs = input_batch.num_reqs_after_padding
+             num_tokens = input_batch.num_tokens_after_padding
+         else:
+             num_reqs = input_batch.num_reqs
+-            num_tokens = input_batch.num_tokens
++            # PCP pads all ranks to the largest local token count. Attention
++            # metadata must describe the actual model-input tensor width.
++            num_tokens = input_batch.num_tokens_after_padding if use_pcp_padding else input_batch.num_tokens
+ 
+         # Keep recurrent queries logical while attention inputs include graph padding.
+         # TODO: Remove this dummy-padding special case once the common metadata
+@@ -364,11 +442,11 @@ class AscendMambaHybridModelState(MambaHybridModelState, AscendModelState):
+         if cudagraph_mode == CUDAGraphMode.PIECEWISE and input_batch.is_dummy:
+             num_input_tokens = input_batch.num_tokens_after_padding
+ 
+-        is_prefilling_np = input_batch.is_prefilling_np
++        is_prefilling_np = input_batch.is_prefilling_np[: input_batch.num_reqs]
+         if input_batch.prefill_runs_as_decode_np is not None:
+             # vLLM #58400 runs one-token prompt tails as decodes. Their
+             # placeholder drafts need rollback-capable decode metadata.
+-            is_prefilling_np = is_prefilling_np & ~input_batch.prefill_runs_as_decode_np
++            is_prefilling_np = is_prefilling_np & ~input_batch.prefill_runs_as_decode_np[: input_batch.num_reqs]
+         is_prefilling = torch.zeros(num_reqs, dtype=torch.bool, device="cpu")
+         is_prefilling[: input_batch.num_reqs] = torch.from_numpy(is_prefilling_np)
+ 
+@@ -376,16 +454,21 @@ class AscendMambaHybridModelState(MambaHybridModelState, AscendModelState):
+         num_decode_draft_tokens_cpu = None
+         if not for_capture and self.vllm_config.num_speculative_tokens > 0:
+             num_accepted_tokens = self.num_accepted_tokens_gpu.new_ones(num_reqs)
+-            num_accepted_tokens[: input_batch.num_reqs] = self.num_accepted_tokens_gpu[input_batch.idx_mapping]
++            num_accepted_tokens[: input_batch.num_reqs] = self.num_accepted_tokens_gpu[
++                input_batch.idx_mapping[: input_batch.num_reqs]
++            ]
+ 
+             num_decode_draft_tokens_np = np.full(num_reqs, -1, dtype=np.int32)
+             num_draft_tokens_per_req = input_batch.num_draft_tokens_per_req
+             if num_draft_tokens_per_req is not None:
+-                is_decode = input_batch.num_scheduled_tokens == num_draft_tokens_per_req + 1
+-                spec_decode_mask = (num_draft_tokens_per_req > 0) & is_decode
++                is_decode = (
++                    input_batch.num_scheduled_tokens[: input_batch.num_reqs]
++                    == num_draft_tokens_per_req[: input_batch.num_reqs] + 1
++                )
++                spec_decode_mask = (num_draft_tokens_per_req[: input_batch.num_reqs] > 0) & is_decode
+                 num_decode_draft_tokens_np[: input_batch.num_reqs] = np.where(
+                     spec_decode_mask,
+-                    num_draft_tokens_per_req,
++                    num_draft_tokens_per_req[: input_batch.num_reqs],
+                     -1,
+                 )
+                 if cudagraph_mode == CUDAGraphMode.FULL and num_reqs > input_batch.num_reqs and spec_decode_mask.all():
+@@ -404,9 +487,7 @@ class AscendMambaHybridModelState(MambaHybridModelState, AscendModelState):
+             num_accepted_tokens=num_accepted_tokens,
+             num_decode_draft_tokens_cpu=num_decode_draft_tokens_cpu,
+         )
+-        # The Mamba model state builds its own complete attention metadata.
+-        # The optional argument is accepted to match AscendModelState's API.
+-        self.attn_metadata = build_attn_metadata(
++        return build_attn_metadata(
+             attn_groups=attn_groups,
+             num_reqs=num_reqs,
+             num_actual_reqs=input_batch.num_reqs,
+@@ -427,6 +508,6 @@ class AscendMambaHybridModelState(MambaHybridModelState, AscendModelState):
+             positions=input_batch.positions,
+             attn_state=input_batch.attn_state,
+             model_specific_attn_metadata=model_specific_metadata,
++            pcp_context=pcp_context,
+             for_cudagraph_capture=for_capture,
+         )
+-        return self.attn_metadata

@@ -1,0 +1,349 @@
+commit 9d5f26eac00fc4758c429e3662fbdbb373220775
+Author:     CXY-Katrina <katrina.cxy@gmail.com>
+AuthorDate: Thu Oct 29 19:29:27 2026 +0800
+Commit:     GitHub <noreply@github.com>
+CommitDate: Thu Oct 29 19:29:27 2026 +0800
+
+    [BugFix][MiniMax] Honor MXFP8 MoE scale policy (#20120)
+    
+    ### What this PR does / why we need it?
+    
+    MiniMax MXFP8 MoE dispatch must use the model's ceil-scale policy. The
+    default fused MC2 mode 4 and init-routing quantizers do not apply that
+    policy on these paths.
+    
+    - Quantize MXFP8 activations explicitly for MC2 and AllGather routing
+    when the model selects scale algorithm 1.
+    - Transport or reorder the FP8 activations and E8M0 scales together,
+    then reuse the returned scales for the first expert GEMM.
+    - Avoid the extra default lossy MC2 combine quantizer for this path,
+    while preserving explicit configuration overrides.
+    
+    Runtime changes cover `token_dispatcher.py` and the shared scale-policy
+    helper in `quantization/utils.py`. `DynamicMXQuantScaleAlg` names the
+    existing operator values (`MAX_EXPONENT = 0`, `CEIL = 1`) without
+    changing the scale policy.
+    
+    ### Does this PR introduce _any_ user-facing change?
+    
+    Yes. MiniMax MXFP8 MoE dispatch and combine use the intended scale
+    policy. No new CLI option or environment variable is introduced.
+    
+    Release note: `release_notes/fragments/20120.yaml`.
+    
+    ### How was this patch tested?
+    
+    Author-reported end-to-end accuracy evaluation on
+    **MiniMax-M3.1-Flash**:
+    
+    | Configuration | Accuracy |
+    | --- | ---: |
+    | Without this patch | 89.36 |
+    | With this patch | 92.13 |
+    
+    The accuracy score improved by **2.77 points**.
+    
+    The conflicting reverted GBSA commits have been removed from branch
+    history. Forced rebase replay onto upstream base `ceac1a2bd` passed in
+    an isolated clone; subsequent changes only name the scale algorithms and
+    remove a comment.
+    
+    - Regression coverage in `tests/ut/ops/test_token_dispatcher.py` checks
+    dispatch scale policy, prepared FP8/E8M0 payloads, and combine
+    defaults/overrides.
+    - Verified `base.py`, the quantization-method test files and sparse
+    attention match upstream base `ceac1a2bd`.
+    - `git diff --check` passed.
+    - Four existing `TestDynamicMxQuantScaleAlg` cases passed using the
+    AST-extracted helper and enum with import/hardware dependencies stubbed.
+    This validates Python selection and integer compatibility, not
+    full-stack or NPU execution.
+    - `bash format.sh ci`: Ruff check/format, codespell, typos,
+    clang-format, Markdown lint, actionlint, filename/package,
+    forbidden-import, boolean-context-manager, long-function and
+    symbolic-meta checks passed. Gitleaks and logger hooks could not find
+    `/bin/bash`; shellcheck was unavailable. A complete lint pass is not
+    claimed.
+    - `python -m pytest -q tests/ut/ops/test_token_dispatcher.py` could not
+    start because pytest is unavailable. The local environment also lacks
+    PyTorch and vLLM.
+    
+    The end-to-end accuracy results above were provided by the PR author.
+    Full matching-stack unit-test and additional NPU correctness validation
+    remain pending. No performance benchmark result is claimed.
+    
+    ---
+    
+    ### Checklist
+    
+    #### Testing
+    
+    - [x] **Boundary / edge-case coverage**: Tests cover prepared payloads
+    and explicit quantization overrides.
+    - [x] **Regression test**: Dispatch/combine scale-policy regression
+    tests are included.
+    - [ ] **Error / failure path coverage**: Complete matching-stack
+    validation remains pending.
+    - [x] **Meaningful & reliable tests**: Tests assert argument contracts
+    and payload handling.
+    - [ ] **Performance impact**: NPU benchmarks remain pending.
+    
+    - vLLM main:
+    https://github.com/vllm-project/vllm/commit/544f182d9f0c9bfe8bd7645525951d5e3692a542
+    
+    ---------
+    
+    Signed-off-by: CXY-Katrina <katrina.cxy@gmail.com>
+
+diff --git a/release_notes/fragments/20120.yaml b/release_notes/fragments/20120.yaml
+new file mode 100644
+index 000000000..bdbd4f9b2
+--- /dev/null
++++ b/release_notes/fragments/20120.yaml
+@@ -0,0 +1,6 @@
++pr: 20120
++entries:
++  - category: bugfix
++    text: >-
++      Fixed MiniMax MXFP8 model scale-policy handling in MoE dispatch and combine,
++      preserving explicitly quantized inputs and configured overrides.
+diff --git a/tests/ut/ops/test_token_dispatcher.py b/tests/ut/ops/test_token_dispatcher.py
+index e938e2f41..49b371c48 100644
+--- a/tests/ut/ops/test_token_dispatcher.py
++++ b/tests/ut/ops/test_token_dispatcher.py
+@@ -523,8 +523,100 @@ class TestTokenDispatcherWithMC2(TestBase):
+         self.assertIsNotNone(output.dynamic_scale)
+         self.assertTrue(output.combine_metadata.quant.dispatch_with_quant)
+ 
+-
+-def test_allgather_token_dispatch_quant_mode_without_dynamic_scale():
++    def test_mxfp8_ceil_dispatch_preserves_fp8_transport(self):
++        self.dispatcher.dynamic_mx_quant_scale_alg = 1
++        self.dispatcher.need_shared_expert_args = True
++        hidden_states = torch.full((2, 128), 1.8984375, dtype=torch.bfloat16)
++        quantized = torch.full((2, 128), 240.0).to(torch.float8_e4m3fn)
++        scales = torch.full((2, 2, 2), 120, dtype=torch.uint8)
++        for comm_mode in (None, 0):
++            with self.subTest(comm_mode=comm_mode):
++                token_input = build_token_dispatch_input_fixture(
++                    hidden_states=hidden_states,
++                    topk_weights=torch.ones(2, 1),
++                    topk_ids=torch.zeros(2, 1, dtype=torch.int32),
++                    expert_map=torch.arange(8),
++                    quant_type=QuantType.W8A8MXFP,
++                    act_quant_type=torch.float8_e4m3fn,
++                    comm_quant_mode=comm_mode,
++                )
++                with patch("torch_npu.npu_dynamic_mx_quant", return_value=(quantized, scales)) as quantize:
++                    kwargs = self.dispatcher.get_dispatch_mc2_kwargs(token_input)
++                if comm_mode is None:
++                    quantize.assert_called_once_with(hidden_states, dst_type=torch.float8_e4m3fn, scale_alg=1)
++                    self.assertIs(kwargs["x"], quantized)
++                    self.assertEqual(kwargs["scales"].dtype, torch.float8_e8m0fnu)
++                    torch.testing.assert_close(kwargs["scales"].view(torch.uint8), scales.reshape(2, -1))
++                    self.assertEqual(kwargs["y_dtype"], torch.float8_e4m3fn)
++                else:
++                    quantize.assert_not_called()
++                    self.assertIs(kwargs["x"], hidden_states)
++                self.assertEqual(kwargs["quant_mode"], 0)
++
++    def test_mxfp8_ceil_combine_preserves_bf16_and_explicit_overrides(self):
++        self.dispatcher.dynamic_mx_quant_scale_alg = 1
++        self.dispatcher.moe_expert_num = 8
++        hidden_states = torch.randn(2, 128, dtype=torch.bfloat16)
++        for scale_alg, forced_mode, comm_mode, expected in (
++            (1, 0, None, 0),
++            (0, 0, None, 4),
++            (1, 4, None, 4),
++            (1, 0, 4, 4),
++            (1, 4, 2, 4),
++        ):
++            with self.subTest(scale_alg=scale_alg, forced_mode=forced_mode, comm_mode=comm_mode):
++                self.dispatcher.dynamic_mx_quant_scale_alg = scale_alg
++                self.mock_ascend_config.combine_quant_mode = forced_mode
++                metadata = MoEMC2CombineMetadata(
++                    topk_ids=torch.zeros(2, 1, dtype=torch.int32),
++                    topk_weights=torch.ones(2, 1),
++                    expert_map=torch.arange(8),
++                    ep_recv_counts=torch.ones(8, dtype=torch.int32),
++                    tp_recv_counts=torch.ones(1, dtype=torch.int32),
++                    assist_info_for_combine=torch.arange(2),
++                    expand_scales=None,
++                    quant=MoEQuantParams(quant_type=QuantType.W8A8MXFP, comm_quant_mode=comm_mode),
++                )
++                kwargs = self.dispatcher.get_combine_mc_kwargs(hidden_states, metadata)
++                self.assertEqual(kwargs["comm_quant_mode"], expected)
++                self.assertIs(kwargs["expand_x"], hidden_states)
++
++
++@pytest.mark.parametrize("prequantized", [False, True])
++def test_allgather_mxfp8_ceil_quantization(prequantized):
++    dispatcher = TokenDispatcherWithAllGather(top_k=1, num_local_experts=2)
++    original = torch.full((2, 128), 1.8984375, dtype=torch.bfloat16)
++    quantized = torch.full((2, 128), 240.0).to(torch.float8_e4m3fn)
++    scales = torch.full((2, 2, 2), 120, dtype=torch.uint8)
++    token_input = build_token_dispatch_input_fixture(
++        hidden_states=quantized if prequantized else original,
++        topk_weights=torch.ones(2, 1),
++        topk_ids=torch.tensor([[0], [1]], dtype=torch.int32),
++        pertoken_scale=scales if prequantized else None,
++        quant_type=QuantType.W8A8MXFP,
++        act_quant_type=torch.float8_e4m3fn,
++    )
++    with (
++        patch("vllm_ascend.ops.fused_moe.token_dispatcher.get_dynamic_mx_quant_scale_alg", return_value=1, create=True),
++        patch("torch_npu.npu_dynamic_mx_quant", return_value=(quantized, scales)) as quantize,
++        patch(
++            "vllm_ascend.ops.fused_moe.token_dispatcher.DeviceOperator.npu_moe_init_routing",
++            return_value=(quantized, torch.arange(2), torch.ones(2, dtype=torch.int32), scales),
++        ) as route,
++    ):
++        output = dispatcher.token_dispatch(token_input)
++    if prequantized:
++        quantize.assert_not_called()
++    else:
++        quantize.assert_called_once_with(original, dst_type=torch.float8_e4m3fn, scale_alg=1)
++    assert route.call_args.args[0] is quantized
++    assert route.call_args.kwargs["quant_mode"] == -1
++    assert route.call_args.kwargs["scale"] is scales
++    assert output.dynamic_scale is scales
++
++
++@patch("vllm_ascend.ops.fused_moe.token_dispatcher.get_dynamic_mx_quant_scale_alg", return_value=0)
++def test_allgather_token_dispatch_quant_mode_without_dynamic_scale(_scale_alg):
+     dispatcher = TokenDispatcherWithAllGather(top_k=2, num_experts=128)
+     hidden_states = torch.randn(3, 128)
+     topk_weights = torch.tensor([[0.7, 0.3], [0.6, 0.4], [0.5, 0.5]])
+diff --git a/vllm_ascend/ops/fused_moe/token_dispatcher.py b/vllm_ascend/ops/fused_moe/token_dispatcher.py
+index 22fc9633b..d9a640bc1 100644
+--- a/vllm_ascend/ops/fused_moe/token_dispatcher.py
++++ b/vllm_ascend/ops/fused_moe/token_dispatcher.py
+@@ -50,6 +50,7 @@ from vllm_ascend.ops.fused_moe.dataclass.token_dispatcher import (
+ )
+ from vllm_ascend.ops.fused_moe.moe_utils import async_all_to_all, gather_from_sequence_parallel_region
+ from vllm_ascend.quantization.quant_type import QuantType
++from vllm_ascend.quantization.utils import DynamicMXQuantScaleAlg, get_dynamic_mx_quant_scale_alg
+ from vllm_ascend.utils import should_skip_allreduce_across_dp_group
+ 
+ EXPERT_TOKEN_NUMS_TYPE_CUMSUM = 0
+@@ -127,6 +128,7 @@ class TokenDispatcherWithMC2(MoETokenDispatcher[MoEMC2CombineMetadata]):
+         # Here we need to calculate the global_bs = max_bs_per_rank * ep_world_size to execute
+         # dispatch & combine operators with different input num_tokens per rank.
+         vllm_config = get_current_vllm_config()
++        self.dynamic_mx_quant_scale_alg = get_dynamic_mx_quant_scale_alg(vllm_config)
+         tp_size = vllm_config.parallel_config.tensor_parallel_size
+         mc2_tokens_capacity = get_mc2_tokens_capacity()
+         num_tokens_per_tp_rank = mc2_tokens_capacity // tp_size
+@@ -222,6 +224,19 @@ class TokenDispatcherWithMC2(MoETokenDispatcher[MoEMC2CombineMetadata]):
+             )
+ 
+         kwargs_mc2.update(stage1_kwargs)
++        if (
++            quant_mode == 4
++            and token_dispatch_input.quant.quant_type == QuantType.W8A8MXFP
++            and self.dynamic_mx_quant_scale_alg == DynamicMXQuantScaleAlg.CEIL
++        ):
++            quantized, scales = torch_npu.npu_dynamic_mx_quant(
++                hidden_states, dst_type=torch.float8_e4m3fn, scale_alg=self.dynamic_mx_quant_scale_alg
++            )
++            kwargs_mc2.update(
++                x=quantized,
++                scales=scales.reshape(scales.shape[0], -1).view(torch.float8_e8m0fnu),
++                quant_mode=0,
++            )
+         return kwargs_mc2
+ 
+     def token_dispatch(
+@@ -282,7 +297,9 @@ class TokenDispatcherWithMC2(MoETokenDispatcher[MoEMC2CombineMetadata]):
+         elif comm_quant_mode is not None:
+             quant_mode = comm_quant_mode
+         elif quant_type == QuantType.W8A8MXFP:
+-            quant_mode = 4
++            # The down projection already produces BF16. Avoid an additional
++            # lossy communication quantizer for models using ceil MX scales.
++            quant_mode = 0 if self.dynamic_mx_quant_scale_alg == DynamicMXQuantScaleAlg.CEIL else 4
+         else:
+             quant_mode = 0
+         kwargs_mc2 = {
+@@ -372,6 +389,23 @@ class TokenDispatcherWithAllGather(MoETokenDispatcher[MoEAllGatherCombineMetadat
+         )
+         global_redundant_expert_num = token_dispatch_input.routing.global_redundant_expert_num
+         restore_shape = hidden_states.shape
++        num_tokens = hidden_states.shape[:-1].numel()
++        apply_router_weight_on_input = token_dispatch_input.routing.apply_router_weight_on_input
++        if apply_router_weight_on_input:
++            assert topk_weights.dim() == 2, "`topk_weights` should be in shape (num_tokens, topk)"
++            _, topk = topk_weights.shape
++            assert topk == 1, "Only support topk=1 when `apply_router_weight_on_input` is True"
++            hidden_states = hidden_states * topk_weights.to(hidden_states.dtype)
++        if (
++            with_quant
++            and dynamic_scale is None
++            and quant_type == QuantType.W8A8MXFP
++            and get_dynamic_mx_quant_scale_alg() == DynamicMXQuantScaleAlg.CEIL
++        ):
++            # init_routing's fused quantizer does not expose scale_alg.
++            hidden_states, dynamic_scale = torch_npu.npu_dynamic_mx_quant(
++                hidden_states, dst_type=torch.float8_e4m3fn, scale_alg=DynamicMXQuantScaleAlg.CEIL
++            )
+         # Fuse the first dynamic quant of moe_mlp into initrouting when
+         # dispatch_with_quant is on but got a None dynamic_scale.
+         if with_quant and dynamic_scale is None:
+@@ -382,13 +416,6 @@ class TokenDispatcherWithAllGather(MoETokenDispatcher[MoEAllGatherCombineMetadat
+         else:
+             quant_mode = -1
+ 
+-        num_tokens = hidden_states.shape[:-1].numel()
+-        apply_router_weight_on_input = token_dispatch_input.routing.apply_router_weight_on_input
+-        if apply_router_weight_on_input:
+-            assert topk_weights.dim() == 2, "`topk_weights` should be in shape (num_tokens, topk)"
+-            _, topk = topk_weights.shape
+-            assert topk == 1, "Only support topk=1 when `apply_router_weight_on_input` is True"
+-            hidden_states = hidden_states * topk_weights.to(hidden_states.dtype)
+         if expert_map is not None:
+             global_num_experts = len(expert_map) + global_redundant_expert_num
+             mask = expert_map[topk_ids] != -1
+diff --git a/vllm_ascend/quantization/utils.py b/vllm_ascend/quantization/utils.py
+index dfaf573d0..a83a353d9 100644
+--- a/vllm_ascend/quantization/utils.py
++++ b/vllm_ascend/quantization/utils.py
+@@ -15,6 +15,7 @@
+ # This file is a part of the vllm-ascend project.
+ #
+ 
++from enum import IntEnum
+ from pathlib import Path
+ 
+ import torch
+@@ -41,6 +42,11 @@ def is_fused_moe_layer(layer: torch.nn.Module) -> bool:
+     return isinstance(layer, (MoERunner, RoutedExperts))
+ 
+ 
++class DynamicMXQuantScaleAlg(IntEnum):
++    MAX_EXPONENT = 0
++    CEIL = 1
++
++
+ def get_dynamic_mx_quant_scale_alg(vllm_config=None) -> int:
+     """Select the MX scale algorithm used by DynamicMxQuantV3.
+ 
+@@ -50,7 +56,7 @@ def get_dynamic_mx_quant_scale_alg(vllm_config=None) -> int:
+     quantization overflow. MiniMax M3 checkpoints require the latter.
+     """
+     if not get_current_hardware_profile().supports(HardwareCapability.DYNAMIC_MX_QUANT_SCALE_ALG_ONE):
+-        return 0
++        return DynamicMXQuantScaleAlg.MAX_EXPONENT
+ 
+     if vllm_config is None:
+         from vllm.forward_context import get_forward_context, is_forward_context_available
+@@ -74,8 +80,8 @@ def get_dynamic_mx_quant_scale_alg(vllm_config=None) -> int:
+         any(isinstance(architecture, str) and architecture.startswith("MiniMaxM3") for architecture in architectures)
+         or model_type == "minimax_m3"
+     ):
+-        return 1
+-    return 0
++        return DynamicMXQuantScaleAlg.CEIL
++    return DynamicMXQuantScaleAlg.MAX_EXPONENT
+ 
+ 
+ def get_model_file(

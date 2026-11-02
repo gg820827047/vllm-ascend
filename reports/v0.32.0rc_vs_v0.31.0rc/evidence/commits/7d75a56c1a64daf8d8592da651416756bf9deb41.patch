@@ -1,0 +1,413 @@
+commit 7d75a56c1a64daf8d8592da651416756bf9deb41
+Author:     Yunxiao Ning <73625538+foraxe@users.noreply.github.com>
+AuthorDate: Thu Oct 29 16:51:51 2026 +0800
+Commit:     GitHub <noreply@github.com>
+CommitDate: Thu Oct 29 16:51:51 2026 +0800
+
+    [BugFix] Preserve duplicate encoder inputs in recompute scheduling (#19573)
+    
+    ### What this PR does / why we need it?
+    
+    With the main-pinned vLLM API, a multimodal request can terminate
+    `RecomputeScheduler.schedule()` with `ValueError: too many values to
+    unpack (expected 4)`. `_try_schedule_encoder_inputs` returns a fifth
+    value, `duplicate_encoder_inputs`, while both waiting and running paths
+    still unpack four values.
+    
+    Consume the duplicate-input list in both paths and use the inherited
+    `_allocate_encoder_inputs` helper to preserve computed, external and
+    duplicate encoder-cache references. Add regressions using the real
+    upstream API and `ScoreEncoderCacheManager`, covering waiting requests
+    with shared encoder identifiers and requests that enter the running
+    queue.
+    
+    Related to #19103. That PR's `normalize_encoder_schedule_result`
+    currently returns `result[:4]` against main. This focused patch retains
+    the fifth value and its allocation semantics; it is intended as concrete
+    code and regression evidence for integrating the fixes, rather than
+    replacing that broader compatibility work.
+    
+    **Draft scope:** this patch targets vLLM main pinned at `a98247ab4`,
+    which has the five-value return contract and native allocation helper.
+    Compatibility with the 0.31.0 release four-value API is not validated
+    here and needs to be reconciled with #19103 before merge. No claim that
+    truncating the fifth value reproduces all upstream cache-reference
+    behavior.
+    
+    ### Does this PR introduce _any_ user-facing change?
+    
+    Multimodal requests using the recompute scheduler can proceed under the
+    main-pinned API, retaining duplicate encoder-cache tracking. No new
+    options or performance changes.
+    
+    ### How was this patch tested?
+    
+    - The two new regression cases reproduced the original `expected 4`
+    failure against unmodified code.
+    - With the original compatibility fix, 48 related
+    recompute/encoder-cache/dyntra/short-request tests passed in the
+    pinned-main environment. That historical test stack also included the
+    independent async-zeroing fix; it is not included in this PR.
+    - Live recovery checks passed for a text arithmetic request and an
+    official AI2D semantic sample. These are functional smoke checks, not
+    full model-quality scores.
+    - The initial submission ported the original fix onto Ascend main
+    `db8836752`. The review revision removes the duplicate type annotation
+    and strengthens waiting/running reference and release tests; its 44
+    related tests passed. The earlier 48-test compatibility stack
+    additionally included four independent async-zeroing cases, tracked
+    separately in #19579.
+    - `bash format.sh ci` and `git diff --check` passed. Full model
+    benchmarks and quality suites were not rerun for this submission.
+    Release-API compatibility remains an explicit Draft limitation.
+    
+    #### Testing checklist
+    
+    - [x] Boundary / edge-case coverage: waiting and running requests,
+    duplicate identifiers and cache references.
+    - [x] Regression test: two cases fail on the old four-value unpack.
+    - [x] Meaningful & reliable tests: real base scheduler API and
+    encoder-cache manager invariants.
+    
+    ### Review closeout
+    
+    Fixed the CI mypy `no-redef` error by removing the second same-function
+    type annotation. Split waiting and running duplicate-reference
+    regressions; running now schedules a new encoder and a duplicate in the
+    same step, checks native allocator arguments `[1]`/`[2]`, and verifies
+    request release/cache invariants. All 44 related tests passed on the
+    pinned-main runtime. The review bot’s duplicate-only result is not
+    produced by this upstream API: duplicate IDs are recorded only alongside
+    an already scheduled compute/external input; cache hits register their
+    references directly. Upstream uses the same allocation guard, which is
+    retained. Replies include this source rationale.
+    
+    Release-note policy: the fragment is omitted for this non-feature
+    change, as requested by the contributor.
+    
+    - vLLM main:
+    https://github.com/vllm-project/vllm/commit/544f182d9f0c9bfe8bd7645525951d5e3692a542
+    
+    ---------
+    
+    Signed-off-by: yunzhi <ningyunxiao.nyx@antgroup.com>
+
+diff --git a/tests/ut/core/test_recompute_scheduler.py b/tests/ut/core/test_recompute_scheduler.py
+index e568f6acc..c9d3344e4 100644
+--- a/tests/ut/core/test_recompute_scheduler.py
++++ b/tests/ut/core/test_recompute_scheduler.py
+@@ -2,7 +2,7 @@
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+ 
+ from types import SimpleNamespace
+-from unittest.mock import MagicMock, patch
++from unittest.mock import MagicMock, call, patch
+ 
+ import pytest
+ from vllm.v1.core.sched.request_queue import SchedulingPolicy
+@@ -11,6 +11,7 @@ from vllm.v1.engine import EngineCoreOutput, EngineCoreOutputs
+ from vllm.v1.request import RequestStatus
+ 
+ from tests.ut.core.test_dyntra_lb_scheduler import create_dyntra_lb_scheduler, make_dyntra_test_config
++from tests.ut.core.test_score_encoder_cache_scheduler import _request as make_mm_request
+ from tests.ut.kv_offload.utils import create_model_runner_output, create_request
+ from vllm_ascend.core.dyntra_lb_scheduler import DyntraLBPolicyMixin
+ from vllm_ascend.core.recompute_scheduler import (
+@@ -20,7 +21,9 @@ from vllm_ascend.core.recompute_scheduler import (
+     RecomputeReqInfo,
+     RecomputeScheduler,
+     RecomputeSchedulerConfig,
++    _normalize_encoder_schedule_result,
+ )
++from vllm_ascend.ec_manager.score_ec_manager import ScoreEncoderCacheManager
+ 
+ 
+ @pytest.fixture(autouse=True)
+@@ -377,3 +380,140 @@ def test_first_request_preserves_ascend_speculative_padding_without_cached_token
+ 
+     assert output.num_scheduled_tokens[request.request_id] == 3
+     assert output.scheduled_spec_decode_tokens[request.request_id] == [-1, -1]
++
++
++def _make_mm_recompute_scheduler():
++    config = make_dyntra_test_config(block_size=16)
++    config.kv_transfer_config = None
++    config.cache_config.enable_prefix_caching = False
++    scheduler = create_dyntra_lb_scheduler(config, scheduler_cls=RecomputeScheduler)
++    config.model_config.hf_config.vision_config = SimpleNamespace(num_heads=1, hidden_size=1, intermediate_size=1)
++    config.ec_manager_config.manager_config = {"cpu_cache_slots": 8}
++    scheduler.encoder_cache_manager = ScoreEncoderCacheManager(8, config)
++    scheduler.max_num_encoder_input_tokens = 32
++    return scheduler
++
++
++@pytest.mark.skipif(
++    not hasattr(Scheduler, "_allocate_encoder_inputs"), reason="Requires the main duplicate-reference API"
++)
++def test_waiting_multimodal_duplicate_cache_tracking():
++    scheduler = _make_mm_recompute_scheduler()
++    scheduler.max_num_scheduled_tokens = 8
++    request = make_mm_request("mm", [("shared", [True, True]), ("shared", [True, True])])
++    scheduler.add_request(request)
++
++    output = scheduler.schedule()
++
++    assert output.scheduled_encoder_inputs[request.request_id] == [0]
++    manager = scheduler.encoder_cache_manager
++    assert manager.request_cached_ids[request.request_id] == {0, 1}
++    assert manager.cpu_num_free_slots == 6
++    assert output.ec_manager_metadata.cpu_get_encoder_mm_hashes == []
++    manager._check_invariant()
++    scheduler.finish_requests(request.request_id, RequestStatus.FINISHED_ABORTED)
++    assert request.request_id not in manager.request_cached_ids
++    assert not manager.cached["shared"]
++    manager._check_invariant()
++
++
++@pytest.mark.skipif(
++    not hasattr(Scheduler, "_allocate_encoder_inputs"), reason="Requires the main duplicate-reference API"
++)
++def test_running_multimodal_duplicate_cache_tracking():
++    scheduler = _make_mm_recompute_scheduler()
++    scheduler.max_num_scheduled_tokens = 2
++    request = make_mm_request("mm", [("first", [True, True]), ("shared", [True, True]), ("shared", [True, True])])
++    scheduler.add_request(request)
++    first = scheduler.schedule()
++    assert first.scheduled_encoder_inputs[request.request_id] == [0]
++    runner_output = create_model_runner_output([request])
++    runner_output.sampled_token_ids = [[]]
++    scheduler.update_from_output(first, runner_output)
++    assert request in scheduler.running
++    scheduler.max_num_scheduled_tokens = 4
++    with patch.object(scheduler, "_allocate_encoder_inputs", wraps=scheduler._allocate_encoder_inputs) as allocate:
++        output = scheduler.schedule()
++
++    assert output.scheduled_encoder_inputs[request.request_id] == [1]
++    allocate.assert_called_once_with(request, [1], [2])
++    manager = scheduler.encoder_cache_manager
++    assert {1, 2} <= manager.request_cached_ids[request.request_id]
++    manager._check_invariant()
++    scheduler.finish_requests(request.request_id, RequestStatus.FINISHED_ABORTED)
++    assert request.request_id not in manager.request_cached_ids
++    assert not manager.cached["shared"]
++    manager._check_invariant()
++
++
++@pytest.mark.parametrize("result", [([1], 8, 16, [2]), ([1], 8, 16, [2], [3])])
++def test_normalize_encoder_schedule_result_preserves_contract(result):
++    normalized = _normalize_encoder_schedule_result(result)
++    assert normalized[:4] == result[:4]
++    assert normalized[4] == (result[4] if len(result) == 5 else [])
++    if len(result) == 5:
++        assert normalized is result
++
++
++@pytest.mark.parametrize("with_connector", [False, True])
++def test_release_encoder_allocation_preserves_notifications(monkeypatch, with_connector):
++    monkeypatch.setattr(Scheduler, "_allocate_encoder_inputs", None, raising=False)
++    scheduler = RecomputeScheduler.__new__(RecomputeScheduler)
++    scheduler.encoder_cache_manager = MagicMock()
++    scheduler.ec_connector = MagicMock() if with_connector else None
++    request = SimpleNamespace(request_id="mm")
++
++    scheduler._allocate_encoder_inputs(request, [0, 2], [])
++
++    assert scheduler.encoder_cache_manager.allocate.call_args_list == [call(request, 0), call(request, 2)]
++    if scheduler.ec_connector is not None:
++        assert scheduler.ec_connector.update_state_after_alloc.call_args_list == [call(request, 0), call(request, 2)]
++
++
++@pytest.mark.parametrize("running", [False, True])
++def test_release_encoder_contract_in_both_schedule_paths(monkeypatch, running):
++    original_schedule = Scheduler._try_schedule_encoder_inputs
++
++    def release_schedule(*args, **kwargs):
++        result = original_schedule(*args, **kwargs)
++        if len(result) == 5:
++            assert result[4] == []
++        return result[:4]
++
++    monkeypatch.setattr(Scheduler, "_try_schedule_encoder_inputs", release_schedule)
++    monkeypatch.setattr(Scheduler, "_allocate_encoder_inputs", None, raising=False)
++    scheduler = _make_mm_recompute_scheduler()
++    scheduler.max_num_scheduled_tokens = 2 if running else 8
++    request = make_mm_request("mm", [("first", [True, True]), ("second", [True, True])])
++    scheduler.add_request(request)
++    output = scheduler.schedule()
++    if running:
++        assert output.scheduled_encoder_inputs[request.request_id] == [0]
++        runner_output = create_model_runner_output([request])
++        runner_output.sampled_token_ids = [[]]
++        scheduler.update_from_output(output, runner_output)
++        assert request in scheduler.running
++        scheduler.max_num_scheduled_tokens = 4
++        output = scheduler.schedule()
++    assert output.scheduled_encoder_inputs[request.request_id] == ([1] if running else [0, 1])
++    manager = scheduler.encoder_cache_manager
++    assert 1 in manager.request_cached_ids[request.request_id]
++    manager._check_invariant()
++    scheduler.finish_requests(request.request_id, RequestStatus.FINISHED_ABORTED)
++    assert request.request_id not in manager.request_cached_ids
++    manager._check_invariant()
++
++
++def test_main_encoder_allocation_uses_native_helper(monkeypatch):
++    native_allocate = MagicMock()
++    monkeypatch.setattr(Scheduler, "_allocate_encoder_inputs", native_allocate, raising=False)
++    scheduler = RecomputeScheduler.__new__(RecomputeScheduler)
++    scheduler.encoder_cache_manager = MagicMock()
++    scheduler.ec_connector = MagicMock()
++    request = SimpleNamespace(request_id="mm")
++
++    scheduler._allocate_encoder_inputs(request, [1], [2])
++
++    native_allocate.assert_called_once_with(request, [1], [2])
++    scheduler.encoder_cache_manager.allocate.assert_not_called()
++    scheduler.ec_connector.update_state_after_alloc.assert_not_called()
+diff --git a/vllm_ascend/core/recompute_scheduler.py b/vllm_ascend/core/recompute_scheduler.py
+index 6a755765b..168be0a47 100644
+--- a/vllm_ascend/core/recompute_scheduler.py
++++ b/vllm_ascend/core/recompute_scheduler.py
+@@ -49,6 +49,15 @@ from vllm_ascend.core.dyntra_lb_scheduler import (
+ from vllm_ascend.utils import get_ascend_config
+ 
+ 
++def _normalize_encoder_schedule_result(
++    result: tuple[list[int], int, int, list[int]] | tuple[list[int], int, int, list[int], list[int]],
++) -> tuple[list[int], int, int, list[int], list[int]]:
++    """Retain duplicate references on main; the release API has none."""
++    if len(result) == 4:
++        return (*result, [])
++    return result
++
++
+ @dataclass
+ class RecomputeSchedulerConfig(SchedulerConfig):
+     scheduler_cls: str | type[object] = "vllm_ascend.core.recompute_scheduler.RecomputeScheduler"
+@@ -93,6 +102,17 @@ class RecomputeScheduler(Scheduler):
+ 
+     prefill_capacity_bound: bool
+ 
++    def _allocate_encoder_inputs(self, request: Request, input_ids: list[int], duplicate_input_ids: list[int]) -> None:
++        allocate = getattr(super(), "_allocate_encoder_inputs", None)
++        if allocate is not None:
++            allocate(request, input_ids, duplicate_input_ids)
++            return
++        # vLLM 0.31.0 has no native helper or duplicate-input return value.
++        for input_id in input_ids:
++            self.encoder_cache_manager.allocate(request, input_id)
++            if self.ec_connector is not None:
++                self.ec_connector.update_state_after_alloc(request, input_id)
++
+     def _apply_load_balance_modifications(self) -> None:
+         """Hook for DyntraLB to apply cross-rank scheduling decisions."""
+ 
+@@ -296,6 +316,7 @@ class RecomputeScheduler(Scheduler):
+             # Schedule encoder inputs.
+             encoder_inputs_to_schedule = None
+             external_load_encoder_input: list[int] = []
++            duplicate_encoder_inputs: list[int] = []
+             new_encoder_compute_budget = encoder_compute_budget
+             if request.has_encoder_inputs:
+                 (
+@@ -303,12 +324,15 @@ class RecomputeScheduler(Scheduler):
+                     num_new_tokens,
+                     new_encoder_compute_budget,
+                     external_load_encoder_input,
+-                ) = self._try_schedule_encoder_inputs(
+-                    request,
+-                    request.num_computed_tokens,
+-                    num_new_tokens,
+-                    encoder_compute_budget,
+-                    shift_computed_tokens=self.num_prefill_lookahead,
++                    duplicate_encoder_inputs,
++                ) = _normalize_encoder_schedule_result(
++                    self._try_schedule_encoder_inputs(
++                        request,
++                        request.num_computed_tokens,
++                        num_new_tokens,
++                        encoder_compute_budget,
++                        shift_computed_tokens=self.num_prefill_lookahead,
++                    )
+                 )
+ 
+             # Multi-module MTP: avoid ending a prefill chunk within
+@@ -439,17 +463,13 @@ class RecomputeScheduler(Scheduler):
+             # Encoder-related.
+             if encoder_inputs_to_schedule:
+                 scheduled_encoder_inputs[request_id] = encoder_inputs_to_schedule
+-                # Allocate the encoder cache.
+-                for i in encoder_inputs_to_schedule:
+-                    self.encoder_cache_manager.allocate(request, i)
+-                    if self.ec_connector is not None:
+-                        self.ec_connector.update_state_after_alloc(request, i)
+                 encoder_compute_budget = new_encoder_compute_budget
+-            if external_load_encoder_input:
+-                for i in external_load_encoder_input:
+-                    self.encoder_cache_manager.allocate(request, i)
+-                    if self.ec_connector is not None:
+-                        self.ec_connector.update_state_after_alloc(request, i)
++            if encoder_inputs_to_schedule or external_load_encoder_input:
++                self._allocate_encoder_inputs(
++                    request,
++                    (encoder_inputs_to_schedule or []) + external_load_encoder_input,
++                    duplicate_encoder_inputs,
++                )
+ 
+         # Record the LoRAs in scheduled_running_reqs
+         scheduled_loras: set[int] = set()
+@@ -614,6 +634,7 @@ class RecomputeScheduler(Scheduler):
+ 
+                 encoder_inputs_to_schedule = None
+                 external_load_encoder_input = []
++                duplicate_encoder_inputs = []
+                 new_encoder_compute_budget = encoder_compute_budget
+                 pad_spec_decode = False
+ 
+@@ -701,12 +722,15 @@ class RecomputeScheduler(Scheduler):
+                             num_new_tokens,
+                             new_encoder_compute_budget,
+                             external_load_encoder_input,
+-                        ) = self._try_schedule_encoder_inputs(
+-                            request,
+-                            num_computed_tokens,
+-                            num_new_tokens,
+-                            encoder_compute_budget,
+-                            shift_computed_tokens=self.num_prefill_lookahead,
++                            duplicate_encoder_inputs,
++                        ) = _normalize_encoder_schedule_result(
++                            self._try_schedule_encoder_inputs(
++                                request,
++                                num_computed_tokens,
++                                num_new_tokens,
++                                encoder_compute_budget,
++                                shift_computed_tokens=self.num_prefill_lookahead,
++                            )
+                         )
+ 
+                     # Multi-module MTP: avoid ending a prefill chunk within
+@@ -839,18 +863,13 @@ class RecomputeScheduler(Scheduler):
+                 # Encoder-related.
+                 if encoder_inputs_to_schedule:
+                     scheduled_encoder_inputs[request_id] = encoder_inputs_to_schedule
+-                    # Allocate the encoder cache.
+-                    for i in encoder_inputs_to_schedule:
+-                        self.encoder_cache_manager.allocate(request, i)
+-                        if self.ec_connector is not None:
+-                            self.ec_connector.update_state_after_alloc(request, i)
+                     encoder_compute_budget = new_encoder_compute_budget
+-                # Allocate for external load encoder cache
+-                if external_load_encoder_input:
+-                    for i in external_load_encoder_input:
+-                        self.encoder_cache_manager.allocate(request, i)
+-                        if self.ec_connector is not None:
+-                            self.ec_connector.update_state_after_alloc(request, i)
++                if encoder_inputs_to_schedule or external_load_encoder_input:
++                    self._allocate_encoder_inputs(
++                        request,
++                        (encoder_inputs_to_schedule or []) + external_load_encoder_input,
++                        duplicate_encoder_inputs,
++                    )
+ 
+             # re-queue requests skipped in this pass ahead of older skipped items.
+             if step_skipped_kv_holding:

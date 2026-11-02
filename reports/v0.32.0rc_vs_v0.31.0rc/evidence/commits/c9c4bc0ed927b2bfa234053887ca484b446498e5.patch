@@ -1,0 +1,2806 @@
+commit c9c4bc0ed927b2bfa234053887ca484b446498e5
+Author:     drslark <96540755+drslark@users.noreply.github.com>
+AuthorDate: Wed Oct 28 18:07:47 2026 +0800
+Commit:     GitHub <noreply@github.com>
+CommitDate: Wed Oct 28 18:07:47 2026 +0800
+
+    [Feature][1/N] Add KDA RecoverSSM Triton operators (#20128)
+    
+    ### What this PR does / why we need it?
+    
+    Add the Ascend GLM KDA RecoverSSM Triton operators. Verification records
+    correction/key/gate data; after sampling, commit reconstructs the
+    accepted recurrent state and compacts convolution history. Each KDA page
+    needs one recurrent checkpoint instead of additional per-draft
+    checkpoints.
+    
+    Support NPU graphs, with optimized verify, compact and commit kernels
+    for A3/A5. This is part 1/N split from #19133, containing the operators,
+    their tests and required operator documentation in one commit. Model,
+    worker, configuration and PD integration are left to the framework
+    follow-up.
+    
+    References: original Kimi-K3 RecoverSSM
+    ([vllm#51855](https://github.com/vllm-project/vllm/pull/51855)) and GLM
+    KDA integration
+    ([vllm#61566](https://github.com/vllm-project/vllm/pull/61566)).
+    
+    ### Does this PR introduce any user-facing change?
+    
+    No serving behavior or configuration is enabled by this part. The new
+    operator entry points are exercised directly by the single-operator
+    tests; framework callers and user-facing activation will be added
+    separately.
+    
+    The historical integrated-model results below remain experimental:
+    generation may differ from ordinary MTP; tokenwise equivalence is not
+    guaranteed. Reduced KDA checkpoint storage does not imply an equivalent
+    reduction in total reserved KV memory.
+    
+    ### How was this patch tested?
+    
+    The following operator validation is inherited from the earlier
+    integrated version in #19133. The exact extracted operator/test source
+    passed 144 A3 cases and 1280 output comparisons; current-source A5
+    full-suite validation remains pending after its validation sequence
+    stopped during the commit microbenchmark due to device OOM.
+    
+    #### Triton operator validation (A3/A5)
+    
+    1. **Functionality:** GLM KDA verification, accepted-state commit and
+    convolution compaction reduce draft checkpoint storage. Eager and NPU
+    graph execution are covered with H32/H64, K=V=128, BF16/FP16 activations
+    and FP32/BF16 states. Operator documentation and tests are included.
+    Grouped commit uses the configured window, with explicit Q1/Q2/Q4/Q6/Q8
+    path regressions.
+    2. **Accuracy:** Against independent FP64 references, each device passed
+    142 tests and 1260 output comparisons. Every output achieved a 100%
+    element-wise mixed-tolerance pass rate and satisfied its maximum
+    absolute-error limit. The largest errors across both devices were BF16
+    `3.2176e-03`, FP16 `2.2898e-05` and FP32 `4.1121e-07`. Copy-only results
+    and untouched regions matched exactly. For the same-algorithm stride
+    optimization, all 24 checkpoint comparisons had zero maximum absolute
+    difference.
+    3. **Performance:** Compared with the same-algorithm baseline
+    `b5326cd6b`, nine alternating graph-timing rounds used recorded strides,
+    B11/B12, L11/L12 and accepted lengths 1/3/6. Commit latency changes
+    ranged from `-5.30%` to `+5.39%` on A3 and `-1.49%` to `+3.62%` on A5;
+    both improvements and regressions are reported. Removing the
+    fixed-window restriction retained identical checkpoints in six Q6 A5
+    cases; grouped latency changed by `-0.52%` to `+0.21%` against
+    `b7ec33b35`.
+    4. **Safety:** Shape/dtype/stride, static-window and tile specialization
+    sources were reviewed. With MTP5/Q6, after warmup, all four active
+    kernels recorded zero JIT memory-cache misses during the full GSM8K run,
+    with no new or modified persistent compilation artifacts. **No
+    recompilation was observed in this dataset run.** Write boundaries and
+    untouched regions were checked; nonlinear operands have FP32 assertions,
+    and the context patch is installed only for GLM with RecoverSSM enabled.
+    
+    - vLLM main:
+    https://github.com/vllm-project/vllm/commit/544f182d9f0c9bfe8bd7645525951d5e3692a542
+    
+    Signed-off-by: drslark <slarksblood@qq.com>
+    Co-authored-by: GPT-6 Codex <codex@openai.com>
+
+diff --git a/tests/e2e/nightly/single_node/ops/singlecard_ops/triton/test_kda_recoverssm_npu.py b/tests/e2e/nightly/single_node/ops/singlecard_ops/triton/test_kda_recoverssm_npu.py
+new file mode 100644
+index 000000000..5ac13add4
+--- /dev/null
++++ b/tests/e2e/nightly/single_node/ops/singlecard_ops/triton/test_kda_recoverssm_npu.py
+@@ -0,0 +1,882 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""Verify and commit must agree with independent, multi-step KDA recurrence."""
++
++import json
++from types import SimpleNamespace
++
++import pytest
++import torch
++
++pytest.importorskip("torch_npu")
++
++from vllm.model_executor.layers.mamba.mamba_utils import is_conv_state_dim_first  # noqa: E402
++from vllm.triton_utils import triton  # noqa: E402
++
++import vllm_ascend.ops.triton.kda.recoverssm as recoverssm_module  # noqa: E402
++from vllm_ascend.device.device_config import is_950  # noqa: E402
++from vllm_ascend.ops.triton.kda.recoverssm import (  # noqa: E402
++    KDARecoverSSMCommitContext,
++    _compact_conv_state_kernel,
++    _conv_compaction_block_d,
++    kda_recoverssm_verify,
++)
++
++
++def assert_accuracy(actual, expected, record_property, name):
++    """Check both dtype-specific limits; retain per-output metrics in JUnit XML."""
++    rtol, atol, fixed_limit = {
++        torch.float16: (2**-9, 2**-9, 0.1),
++        torch.bfloat16: (2**-6, 2**-6, 1.0),
++        torch.float32: (2**-10, 2**-16, 0.01),
++    }[actual.dtype]
++    assert actual.shape == expected.shape
++    observed = actual.detach().to(device="cpu", dtype=torch.float64)
++    golden = expected.detach().to(device="cpu", dtype=torch.float64)
++    finite = bool(torch.isfinite(observed).all() and torch.isfinite(golden).all())
++    error = (observed - golden).abs()
++    elements = error.numel()
++    matched = int((error <= atol + rtol * golden.abs()).sum())
++    ratio = matched / elements if elements else 1.0
++    maximum = float(error.max()) if elements and finite else 0.0 if finite else None
++    limit = max(fixed_limit, 32 * torch.finfo(actual.dtype).eps)
++    metrics = {
++        "dtype": str(actual.dtype),
++        "rtol": rtol,
++        "atol": atol,
++        "elements": elements,
++        "matched": matched,
++        "pass_ratio": ratio,
++        "max_abs_error": maximum,
++        "max_abs_error_limit": limit,
++        "finite": finite,
++    }
++    record_property("accuracy/" + name, json.dumps(metrics, sort_keys=True))
++    assert finite, f"{name}: non-finite result or reference: {metrics}"
++    assert ratio >= 0.99, f"{name}: fewer than 99% of elements satisfy mixed tolerance: {metrics}"
++    assert maximum <= limit, f"{name}: maximum absolute error exceeds its limit: {metrics}"
++
++
++@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])
++def test_accuracy_criteria_enforce_both_limits(dtype, record_property):
++    atol = {torch.float16: 2**-9, torch.bfloat16: 2**-6, torch.float32: 2**-16}[dtype]
++    golden = torch.zeros(100, dtype=torch.float64)
++    actual = torch.zeros(100, dtype=dtype)
++    actual[0] = 2 * atol
++    assert_accuracy(actual, golden, record_property, "exactly_99_percent")
++    actual[1] = 2 * atol
++    with pytest.raises(AssertionError, match="fewer than 99%"):
++        assert_accuracy(actual, golden, record_property, "below_99_percent")
++    actual[1] = 0
++    actual[0] = {torch.float16: 0.2, torch.bfloat16: 2.0, torch.float32: 0.02}[dtype]
++    with pytest.raises(AssertionError, match="maximum absolute error"):
++        assert_accuracy(actual, golden, record_property, "exceeds_maximum")
++
++
++def assert_verify_records(correction, kg, records, record_property):
++    for block, (expected_correction, expected_kg) in records.items():
++        length = expected_correction.shape[1]
++        assert_accuracy(correction[block, :, :length], expected_correction, record_property, f"correction_block{block}")
++        torch.testing.assert_close(kg[block, :, :length].cpu().double(), expected_kg, atol=0, rtol=0)
++
++
++def kda_recoverssm_commit(state, correction, kg, a_log, bias, bound, starts, indices, counts):
++    # Adapt the old mathematical cases to the full multi-layer commit API.
++    length = correction.shape[2]
++    conv = torch.zeros(
++        (state.shape[0], 3 * state.shape[1] * state.shape[2], length + 2), dtype=kg.dtype, device=state.device
++    )
++    if not is_conv_state_dim_first():
++        conv = conv.transpose(-1, -2).contiguous()
++    layer = SimpleNamespace(
++        kv_cache=(conv, state, correction, kg),
++        A_log=a_log,
++        dt_bias=bias,
++        gate_lower_bound=bound,
++        local_num_heads=state.shape[1],
++        head_dim=state.shape[3],
++    )
++    context = KDARecoverSSMCommitContext.create([layer], spec_query_len=length, max_num_reqs=indices.numel())
++    context.commit(counts, indices, starts)
++
++
++def page_view(shape, dtype, padding, head_padding=0):
++    elements = 1
++    inner_strides: list[int] = []
++    for size in reversed(shape[1:]):
++        inner_strides.insert(0, elements)
++        elements *= size
++    inner_strides[0] += head_padding
++    elements += (shape[1] - 1) * head_padding
++    backing = torch.full((shape[0], elements + padding), 11.0, dtype=dtype, device="npu")
++    return backing, backing.as_strided(shape, (elements + padding, *inner_strides))
++
++
++@pytest.mark.parametrize("head_padding", [0, 128])
++@pytest.mark.parametrize("heads", [2, 32, 64])
++@pytest.mark.parametrize("state_dtype", [torch.float32, torch.bfloat16])
++@pytest.mark.parametrize("padding", [0, 128])
++@pytest.mark.skip_global_cleanup
++@torch.inference_mode()
++def test_multilayer_paged_commit_maps_sampler_rows_and_compacts_conv(
++    state_dtype, padding, heads, head_padding, record_property
++):
++    if not torch.npu.is_available():
++        pytest.skip("requires an Ascend NPU")
++    torch.manual_seed(73)
++    dim, length, slots = 128, 6, 5
++    blocks, starts, accepted = [3, 1, 0], [0, 6, 8, 8], [4, 2, 0]
++    indices = torch.tensor(blocks, dtype=torch.int32, device="npu")
++    if head_padding:
++        # Vary the runtime metadata stride together with the cache head strides.
++        indices = torch.stack((indices, torch.zeros_like(indices)), dim=1).flatten()[::2]
++    offsets = torch.tensor(starts, dtype=torch.int32, device="npu")
++    # Sampler contains non-spec requests and uses a different row order.
++    counts = torch.tensor([2, 0, 4, 0, 0], dtype=torch.int32, device="npu")
++    request_indices = torch.tensor([2, 0, 1], dtype=torch.int32, device="npu")
++    layers, expectations, backings, head_gaps = [], [], [], []
++    for _ in range(2):
++        state_backing, state = page_view((slots, heads, dim, dim), state_dtype, padding, head_padding)
++        correction_backing, correction = page_view((slots, heads, length, dim), torch.float32, padding, head_padding)
++        kg_backing, kg = page_view((slots, heads, length, 2 * dim), torch.bfloat16, padding, head_padding)
++        conv_shape = (slots, 3 * heads * dim, length + 2)
++        if not is_conv_state_dim_first():
++            conv_shape = (slots, length + 2, 3 * heads * dim)
++        conv_backing, conv = page_view(conv_shape, torch.bfloat16, padding)
++        state.copy_(torch.randn_like(state) * 0.05)
++        conv.copy_(torch.randn_like(conv))
++        initial, original_conv = state.clone(), conv.clone()
++        q, k, v, gate = (torch.randn((1, 8, heads, dim), dtype=torch.bfloat16, device="npu") for _ in range(4))
++        beta = torch.randn((1, 8, heads), dtype=torch.bfloat16, device="npu")
++        a_log = torch.randn(heads, device="npu") * 0.2
++        bias = torch.randn(heads * dim, device="npu") * 0.1
++        expected_output, expected_state, records = reference(
++            q, k, v, gate, beta, a_log, bias, -5.0, initial, starts, blocks, accepted
++        )
++        output = kda_recoverssm_verify(
++            q, k, v, gate, beta, a_log, bias, -5.0, state, correction, kg, offsets, indices, length
++        )
++        assert_accuracy(output, expected_output, record_property, "verify")
++        assert_verify_records(correction, kg, records, record_property)
++        torch.testing.assert_close(state, initial, atol=0, rtol=0)
++        for block, count in zip(blocks[:2], accepted[:2]):
++            correction[block, :, count:] = float("nan")
++            kg[block, :, count:] = float("nan")
++        expected_conv = original_conv.clone()
++        source = original_conv if is_conv_state_dim_first() else original_conv.transpose(-1, -2)
++        destination = expected_conv if is_conv_state_dim_first() else expected_conv.transpose(-1, -2)
++        for block, count in zip(blocks[:2], accepted[:2]):
++            destination[block, :, :3] = source[block, :, count - 1 : count + 2]
++        layer = SimpleNamespace(
++            kv_cache=(conv, state, correction, kg),
++            A_log=a_log,
++            dt_bias=bias,
++            gate_lower_bound=-5.0,
++            local_num_heads=heads,
++            head_dim=dim,
++        )
++        layers.append(layer)
++        expectations.append((expected_state, expected_conv))
++        backings.extend([state_backing, correction_backing, kg_backing, conv_backing])
++        if head_padding:
++            for backing, view in ((state_backing, state), (correction_backing, correction), (kg_backing, kg)):
++                for head in range(heads - 1):
++                    start = (head + 1) * view.stride(1) - head_padding
++                    head_gaps.append(backing[:, start : start + head_padding])
++    context = KDARecoverSSMCommitContext.create(layers, spec_query_len=length, max_num_reqs=3)
++    context.commit(counts, indices, offsets, request_indices=request_indices)
++    for index, (layer, (state, conv)) in enumerate(zip(layers, expectations)):
++        assert_accuracy(layer.kv_cache[1], state, record_property, f"commit_layer{index}")
++        torch.testing.assert_close(layer.kv_cache[0], conv, atol=0, rtol=0)
++    for gap in head_gaps:
++        torch.testing.assert_close(gap, torch.full_like(gap, 11.0), atol=0, rtol=0)
++    if padding:
++        for backing in backings:
++            torch.testing.assert_close(
++                backing[:, -padding:], torch.full_like(backing[:, -padding:], 11.0), atol=0, rtol=0
++            )
++
++
++@pytest.mark.skip_global_cleanup
++@torch.inference_mode()
++def test_conv_compaction_recorded_b11_l11_shape():
++    if not torch.npu.is_available():
++        pytest.skip("requires an Ascend NPU")
++    torch.manual_seed(73)
++    # Most common captured layout: B11/L11 (200 of384 commit records).
++    channels, state_len, layers = 12288, 8, 11
++    page_stride, history, block_d, plan_capacity = 1245184, 3, 256, 16
++    blocks = [4, 9, 14, 19, 24, 29, 34, 39, 44, 49, 54]
++    accepted = [4, 2, 6, 2, 2, 5, 3, 3, 1, 3, 5]
++    # Keep captured strides/indices without allocating hundreds of unused pages.
++    slots = max(blocks) + 2
++    checked_blocks = [0, *blocks, slots - 1]
++    backings, views, expectations = [], [], []
++    for _ in range(layers):
++        backing = torch.full((slots, page_stride), 11.0, dtype=torch.bfloat16, device="npu")
++        conv = backing.as_strided((slots, channels, state_len), (page_stride, 1, channels))
++        conv.copy_(torch.randn_like(conv))
++        # Snapshot the complete touched pages, their padding, and two untouched pages.
++        expected_backing = backing[checked_blocks].clone()
++        expected = expected_backing.as_strided((len(checked_blocks), channels, state_len), (page_stride, 1, channels))
++        for row, (block, count) in enumerate(zip(blocks, accepted), start=1):
++            expected[row, :, :history] = conv[block, :, count - 1 : count - 1 + history]
++        backings.append(backing)
++        views.append(conv)
++        expectations.append(expected_backing)
++    metadata = [
++        torch.tensor(values, dtype=torch.int64, device="npu")
++        for values in (
++            [view.data_ptr() for view in views],
++            [page_stride] * layers,
++            [1] * layers,
++            [channels] * layers,
++        )
++    ]
++    indices = torch.tensor(blocks, dtype=torch.int32, device="npu")
++    counts = torch.tensor(accepted + [0] * (plan_capacity - len(blocks)), dtype=torch.int32, device="npu")
++    finals = torch.tensor(blocks + [0] * (plan_capacity - len(blocks)), dtype=torch.int32, device="npu")
++    boundary = torch.zeros(plan_capacity, dtype=torch.int32, device="npu")
++    _compact_conv_state_kernel[(triton.cdiv(channels, block_d), len(blocks), layers)](
++        views[0],
++        *metadata,
++        indices,
++        counts,
++        finals,
++        boundary,
++        boundary,
++        0,
++        channels,
++        history,
++        1,
++        BLOCK_D=block_d,
++        BLOCK_HISTORY=4,
++        ALIGN_MODE=False,
++        DIM_STRIDE=1,
++        num_warps=4,
++    )
++    for backing, expected_backing in zip(backings, expectations):
++        torch.testing.assert_close(backing[checked_blocks], expected_backing, atol=0, rtol=0)
++
++
++@pytest.mark.parametrize("channels", [127, 12288])
++@pytest.mark.parametrize("dim_first", [False, True])
++@pytest.mark.parametrize("align", [False, True])
++@pytest.mark.skip_global_cleanup
++@torch.inference_mode()
++def test_conv_compaction_device_tile_preserves_other_slots(channels, dim_first, align):
++    if not torch.npu.is_available():
++        pytest.skip("requires an Ascend NPU")
++    torch.manual_seed(91)
++    slots, state_len, history = 8, 8, 3
++    sources, destinations, accepted = [6, 3, 1, 0], [7, 4, 2, 0], [6, 1, 3, 6]
++    boundaries, boundary_lengths = [5, 0, 0, 0], [2, 0, 0, 0]
++    views, backings, expected_backings = [], [], []
++    for _ in range(2):
++        shape = (slots, channels, state_len) if dim_first else (slots, state_len, channels)
++        backing, conv = page_view(shape, torch.bfloat16, 128)
++        conv.copy_(torch.randn_like(conv))
++        expected_backing = backing.clone()
++        expected = expected_backing.as_strided(conv.shape, conv.stride())
++        source_view = conv if dim_first else conv.transpose(-1, -2)
++        expected_view = expected if dim_first else expected.transpose(-1, -2)
++        for source, destination, count in zip(sources[:3], destinations[:3], accepted[:3]):
++            expected_view[destination, :, :history] = source_view[source, :, count - 1 : count + 2]
++        if align:
++            expected_view[5, :, :history] = source_view[6, :, 1:4]
++        views.append(source_view)
++        backings.append(backing)
++        expected_backings.append(expected_backing)
++    metadata = [
++        torch.tensor(values, dtype=torch.int64, device="npu")
++        for values in (
++            [view.data_ptr() for view in views],
++            [view.stride(0) for view in views],
++            [view.stride(1) for view in views],
++            [view.stride(2) for view in views],
++        )
++    ]
++    indices, counts, finals, boundary, lengths = (
++        torch.tensor(values, dtype=torch.int32, device="npu")
++        for values in (sources, accepted, destinations, boundaries, boundary_lengths)
++    )
++    block_d = _conv_compaction_block_d(views[0].stride(1))
++    _compact_conv_state_kernel[(triton.cdiv(channels, block_d), len(sources), len(views))](
++        views[0],
++        *metadata,
++        indices,
++        counts,
++        finals,
++        boundary,
++        lengths,
++        0,
++        channels,
++        history,
++        1,
++        BLOCK_D=block_d,
++        BLOCK_HISTORY=4,
++        ALIGN_MODE=align,
++        DIM_STRIDE=views[0].stride(1),
++        USE_1D_CHANNEL_GATHER=not is_950(),
++        num_warps=4,
++    )
++    for actual, expected in zip(backings, expected_backings):
++        torch.testing.assert_close(actual, expected, atol=0, rtol=0)
++
++
++def reference(q, k, v, raw_g, raw_beta, a_log, bias, lower_bound, state, starts, blocks, accepted):
++    q, k, v, raw_g, raw_beta, a_log, bias, state = (
++        tensor.detach().to(device="cpu", dtype=torch.float64)
++        for tensor in (q, k, v, raw_g, raw_beta, a_log, bias, state)
++    )
++    output = torch.zeros_like(v)
++    final = state.clone()
++    records = {}
++    heads, value_dim, key_dim = state.shape[1:]
++    for row, block in enumerate(blocks):
++        if block == 0:
++            continue
++        current = state[block].clone()
++        corrections = []
++        for position, token in enumerate(range(starts[row], starts[row + 1])):
++            key = k[0, token]
++            key_norm = key.square().sum(-1, keepdim=True)
++            key = key * torch.rsqrt(torch.where(key_norm > 0, key_norm, 1.0))
++            query = q[0, token]
++            query_norm = query.square().sum(-1, keepdim=True)
++            query = query * torch.rsqrt(torch.where(query_norm > 0, query_norm, 1.0)) * key_dim**-0.5
++            gate_input = raw_g[0, token] + bias.view(heads, key_dim)
++            a = a_log.view(heads, 1).exp()
++            if lower_bound is None:
++                gate = -a * torch.nn.functional.softplus(gate_input)
++            else:
++                gate = lower_bound * torch.sigmoid(a * gate_input)
++            current = current * gate.exp()[:, None, :]
++            correction = raw_beta[0, token].sigmoid()[:, None] * (v[0, token] - (current * key[:, None, :]).sum(-1))
++            corrections.append(correction)
++            current = current + correction[:, :, None] * key[:, None, :]
++            output[0, token] = (current * query[:, None, :]).sum(-1)
++            if position + 1 == accepted[row]:
++                final[block] = current
++        if corrections:
++            span = slice(starts[row], starts[row + 1])
++            records[block] = (
++                torch.stack(corrections, dim=1),
++                torch.cat((k[0, span], raw_g[0, span]), dim=-1).transpose(0, 1),
++            )
++    return output, final, records
++
++
++@pytest.mark.parametrize("num_spec", [0, 1, 3, 5, 7])
++@pytest.mark.parametrize("state_dtype", [torch.float32, torch.bfloat16])
++@pytest.mark.parametrize("activation_dtype", [torch.bfloat16, torch.float16])
++@pytest.mark.parametrize("lower_bound", [-5.0, None])
++@pytest.mark.skip_global_cleanup
++@torch.inference_mode()
++def test_recoverssm_preserves_accepted_state_across_steps(
++    num_spec, state_dtype, activation_dtype, lower_bound, record_property
++):
++    if not torch.npu.is_available():
++        pytest.skip("requires an Ascend NPU")
++    torch.manual_seed(42)
++    device = "npu"
++    heads, dim, capacity = 4, 128, num_spec + 1
++    # Permuted slots, rejected-all row, short rows, padding and an empty row.
++    blocks = [3, 1, 5, 2, 0, 4]
++    lengths = [capacity, 1, capacity - 1, capacity, 1, 0]
++    accepted = [0, 1, min(3, capacity - 1), capacity, 1, 0]
++    starts = [0]
++    for length in lengths:
++        starts.append(starts[-1] + length)
++    indices = torch.tensor(blocks, dtype=torch.int32, device=device)
++    query_starts = torch.tensor(starts, dtype=torch.int64, device=device)
++    counts = torch.tensor(accepted, dtype=torch.int32, device=device)
++    state = (torch.randn(8, heads, dim, dim, device=device) * 0.05).to(state_dtype)
++    correction = torch.full((8, heads, capacity, dim), float("nan"), device=device)
++    kg = torch.full((8, heads, capacity, 2 * dim), float("nan"), dtype=activation_dtype, device=device)
++    a_log = (0.2 * torch.randn(heads, device=device)).view(1, 1, heads, 1)
++    bias = 0.1 * torch.randn(heads * dim, device=device)
++
++    for _ in range(2):
++        # Token-strided inputs exercise projected/split tensor layouts.
++        projections = torch.randn(1, starts[-1], heads * dim * 4, dtype=activation_dtype, device=device)
++        q, k, v, raw_g = (x.view(1, starts[-1], heads, dim) for x in projections.split(heads * dim, dim=-1))
++        beta = torch.randn(1, starts[-1], heads, dtype=activation_dtype, device=device)
++        initial = state.clone()
++        expected_out, expected_state, records = reference(
++            q, k, v, raw_g, beta, a_log, bias, lower_bound, initial, starts, blocks, accepted
++        )
++        output_buffer = torch.empty_like(v)
++        output = kda_recoverssm_verify(
++            q,
++            k,
++            v,
++            raw_g,
++            beta,
++            a_log.reshape(-1),
++            bias,
++            lower_bound,
++            state,
++            correction,
++            kg,
++            query_starts,
++            indices,
++            capacity,
++            out=output_buffer,
++        )
++        assert output is output_buffer
++        torch.testing.assert_close(state, initial, atol=0, rtol=0)
++        assert_accuracy(output, expected_out, record_property, "verify")
++        assert_verify_records(correction, kg, records, record_property)
++        # Rejected suffix records must never influence the committed state.
++        for row, block in enumerate(blocks):
++            if block > 0:
++                correction[block, :, accepted[row] :] = float("nan")
++                kg[block, :, accepted[row] :] = float("nan")
++        kda_recoverssm_commit(state, correction, kg, a_log, bias, lower_bound, query_starts, indices, counts)
++        assert_accuracy(state, expected_state, record_property, "commit")
++        # Includes block zero and unused slots as well as zero-acceptance rows.
++        torch.testing.assert_close(state[[0, 3, 4, 6, 7]], initial[[0, 3, 4, 6, 7]], atol=0, rtol=0)
++
++
++@pytest.mark.skip_global_cleanup
++@torch.inference_mode()
++def test_recoverssm_empty_batch():
++    if not torch.npu.is_available():
++        pytest.skip("requires an Ascend NPU")
++    device, heads, dim, capacity = "npu", 2, 128, 5
++    q = torch.empty(1, 0, heads, dim, dtype=torch.bfloat16, device=device)
++    beta = torch.empty(1, 0, heads, dtype=q.dtype, device=device)
++    state = torch.zeros(1, heads, dim, dim, device=device)
++    correction = torch.empty(1, heads, capacity, dim, device=device)
++    kg = torch.empty(1, heads, capacity, 2 * dim, dtype=q.dtype, device=device)
++    a_log, bias = torch.zeros(heads, device=device), torch.zeros(heads * dim, device=device)
++    starts = torch.zeros(1, dtype=torch.int32, device=device)
++    indices = torch.empty(0, dtype=torch.int32, device=device)
++    output = kda_recoverssm_verify(
++        q, q, q, q, beta, a_log.reshape(-1), bias, -5.0, state, correction, kg, starts, indices, capacity
++    )
++    assert output.shape == q.shape
++    kda_recoverssm_commit(state, correction, kg, a_log, bias, -5.0, starts, indices, indices)
++    assert torch.count_nonzero(state) == 0
++
++
++@pytest.mark.parametrize("amplitude", [1.0, 1e-2, 1e-3, 1e-6, 1e-8, 0.0])
++@pytest.mark.skip_global_cleanup
++@torch.inference_mode()
++def test_recoverssm_matches_ascendc_small_norms(amplitude, record_property):
++    from vllm_ascend.ops.kda import run_recurrent_kda
++
++    if not torch.npu.is_available():
++        pytest.skip("requires an Ascend NPU")
++    torch.manual_seed(61566)
++    device, heads, dim, capacity = "npu", 8, 128, 6
++    q, k = (torch.randn(1, capacity, heads, dim, dtype=torch.bfloat16, device=device) * amplitude for _ in range(2))
++    v, gate = (torch.randn_like(q) for _ in range(2))
++    beta = torch.randn(1, capacity, heads, dtype=q.dtype, device=device)
++    a_log, bias = torch.zeros(heads, device=device), torch.zeros(heads * dim, device=device)
++    initial = torch.randn(heads, dim, dim, device=device) * 0.05
++    native = torch.zeros(capacity + 1, heads, dim, dim, device=device)
++    native[1] = initial
++    checkpoint = torch.zeros(2, heads, dim, dim, device=device)
++    checkpoint[1] = initial
++    starts = torch.tensor([0, capacity], dtype=torch.int32, device=device)
++    indices = torch.ones(1, dtype=torch.int32, device=device)
++    native_indices = torch.arange(1, capacity + 1, dtype=torch.int32, device=device).view(1, capacity)
++    expected = run_recurrent_kda(
++        q,
++        k,
++        v,
++        gate,
++        beta,
++        native,
++        starts,
++        native_indices,
++        a_log.reshape(-1),
++        bias,
++        lower_bound=-5.0,
++        beta_is_preprocessed=False,
++        num_accepted_tokens=indices,
++    )
++    correction = torch.empty(2, heads, capacity, dim, device=device)
++    kg = torch.empty(2, heads, capacity, 2 * dim, dtype=q.dtype, device=device)
++    output = kda_recoverssm_verify(
++        q,
++        k,
++        v,
++        gate,
++        beta,
++        a_log.reshape(-1),
++        bias,
++        -5.0,
++        checkpoint,
++        correction,
++        kg,
++        starts,
++        indices,
++        capacity,
++    )
++    assert_accuracy(output, expected, record_property, "verify_ascendc")
++    # Retain the stronger small-norm regression checks alongside the common criteria.
++    torch.testing.assert_close(output.float(), expected.float(), atol=1e-4, rtol=2e-4)
++    for count in (1, 3, capacity):
++        restored = checkpoint.clone()
++        accepted = torch.full_like(indices, count)
++        kda_recoverssm_commit(restored, correction, kg, a_log, bias, -5.0, starts, indices, accepted)
++        assert_accuracy(restored[1], native[count], record_property, f"commit_ascendc_accepted{count}")
++        torch.testing.assert_close(restored[1], native[count], atol=2e-6, rtol=2e-5)
++
++
++@pytest.mark.parametrize("key_dim,value_dim", [(7, 5), (7, 8), (8, 5)])
++@pytest.mark.parametrize("lower_bound", [-5.0, None])
++@pytest.mark.skip_global_cleanup
++@torch.inference_mode()
++def test_recoverssm_ragged_tiles(key_dim, value_dim, lower_bound, record_property):
++    if not torch.npu.is_available():
++        pytest.skip("requires an Ascend NPU")
++    torch.manual_seed(83)
++    heads, capacity, slots = 2, 3, 4
++    starts, blocks, accepted = [0, 3, 5, 6], [2, 1, 0], [2, 1, 0]
++    q, k, gate = (torch.randn(1, 6, heads, key_dim, dtype=torch.bfloat16, device="npu") for _ in range(3))
++    v = torch.randn(1, 6, heads, value_dim, dtype=torch.bfloat16, device="npu")
++    beta = torch.randn(1, 6, heads, dtype=torch.bfloat16, device="npu")
++    state = torch.randn(slots, heads, value_dim, key_dim, device="npu") * 0.05
++    initial = state.clone()
++    correction = torch.empty(slots, heads, capacity, value_dim, device="npu")
++    kg = torch.empty(slots, heads, capacity, 2 * key_dim, dtype=q.dtype, device="npu")
++    a_log = torch.randn(heads, device="npu") * 0.1
++    bias = torch.randn(heads * key_dim, device="npu") * 0.1
++    offsets, indices, counts = (
++        torch.tensor(values, dtype=torch.int32, device="npu") for values in (starts, blocks, accepted)
++    )
++    expected_output, expected_state, records = reference(
++        q, k, v, gate, beta, a_log, bias, lower_bound, initial, starts, blocks, accepted
++    )
++    output = kda_recoverssm_verify(
++        q, k, v, gate, beta, a_log, bias, lower_bound, state, correction, kg, offsets, indices, capacity
++    )
++    assert_accuracy(output, expected_output, record_property, "verify_ragged")
++    assert_verify_records(correction, kg, records, record_property)
++    torch.testing.assert_close(state, initial, atol=0, rtol=0)
++    kda_recoverssm_commit(state, correction, kg, a_log, bias, lower_bound, offsets, indices, counts)
++    assert_accuracy(state, expected_state, record_property, "commit_ragged")
++
++
++@pytest.mark.parametrize("mode", ["cross", "exact", "no_cross"])
++@pytest.mark.parametrize("graph_mode", [False, True])
++@pytest.mark.parametrize("state_dtype", [torch.float32, torch.bfloat16])
++@pytest.mark.skip_global_cleanup
++@torch.inference_mode()
++def test_align_context(mode, graph_mode, state_dtype, record_property):
++    if not torch.npu.is_available():
++        pytest.skip("requires an Ascend NPU")
++    torch.manual_seed(19516)
++    slots, heads, dim, capacity = 12, 2, 128, 6
++    blocks, starts, accepted = [1, 2, 0], [0, 6, 9, 15], [4, 3, 0]
++    offsets = torch.tensor(starts, dtype=torch.int64, device="npu")
++
++    def strided(values):
++        backing = torch.zeros(len(values) * 2, dtype=torch.int32, device="npu")
++        backing[::2] = torch.tensor(values, dtype=torch.int32, device="npu")
++        return backing[::2]
++
++    indices = strided(blocks)
++    mapping, counts = strided([2, 0, 1]), strided([9, -2, 4])
++    computed_values = {"cross": [7, 0, 5], "exact": [5, 0, 4], "no_cross": [1, 0, 1]}[mode]
++    computed = strided(computed_values)
++    table_cpu = torch.tensor([[7, 8, 9], [0, 0, 0], [5, 6, 10]], dtype=torch.int32)
++    table = table_cpu.npu()
++    layers, expected, originals = [], [], []
++    block_size = 8
++    for layer_no in range(2):
++        state = (torch.randn(slots, heads, dim, dim, device="npu") * 0.03).to(state_dtype)
++        initial = state.clone()
++        correction = torch.full((slots, heads, capacity, dim), float("nan"), device="npu")
++        kg = torch.full((slots, heads, capacity, 2 * dim), float("nan"), dtype=torch.bfloat16, device="npu")
++        q, k, v, gate = (torch.randn(1, 15, heads, dim, dtype=torch.bfloat16, device="npu") for _ in range(4))
++        beta = torch.randn(1, 15, heads, dtype=torch.bfloat16, device="npu")
++        a_log = torch.randn(heads, device="npu") * 0.1
++        bias = torch.randn(heads * dim, device="npu") * 0.1
++        golden_output, final, _ = reference(q, k, v, gate, beta, a_log, bias, -5.0, initial, starts, blocks, accepted)
++        output = kda_recoverssm_verify(
++            q, k, v, gate, beta, a_log, bias, -5.0, state, correction, kg, offsets, indices, capacity
++        )
++        assert_accuracy(output, golden_output, record_property, f"layer{layer_no}_verify")
++        conv = torch.randn(slots, 3 * heads * dim, capacity + 2, dtype=torch.bfloat16, device="npu")
++        # Different physical layouts exercise the per-layer stride-table path.
++        if layer_no:
++            conv = conv.transpose(-1, -2).contiguous().transpose(-1, -2)
++        original_conv, golden_conv = conv.clone(), conv.clone()
++        golden_state = initial.cpu().double()
++        touched = set()
++        for row, src in enumerate(blocks[:2]):
++            req = [2, 0, 1][row]
++            prior, count = computed_values[req], accepted[row]
++            dst = int(table_cpu[req, min((prior + count) // block_size, 2)])
++            boundary = (prior // block_size + 1) * block_size
++            golden_state[dst] = final[src]
++            golden_conv[dst, :, :3] = original_conv[src, :, count - 1 : count + 2]
++            touched.add(dst)
++            if prior + count >= boundary:
++                boundary_dst = int(table_cpu[req, boundary // block_size - 1])
++                length = boundary - prior
++                _, intermediate, _ = reference(
++                    q,
++                    k,
++                    v,
++                    gate,
++                    beta,
++                    a_log,
++                    bias,
++                    -5.0,
++                    initial,
++                    starts,
++                    blocks,
++                    [length if index == row else 0 for index in range(3)],
++                )
++                golden_state[boundary_dst] = intermediate[src]
++                golden_conv[boundary_dst, :, :3] = original_conv[src, :, length - 1 : length + 2]
++                touched.add(boundary_dst)
++        stored_conv = conv if is_conv_state_dim_first() else conv.transpose(-1, -2)
++        layers.append(
++            SimpleNamespace(
++                kv_cache=(stored_conv, state, correction, kg),
++                A_log=a_log,
++                dt_bias=bias,
++                gate_lower_bound=-5.0,
++                local_num_heads=heads,
++                head_dim=dim,
++            )
++        )
++        expected.append((golden_state, golden_conv, touched))
++        originals.append((initial, original_conv))
++    context = KDARecoverSSMCommitContext.create(layers, spec_query_len=capacity, max_num_reqs=3)
++    assert context.conv_dim_stride is None
++
++    def launch():
++        context.commit(counts, indices, offsets, mapping, table, computed, block_size)
++
++    if graph_mode:
++        launch()
++        torch.npu.synchronize()
++        captured = torch.npu.NPUGraph()
++        with torch.npu.graph(captured):
++            launch()
++        for layer, (initial, conv) in zip(layers, originals):
++            layer.kv_cache[1].copy_(initial)
++            view = layer.kv_cache[0] if is_conv_state_dim_first() else layer.kv_cache[0].transpose(-1, -2)
++            view.copy_(conv)
++        captured.replay()
++    else:
++        launch()
++    for index, (layer, (state, conv, touched), (initial, _)) in enumerate(zip(layers, expected, originals)):
++        assert_accuracy(layer.kv_cache[1], state, record_property, f"layer{index}_align_state")
++        view = layer.kv_cache[0] if is_conv_state_dim_first() else layer.kv_cache[0].transpose(-1, -2)
++        torch.testing.assert_close(view, conv, atol=0, rtol=0)
++        unused = sorted(set(range(slots)) - touched)
++        torch.testing.assert_close(layer.kv_cache[1][unused], initial[unused], atol=0, rtol=0)
++
++
++def test_context_input_constraints():
++    with pytest.raises(ValueError, match="at least one layer"):
++        KDARecoverSSMCommitContext.create([], spec_query_len=6, max_num_reqs=4)
++
++
++@pytest.mark.parametrize("num_layers", [11, 12, 34])
++@pytest.mark.parametrize("batch", [11, 12])
++@pytest.mark.parametrize("graph_mode", [False, True])
++@pytest.mark.skip_global_cleanup
++@torch.inference_mode()
++def test_model_commit_context(batch, graph_mode, num_layers, record_property):
++    if not torch.npu.is_available():
++        pytest.skip("requires an Ascend NPU")
++    slots, heads, dim, span = batch + 2, 64 if is_950() else 32, 128, 6
++    # Real contexts have 11/11/12 layers; 34 layers is an extra capacity stress case.
++    real_pool_layout = num_layers != 34
++    state_page_stride = {32: 625152, 64: 1250304}[heads]
++
++    def allocate(shape, dtype, strides):
++        if real_pool_layout:
++            return torch.empty_strided(shape, strides, dtype=dtype, device="npu")
++        return torch.empty(shape, dtype=dtype, device="npu")
++
++    indices = torch.arange(1, batch + 1, dtype=torch.int32, device="npu")
++    starts = torch.arange(batch + 1, dtype=torch.int32, device="npu") * span
++    counts_cpu = torch.tensor(([1, 3, 6] * ((batch + 2) // 3))[:batch], dtype=torch.int32)
++    counts = counts_cpu.npu()
++    entries, seeds = [], []
++    # k=0 and g=A_log=dt_bias=0 give S_after = S_before * exp(-2.5 * accepted).
++    for layer_no in range(num_layers):
++        seed = torch.arange(slots, dtype=torch.float32) * 0.002 + (layer_no + 1) * 0.001
++        state = allocate((slots, heads, dim, dim), torch.float32, (state_page_stride, dim * dim, dim, 1))
++        state.copy_(seed.npu()[:, None, None, None])
++        correction = allocate((slots, heads, span, dim), torch.float32, (state_page_stride, span * dim, dim, 1)).fill_(
++            1
++        )
++        kg = allocate(
++            (slots, heads, span, 2 * dim),
++            torch.bfloat16,
++            (2 * state_page_stride, span * 2 * dim, 2 * dim, 1),
++        ).zero_()
++        conv = allocate((slots, 3 * heads * dim, 8), torch.bfloat16, (2 * state_page_stride, 1, 3 * heads * dim))
++        conv.copy_(torch.arange(8, dtype=torch.bfloat16, device="npu").view(1, 1, 8) + layer_no * 4)
++        if not is_conv_state_dim_first():
++            conv = conv.transpose(-1, -2)
++            if not real_pool_layout:
++                conv = conv.contiguous()
++        entries.append(
++            SimpleNamespace(
++                kv_cache=(conv, state, correction, kg),
++                A_log=torch.zeros(heads, device="npu"),
++                dt_bias=torch.zeros(heads * dim, device="npu"),
++                gate_lower_bound=-5.0,
++                local_num_heads=heads,
++                head_dim=dim,
++            )
++        )
++        seeds.append(seed)
++    context = KDARecoverSSMCommitContext.create(entries, spec_query_len=span, max_num_reqs=batch)
++
++    def reset():
++        for layer_no, (entry, seed) in enumerate(zip(entries, seeds)):
++            conv, state, _, _ = entry.kv_cache
++            state.copy_(seed.npu()[:, None, None, None])
++            logical = conv if is_conv_state_dim_first() else conv.transpose(-1, -2)
++            logical.copy_(torch.arange(8, dtype=torch.bfloat16, device="npu").view(1, 1, 8) + layer_no * 4)
++
++    context.commit(counts, indices, starts)
++    if graph_mode:
++        graph = torch.npu.NPUGraph()
++        with torch.npu.graph(graph):
++            context.commit(counts, indices, starts)
++        reset()
++        graph.replay()
++    torch.npu.synchronize()
++    factors = torch.ones(slots, dtype=torch.float64)
++    factors[1 : batch + 1] = torch.exp(-2.5 * counts_cpu.double())
++    for layer_no, (entry, seed) in enumerate(zip(entries, seeds)):
++        conv, state, _, _ = entry.kv_cache
++        golden = (seed.double() * factors)[:, None, None, None].expand(slots, heads, dim, dim)
++        assert_accuracy(state, golden, record_property, f"layer{layer_no}_full_context")
++        assert torch.equal(state[0].cpu(), seed[0].expand(heads, dim, dim))
++        assert torch.equal(state[-1].cpu(), seed[-1].expand(heads, dim, dim))
++        expected = (torch.arange(8, dtype=torch.bfloat16) + layer_no * 4).view(1, 1, 8)
++        expected = expected.expand(slots, 3 * heads * dim, 8).clone()
++        original = expected.clone()
++        for row, count in enumerate(counts_cpu.tolist(), 1):
++            expected[row, :, :3] = original[row, :, count - 1 : count + 2]
++        logical = conv if is_conv_state_dim_first() else conv.transpose(-1, -2)
++        assert torch.equal(logical.cpu(), expected)
++    record_property("full_context_layers", num_layers)
++
++
++@pytest.mark.parametrize(
++    "span,heads,activation_dtype,lower_bound",
++    [(span, heads, torch.bfloat16, -5.0) for heads in (32, 64) for span in (1, 2, 4, 6, 8)]
++    + [
++        (4, 64, torch.float16, -5.0),
++        (8, 64, torch.float16, None),
++        (2, 32, torch.bfloat16, None),
++        (8, 64, torch.bfloat16, None),
++        (6, 16, torch.bfloat16, -5.0),
++    ],
++)
++@pytest.mark.parametrize("graph_mode", [False, True])
++@pytest.mark.skip_global_cleanup
++@torch.inference_mode()
++def test_commit_window_uses_device_path(
++    span, heads, activation_dtype, lower_bound, graph_mode, monkeypatch, record_property
++):
++    if not torch.npu.is_available():
++        pytest.skip("requires an Ascend NPU")
++    torch.manual_seed(19133)
++    slots, dim, batch = 6, 128, 4
++    blocks, accepted = [2, 1, 3, 0], [span, max(span // 2, 1), 0, 0]
++    starts = [row * span for row in range(batch + 1)]
++    indices, offsets, counts = (
++        torch.tensor(values, dtype=torch.int32, device="npu") for values in (blocks, starts, accepted)
++    )
++    layers, expected, originals = [], [], []
++    for layer_no in range(2):
++        state = torch.randn(slots, heads, dim, dim, device="npu") * 0.03
++        initial = state.clone()
++        correction = torch.full((slots, heads, span, dim), float("nan"), device="npu")
++        kg = torch.full((slots, heads, span, 2 * dim), float("nan"), dtype=activation_dtype, device="npu")
++        projections = torch.randn(1, batch * span, 4 * heads * dim, dtype=activation_dtype, device="npu")
++        q, k, v, gate = (view.view(1, batch * span, heads, dim) for view in projections.split(heads * dim, dim=-1))
++        beta = torch.randn(1, batch * span, heads, dtype=activation_dtype, device="npu")
++        a_log = torch.randn(heads, device="npu") * 0.1
++        bias = torch.randn(heads * dim, device="npu") * 0.1
++        golden_output, golden_state, records = reference(
++            q, k, v, gate, beta, a_log, bias, lower_bound, initial, starts, blocks, accepted
++        )
++        output = kda_recoverssm_verify(
++            q, k, v, gate, beta, a_log, bias, lower_bound, state, correction, kg, offsets, indices, span
++        )
++        assert_accuracy(output, golden_output, record_property, f"window_layer{layer_no}_verify")
++        assert_verify_records(correction, kg, records, record_property)
++        torch.testing.assert_close(state, initial, atol=0, rtol=0)
++        for block, count in zip(blocks[:3], accepted[:3]):
++            correction[block, :, count:] = float("nan")
++            kg[block, :, count:] = float("nan")
++        conv = torch.randn(slots, 3 * heads * dim, span + 2, dtype=activation_dtype, device="npu")
++        golden_conv = conv.clone()
++        for block, count in zip(blocks[:2], accepted[:2]):
++            golden_conv[block, :, :3] = conv[block, :, count - 1 : count + 2]
++        stored_conv = conv if is_conv_state_dim_first() else conv.transpose(-1, -2)
++        layers.append(
++            SimpleNamespace(
++                kv_cache=(stored_conv, state, correction, kg),
++                A_log=a_log,
++                dt_bias=bias,
++                gate_lower_bound=lower_bound,
++                local_num_heads=heads,
++                head_dim=dim,
++            )
++        )
++        expected.append((golden_state, golden_conv))
++        originals.append((initial, conv.clone()))
++    context = KDARecoverSSMCommitContext.create(layers, spec_query_len=span, max_num_reqs=batch)
++    grouped_commit = is_950() and heads in (32, 64)
++    kernel_name = "_commit_kda_state_grouped_kernel" if grouped_commit else "_commit_kda_state_kernel"
++    original_kernel, launches = getattr(recoverssm_module, kernel_name), []
++
++    class RecordingKernel:
++        def __getitem__(self, grid):
++            launch = original_kernel[grid]
++
++            def invoke(*args, **kwargs):
++                launches.append(kernel_name)
++                if not grouped_commit:
++                    matrix_buffers = 2
++                    assert (
++                        kwargs["BV"] * kwargs["BK"] * torch.float32.itemsize * matrix_buffers
++                        <= recoverssm_module.get_ub_size_bytes()
++                    )
++                    assert kwargs["UNROLL_COMMIT"] == is_950()
++                return launch(*args, **kwargs)
++
++            return invoke
++
++    # Assert the selected path so a fixed-window fallback cannot hide missing coverage.
++    monkeypatch.setattr(recoverssm_module, kernel_name, RecordingKernel())
++    context.commit(counts, indices, offsets)
++    if graph_mode:
++        graph = torch.npu.NPUGraph()
++        with torch.npu.graph(graph):
++            context.commit(counts, indices, offsets)
++        for layer, (initial, conv) in zip(layers, originals):
++            layer.kv_cache[1].copy_(initial)
++            logical = layer.kv_cache[0] if is_conv_state_dim_first() else layer.kv_cache[0].transpose(-1, -2)
++            logical.copy_(conv)
++        graph.replay()
++    assert launches and all(name == kernel_name for name in launches)
++    for layer_no, (layer, (state, conv)) in enumerate(zip(layers, expected)):
++        assert_accuracy(layer.kv_cache[1], state, record_property, f"window_layer{layer_no}_commit")
++        logical = layer.kv_cache[0] if is_conv_state_dim_first() else layer.kv_cache[0].transpose(-1, -2)
++        torch.testing.assert_close(logical, conv, atol=0, rtol=0)
++        torch.testing.assert_close(
++            layer.kv_cache[1][[0, 3, 4, 5]], originals[layer_no][0][[0, 3, 4, 5]], atol=0, rtol=0
++        )
++    record_property("commit_kernel", kernel_name)
++    record_property("spec_query_len", span)
+diff --git a/vllm_ascend/ops/triton/docs/kda_recoverssm.md b/vllm_ascend/ops/triton/docs/kda_recoverssm.md
+new file mode 100644
+index 000000000..7e09b3ffd
+--- /dev/null
++++ b/vllm_ascend/ops/triton/docs/kda_recoverssm.md
+@@ -0,0 +1,370 @@
++# KDA RecoverSSM
++
++## Description
++
++- **Function**: Verify a speculative KDA window using one persistent recurrent
++  checkpoint per cache page. Record each token's correction and raw key/gate,
++  then reconstruct only the accepted recurrent state after sampling. Commit also
++  compacts the convolution history prepared by the caller. This supports GLM
++  speculative decoding without keeping a full recurrent checkpoint per draft.
++- **Formula**: For one head, let `S` have shape `[V, K]`, and normalize nonzero
++  query/key vectors to unit L2 norm; zero vectors remain zero. Scale the normalized
++  query by `K**-0.5`. With `a = exp(A_log)` and `x = raw_g + dt_bias`:
++
++  ```text
++  g = lower_bound * sigmoid(a * x)       if lower_bound is not None
++      -a * softplus(x)                  otherwise
++  decay = exp(g)
++  decayed_state = S * decay[None, :]
++  correction = sigmoid(raw_beta) * (v - decayed_state @ normalized_k)
++  next_state = decayed_state + correction[:, None] * normalized_k[None, :]
++  output = next_state @ normalized_scaled_q
++  ```
++
++  Verification records `correction` and the unnormalized `k/raw_g`. Commit
++  reconstructs `next_state` through the accepted prefix from those records and
++  the original checkpoint. Softplus uses its linear branch above 20.
++- **Algorithm flow** (independent requests and heads, with value-dimension tiles):
++  1. `_kda_recoverssm_verify_kernel` loads a request's checkpoint, advances a
++     register-held recurrence, writes outputs and compact records, and leaves the
++     persistent checkpoint unchanged. Null-page rows produce zero output and do
++     not write records.
++  2. `_prepare_commit_plan_kernel` maps speculative rows to sampler rows, clamps
++     accepted lengths to the query length and window capacity, and prepares final
++     and optional boundary destinations. Null pages and zero accepted lengths
++     become no-op plan entries.
++  3. `_compact_conv_state_kernel` copies the accepted convolution history to its
++     destination. For history length `W` and accepted length `c > 0`, the source
++     interval is `[c - 1, c - 1 + W)` and the destination interval is `[0, W)`.
++  4. `_commit_kda_state_kernel` traverses the accepted records backwards,
++     accumulates decay/products and correction outer products, and writes the
++     reconstructed recurrent checkpoint. `_commit_kda_state_grouped_kernel`
++     performs the same operation for two adjacent heads per program on its A5
++     fast path.
++- **Supported modes**: Atlas A3 and Ascend 950DT (A5), inference only, eager and
++  NPU graph execution. Atlas A2 and 950PR are not validated by these tests.
++  This operator-only change does not activate the GLM serving path. Model,
++  configuration and worker integration will be provided in a follow-up change.
++  The low-level optional align arguments do not establish serving support for
++  Mamba cache mode `align`.
++
++## Parameters
++
++Notation: `B` speculative requests, `T` flattened tokens, `H` local heads,
++`K/V` key/value widths, `P` cache pages, `Q` speculative-window capacity,
++`L` local KDA layers, `C` convolution channels, `W` convolution history length.
++An optional argument's default is part of its description.
++
++### `kda_recoverssm_verify`
++
++| Parameter | Input/Output/Attribute | Description | Data type | Data format |
++| --- | --- | --- | --- | --- |
++| `q`, `k`, `raw_g` | Input | Query, raw key, raw gate, each `[1, T, H, K]` | BF16 / FP16 | ND; token-strided views allowed |
++| `v` | Input | Values `[1, T, H, V]` | Same activation dtype | ND |
++| `raw_beta` | Input | Raw update gate `[1, T, H]`; sigmoid is applied internally | Same activation dtype | ND |
++| `A_log` | Input | Per-head log decay scale `[H]` | FP32 in validated callers | Contiguous ND |
++| `dt_bias` | Input | Gate bias with `H * K` elements | FP32 in validated callers | Contiguous ND |
++| `lower_bound` | Attribute | Gate lower bound; `None` selects negative softplus instead of bounded sigmoid | Python float / `None` | Scalar / N/A |
++| `checkpoint_state` | Input | Persistent recurrent state `[P, H, V, K]`, read-only during verification | FP32 / BF16 | Paged ND, explicit strides |
++| `correction_cache` | Output | Per-token correction records `[P, H, Q, V]` | FP32 | Paged ND, explicit strides |
++| `kg_cache` | Output | Raw key and raw gate concatenated on the last axis, `[P, H, Q, 2 * K]` | Same dtype as `k` | Paged ND, explicit strides |
++| `query_start_loc` | Input | Nondecreasing token offsets `[B + 1]` | INT32 / INT64 | Strided 1D |
++| `state_indices` | Input | Source page per speculative row `[B]`; values at or below `NULL_BLOCK_ID` select null rows | INT32 | Strided 1D |
++| `spec_query_len` | Attribute | `Q`, normally `num_speculative_tokens + 1` | Python int | Positive scalar |
++| `out` | Output | Output `[1, T, H, V]`; default `None` allocates an output with `v`'s shape and dtype; returns the supplied buffer when present | Same dtype as `v` in validated callers | ND |
++
++### `KDARecoverSSMCommitContext.create`
++
++| Parameter | Input/Output/Attribute | Description | Data type | Data format |
++| --- | --- | --- | --- | --- |
++| `layers` | Input | Nonempty sequence of layer objects exposing the fields below | Python sequence | N/A |
++| `spec_query_len` | Attribute | `Q`, shared by the local layers | Python int | Positive scalar |
++| `max_num_reqs` | Attribute | Capacity of the reusable commit-plan arrays | Python int | Positive scalar |
++| Returned context | Output | Retains references to layer-owned pages, stacks gate parameters and allocates address/stride tables and plan arrays | Context object | N/A |
++
++Required layer fields:
++
++| Parameter | Input/Output/Attribute | Description | Data type | Data format |
++| --- | --- | --- | --- | --- |
++| `kv_cache[0]` | Input/Output | Convolution state; normalized view `[P, C, Q + W - 1]` | BF16 in validated callers | Paged ND; channel-first or token-first physical layout |
++| `kv_cache[1]` | Input/Output | Recurrent checkpoint `[P, H, V, K]` | FP32 / BF16 | Paged ND |
++| `kv_cache[2]` | Input | Correction records from verification `[P, H, Q, V]` | FP32 | Paged ND |
++| `kv_cache[3]` | Input | Key/gate records from verification `[P, H, Q, 2 * K]` | BF16 / FP16 | Paged ND |
++| `A_log` | Input | Decay parameter with `H` elements, stacked as `[L, H]` internally | FP32 in validated callers | ND |
++| `dt_bias` | Input | Gate bias with `H * K` elements, stacked as `[L, H, K]` internally | FP32 in validated callers | ND |
++| `gate_lower_bound` | Attribute | Shared `lower_bound` across layers | Python float / `None` | Scalar / N/A |
++| `local_num_heads`, `head_dim` | Attribute | `H` and `K`, used to view gate parameters | Python int | Positive scalars |
++
++### `KDARecoverSSMCommitContext.commit`
++
++| Parameter | Input/Output/Attribute | Description | Data type | Data format |
++| --- | --- | --- | --- | --- |
++| `num_accepted_tokens` | Input | Number of recurrent steps to commit per sampler row; includes any target input step in that row | INT32 | Strided 1D |
++| `state_indices` | Input | Source page per speculative row `[B]` | INT32 | Strided 1D |
++| `query_start_loc` | Input | Token offsets `[B + 1]`, as in verification | INT32 / INT64 | Strided 1D |
++| `request_indices` | Input | Optional mapping from speculative rows to sampler rows; default `None` means identity mapping | INT32 / `None` | Strided 1D / N/A |
++| `block_table` | Input | Optional request-to-page table for low-level align destinations; default `None` commits to the source page | INT32 / `None` | Strided 2D / N/A |
++| `num_computed_tokens` | Input | Optional prior token count per sampler row, used with `block_table`; default `None` | INT32 / `None` | Strided 1D / N/A |
++| `mamba_block_size` | Attribute | Optional token span per align block, at least `Q`; default `None` | Python int / `None` | Scalar / N/A |
++| Context checkpoint/convolution pages | Input/Output | Reconstructed state and compacted history are written in place; the method returns `None` | See layer fields | Paged ND |
++| Context plan arrays | Output | Accepted lengths, final page IDs, boundary page IDs and boundary recovery lengths | INT32 | Contiguous 1D |
++
++Internal kernel arguments consist of the tensors above, INT64 base-address and
++per-layer stride tables, element-stride scalars, `NULL_BLOCK_ID` and shape/tile
++attributes. `K`, `V`, `BK`, `BV`, `NUM_HEADS`, `SPEC_QUERY_LEN`, `UNROLL_COMMIT`, gate/align flags,
++`BLOCK_D`, `BLOCK_HISTORY`, `DIM_STRIDE`, `USE_1D_CHANNEL_GATHER` and grouped-head tile
++`BH` specialize their respective kernels. The plan's `HAS_REQUEST_INDICES` and `ALIGN_MODE` are derived
++from optional pointer presence by `triton.heuristics`. Address tables and context
++buffers are implementation-owned, not user outputs to replace between replays.
++
++## Constraints
++
++- All tensor arguments to a call must be on the same NPU. Shapes and floating
++  dtypes must match the parameter tables. The tensor batch dimension for
++  activations is 1: requests are represented by flattened token offsets.
++- `K`, `V` and `Q` are positive. Every query span is in `[0, Q]`, offsets begin at
++  zero and end at `T`, and live page IDs and sampler-row mappings are in range.
++  Concurrent live rows must not write overlapping cache pages.
++- The last two strides of `q/k/raw_g` are `(K, 1)` and those of `v/out` are
++  `(V, 1)`; the head stride of `raw_beta` is 1. Token strides may differ.
++  `A_log` and `dt_bias` are contiguous. Cache pages may include page/head padding;
++  supplied strides must describe allocated, nonoverlapping storage.
++- Layer checkpoint, correction and key/gate inner strides must match within a
++  context; page strides may differ by layer. Convolution layout is derived from
++  `is_conv_state_dim_first()` and converted to a view, without changing caller
++  storage. `W = conv_state_len - Q + 1` must be positive.
++- `B` must not exceed context capacity. Accepted counts are clamped to
++  `[0, min(query_length, Q)]`. Null pages and zero accepted lengths do not modify
++  persistent state/history. Rejected suffix records are not read by commit.
++- The caller prepares convolution state before commit. Commit writes only the
++  accepted checkpoint destinations and the first `W` convolution positions;
++  verification writes only `out` and the valid correction/key/gate record spans.
++  Input/output buffers must not alias these write regions unexpectedly.
++- `block_table`, `num_computed_tokens` and `mamba_block_size` must either all be
++  absent or all be supplied. Low-level align can additionally write a boundary
++  checkpoint/history; full align commit is not covered by the GLM `none`-mode
++  serving validation. Compact's align copy path has separate exact-copy tests.
++- Normalization and nonlinear arithmetic operate on FP32 values after existing
++  load-time conversions. Output is stored in the activation dtype; checkpoints
++  retain their storage dtype. This does not change caller tensor dtype/layout.
++  Finite, non-overflowing inputs/intermediates are the validated numerical domain.
++- A3 verification/commit use value tiles no larger than 64. A5 can select 128
++  where its occupancy/layout rules permit. Grouped commit requires A5, FP32 state,
++  no align table, `K = V = 128` and `H` in `{32, 64}`; the window is supplied by
++  the caller rather than restricted to six tokens. Other supported cases use
++  ordinary commit. A3 strided convolution compaction uses 256-channel
++  tiles; A5 and contiguous-channel compaction retain 4096-channel tiles.
++  Ordinary commit further caps its value tile using the existing
++  `triton_utils.get_ub_size_bytes()` result, the key tile and align buffers.
++  A3 iterates accepted records at runtime to avoid compiler-expanded matrix
++  lifetimes; A5 retains static unrolling for both ordinary and grouped commit.
++  The estimate covers two matrix buffers normally and six with align enabled.
++  Two rows' worth of vector temporaries
++  are reserved before rounding down to a power of two. Context creation initializes
++  the shared device-property cache outside graph capture; kernel launch reads its UB budget.
++  Missing device properties use the utility's existing
++  conservative 192 KiB fallback, including on A5; this is not a hardware-size claim.
++  A3 strided compaction copies one history position at a time, preserving exact
++  in-place shifts and graph support on Triton-Ascend 3.2.2.
++- Create the context before graph capture and retain its buffers and layer
++  allocations across replays. Speculative capacity and specialization attributes
++  remain fixed for each captured graph; an empty batch is a no-op.
++- Hardware evidence records each validated per-device software stack. The
++  ordinary commit budget also covers the TP4/H16 case that previously exceeded
++  A3 UB capacity with Triton-Ascend 3.2.2.
++
++## Origin and Differences
++
++- **Origin**: Adapted from upstream vLLM KDA RecoverSSM at `c4df37dfcc`, as recorded
++  in `vllm_ascend/ops/triton/kda/recoverssm.py`. It implements the paged verify and
++  accepted-state commit contracts for Ascend GLM KDA.
++- **Differences**:
++    - Q/K normalization follows AscendC KDA: no squared-norm epsilon is added to
++    nonzero vectors, and zero vectors normalize to zero.
++    - FP32 recurrent arithmetic, explicit strided paged records and batched
++    multi-layer commit are used for Ascend. Persistent state is not advanced
++    during verification.
++    - Verify avoids the final unnecessary full-state update. A3 ordinary commit
++    reconstructs accepted prefixes with runtime iteration; A5 retains static
++    window expansion and can process two heads together.
++    - Convolution history is compacted by an Ascend kernel with device/layout-aware
++    tiles. Commit strides remain runtime arguments where static shapes are not
++    required. There is no autograd implementation (N/A for inference).
++
++## Test Cases
++
++The NPU test file uses an independent CPU FP64 forward recurrence for verify
++outputs, FP32 correction records and accepted states. Raw key/gate records and
++convolution compaction are compared exactly. AscendC is an additional reference
++for zero/small-norm inputs, rather than the only mathematical reference.
++
++Each arithmetic comparison uses the **actual output storage dtype**, computes
++errors on CPU in FP64, and enforces both criteria:
++
++| Output dtype | rtol | atol | Fixed maximum absolute error |
++| --- | --- | --- | --- |
++| FP16 | `2^-9` | `2^-9` | 0.1 |
++| BF16 | `2^-6` | `2^-6` | 1 |
++| FP32 | `2^-10` | `2^-16` | 0.01 |
++
++At least 99% of elements must satisfy
++`abs(actual - golden) <= atol + rtol * abs(golden)`, and **all** elements must have
++absolute error at most `max(fixed_limit, 32 * ULP_1.0(output_dtype))`. Non-finite
++results/references fail. Pure data movement and unchanged regions require exact
++agreement. The small-norm AscendC tests also retain their stronger regression
++tolerances. JUnit properties record each comparison's dtype, element counts,
++tolerances, pass ratio, maximum error and error limit; comparisons are not pooled
++to conceal a failed output.
++
++Coverage includes H32/H64 and K=V128 model dimensions, a recorded B11/L11 compact
++shape, FP16/BF16 activations, FP32/BF16 state, windows of 1/2/4/6/8 tokens,
++multi-step recovery, sampler-row mappings, page/head padding, metadata strides,
++null/empty rows, rejected-all and rejected-suffix records, ragged tiles,
++sigmoid/softplus gates, both convolution layouts and exact untouched regions.
++The same test file also covers full align commit across/exactly at/before a page
++boundary, mixed per-layer convolution layouts, and ordinary/grouped commit with
++the model's B11/B12 and L11/L12 pool strides. The L34 cases are capacity stress
++tests: actual GLM contexts split the 34 KDA layers into groups of 11/11/12.
++Pool-stride cases retain the recorded strides with B+2 pages and independent
++per-layer allocations; they do not reproduce every shared-pool address alias.
++The criteria themselves test the 99% boundary and independently failing the
++ratio or maximum-error gate.
++Window regressions explicitly check the selected ordinary/grouped path for
++Q1/Q2/Q4/Q6/Q8, both local head counts and eager/graph execution, with additional
++FP16 and unbounded-gate cases. This prevents a fixed-window fallback from masking
++missing grouped-kernel coverage.
++
++```bash
++pytest -sv -o junit_family=xunit1 \
++  tests/e2e/nightly/single_node/ops/singlecard_ops/triton/test_kda_recoverssm_npu.py \
++  --junitxml=kda_recoverssm.xml
++```
++
++Earlier validation on 2026-10-28 with verified vLLM `544f182d9` passed on A3
++with Triton-Ascend 3.2.2 and 3.6, and on A5 with 3.2.2. The validated
++earlier operator source SHA256 (LF line endings) is
++`ef436f90cea2db8e251cb1a0de91acd61b586d460c096af5c22634cb082de903`.
++Each stack passed all 144 cases with no failures or skips, including H16
++eager/graph and align-boundary regressions. Each produced 1280 arithmetic
++comparisons. Every comparison independently passed both accuracy gates;
++the A3 results below are identical on both tested Triton versions.
++
++| Device | Output dtype | Comparisons | Minimum pass ratio | Maximum absolute error | Error limit |
++| --- | --- | --- | --- | --- | --- |
++| A3 | BF16 | 252 | 100% | `0.00195286687` | 1 |
++| A3 | FP16 | 48 | 100% | `2.28976024e-05` | 0.1 |
++| A3 | FP32 | 980 | 100% | `4.11211216e-07` | 0.01 |
++| A5 | BF16 | 252 | 100% | `0.00321757621` | 1 |
++| A5 | FP16 | 48 | 100% | `1.51970713e-05` | 0.1 |
++| A5 | FP32 | 980 | 100% | `4.04177257e-07` | 0.01 |
++
++A3 used torch 2.10.0, torch-npu 2.10.0.post7, and either an isolated
++triton-ascend 3.2.2 package or 3.6.0+dev20261013220622. A5 used torch
++2.10.0+cpu, torch-npu 2.10.0.post7.dev20261020 and triton-ascend 3.2.2.
++The isolated 3.2.2 run does not replace the A3 container's installed package.
++
++Operator accuracy is evaluated against the independent references above.
++RecoverSSM off/on changes the model's algorithm path and is not a before/after
++comparison of the same Triton optimization. It is therefore not used to judge
++whether that optimization preserves numerical accuracy. For the runtime-stride
++change, the same-algorithm microbenchmarks below additionally compared all
++committed checkpoint tensors: the maximum before/after absolute difference was
++zero in all 24 A3/A5, L11/L12, B11/B12 and accepted-length cases. This checkpoint
++comparison complements, rather than replaces, the independent golden checks.
++
++Single-operator graph microbenchmarks compared the candidate with `b5326cd6b`
++(before runtime-stride changes), alternating both implementations for nine
++rounds on B11/B12, L11/L12 and accepted lengths 1/3/6. Commit latency changes
++ranged from -5.30% to +5.39% on A3 and -1.49% to +3.62% on A5. Event-averaged
++timings include graph submission gaps and are distinct from pure kernel time.
++
++Separately, the RecoverSSM algorithm-switch comparison used GLM-5.3-Flash W8A8
++on A3 (DP8/TP2) and local MXFP8 on A5 (DP8/TP1), MTP5 and FULL_DECODE_ONLY.
++At actual decode concurrency 90, three-trial median TPOT changed from 34.5218
++to 33.0748 ms/token on A3 and 21.1032 to 20.9797 on A5; A5 trial ranges overlap.
++Full GSM8K mixed-prefill workload TPOT regressed by 3.26% and 1.62%, respectively.
++These off/on results describe algorithm integration and are not attributed to
++the runtime-stride optimization.
++
++The 2026-10-27 dataset audit covered all four active RecoverSSM kernels, recording
++shape/dtype/stride, scalar specialization parameters and compiled identifiers.
++After warmup, GSM8K introduced no JIT memory misses or new/changed persistent
++compiler artifacts: A3 retained five variants and A5 six. This is a warm-cache
++result for the tested configuration, not a guarantee for arbitrary shapes or
++low-level align serving. Explicit specialization attributes are listed above;
++runtime strides may still trigger Triton type/alignment specialization.
++
++### Extracted-source validation
++
++This split preserves the latest operator and tests from PR #19133 at
++`423bc7e0da6f1d17699a7d4bfa6d2438506101bc`. The operator source SHA256
++(LF line endings) is
++`4e0e6b174d07931f56df9a69a0ad2e9714808fa23f6bb1e204fe019680b7d1fa`.
++The same source passed 144/144 A3 cases and 1280 arithmetic comparisons,
++with a 100% mixed-tolerance pass ratio for every comparison and the same A3
++maximum errors listed above. The current A5 sequence stopped during the
++commit microbenchmark because the device ran out of memory; it did not
++complete the full accuracy suite. Earlier A5 results above apply to their
++recorded source, rather than proving this extracted version passed.
++Model dataset results and compilation audits above are historical integration
++evidence; the operator-only split does not enable or revalidate serving.
++
++### Configured-window regression
++
++Both commit kernels require the caller's `SPEC_QUERY_LEN`; neither supplies a
++six-token default. Grouped dispatch and compilation have no six-token-only
++condition. The configured positive window bounds A3 runtime iteration
++and controls A5 `tl.static_range`.
++The 30 path cases check Q1/Q2/Q4/Q6/Q8, H16/H32/H64, eager/graph execution,
++FP16/BF16 activations, bounded/unbounded gates, null/zero-acceptance rows,
++accepted-prefix recovery, and the actual selected kernel.
++
++For the original Q6 configuration, six A5 B11/B12 and accepted-length 1/3/6
++cases were measured against `b7ec33b35` using the same alternating graph
++microbenchmark. Committed checkpoints were identical; grouped commit latency
++changes ranged from -0.52% to +0.21%. The arithmetic bodies and Q6
++dispatch are unchanged; the source comparison is recorded with the tests.
++
++### UB compatibility regression
++
++The original TP4/H16 ordinary commit required 260 KiB on A3 with
++Triton-Ascend 3.2.2, exceeding its 192 KiB UB. Accepted-prefix runtime
++iteration and the shared UB budget fix that compilation failure without
++halving the normal A3 value tile. The A3 strided-copy path is also validated
++for exact results and graph capture. A5 retains static commit expansion.
++
++Final-source graph microbenchmarks against `e6ac48c00` use B12, L11, Q6,
++K=V128, FP32 checkpoints/corrections and BF16 activations. Each value is
++the median of nine alternating samples, with eight calls per graph capture
++and eight replays per timed sample. A3 uses Triton 3.6 for a valid pre-fix
++comparison; A5 uses 3.2.2. H32/H64 use recorded serving strides. H16 keeps
++those padded strides to exercise ordinary A5 commit. Checkpoints are
++bitwise identical in all nine cases.
++
++| Device/path | H | Accepted steps | Before (us) | After (us) | Latency change |
++| --- | --- | --- | --- | --- | --- |
++| A3 ordinary | 32 | 1 | 705.819 | 574.976 | -18.54% |
++| A3 ordinary | 32 | 3 | 962.567 | 763.802 | -20.65% |
++| A3 ordinary | 32 | 6 | 1290.735 | 1135.232 | -12.05% |
++| A5 grouped | 64 | 1 | 375.868 | 376.889 | +0.27% |
++| A5 grouped | 64 | 3 | 478.538 | 479.389 | +0.18% |
++| A5 grouped | 64 | 6 | 744.741 | 745.046 | +0.04% |
++| A5 ordinary | 16 | 1 | 93.820 | 93.595 | -0.24% |
++| A5 ordinary | 16 | 3 | 130.539 | 131.881 | +1.03% |
++| A5 ordinary | 16 | 6 | 189.493 | 190.258 | +0.40% |
++
++Including plan and compact, context latency changes range from -20.03% to
++-10.44% on A3, -0.11% to +0.19% for A5 grouped, and -1.34% to +0.81%
++for A5 ordinary. These are operator graph measurements; serving TPOT/ITL
++was not remeasured for this UB compatibility change. `UNROLL_COMMIT` and
++`USE_1D_CHANNEL_GATHER` are fixed by device/layout; UB selection reads the shared
++device-property cache and does not create a new per-iteration compilation parameter.
++
++## Example
++
++The multi-layer and multi-step cases in
++`tests/e2e/nightly/single_node/ops/singlecard_ops/triton/test_kda_recoverssm_npu.py`
++show how to allocate page views, call `kda_recoverssm_verify`, construct a commit
++context and commit accepted prefixes. Model activation and configuration will be
++provided by the framework follow-up. This operator test does not establish
++model dataset accuracy or serving performance.
+diff --git a/vllm_ascend/ops/triton/kda/recoverssm.py b/vllm_ascend/ops/triton/kda/recoverssm.py
+new file mode 100644
+index 000000000..d391a513d
+--- /dev/null
++++ b/vllm_ascend/ops/triton/kda/recoverssm.py
+@@ -0,0 +1,1451 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""Ascend RecoverSSM verify and batched accepted-state recovery.
++
++Adapted from vLLM c4df37dfcc. Preserve its paged-cache strides and public
++verify/commit contracts. Q/K normalization follows the AscendC KDA kernel.
++"""
++
++from collections.abc import Sequence
++from dataclasses import dataclass
++from typing import Any
++
++import torch
++from vllm.model_executor.layers.mamba.mamba_utils import is_conv_state_dim_first
++from vllm.triton_utils import tl, triton
++from vllm.v1.attention.backends.utils import NULL_BLOCK_ID
++
++from vllm_ascend.device.device_config import is_950
++from vllm_ascend.ops.triton.triton_utils import get_ub_size_bytes, init_device_properties_triton
++
++RECOVERSSM_COMMIT_HEAD_TILE = 2
++RECOVERSSM_VALUE_TILE = 64
++RECOVERSSM_VALUE_TILE_LARGE = 128
++RECOVERSSM_LARGE_TILE_MIN_PROGRAMS = 96
++RECOVERSSM_CONV_TILE = 4096
++RECOVERSSM_CONV_STRIDED_TILE = 256
++
++
++@triton.jit
++def _kda_l2_normalize(vector):
++    # AscendC normalizes nonzero vectors without CUDA's squared-norm bias.
++    norm_square = tl.sum(vector * vector)
++    norm_input = tl.where(norm_square > 0.0, norm_square, 1.0)
++    tl.static_assert(norm_input.dtype == tl.float32)
++    inverse = tl.rsqrt(norm_input)
++    return tl.where(norm_square > 0.0, vector * inverse, 0.0)
++
++
++@triton.jit
++def _kda_gate(
++    raw_g,
++    dt_bias,
++    A,
++    lower_bound,
++    USE_LOWER_BOUND: tl.constexpr,
++):
++    gate_input = raw_g + dt_bias
++    if USE_LOWER_BOUND:
++        scaled_gate = A * gate_input
++        tl.static_assert(scaled_gate.dtype == tl.float32)
++        return lower_bound * tl.sigmoid(scaled_gate)
++    tl.static_assert(gate_input.dtype == tl.float32)
++    softplus_input = 1.0 + tl.exp(gate_input)
++    tl.static_assert(softplus_input.dtype == tl.float32)
++    log_softplus = tl.log(softplus_input)
++    softplus_gate = tl.where(
++        gate_input > 20.0,
++        gate_input,
++        log_softplus,
++    )
++    return -A * softplus_gate
++
++
++@triton.jit
++def _kda_recurrent_step(
++    state,
++    k,
++    v,
++    raw_g,
++    raw_beta,
++    dt_bias,
++    A,
++    lower_bound,
++    USE_LOWER_BOUND: tl.constexpr,
++):
++    normalized_k = _kda_l2_normalize(k)
++    gate = _kda_gate(
++        raw_g,
++        dt_bias,
++        A,
++        lower_bound,
++        USE_LOWER_BOUND,
++    )
++
++    tl.static_assert(gate.dtype == tl.float32)
++    state *= tl.exp(gate)[None, :]
++    correction = v - tl.sum(state * normalized_k[None, :], axis=1)
++    tl.static_assert(raw_beta.dtype == tl.float32)
++    correction *= tl.sigmoid(raw_beta)
++    return state + correction[:, None] * normalized_k[None, :], correction
++
++
++@triton.jit
++def _kda_recoverssm_verify_kernel(
++    q_ptr,
++    k_ptr,
++    v_ptr,
++    raw_g_ptr,
++    raw_beta_ptr,
++    A_log_ptr,
++    dt_bias_ptr,
++    state_ptr,
++    correction_cache_ptr,
++    kg_cache_ptr,
++    out_ptr,
++    query_start_loc_ptr,
++    state_indices_ptr,
++    lower_bound,
++    null_block_id,
++    stride_q_token,
++    stride_k_token,
++    stride_v_token,
++    stride_g_token,
++    stride_beta_token,
++    stride_state_block,
++    stride_state_head,
++    stride_state_v,
++    stride_state_k,
++    stride_correction_block,
++    stride_correction_head,
++    stride_correction_pos,
++    stride_correction_dim,
++    stride_kg_block,
++    stride_kg_head,
++    stride_kg_pos,
++    stride_kg_dim,
++    stride_out_token,
++    stride_query_start_loc,
++    stride_state_indices,
++    K: tl.constexpr,
++    V: tl.constexpr,
++    BK: tl.constexpr,
++    BV: tl.constexpr,
++    USE_LOWER_BOUND: tl.constexpr,
++):
++    # Advance a register-held checkpoint and record each token's compact
++    # correction/key/gate; persistent checkpoint pages remain read-only.
++    pid_v = tl.program_id(0)
++    pid_b = tl.program_id(2)
++    pid_h = tl.program_id(1)
++
++    bos = tl.load(query_start_loc_ptr + pid_b * stride_query_start_loc).to(tl.int64)
++    eos = tl.load(query_start_loc_ptr + (pid_b + 1) * stride_query_start_loc).to(tl.int64)
++    query_len = eos - bos
++    state_idx = tl.load(state_indices_ptr + pid_b * stride_state_indices).to(tl.int64)
++
++    offs_k = tl.arange(0, BK)
++    offs_v = pid_v * BV + tl.arange(0, BV)
++    # Provably-full tiles (K a power of two, BV dividing V) drop their
++    # predication masks entirely; ragged shapes keep the original masks.
++    if K == BK:
++        mask_k = None
++    else:
++        mask_k = offs_k < K
++    if V % BV == 0:
++        mask_v = None
++    else:
++        mask_v = offs_v < V
++    if (K == BK) and (V % BV == 0):
++        mask_state = None
++    elif K == BK:
++        mask_state = tl.broadcast_to((offs_v < V)[:, None], (BV, BK))
++    elif V % BV == 0:
++        mask_state = tl.broadcast_to((offs_k < K)[None, :], (BV, BK))
++    else:
++        mask_state = (offs_v < V)[:, None] & (offs_k < K)[None, :]
++
++    if state_idx <= null_block_id:
++        for token_offset in range(query_len):
++            tl.store(
++                out_ptr + (bos + token_offset) * stride_out_token + pid_h * V + offs_v,
++                tl.zeros([BV], dtype=tl.float32),
++                mask=mask_v,
++            )
++        return
++
++    state_ptrs = (
++        state_ptr
++        + state_idx * stride_state_block
++        + pid_h * stride_state_head
++        + offs_v[:, None] * stride_state_v
++        + offs_k[None, :] * stride_state_k
++    )
++    state = tl.load(state_ptrs, mask=mask_state, other=0.0 if mask_state is not None else None).to(tl.float32)
++    a_log = tl.load(A_log_ptr + pid_h).to(tl.float32)
++    tl.static_assert(a_log.dtype == tl.float32)
++    A = tl.exp(a_log)
++
++    # token_offset < query_len always holds inside range(query_len); the
++    # token_valid masks and the tl.where state select are redundant and dropped.
++    dt_bias = tl.load(
++        dt_bias_ptr + pid_h * K + offs_k,
++        mask=mask_k,
++        other=0.0 if mask_k is not None else None,
++    ).to(tl.float32)
++    for token_offset in range(tl.maximum(query_len - 1, 0)):
++        token = bos + token_offset
++        q = tl.load(
++            q_ptr + token * stride_q_token + pid_h * K + offs_k,
++            mask=mask_k,
++            other=0.0 if mask_k is not None else None,
++        ).to(tl.float32)
++        k = tl.load(
++            k_ptr + token * stride_k_token + pid_h * K + offs_k,
++            mask=mask_k,
++            other=0.0 if mask_k is not None else None,
++        ).to(tl.float32)
++        v = tl.load(
++            v_ptr + token * stride_v_token + pid_h * V + offs_v,
++            mask=mask_v,
++            other=0.0 if mask_v is not None else None,
++        ).to(tl.float32)
++        raw_g = tl.load(
++            raw_g_ptr + token * stride_g_token + pid_h * K + offs_k,
++            mask=mask_k,
++            other=0.0 if mask_k is not None else None,
++        ).to(tl.float32)
++        raw_beta = tl.load(
++            raw_beta_ptr + token * stride_beta_token + pid_h,
++        ).to(tl.float32)
++
++        q = _kda_l2_normalize(q) * (K**-0.5)
++        normalized_k = _kda_l2_normalize(k)
++        gate = _kda_gate(raw_g, dt_bias, A, lower_bound, USE_LOWER_BOUND)
++        tl.static_assert(gate.dtype == tl.float32)
++        decay = tl.exp(gate)
++        weighted_k = normalized_k * decay
++        weighted_q = q * decay
++        tl.static_assert(raw_beta.dtype == tl.float32)
++        correction = (v - tl.sum(state * weighted_k[None, :], axis=1)) * tl.sigmoid(raw_beta)
++        out = tl.sum(state * weighted_q[None, :], axis=1) + correction * tl.sum(normalized_k * q)
++        state = state * decay[None, :] + correction[:, None] * normalized_k[None, :]
++        tl.store(
++            out_ptr + token * stride_out_token + pid_h * V + offs_v,
++            out,
++            mask=mask_v,
++        )
++
++        correction_ptr = (
++            correction_cache_ptr
++            + state_idx * stride_correction_block
++            + pid_h * stride_correction_head
++            + token_offset * stride_correction_pos
++        )
++        tl.store(
++            correction_ptr + offs_v * stride_correction_dim,
++            correction,
++            mask=mask_v,
++        )
++        if pid_v == 0:
++            kg_ptr = kg_cache_ptr + state_idx * stride_kg_block + pid_h * stride_kg_head + token_offset * stride_kg_pos
++            tl.store(
++                kg_ptr + offs_k * stride_kg_dim,
++                k,
++                mask=mask_k,
++            )
++            tl.store(
++                kg_ptr + (K + offs_k) * stride_kg_dim,
++                raw_g,
++                mask=mask_k,
++            )
++    if query_len > 0:
++        token_offset = query_len - 1
++        token = bos + token_offset
++        q = tl.load(
++            q_ptr + token * stride_q_token + pid_h * K + offs_k,
++            mask=mask_k,
++            other=0.0 if mask_k is not None else None,
++        ).to(tl.float32)
++        k = tl.load(
++            k_ptr + token * stride_k_token + pid_h * K + offs_k,
++            mask=mask_k,
++            other=0.0 if mask_k is not None else None,
++        ).to(tl.float32)
++        v = tl.load(
++            v_ptr + token * stride_v_token + pid_h * V + offs_v,
++            mask=mask_v,
++            other=0.0 if mask_v is not None else None,
++        ).to(tl.float32)
++        raw_g = tl.load(
++            raw_g_ptr + token * stride_g_token + pid_h * K + offs_k,
++            mask=mask_k,
++            other=0.0 if mask_k is not None else None,
++        ).to(tl.float32)
++        raw_beta = tl.load(
++            raw_beta_ptr + token * stride_beta_token + pid_h,
++        ).to(tl.float32)
++
++        q = _kda_l2_normalize(q) * (K**-0.5)
++        normalized_k = _kda_l2_normalize(k)
++        gate = _kda_gate(raw_g, dt_bias, A, lower_bound, USE_LOWER_BOUND)
++        tl.static_assert(gate.dtype == tl.float32)
++        decay = tl.exp(gate)
++        weighted_k = normalized_k * decay
++        weighted_q = q * decay
++        tl.static_assert(raw_beta.dtype == tl.float32)
++        correction = (v - tl.sum(state * weighted_k[None, :], axis=1)) * tl.sigmoid(raw_beta)
++        out = tl.sum(state * weighted_q[None, :], axis=1) + correction * tl.sum(normalized_k * q)
++        tl.store(
++            out_ptr + token * stride_out_token + pid_h * V + offs_v,
++            out,
++            mask=mask_v,
++        )
++
++        correction_ptr = (
++            correction_cache_ptr
++            + state_idx * stride_correction_block
++            + pid_h * stride_correction_head
++            + token_offset * stride_correction_pos
++        )
++        tl.store(
++            correction_ptr + offs_v * stride_correction_dim,
++            correction,
++            mask=mask_v,
++        )
++        if pid_v == 0:
++            kg_ptr = kg_cache_ptr + state_idx * stride_kg_block + pid_h * stride_kg_head + token_offset * stride_kg_pos
++            tl.store(
++                kg_ptr + offs_k * stride_kg_dim,
++                k,
++                mask=mask_k,
++            )
++            tl.store(
++                kg_ptr + (K + offs_k) * stride_kg_dim,
++                raw_g,
++                mask=mask_k,
++            )
++
++
++@triton.heuristics(
++    {
++        "HAS_REQUEST_INDICES": lambda args: args["request_indices_ptr"] is not None,
++        "ALIGN_MODE": lambda args: args["block_table_ptr"] is not None,
++    }
++)
++@triton.jit
++def _prepare_commit_plan_kernel(
++    num_accepted_ptr,
++    request_indices_ptr,
++    state_indices_ptr,
++    query_start_loc_ptr,
++    block_table_ptr,
++    num_computed_ptr,
++    commit_lens_ptr,
++    final_state_indices_ptr,
++    boundary_state_indices_ptr,
++    boundary_recovery_lens_ptr,
++    null_block_id,
++    mamba_block_size,
++    block_table_width,
++    stride_num_accepted,
++    stride_request_indices,
++    stride_state_indices,
++    stride_query_start_loc,
++    stride_block_table_row,
++    stride_block_table_col,
++    stride_num_computed,
++    SPEC_QUERY_LEN: tl.constexpr,
++    HAS_REQUEST_INDICES: tl.constexpr,
++    ALIGN_MODE: tl.constexpr,
++):
++    spec_idx = tl.program_id(0)
++    source_state_idx = tl.load(state_indices_ptr + spec_idx * stride_state_indices).to(tl.int64)
++    request_idx = spec_idx
++    if HAS_REQUEST_INDICES:
++        request_idx = tl.load(request_indices_ptr + spec_idx * stride_request_indices).to(tl.int64)
++    num_accepted = tl.load(num_accepted_ptr + request_idx * stride_num_accepted).to(tl.int32)
++    bos = tl.load(query_start_loc_ptr + spec_idx * stride_query_start_loc).to(tl.int64)
++    eos = tl.load(query_start_loc_ptr + (spec_idx + 1) * stride_query_start_loc).to(tl.int64)
++    query_len = (eos - bos).to(tl.int32)
++    commit_len = tl.minimum(tl.maximum(num_accepted, 0), query_len)
++    commit_len = tl.minimum(commit_len, SPEC_QUERY_LEN)
++
++    final_state_idx = source_state_idx
++    boundary_state_idx = null_block_id
++    boundary_recovery_len = 0
++    if ALIGN_MODE:
++        num_computed = tl.load(num_computed_ptr + request_idx * stride_num_computed).to(tl.int32)
++        final_num_computed = num_computed + commit_len
++        final_state_col = tl.minimum(final_num_computed // mamba_block_size, block_table_width - 1)
++        final_state_idx = tl.load(
++            block_table_ptr + request_idx * stride_block_table_row + final_state_col * stride_block_table_col
++        ).to(tl.int64)
++        next_boundary = (num_computed // mamba_block_size + 1) * mamba_block_size
++        crosses_boundary = final_num_computed >= next_boundary
++        boundary_recovery_len = next_boundary - num_computed
++        boundary_state_idx = tl.load(
++            block_table_ptr
++            + request_idx * stride_block_table_row
++            + (next_boundary // mamba_block_size - 1) * stride_block_table_col,
++            mask=crosses_boundary,
++            other=null_block_id,
++        ).to(tl.int64)
++    valid = (source_state_idx > null_block_id) & (commit_len > 0)
++    tl.store(commit_lens_ptr + spec_idx, tl.where(valid, commit_len, 0))
++    tl.store(
++        final_state_indices_ptr + spec_idx,
++        tl.where(valid, final_state_idx, null_block_id),
++    )
++    tl.store(
++        boundary_state_indices_ptr + spec_idx,
++        tl.where(valid, boundary_state_idx, null_block_id),
++    )
++    tl.store(
++        boundary_recovery_lens_ptr + spec_idx,
++        tl.where(valid, boundary_recovery_len, 0),
++    )
++
++
++@triton.jit
++def _copy_conv_state_tile(
++    source_ptr,
++    final_ptr,
++    boundary_ptr,
++    channel_offsets,
++    history_offsets,
++    token_stride,
++    commit_len,
++    boundary_recovery_len,
++    mask,
++    boundary_valid,
++    ALIGN_MODE: tl.constexpr,
++):
++    final_values = tl.load(
++        source_ptr + channel_offsets + (commit_len - 1 + history_offsets) * token_stride,
++        mask=mask,
++    )
++    if ALIGN_MODE:
++        boundary_values = tl.load(
++            source_ptr + channel_offsets + (boundary_recovery_len - 1 + history_offsets) * token_stride,
++            mask=mask & boundary_valid,
++        )
++        tl.store(
++            boundary_ptr + channel_offsets + history_offsets * token_stride,
++            boundary_values,
++            mask=mask & boundary_valid,
++        )
++    tl.store(
++        final_ptr + channel_offsets + history_offsets * token_stride,
++        final_values,
++        mask=mask,
++    )
++
++
++@triton.jit
++def _compact_conv_state_kernel(
++    conv_state_ref_ptr,
++    conv_state_base_addrs_ptr,
++    conv_state_block_strides_ptr,
++    conv_state_dim_strides_ptr,
++    conv_state_token_strides_ptr,
++    state_indices_ptr,
++    commit_lens_ptr,
++    final_state_indices_ptr,
++    boundary_state_indices_ptr,
++    boundary_recovery_lens_ptr,
++    null_block_id,
++    conv_dim,
++    conv_history_len,
++    stride_state_indices,
++    BLOCK_D: tl.constexpr,
++    BLOCK_HISTORY: tl.constexpr,
++    ALIGN_MODE: tl.constexpr,
++    DIM_STRIDE: tl.constexpr = None,
++    USE_1D_CHANNEL_GATHER: tl.constexpr = False,
++):
++    pid_d = tl.program_id(0)
++    pid_b = tl.program_id(1)
++    pid_l = tl.program_id(2)
++    source_state_idx = tl.load(state_indices_ptr + pid_b * stride_state_indices).to(tl.int64)
++    if source_state_idx <= null_block_id:
++        return
++
++    commit_len = tl.load(commit_lens_ptr + pid_b)
++    if commit_len == 0:
++        return
++    final_state_idx = tl.load(final_state_indices_ptr + pid_b).to(tl.int64)
++    boundary_state_idx = tl.load(boundary_state_indices_ptr + pid_b).to(tl.int64)
++    boundary_recovery_len = tl.load(boundary_recovery_lens_ptr + pid_b)
++
++    if final_state_idx <= null_block_id:
++        return
++
++    base_addr = tl.load(conv_state_base_addrs_ptr + pid_l)
++    block_stride = tl.load(conv_state_block_strides_ptr + pid_l)
++    if DIM_STRIDE is None:
++        dim_stride = tl.load(conv_state_dim_strides_ptr + pid_l)
++    else:
++        dim_stride = DIM_STRIDE
++    token_stride = tl.load(conv_state_token_strides_ptr + pid_l)
++    conv_state_ptr = base_addr.to(tl.pointer_type(conv_state_ref_ptr.dtype.element_ty))
++    source_ptr = conv_state_ptr + source_state_idx * block_stride
++    final_ptr = conv_state_ptr + final_state_idx * block_stride
++
++    boundary_ptr = None
++    if ALIGN_MODE:
++        boundary_ptr = conv_state_ptr + boundary_state_idx * block_stride
++
++    if USE_1D_CHANNEL_GATHER and (DIM_STRIDE is not None and DIM_STRIDE != 1):
++        # A3 Triton 3.2 requires one-dimensional gathers for strided channels.
++        offs_d = pid_d * BLOCK_D + tl.arange(0, BLOCK_D)
++        for history in tl.static_range(BLOCK_HISTORY):
++            mask = (offs_d < conv_dim) & (history < conv_history_len)
++            _copy_conv_state_tile(
++                source_ptr,
++                final_ptr,
++                boundary_ptr,
++                offs_d * dim_stride,
++                history,
++                token_stride,
++                commit_len,
++                boundary_recovery_len,
++                mask,
++                boundary_state_idx > null_block_id,
++                ALIGN_MODE,
++            )
++        return
++    offs_d = (pid_d * BLOCK_D + tl.arange(0, BLOCK_D))[None, :]
++    offs_h = tl.arange(0, BLOCK_HISTORY)[:, None]
++    mask = (offs_d < conv_dim) & (offs_h < conv_history_len)
++    _copy_conv_state_tile(
++        source_ptr,
++        final_ptr,
++        boundary_ptr,
++        offs_d * dim_stride,
++        offs_h,
++        token_stride,
++        commit_len,
++        boundary_recovery_len,
++        mask,
++        boundary_state_idx > null_block_id,
++        ALIGN_MODE,
++    )
++
++
++@triton.jit
++def _accumulate_kda_commit_step(
++    correction_cache_ptr,
++    kg_cache_ptr,
++    token_offset,
++    offs_k,
++    offs_v,
++    mask_k,
++    mask_v,
++    stride_correction_cache_pos,
++    stride_correction_cache_dim,
++    stride_kg_cache_pos,
++    stride_kg_cache_dim,
++    A,
++    dt_bias,
++    lower_bound,
++    boundary_recovery_len,
++    final_decay,
++    final_correction,
++    boundary_decay,
++    boundary_correction,
++    K: tl.constexpr,
++    USE_LOWER_BOUND: tl.constexpr,
++    ALIGN_MODE: tl.constexpr,
++):
++    correction_ptr = correction_cache_ptr + token_offset * stride_correction_cache_pos
++    kg_ptr = kg_cache_ptr + token_offset * stride_kg_cache_pos
++    k = tl.load(
++        kg_ptr + offs_k * stride_kg_cache_dim,
++        mask=mask_k,
++        other=0.0 if mask_k is not None else None,
++    ).to(tl.float32)
++    correction = tl.load(
++        correction_ptr + offs_v * stride_correction_cache_dim,
++        mask=mask_v,
++        other=0.0 if mask_v is not None else None,
++    ).to(tl.float32)
++    raw_g = tl.load(
++        kg_ptr + (K + offs_k) * stride_kg_cache_dim,
++        mask=mask_k,
++        other=0.0 if mask_k is not None else None,
++    ).to(tl.float32)
++    normalized_k = _kda_l2_normalize(k)
++    gate = _kda_gate(
++        raw_g,
++        dt_bias,
++        A,
++        lower_bound,
++        USE_LOWER_BOUND,
++    )
++    tl.static_assert(gate.dtype == tl.float32)
++    decay = tl.exp(gate)
++    weighted_k = normalized_k * final_decay
++    final_correction = tl.fma(correction[:, None], weighted_k[None, :], final_correction)
++    final_decay *= decay
++    if ALIGN_MODE:
++        before_boundary = token_offset < boundary_recovery_len
++        boundary_k = normalized_k * boundary_decay
++        boundary_correction = tl.where(
++            before_boundary,
++            tl.fma(correction[:, None], boundary_k[None, :], boundary_correction),
++            boundary_correction,
++        )
++        boundary_decay *= tl.where(before_boundary, decay, 1.0)
++    return final_decay, final_correction, boundary_decay, boundary_correction
++
++
++@triton.jit
++def _commit_kda_state_kernel(
++    state_ref_ptr,
++    state_base_addrs_ptr,
++    state_block_strides_ptr,
++    correction_cache_ref_ptr,
++    correction_cache_base_addrs_ptr,
++    correction_cache_block_strides_ptr,
++    kg_cache_ref_ptr,
++    kg_cache_base_addrs_ptr,
++    kg_cache_block_strides_ptr,
++    A_log_ptr,
++    dt_bias_ptr,
++    state_indices_ptr,
++    commit_lens_ptr,
++    final_state_indices_ptr,
++    boundary_state_indices_ptr,
++    boundary_recovery_lens_ptr,
++    lower_bound,
++    null_block_id,
++    stride_state_head,
++    stride_state_v,
++    stride_state_k,
++    stride_correction_cache_head,
++    stride_correction_cache_pos,
++    stride_correction_cache_dim,
++    stride_kg_cache_head,
++    stride_kg_cache_pos,
++    stride_kg_cache_dim,
++    stride_A_layer,
++    stride_A_head,
++    stride_dt_bias_layer,
++    stride_dt_bias_head,
++    stride_dt_bias_dim,
++    stride_state_indices,
++    K: tl.constexpr,
++    V: tl.constexpr,
++    BK: tl.constexpr,
++    BV: tl.constexpr,
++    NUM_HEADS: tl.constexpr,
++    USE_LOWER_BOUND: tl.constexpr,
++    ALIGN_MODE: tl.constexpr,
++    SPEC_QUERY_LEN: tl.constexpr,
++    UNROLL_COMMIT: tl.constexpr,
++):
++    pid_v = tl.program_id(0)
++    pid_b = tl.program_id(1)
++    # Walk accepted records backwards, composing decay-weighted rank-one
++    # updates before combining them with the unchanged initial checkpoint.
++    pid_lh = tl.program_id(2)
++    pid_l = pid_lh // NUM_HEADS
++    pid_h = pid_lh % NUM_HEADS
++
++    source_state_idx = tl.load(state_indices_ptr + pid_b * stride_state_indices).to(tl.int64)
++    if source_state_idx <= null_block_id:
++        return
++    commit_len = tl.load(commit_lens_ptr + pid_b)
++    if commit_len == 0:
++        return
++    final_state_idx = tl.load(final_state_indices_ptr + pid_b).to(tl.int64)
++    boundary_state_idx = tl.load(boundary_state_indices_ptr + pid_b).to(tl.int64)
++    boundary_recovery_len = tl.load(boundary_recovery_lens_ptr + pid_b)
++
++    if final_state_idx <= null_block_id:
++        return
++
++    state_base_addr = tl.load(state_base_addrs_ptr + pid_l)
++    state_block_stride = tl.load(state_block_strides_ptr + pid_l)
++    state_ptr = state_base_addr.to(tl.pointer_type(state_ref_ptr.dtype.element_ty))
++    source_state_ptr = state_ptr + source_state_idx * state_block_stride + pid_h * stride_state_head
++
++    correction_cache_base_addr = tl.load(correction_cache_base_addrs_ptr + pid_l)
++    correction_cache_block_stride = tl.load(correction_cache_block_strides_ptr + pid_l)
++    correction_cache_ptr = correction_cache_base_addr.to(tl.pointer_type(correction_cache_ref_ptr.dtype.element_ty))
++    correction_cache_ptr += source_state_idx * correction_cache_block_stride + pid_h * stride_correction_cache_head
++    kg_cache_base_addr = tl.load(kg_cache_base_addrs_ptr + pid_l)
++    kg_cache_block_stride = tl.load(kg_cache_block_strides_ptr + pid_l)
++    kg_cache_ptr = kg_cache_base_addr.to(tl.pointer_type(kg_cache_ref_ptr.dtype.element_ty))
++    kg_cache_ptr += source_state_idx * kg_cache_block_stride + pid_h * stride_kg_cache_head
++
++    offs_k = tl.arange(0, BK)
++    offs_v = pid_v * BV + tl.arange(0, BV)
++    mask_k = None if K == BK else offs_k < K
++    mask_v = None if V % BV == 0 else offs_v < V
++    if K == BK and V % BV == 0:
++        mask_state = None
++    elif K == BK:
++        mask_state = tl.broadcast_to((offs_v < V)[:, None], (BV, BK))
++    elif V % BV == 0:
++        mask_state = tl.broadcast_to((offs_k < K)[None, :], (BV, BK))
++    else:
++        mask_state = (offs_v < V)[:, None] & (offs_k < K)[None, :]
++    state_ptrs = source_state_ptr + offs_v[:, None] * stride_state_v + offs_k[None, :] * stride_state_k
++    a_log = tl.load(A_log_ptr + pid_l * stride_A_layer + pid_h * stride_A_head).to(tl.float32)
++    tl.static_assert(a_log.dtype == tl.float32)
++    A = tl.exp(a_log)
++
++    dt_bias = tl.load(
++        dt_bias_ptr + pid_l * stride_dt_bias_layer + pid_h * stride_dt_bias_head + offs_k * stride_dt_bias_dim,
++        mask=mask_k,
++        other=0.0 if mask_k is not None else None,
++    ).to(tl.float32)
++    final_decay = tl.full([BK], 1.0, tl.float32)
++    final_correction = tl.zeros([BV, BK], tl.float32)
++    boundary_decay = tl.full([BK], 1.0, tl.float32)
++    boundary_correction = tl.zeros([BV, BK], tl.float32)
++
++    # A3 runtime iteration bounds UB use; A5 retains its faster static expansion.
++    if UNROLL_COMMIT:
++        for reverse_offset in tl.static_range(SPEC_QUERY_LEN):
++            if reverse_offset < commit_len:
++                final_decay, final_correction, boundary_decay, boundary_correction = _accumulate_kda_commit_step(
++                    correction_cache_ptr,
++                    kg_cache_ptr,
++                    commit_len - reverse_offset - 1,
++                    offs_k,
++                    offs_v,
++                    mask_k,
++                    mask_v,
++                    stride_correction_cache_pos,
++                    stride_correction_cache_dim,
++                    stride_kg_cache_pos,
++                    stride_kg_cache_dim,
++                    A,
++                    dt_bias,
++                    lower_bound,
++                    boundary_recovery_len,
++                    final_decay,
++                    final_correction,
++                    boundary_decay,
++                    boundary_correction,
++                    K,
++                    USE_LOWER_BOUND,
++                    ALIGN_MODE,
++                )
++    else:
++        for reverse_offset in range(tl.minimum(commit_len, SPEC_QUERY_LEN)):
++            if reverse_offset < commit_len:
++                final_decay, final_correction, boundary_decay, boundary_correction = _accumulate_kda_commit_step(
++                    correction_cache_ptr,
++                    kg_cache_ptr,
++                    commit_len - reverse_offset - 1,
++                    offs_k,
++                    offs_v,
++                    mask_k,
++                    mask_v,
++                    stride_correction_cache_pos,
++                    stride_correction_cache_dim,
++                    stride_kg_cache_pos,
++                    stride_kg_cache_dim,
++                    A,
++                    dt_bias,
++                    lower_bound,
++                    boundary_recovery_len,
++                    final_decay,
++                    final_correction,
++                    boundary_decay,
++                    boundary_correction,
++                    K,
++                    USE_LOWER_BOUND,
++                    ALIGN_MODE,
++                )
++    initial_state = tl.load(state_ptrs, mask=mask_state, other=0.0 if mask_state is not None else None).to(tl.float32)
++    state = initial_state * final_decay[None, :] + final_correction
++    if ALIGN_MODE:
++        boundary_ptrs = (
++            state_ptr
++            + boundary_state_idx * state_block_stride
++            + pid_h * stride_state_head
++            + offs_v[:, None] * stride_state_v
++            + offs_k[None, :] * stride_state_k
++        )
++        boundary_state = initial_state * boundary_decay[None, :] + boundary_correction
++        tl.store(
++            boundary_ptrs,
++            boundary_state,
++            mask=(boundary_state_idx > null_block_id)
++            if mask_state is None
++            else mask_state & (boundary_state_idx > null_block_id),
++        )
++
++    final_ptrs = (
++        state_ptr
++        + final_state_idx * state_block_stride
++        + pid_h * stride_state_head
++        + offs_v[:, None] * stride_state_v
++        + offs_k[None, :] * stride_state_k
++    )
++    tl.store(final_ptrs, state, mask=mask_state)
++
++
++@triton.jit
++def _kda_l2_normalize_heads(vector):
++    norm_square = tl.sum(vector * vector, axis=1)
++    norm_input = tl.where(norm_square > 0.0, norm_square, 1.0)
++    tl.static_assert(norm_input.dtype == tl.float32)
++    inverse = tl.rsqrt(norm_input)
++    return tl.where(norm_square[:, None] > 0.0, vector * inverse[:, None], 0.0)
++
++
++@triton.jit
++def _commit_kda_state_grouped_kernel(
++    state_ref_ptr,
++    state_base_addrs_ptr,
++    state_block_strides_ptr,
++    correction_cache_ref_ptr,
++    correction_cache_base_addrs_ptr,
++    correction_cache_block_strides_ptr,
++    kg_cache_ref_ptr,
++    kg_cache_base_addrs_ptr,
++    kg_cache_block_strides_ptr,
++    A_log_ptr,
++    dt_bias_ptr,
++    state_indices_ptr,
++    commit_lens_ptr,
++    final_state_indices_ptr,
++    boundary_state_indices_ptr,
++    boundary_recovery_lens_ptr,
++    lower_bound,
++    null_block_id,
++    stride_state_head,
++    stride_state_v,
++    stride_state_k,
++    stride_correction_cache_head,
++    stride_correction_cache_pos,
++    stride_correction_cache_dim,
++    stride_kg_cache_head,
++    stride_kg_cache_pos,
++    stride_kg_cache_dim,
++    stride_A_layer,
++    stride_A_head,
++    stride_dt_bias_layer,
++    stride_dt_bias_head,
++    stride_dt_bias_dim,
++    stride_state_indices,
++    K: tl.constexpr,
++    V: tl.constexpr,
++    BK: tl.constexpr,
++    BV: tl.constexpr,
++    NUM_HEADS: tl.constexpr,
++    USE_LOWER_BOUND: tl.constexpr,
++    ALIGN_MODE: tl.constexpr,
++    SPEC_QUERY_LEN: tl.constexpr,
++    BH: tl.constexpr = 2,
++):
++    # Commit two independent heads per program with BV64, matching the
++    # state-element count of a single-head BV128 tile.
++    tl.static_assert(not ALIGN_MODE)
++    tl.static_assert(K == 128)
++    tl.static_assert(V == 128)
++    tl.static_assert(BK == 128)
++    tl.static_assert(BV == 64)
++    pid_v = tl.program_id(0)
++    pid_b = tl.program_id(1)
++    pid_lh = tl.program_id(2)
++    tl.static_assert(NUM_HEADS % BH == 0)
++    pid_l = pid_lh // (NUM_HEADS // BH)
++    pid_h = pid_lh % (NUM_HEADS // BH) * BH + tl.arange(0, BH)
++    source_state_idx = tl.load(state_indices_ptr + pid_b * stride_state_indices).to(tl.int64)
++    if source_state_idx <= null_block_id:
++        return
++    commit_len = tl.load(commit_lens_ptr + pid_b)
++    if commit_len == 0:
++        return
++    final_state_idx = tl.load(final_state_indices_ptr + pid_b).to(tl.int64)
++    if final_state_idx <= null_block_id:
++        return
++    state_base_addr = tl.load(state_base_addrs_ptr + pid_l)
++    state_block_stride = tl.load(state_block_strides_ptr + pid_l)
++    state_ptr = state_base_addr.to(tl.pointer_type(state_ref_ptr.dtype.element_ty))
++    source_state_ptr = state_ptr + source_state_idx * state_block_stride + pid_h * stride_state_head
++    correction_cache_base_addr = tl.load(correction_cache_base_addrs_ptr + pid_l)
++    correction_cache_block_stride = tl.load(correction_cache_block_strides_ptr + pid_l)
++    correction_cache_ptr = correction_cache_base_addr.to(tl.pointer_type(correction_cache_ref_ptr.dtype.element_ty))
++    correction_cache_ptr += source_state_idx * correction_cache_block_stride + pid_h * stride_correction_cache_head
++    kg_cache_base_addr = tl.load(kg_cache_base_addrs_ptr + pid_l)
++    kg_cache_block_stride = tl.load(kg_cache_block_strides_ptr + pid_l)
++    kg_cache_ptr = kg_cache_base_addr.to(tl.pointer_type(kg_cache_ref_ptr.dtype.element_ty))
++    kg_cache_ptr += source_state_idx * kg_cache_block_stride + pid_h * stride_kg_cache_head
++    offs_k = tl.arange(0, BK)
++    offs_v = pid_v * BV + tl.arange(0, BV)
++    mask_k = None if K == BK else offs_k < K
++    mask_v = None if V % BV == 0 else offs_v < V
++    if K == BK and V % BV == 0:
++        mask_state = None
++    elif K == BK:
++        mask_state = tl.broadcast_to((offs_v < V)[:, None], (BV, BK))
++    elif V % BV == 0:
++        mask_state = tl.broadcast_to((offs_k < K)[None, :], (BV, BK))
++    else:
++        mask_state = (offs_v < V)[:, None] & (offs_k < K)[None, :]
++    if mask_state is not None:
++        mask_state = tl.broadcast_to(mask_state[None, :, :], (BH, BV, BK))
++    if mask_k is not None:
++        mask_k = tl.broadcast_to(mask_k[None, :], (BH, BK))
++    if mask_v is not None:
++        mask_v = tl.broadcast_to(mask_v[None, :], (BH, BV))
++    state_ptrs = (
++        source_state_ptr[:, None, None]
++        + offs_v[None, :, None] * stride_state_v
++        + offs_k[None, None, :] * stride_state_k
++    )
++    a_log = tl.load(A_log_ptr + pid_l * stride_A_layer + pid_h * stride_A_head).to(tl.float32)
++    tl.static_assert(a_log.dtype == tl.float32)
++    A = tl.exp(a_log)
++    dt_bias = tl.load(
++        dt_bias_ptr
++        + pid_l * stride_dt_bias_layer
++        + pid_h[:, None] * stride_dt_bias_head
++        + offs_k[None, :] * stride_dt_bias_dim,
++        mask=mask_k,
++        other=0.0 if mask_k is not None else None,
++    ).to(tl.float32)
++    final_decay = tl.full([BH, BK], 1.0, tl.float32)
++    final_correction = tl.zeros([BH, BV, BK], tl.float32)
++    for reverse_offset in tl.static_range(SPEC_QUERY_LEN):
++        if reverse_offset < commit_len:
++            token_offset = commit_len - reverse_offset - 1
++            correction_ptr = correction_cache_ptr + token_offset * stride_correction_cache_pos
++            kg_ptr = kg_cache_ptr + token_offset * stride_kg_cache_pos
++            k = tl.load(
++                kg_ptr[:, None] + offs_k[None, :] * stride_kg_cache_dim,
++                mask=mask_k,
++                other=0.0 if mask_k is not None else None,
++            ).to(tl.float32)
++            correction = tl.load(
++                correction_ptr[:, None] + offs_v[None, :] * stride_correction_cache_dim,
++                mask=mask_v,
++                other=0.0 if mask_v is not None else None,
++            ).to(tl.float32)
++            raw_g = tl.load(
++                kg_ptr[:, None] + (K + offs_k[None, :]) * stride_kg_cache_dim,
++                mask=mask_k,
++                other=0.0 if mask_k is not None else None,
++            ).to(tl.float32)
++            normalized_k = _kda_l2_normalize_heads(k)
++            gate = _kda_gate(raw_g, dt_bias, A[:, None], lower_bound, USE_LOWER_BOUND)
++            tl.static_assert(gate.dtype == tl.float32)
++            decay = tl.exp(gate)
++            weighted_k = normalized_k * final_decay
++            final_correction = tl.fma(correction[:, :, None], weighted_k[:, None, :], final_correction)
++            final_decay *= decay
++    initial_state = tl.load(state_ptrs, mask=mask_state, other=0.0 if mask_state is not None else None).to(tl.float32)
++    state = initial_state * final_decay[:, None, :] + final_correction
++    final_ptrs = (
++        state_ptr
++        + final_state_idx * state_block_stride
++        + pid_h[:, None, None] * stride_state_head
++        + offs_v[None, :, None] * stride_state_v
++        + offs_k[None, None, :] * stride_state_k
++    )
++    tl.store(final_ptrs, state, mask=mask_state)
++
++
++def kda_recoverssm_verify(
++    q: torch.Tensor,
++    k: torch.Tensor,
++    v: torch.Tensor,
++    raw_g: torch.Tensor,
++    raw_beta: torch.Tensor,
++    A_log: torch.Tensor,
++    dt_bias: torch.Tensor,
++    lower_bound: float | None,
++    checkpoint_state: torch.Tensor,
++    correction_cache: torch.Tensor,
++    kg_cache: torch.Tensor,
++    query_start_loc: torch.Tensor,
++    state_indices: torch.Tensor,
++    spec_query_len: int,
++    out: torch.Tensor | None = None,
++) -> torch.Tensor:
++    """Verify a KDA speculative window without modifying its checkpoint."""
++    if q.ndim != 4 or q.shape[0] != 1:
++        raise ValueError("KDA RecoverSSM q must have shape [1, tokens, heads, dim]")
++    _, total_tokens, num_heads, key_dim = q.shape
++    value_dim = v.shape[-1]
++    if k.shape != q.shape or v.shape != (1, total_tokens, num_heads, value_dim):
++        raise ValueError("KDA RecoverSSM q, k, and v shapes are incompatible")
++    if raw_g.shape != q.shape or raw_beta.shape != (1, total_tokens, num_heads):
++        raise ValueError("KDA RecoverSSM gate or beta shape is incompatible")
++    if any(tensor.stride()[2:] != (key_dim, 1) for tensor in (q, k, raw_g)):
++        raise ValueError("KDA RecoverSSM q, k, and gate heads must be contiguous")
++    if v.stride()[2:] != (value_dim, 1) or raw_beta.stride(2) != 1:
++        raise ValueError("KDA RecoverSSM v and beta heads must be contiguous")
++    num_blocks = checkpoint_state.shape[0]
++    if checkpoint_state.shape[1:] != (
++        num_heads,
++        value_dim,
++        key_dim,
++    ):
++        raise ValueError("KDA RecoverSSM checkpoint shape is incompatible")
++    expected_correction_shape = (
++        num_blocks,
++        num_heads,
++        spec_query_len,
++        value_dim,
++    )
++    if correction_cache.shape != expected_correction_shape:
++        raise ValueError(f"KDA RecoverSSM correction buffer needs shape {expected_correction_shape}")
++    expected_kg_shape = (num_blocks, num_heads, spec_query_len, 2 * key_dim)
++    if kg_cache.shape != expected_kg_shape:
++        raise ValueError(f"KDA RecoverSSM key/gate buffer needs shape {expected_kg_shape}")
++    if correction_cache.dtype != torch.float32:
++        raise ValueError("KDA RecoverSSM correction buffer must use float32")
++    if kg_cache.dtype != k.dtype:
++        raise ValueError("KDA RecoverSSM key/gate buffer must match activation dtype")
++    if A_log.shape != (num_heads,) or dt_bias.numel() != num_heads * key_dim:
++        raise ValueError("KDA RecoverSSM gate parameters are incompatible")
++    if not A_log.is_contiguous() or not dt_bias.is_contiguous():
++        raise ValueError("KDA RecoverSSM gate parameters must be contiguous")
++    batch = state_indices.shape[0]
++    if query_start_loc.shape[0] != batch + 1:
++        raise ValueError("KDA RecoverSSM query metadata is incompatible")
++    if total_tokens > batch * spec_query_len:
++        raise ValueError("KDA RecoverSSM speculative decode input exceeds its activation capacity")
++    if out is None:
++        out = torch.empty_like(v)
++    if out.shape != v.shape:
++        raise ValueError("KDA RecoverSSM output shape is incompatible")
++    if out.stride()[2:] != (value_dim, 1):
++        raise ValueError("KDA RecoverSSM output heads must be contiguous")
++    device = q.device
++    if any(
++        tensor.device != device
++        for tensor in (
++            k,
++            v,
++            raw_g,
++            raw_beta,
++            A_log,
++            dt_bias,
++            checkpoint_state,
++            correction_cache,
++            kg_cache,
++            query_start_loc,
++            state_indices,
++            out,
++        )
++    ):
++        raise ValueError("KDA RecoverSSM inputs must be on the same device")
++    if total_tokens == 0:
++        return out
++
++    block_k = triton.next_power_of_2(key_dim)
++    # Grid specialization: large tiles halve redundant K-side loads and win once
++    # enough programs keep the NPU busy; below that, smaller tiles keep more
++    # programs in flight. Measured crossover: 96 programs (batch*heads*V tiles).
++    is_a5 = is_950()
++    block_v = min(triton.next_power_of_2(value_dim), RECOVERSSM_VALUE_TILE)
++    if is_a5 and block_v < RECOVERSSM_VALUE_TILE_LARGE and batch * num_heads >= RECOVERSSM_LARGE_TILE_MIN_PROGRAMS:
++        large_v = min(triton.next_power_of_2(value_dim), RECOVERSSM_VALUE_TILE_LARGE)
++        if batch * num_heads * triton.cdiv(value_dim, large_v) >= RECOVERSSM_LARGE_TILE_MIN_PROGRAMS:
++            block_v = large_v
++    grid = (triton.cdiv(value_dim, block_v), num_heads, batch)
++    _kda_recoverssm_verify_kernel[grid](
++        q,
++        k,
++        v,
++        raw_g,
++        raw_beta,
++        A_log,
++        dt_bias,
++        checkpoint_state,
++        correction_cache,
++        kg_cache,
++        out,
++        query_start_loc,
++        state_indices,
++        lower_bound or 0.0,
++        NULL_BLOCK_ID,
++        q.stride(1),
++        k.stride(1),
++        v.stride(1),
++        raw_g.stride(1),
++        raw_beta.stride(1),
++        checkpoint_state.stride(0),
++        checkpoint_state.stride(1),
++        checkpoint_state.stride(2),
++        checkpoint_state.stride(3),
++        correction_cache.stride(0),
++        correction_cache.stride(1),
++        correction_cache.stride(2),
++        correction_cache.stride(3),
++        kg_cache.stride(0),
++        kg_cache.stride(1),
++        kg_cache.stride(2),
++        kg_cache.stride(3),
++        out.stride(1),
++        query_start_loc.stride(0),
++        state_indices.stride(0),
++        K=key_dim,
++        V=value_dim,
++        BK=block_k,
++        BV=block_v,
++        USE_LOWER_BOUND=lower_bound is not None,
++        num_warps=4,
++        num_stages=2,
++    )
++    return out
++
++
++def _conv_compaction_block_d(dim_stride):
++    # A3 strided gathers need smaller tiles to fit the 192 KiB UB.
++    return RECOVERSSM_CONV_TILE if is_950() or dim_stride == 1 else RECOVERSSM_CONV_STRIDED_TILE
++
++
++@dataclass
++class KDARecoverSSMCommitContext:
++    conv_states: tuple[torch.Tensor, ...]
++    conv_state_base_addrs: torch.Tensor
++    conv_state_block_strides: torch.Tensor
++    conv_state_dim_strides: torch.Tensor
++    conv_state_token_strides: torch.Tensor
++    conv_history_len: int
++    checkpoints: tuple[torch.Tensor, ...]
++    state_base_addrs: torch.Tensor
++    state_block_strides: torch.Tensor
++    correction_caches: tuple[torch.Tensor, ...]
++    correction_cache_base_addrs: torch.Tensor
++    correction_cache_block_strides: torch.Tensor
++    kg_caches: tuple[torch.Tensor, ...]
++    kg_cache_base_addrs: torch.Tensor
++    kg_cache_block_strides: torch.Tensor
++    commit_lens: torch.Tensor
++    final_state_indices: torch.Tensor
++    boundary_state_indices: torch.Tensor
++    boundary_recovery_lens: torch.Tensor
++    A_log: torch.Tensor
++    dt_bias: torch.Tensor
++    lower_bound: float | None
++    spec_query_len: int
++    conv_dim_stride: int | None
++
++    @classmethod
++    def create(
++        cls,
++        layers: Sequence[Any],
++        *,
++        spec_query_len: int,
++        max_num_reqs: int,
++    ) -> "KDARecoverSSMCommitContext":
++        """Bind layer-owned page views and allocate reusable commit-plan buffers."""
++        if not layers:
++            raise ValueError("KDA RecoverSSM commit requires at least one layer")
++        if any(len(layer.kv_cache) != 4 for layer in layers):
++            raise ValueError("KDA RecoverSSM pages must contain conv, state, correction, and key/gate")
++        init_device_properties_triton()
++
++        conv_states = [layer.kv_cache[0] for layer in layers]
++        if not is_conv_state_dim_first():
++            conv_states = [state.transpose(-1, -2) for state in conv_states]
++        checkpoints = [layer.kv_cache[1] for layer in layers]
++        correction_caches = [layer.kv_cache[2] for layer in layers]
++        kg_caches = [layer.kv_cache[3] for layer in layers]
++        A_log = [layer.A_log.reshape(-1) for layer in layers]
++        dt_bias = [layer.dt_bias.view(layer.local_num_heads, layer.head_dim) for layer in layers]
++        lower_bounds = {layer.gate_lower_bound for layer in layers}
++        if len(lower_bounds) != 1:
++            raise ValueError("KDA RecoverSSM layers need matching gate bounds")
++
++        state_ref = checkpoints[0]
++        if state_ref.ndim != 4:
++            raise ValueError("KDA RecoverSSM checkpoint must be four-dimensional")
++        num_blocks, num_heads, value_dim, key_dim = state_ref.shape
++        for state in checkpoints:
++            if (
++                state.shape != state_ref.shape
++                or state.dtype != state_ref.dtype
++                or state.device != state_ref.device
++                or state.stride()[1:] != state_ref.stride()[1:]
++            ):
++                raise ValueError("KDA RecoverSSM layers need matching checkpoint layout")
++        expected_correction_shape = (
++            num_blocks,
++            num_heads,
++            spec_query_len,
++            value_dim,
++        )
++        correction_ref = correction_caches[0]
++        for correction_cache in correction_caches:
++            if (
++                correction_cache.shape != expected_correction_shape
++                or correction_cache.dtype != torch.float32
++                or correction_cache.device != state_ref.device
++                or correction_cache.stride()[1:] != correction_ref.stride()[1:]
++            ):
++                raise ValueError(f"KDA RecoverSSM correction buffers need float32 shape {expected_correction_shape}")
++        expected_kg_shape = (num_blocks, num_heads, spec_query_len, 2 * key_dim)
++        kg_ref = kg_caches[0]
++        for kg_cache in kg_caches:
++            if (
++                kg_cache.shape != expected_kg_shape
++                or kg_cache.dtype != kg_ref.dtype
++                or kg_cache.device != state_ref.device
++                or kg_cache.stride()[1:] != kg_ref.stride()[1:]
++            ):
++                raise ValueError(f"KDA RecoverSSM key/gate buffers need shape {expected_kg_shape}")
++        if any(param.shape != (num_heads,) for param in A_log):
++            raise ValueError("KDA RecoverSSM A_log shape is incompatible")
++        if any(param.shape != (num_heads, key_dim) for param in dt_bias):
++            raise ValueError("KDA RecoverSSM dt_bias shape is incompatible")
++
++        conv_ref = conv_states[0]
++        if conv_ref.ndim != 3:
++            raise ValueError("KDA RecoverSSM conv state must be three-dimensional")
++        conv_dim, conv_state_len = conv_ref.shape[1:]
++        conv_history_len = conv_state_len - spec_query_len + 1
++        if conv_history_len <= 0:
++            raise ValueError("KDA RecoverSSM conv state is shorter than its window")
++        for conv_state in conv_states:
++            if (
++                conv_state.shape != conv_ref.shape
++                or conv_state.dtype != conv_ref.dtype
++                or conv_state.device != state_ref.device
++                or conv_state.shape[0] != num_blocks
++            ):
++                raise ValueError("KDA RecoverSSM layers need matching conv state")
++
++        device = state_ref.device
++
++        def _base_addrs(tensors: Sequence[torch.Tensor]) -> torch.Tensor:
++            return torch.tensor(
++                [tensor.data_ptr() for tensor in tensors],
++                dtype=torch.int64,
++                device=device,
++            )
++
++        def _block_strides(tensors: Sequence[torch.Tensor]) -> torch.Tensor:
++            return torch.tensor(
++                [tensor.stride(0) for tensor in tensors],
++                dtype=torch.int64,
++                device=device,
++            )
++
++        return cls(
++            conv_states=tuple(conv_states),
++            conv_state_base_addrs=_base_addrs(conv_states),
++            conv_state_block_strides=_block_strides(conv_states),
++            conv_state_dim_strides=torch.tensor(
++                [state.stride(1) for state in conv_states],
++                dtype=torch.int64,
++                device=device,
++            ),
++            conv_state_token_strides=torch.tensor(
++                [state.stride(2) for state in conv_states],
++                dtype=torch.int64,
++                device=device,
++            ),
++            conv_history_len=conv_history_len,
++            checkpoints=tuple(checkpoints),
++            state_base_addrs=_base_addrs(checkpoints),
++            state_block_strides=_block_strides(checkpoints),
++            correction_caches=tuple(correction_caches),
++            correction_cache_base_addrs=_base_addrs(correction_caches),
++            correction_cache_block_strides=_block_strides(correction_caches),
++            kg_caches=tuple(kg_caches),
++            kg_cache_base_addrs=_base_addrs(kg_caches),
++            kg_cache_block_strides=_block_strides(kg_caches),
++            commit_lens=torch.empty(max_num_reqs, dtype=torch.int32, device=device),
++            final_state_indices=torch.empty(max_num_reqs, dtype=torch.int32, device=device),
++            boundary_state_indices=torch.empty(max_num_reqs, dtype=torch.int32, device=device),
++            boundary_recovery_lens=torch.empty(max_num_reqs, dtype=torch.int32, device=device),
++            A_log=torch.stack(tuple(A_log)).contiguous(),
++            dt_bias=torch.stack(tuple(dt_bias)).contiguous(),
++            lower_bound=lower_bounds.pop(),
++            spec_query_len=spec_query_len,
++            conv_dim_stride=(
++                conv_ref.stride(1) if all(state.stride(1) == conv_ref.stride(1) for state in conv_states) else None
++            ),
++        )
++
++    def commit(
++        self,
++        num_accepted_tokens: torch.Tensor,
++        state_indices: torch.Tensor,
++        query_start_loc: torch.Tensor,
++        request_indices: torch.Tensor | None = None,
++        block_table: torch.Tensor | None = None,
++        num_computed_tokens: torch.Tensor | None = None,
++        mamba_block_size: int | None = None,
++    ) -> None:
++        """Fold accepted KDA and convolution inputs into every layer."""
++        batch = state_indices.shape[0]
++        if batch == 0:
++            return
++        if batch > self.commit_lens.shape[0]:
++            raise ValueError("KDA RecoverSSM commit batch exceeds its plan capacity")
++        if query_start_loc.shape[0] != batch + 1:
++            raise ValueError("KDA RecoverSSM commit metadata is incompatible")
++        if request_indices is not None and request_indices.shape[0] < batch:
++            raise ValueError("KDA RecoverSSM request mapping is too short")
++        align_args = (block_table, num_computed_tokens, mamba_block_size)
++        if any(arg is not None for arg in align_args) and any(arg is None for arg in align_args):
++            raise ValueError("KDA RecoverSSM align metadata is incomplete")
++        if mamba_block_size is not None and mamba_block_size < self.spec_query_len:
++            raise ValueError("KDA RecoverSSM align block size must cover one speculative window")
++        if block_table is not None and block_table.ndim != 2:
++            raise ValueError("KDA RecoverSSM block table must be two-dimensional")
++        device = self.checkpoints[0].device
++        if (
++            any(
++                tensor.device != device
++                for tensor in (
++                    num_accepted_tokens,
++                    state_indices,
++                    query_start_loc,
++                )
++            )
++            or (request_indices is not None and request_indices.device != device)
++            or (block_table is not None and block_table.device != device)
++            or (num_computed_tokens is not None and num_computed_tokens.device != device)
++        ):
++            raise ValueError("KDA RecoverSSM commit inputs must be on the same device")
++
++        block_table_stride = (0, 0) if block_table is None else block_table.stride()
++        num_computed_stride = 0 if num_computed_tokens is None else num_computed_tokens.stride(0)
++
++        num_layers = len(self.checkpoints)
++        conv_ref = self.conv_states[0]
++        conv_dim = conv_ref.shape[1]
++        block_history = triton.next_power_of_2(self.conv_history_len)
++        _prepare_commit_plan_kernel[(batch,)](
++            num_accepted_tokens,
++            request_indices,
++            state_indices,
++            query_start_loc,
++            block_table,
++            num_computed_tokens,
++            self.commit_lens,
++            self.final_state_indices,
++            self.boundary_state_indices,
++            self.boundary_recovery_lens,
++            NULL_BLOCK_ID,
++            mamba_block_size or 1,
++            block_table.shape[1] if block_table is not None else 1,
++            num_accepted_tokens.stride(0),
++            request_indices.stride(0) if request_indices is not None else 0,
++            state_indices.stride(0),
++            query_start_loc.stride(0),
++            block_table_stride[0],
++            block_table_stride[1],
++            num_computed_stride,
++            SPEC_QUERY_LEN=self.spec_query_len,
++            num_warps=1,
++        )
++        conv_block_d = _conv_compaction_block_d(self.conv_dim_stride)
++        _compact_conv_state_kernel[(triton.cdiv(conv_dim, conv_block_d), batch, num_layers)](
++            conv_ref,
++            self.conv_state_base_addrs,
++            self.conv_state_block_strides,
++            self.conv_state_dim_strides,
++            self.conv_state_token_strides,
++            state_indices,
++            self.commit_lens,
++            self.final_state_indices,
++            self.boundary_state_indices,
++            self.boundary_recovery_lens,
++            NULL_BLOCK_ID,
++            conv_dim,
++            self.conv_history_len,
++            state_indices.stride(0),
++            BLOCK_D=conv_block_d,
++            BLOCK_HISTORY=block_history,
++            ALIGN_MODE=block_table is not None,
++            DIM_STRIDE=self.conv_dim_stride,
++            USE_1D_CHANNEL_GATHER=not is_950(),
++            num_warps=4,
++        )
++
++        state_ref = self.checkpoints[0]
++        _, num_heads, value_dim, key_dim = state_ref.shape
++        block_k = triton.next_power_of_2(key_dim)
++        is_a5 = is_950()
++        # Group two adjacent heads in one program to reconstruct and commit their states.
++        grouped_commit = (
++            is_a5
++            and block_table is None
++            and state_ref.dtype == torch.float32
++            and key_dim == value_dim == 128
++            and num_heads in (32, 64)
++        )
++        value_tile = RECOVERSSM_VALUE_TILE
++        if grouped_commit:
++            head_groups = num_heads // RECOVERSSM_COMMIT_HEAD_TILE
++            commit_kernel = _commit_kda_state_grouped_kernel
++            commit_options = {}
++        else:
++            if is_a5 and block_table is None:
++                value_tile *= 2
++            # Runtime iteration keeps accumulator/merge matrices independent of window length.
++            matrix_buffers = 6 if block_table is not None else 2
++            bytes_per_row = matrix_buffers * block_k * torch.float32.itemsize
++            # Reserve two rows' worth for FP32 vector temporaries.
++            max_rows = max(1, get_ub_size_bytes() // bytes_per_row - 2)
++            value_tile = min(value_tile, 1 << (max_rows.bit_length() - 1))
++            head_groups = num_heads
++            commit_kernel = _commit_kda_state_kernel
++            commit_options = {"UNROLL_COMMIT": is_a5}
++        block_v = min(triton.next_power_of_2(value_dim), value_tile)
++        grid = (triton.cdiv(value_dim, block_v), batch, num_layers * head_groups)
++        commit_kernel[grid](
++            state_ref,
++            self.state_base_addrs,
++            self.state_block_strides,
++            self.correction_caches[0],
++            self.correction_cache_base_addrs,
++            self.correction_cache_block_strides,
++            self.kg_caches[0],
++            self.kg_cache_base_addrs,
++            self.kg_cache_block_strides,
++            self.A_log,
++            self.dt_bias,
++            state_indices,
++            self.commit_lens,
++            self.final_state_indices,
++            self.boundary_state_indices,
++            self.boundary_recovery_lens,
++            self.lower_bound or 0.0,
++            NULL_BLOCK_ID,
++            state_ref.stride(1),
++            state_ref.stride(2),
++            state_ref.stride(3),
++            self.correction_caches[0].stride(1),
++            self.correction_caches[0].stride(2),
++            self.correction_caches[0].stride(3),
++            self.kg_caches[0].stride(1),
++            self.kg_caches[0].stride(2),
++            self.kg_caches[0].stride(3),
++            self.A_log.stride(0),
++            self.A_log.stride(1),
++            self.dt_bias.stride(0),
++            self.dt_bias.stride(1),
++            self.dt_bias.stride(2),
++            state_indices.stride(0),
++            K=key_dim,
++            V=value_dim,
++            BK=block_k,
++            BV=block_v,
++            NUM_HEADS=num_heads,
++            USE_LOWER_BOUND=self.lower_bound is not None,
++            ALIGN_MODE=block_table is not None,
++            SPEC_QUERY_LEN=self.spec_query_len,
++            num_warps=4,
++            num_stages=2,
++            **commit_options,
++        )
++
++
++__all__ = ["KDARecoverSSMCommitContext", "kda_recoverssm_verify"]

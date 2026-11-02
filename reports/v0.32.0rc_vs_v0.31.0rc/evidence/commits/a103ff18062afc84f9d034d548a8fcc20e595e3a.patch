@@ -1,0 +1,356 @@
+commit a103ff18062afc84f9d034d548a8fcc20e595e3a
+Author:     leolee <83689697+li1how@users.noreply.github.com>
+AuthorDate: Fri Oct 23 09:06:25 2026 +0800
+Commit:     GitHub <noreply@github.com>
+CommitDate: Fri Oct 23 09:06:25 2026 +0800
+
+    [Performance] Avoid full-buffer copies in compiled embedding token exchange (#19409)
+    
+    ### What this PR does / why we need it?
+    
+    Embedding token exchange mutates slices of persistent, capacity-sized
+    buffers. AOT functionalization can rebuild/copy the entire backing
+    buffers even for a small decode batch, adding unnecessary memory traffic
+    and graph memory.
+    
+    Use invocation-local padding and masking with the existing group
+    AllGather/ReduceScatter APIs. Captured allocations are managed by the
+    ACL graph pool. Keep common exchange lengths, output cropping and
+    PCP-before-TP reduction; no runner changes or new Embedding custom op.
+    
+    ### Does this PR introduce _any_ user-facing change?
+    
+    Lower compiled embedding overhead without configuration or API changes.
+    
+    ### How was this patch tested?
+    
+    #### End-to-end performance
+    
+    **DSV4 Flash W4A8, three-round end-to-end comparison:** A3, 8 NPUs,
+    MRV2, DP1 × TP1 × PCP8 + EP8, FULL_DECODE_ONLY. Parent main `576b1b0c3`
+    vs PR `8ff49a6cd`, with identical hardware/configuration and vLLM
+    `a98247ab4` + error-message-only Python 3.11 compatibility commit
+    `20804fc0f`.
+    
+    Each version used two warm-up batches, then three rounds of 8 concurrent
+    streaming requests with 32 input / 1,024 output tokens (`temperature=0`,
+    `seed=1024`, `ignore_eos=true`). Three-round means:
+    
+    | Metric | main | PR | Change |
+    |---|---:|---:|---:|
+    | End-to-end output throughput | 197.40 token/s | 212.01 token/s |
+    +7.40% |
+    | Request latency | 41.44 s | 38.58 s | -6.90% |
+    | TTFT | 443.47 ms | 416.06 ms | -6.18% |
+    | Client TPOT | 40.08 ms | 37.31 ms | -6.91% |
+    
+    End-to-end throughput includes prefill, queueing and stream completion.
+    All 48 measured requests passed token-length checks, with zero
+    prefix-cache hits/preemptions and no external NPU processes on the
+    selected devices. Actual FULL graph replay and the compiled embedding
+    exchange path were verified.
+    
+    Historical DSV4.1 W4A8 measurements against main (A3, PCP8, batch 4,
+    65,536 input / 1,024 output tokens, FULL decode):
+    
+    | Metric | main | Optimized | Reduction |
+    |---|---:|---:|---:|
+    | Server decode TPOT | 47.492 ms | 40.294 ms | 15.16% |
+    | ITL while all four requests decode | 43.104 ms | 35.921 ms | 16.66% |
+    
+    The DSV4.1 figures are single-round historical results.
+    
+    #### Profiling evidence
+    
+    DSV4 Flash W4A8, PCP8 + EP8, concurrency 8, 32 input / 1,024 output
+    tokens; parent main `576b1b0c3` vs PR `b7645500d` (same production code
+    as `8ff49a6cd`, with a CPU-test mock fix). Native torch_npu Level1
+    captured 16 FULL decode steps on each of 8 ranks, while all 8 requests
+    were decoding; prefill was outside the capture.
+    
+    | Embedding capacity-buffer copies, per rank per decode step | main | PR
+    |
+    |---|---:|---:|
+    | Large TensorMove kernels | 5 | 0 |
+    | Logical bytes copied | 1.625 GiB | 0 |
+    | Summed kernel duration, mean across 8 ranks | 2.677 ms | 0 |
+    
+    The removed copies are three 512 MiB and two 64 MiB tensors per step.
+    Embedding collective payloads are unchanged: AllGather 4 B input / 32 B
+    output; ReduceScatter 64 KiB input / 8 KiB output. The gain comes from
+    removing local full-buffer copies. Kernel-duration sums are not
+    end-to-end latency savings; the +7.40% throughput result above was
+    measured separately without profiling. The first sampled collective
+    includes profiler-start/rank-arrival skew and is not used as
+    steady-state communication latency.
+    
+    **Before:** long `aclnnInplaceCopy_TensorMoveAiCore_TensorMove` kernels
+    in the embedding exchange region.
+    
+    <img width="2135" height="1285" alt="Before: capacity-sized TensorMove
+    copies in compiled embedding exchange"
+    src="https://github.com/user-attachments/assets/97649e5a-ef5e-487f-bc9e-c7dc56f1774f"
+    />
+    
+    **After:** the capacity-sized copies disappear; token exchange, lookup
+    and masking remain.
+    
+    <img width="2144" height="1043" alt="After: embedding exchange without
+    capacity-sized TensorMove copies"
+    src="https://github.com/user-attachments/assets/48f25299-d236-4d7f-a4b2-cadd82ada61f"
+    />
+    
+    The screenshots use different zoom levels and selected windows; their
+    selection durations should not be used to calculate a speedup.
+    
+    #### Correctness
+    
+    - 20 focused CPU tests passed, covering AOT functionalization/dynamic
+    shapes, empty input, invalid exchange lengths and output stability
+    across calls.
+    - Full DSV4.1 W8A8 services on A3, DP2 × TP1 × PCP8 with EP: text and
+    real-image inputs under eager, PIECEWISE and FULL_DECODE_ONLY;
+    concurrency 1/3/4/8 and inputs up to 65,536 tokens. All 120 formal
+    requests completed; 1,320 sampled function outputs matched CPU
+    checkpoint lookup elementwise, with zero mismatches. All 2,960 profiled
+    AllGather/ReduceScatter pairs matched the actual N and dtype.
+    - Text graph capture/replay passed with changing inputs. Multimodal
+    embedding runs outside the decoder graph; unequal rank lengths and
+    cropping passed. PIECEWISE capture covered buckets through 128; larger
+    prefill ran uncaptured.
+    - The function-level hardware validation above used `6733d1528`. The
+    subsequent in-place mask change also passed CPU correctness and AOT
+    graph-equivalence checks. These function checks do not measure physical
+    HCCL link bytes.
+    - End-to-end GPQA Diamond on PR `8ff49a6cd`, DSV4 W4A8, the same fixed
+    100 questions, concurrency 8: **77% / 71% / 77%, mean 75% (range
+    71–77%)**. All 300 responses completed with zero HTTP failures/timeouts;
+    prompt hashes and native per-question scoring matched. Outputs hitting
+    the 8,192-token cap counted as incorrect (question 79 in all rounds;
+    question 69 also in round 2). Historical results were 70% / 74% / 75%
+    (mean 73%); this is reference only, since main accuracy was not rerun
+    and the historical environment/version differed.
+    
+    ---
+    
+    ### Checklist
+    
+    #### Testing
+    
+    - [x] **Boundary / edge-case coverage**
+    - [x] **Regression test**
+    - [x] **Error / failure path coverage**
+    - [x] **Meaningful & reliable tests**
+    - [x] **Performance impact**: three-round DSV4 end-to-end comparison
+    above.
+    
+    - vLLM main:
+    https://github.com/vllm-project/vllm/commit/a98247ab4db686ee03c66d5feb3c761e52a2f8ab
+    
+    Signed-off-by: leolee <yihao.li@huawei.com>
+
+diff --git a/tests/ut/ops/test_vocab_parallel_embedding.py b/tests/ut/ops/test_vocab_parallel_embedding.py
+index c6334e5a1..605a618d6 100644
+--- a/tests/ut/ops/test_vocab_parallel_embedding.py
++++ b/tests/ut/ops/test_vocab_parallel_embedding.py
+@@ -20,6 +20,7 @@ from unittest.mock import MagicMock, patch
+ 
+ import pytest
+ import torch
++from torch._dynamo.backends.common import aot_autograd
+ from vllm.config.vllm import set_current_vllm_config
+ from vllm.forward_context import ForwardContext, override_forward_context
+ 
+@@ -311,7 +312,7 @@ def _exchange_embedding(monkeypatch, mode, tp_rank=0, tp_size=1, exchange_rank=0
+     """Keep real planning, weight loading and lookup; replace only runtime topology."""
+     module = "vllm_ascend.ops.vocab_parallel_embedding"
+     tp_group = SimpleNamespace(rank_in_group=tp_rank, world_size=tp_size, unique_name="tp")
+-    exchange_group = SimpleNamespace(rank_in_group=exchange_rank, world_size=2, device_group="exchange")
++    exchange_group = SimpleNamespace(rank_in_group=exchange_rank, world_size=2)
+     config = SimpleNamespace(
+         parallel_config=SimpleNamespace(prefill_context_parallel_size=2 if mode is VocabParallelMode.PCP_X_TP else 1),
+         scheduler_config=SimpleNamespace(max_num_batched_tokens=8),
+@@ -349,21 +350,17 @@ def test_embedding_exchange_batch_lifecycle(monkeypatch, mode, tp_size):
+         tp_contribution = expected * (gathered // (8 // tp_size) == tp_rank).unsqueeze(-1)
+         events = []
+ 
+-        def all_gather(output, input_, *, group):
++        def all_gather(input_, dim):
+             events.append("gather")
+-            assert group == "exchange"
+-            assert input_.data_ptr() == layer._embed_ag_in_buf.data_ptr()
+-            assert output.data_ptr() == layer._embed_ag_out_buf.data_ptr()
++            assert dim == 0
+             torch.testing.assert_close(input_, padded_ids[rank])
+-            output.copy_(gathered)
++            return gathered.clone()
+ 
+-        def reduce_scatter(output, input_, *, group):
++        def reduce_scatter(input_, dim):
+             events.append("scatter")
+-            assert group == "exchange"
+-            assert input_.data_ptr() == layer._embed_rs_in_buf.data_ptr()
+-            assert output.data_ptr() == layer._embed_rs_out_buf.data_ptr()
++            assert dim == 0
+             torch.testing.assert_close(input_, local_contribution)
+-            output.copy_(tp_contribution.reshape(2, span, 2)[rank])
++            return tp_contribution.reshape(2, span, 2)[rank].clone()
+ 
+         def all_reduce(output, group_name):
+             events.append("reduce")
+@@ -371,9 +368,8 @@ def test_embedding_exchange_batch_lifecycle(monkeypatch, mode, tp_size):
+             torch.testing.assert_close(output, tp_contribution.reshape(2, span, 2)[rank, : ids[rank].numel()])
+             return weight[ids[rank]]
+ 
+-        module = "vllm_ascend.ops.vocab_parallel_embedding"
+-        monkeypatch.setattr(f"{module}.dist.all_gather_into_tensor", all_gather)
+-        monkeypatch.setattr(f"{module}.dist.reduce_scatter_tensor", reduce_scatter)
++        monkeypatch.setattr(layer.token_exchange_group, "all_gather", all_gather, raising=False)
++        monkeypatch.setattr(layer.token_exchange_group, "reduce_scatter", reduce_scatter, raising=False)
+         monkeypatch.setattr(torch.ops.vllm, "all_reduce", all_reduce)
+         output = layer(ids[rank])
+         torch.testing.assert_close(output, weight[ids[rank]])
+@@ -392,7 +388,6 @@ def test_embedding_exchange_batch_lifecycle(monkeypatch, mode, tp_size):
+     for tp_rank in range(tp_size):
+         for rank in range(2):
+             layer, weight = _exchange_embedding(monkeypatch, mode, tp_rank, tp_size, rank)
+-            addresses = None
+             for first_ids, second_ids, published_span, in_forward, pcp_span in batches:
+                 ids = [torch.tensor(first_ids, dtype=torch.long), torch.tensor(second_ids, dtype=torch.long)]
+                 span = pcp_span if mode is VocabParallelMode.PCP_X_TP else 8
+@@ -400,17 +395,6 @@ def test_embedding_exchange_batch_lifecycle(monkeypatch, mode, tp_size):
+                     layer.set_embedding_num_tokens_padded(published_span)
+                 with override_forward_context(ForwardContext({}, {}, {}) if in_forward else None):
+                     run_batch(layer, weight, ids, span, tp_rank, rank)
+-                buffers = (
+-                    layer._embed_ag_in_buf,
+-                    layer._embed_ag_out_buf,
+-                    layer._embed_rs_in_buf,
+-                    layer._embed_rs_out_buf,
+-                )
+-                current_addresses = tuple(buffer.data_ptr() for buffer in buffers)
+-                if addresses is not None:
+-                    assert current_addresses == addresses
+-                addresses = current_addresses
+-                assert [buffer.shape[0] for buffer in buffers] == [8, 16, 16, 8]
+ 
+ 
+ @pytest.mark.parametrize("num_tokens,padded_tokens", [(3, 2), (1, 9)])
+@@ -419,13 +403,43 @@ def test_embedding_exchange_rejects_invalid_batch_before_communication(monkeypat
+     layer.set_embedding_num_tokens_padded(padded_tokens)
+     with (
+         override_forward_context(None),
+-        patch("vllm_ascend.ops.vocab_parallel_embedding.dist.all_gather_into_tensor") as gather,
++        patch.object(layer.token_exchange_group, "all_gather", create=True) as gather,
+         pytest.raises(ValueError, match="must cover .* tokens and fit the static capacity"),
+     ):
+         layer(torch.ones(num_tokens, dtype=torch.long))
+     gather.assert_not_called()
+ 
+ 
++def test_embedding_exchange_compilation(monkeypatch):
++    """AOT must keep scratch batch-sized and preserve outputs across calls."""
++    # CPU UTs mock NPU APIs; Dynamo must not query a real accelerator stream.
++    monkeypatch.setattr(torch.accelerator, "is_available", lambda: False)
++    layer, weight = _exchange_embedding(monkeypatch, VocabParallelMode.PCP_X_TP)
++    monkeypatch.setattr(layer.token_exchange_group, "all_gather", lambda x, dim: x.repeat(2), raising=False)
++    monkeypatch.setattr(
++        layer.token_exchange_group, "reduce_scatter", lambda x, dim: x[: x.shape[0] // 2].clone(), raising=False
++    )
++    graphs = []
++
++    def compiler(graph, inputs):
++        graphs.append(graph)
++        return graph.forward
++
++    torch._dynamo.reset()
++    compiled = torch.compile(layer.forward, backend=aot_autograd(fw_compiler=compiler), fullgraph=True, dynamic=True)
++    outputs = []
++    with override_forward_context(ForwardContext({}, {}, {})):
++        for ids in [[1, 2], [3], [2, 1, 3, 2], [], [1, 3]]:
++            ids = torch.tensor(ids, dtype=torch.long)
++            output = compiled(ids)
++            outputs.append((output, weight[ids]))
++        for output, expected in outputs:
++            torch.testing.assert_close(output, expected)
++    assert graphs
++    assert all("slice_scatter" not in str(node.target) for graph in graphs for node in graph.graph.nodes)
++    assert not any(name.startswith("_embed_") for name in vars(layer))
++
++
+ class TestVocabParallelPlan(unittest.TestCase):
+     def test_resolve_vocab_parallel_plan(self):
+         """Cover layout selection, communication groups, and conflicts."""
+diff --git a/vllm_ascend/ops/vocab_parallel_embedding.py b/vllm_ascend/ops/vocab_parallel_embedding.py
+index 856b5220b..31e905f16 100644
+--- a/vllm_ascend/ops/vocab_parallel_embedding.py
++++ b/vllm_ascend/ops/vocab_parallel_embedding.py
+@@ -332,7 +332,6 @@ class AscendVocabParallelEmbedding(VocabParallelEmbedding):
+         num_tokens = input_.shape[0]
+         exchange_group = self.token_exchange_group
+         assert exchange_group is not None
+-        exchange_group_size = exchange_group.world_size
+ 
+         # The scheduler's token limit covers the static buffers for both
+         # prefill and decode.
+@@ -361,36 +360,8 @@ class AscendVocabParallelEmbedding(VocabParallelEmbedding):
+                 f"and fit the static capacity {capacity}."
+             )
+ 
+-        # Lazy init on first call (profiling run, which precedes ACL graph
+-        # capture). Static buffers keep a stable device address across all
+-        # later capture/replay cycles — graph replay requires the same
+-        # address that was recorded at capture (the group helpers allocate new
+-        # collective outputs per call, which would desync the HCCL operator
+-        # recorded at capture).
+-        # Mirrors the OTP v13 fix in dsa_v1.py:_forward_o_proj.
+-        if not hasattr(self, "_embed_ag_in_buf"):
+-            device = input_.device
+-            # all_gather buffers carry token IDs (int64).
+-            self._embed_ag_in_buf = torch.zeros((capacity,), dtype=input_.dtype, device=device)
+-            self._embed_ag_out_buf = torch.empty((exchange_group_size * capacity,), dtype=input_.dtype, device=device)
+-            # reduce_scatter buffers carry bf16 embeddings.
+-            self._embed_rs_in_buf = torch.empty(
+-                (exchange_group_size * capacity, self.embedding_dim), dtype=self.params_dtype, device=device
+-            )
+-            self._embed_rs_out_buf = torch.empty((capacity, self.embedding_dim), dtype=self.params_dtype, device=device)
+-
+-        # Exchange only this batch's padded rows while keeping capacity-sized
+-        # allocations. Prefix slices preserve the buffers' base addresses.
+-        all_gather_input = self._embed_ag_in_buf[:exchange_tokens]
+-        # Zero unconditionally so padding does not specialize dynamic inputs.
+-        all_gather_input.zero_()
+-        all_gather_input[:num_tokens].copy_(input_)
+-        all_gather_output = self._embed_ag_out_buf[: exchange_group_size * exchange_tokens]
+-        dist.all_gather_into_tensor(
+-            all_gather_output,
+-            all_gather_input,
+-            group=exchange_group.device_group,
+-        )
++        all_gather_input = torch.nn.functional.pad(input_, (0, exchange_tokens - num_tokens))
++        all_gather_output = exchange_group.all_gather(all_gather_input, dim=0)
+ 
+         # Out-of-vocabulary rows are masked below. The DP exchange padding and
+         # PCP rank-local padding both use token ID 0, which is a valid token.
+@@ -402,19 +373,9 @@ class AscendVocabParallelEmbedding(VocabParallelEmbedding):
+             self.shard_indices.added_vocab_start_index,
+             self.shard_indices.added_vocab_end_index,
+         )
+-        # Embedding lookup is a local op (F.embedding); its fresh allocation
+-        # does not affect ACL graph replay. Copy into the static reduce_scatter input
+-        # buffer so reduce_scatter reads from a stable address.
+         output_parallel = self.quant_method.embedding(self, masked_input.long())
+-        reduce_scatter_input = self._embed_rs_in_buf[: exchange_group_size * exchange_tokens]
+-        reduce_scatter_input.copy_(output_parallel)
+-        reduce_scatter_input.masked_fill_(input_mask.unsqueeze(-1), 0)
+-        reduce_scatter_output = self._embed_rs_out_buf[:exchange_tokens]
+-        dist.reduce_scatter_tensor(
+-            reduce_scatter_output,
+-            reduce_scatter_input,
+-            group=exchange_group.device_group,
+-        )
++        output_parallel.masked_fill_(input_mask.unsqueeze(-1), 0)
++        reduce_scatter_output = exchange_group.reduce_scatter(output_parallel, dim=0)
+ 
+         # Preserve the caller's row count. In MM preparation this removes
+         # exchange padding so embeddings match the unpadded is_multimodal mask.

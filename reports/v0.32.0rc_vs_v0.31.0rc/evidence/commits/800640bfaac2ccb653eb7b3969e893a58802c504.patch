@@ -1,0 +1,255 @@
+commit 800640bfaac2ccb653eb7b3969e893a58802c504
+Author:     zhao-stack <80399320+zhao-stack@users.noreply.github.com>
+AuthorDate: Wed Oct 28 15:29:28 2026 +0800
+Commit:     GitHub <noreply@github.com>
+CommitDate: Wed Oct 28 15:29:28 2026 +0800
+
+    [BugFix] Backport nonpersistent image normalization buffers (#20008)
+    
+    ### What this PR does / why we need it?
+    
+    Qwen3-VL legacy pre-sharded checkpoints fail to start on vLLM v0.32.0
+    with `Missing keys ('visual.input_norm.weight',
+    'visual.input_norm.bias')`:
+    https://github.com/vllm-project/vllm-ascend/actions/runs/40524055660/job/122258855663.
+    
+    Backport the runtime semantics of upstream
+    https://github.com/vllm-project/vllm/pull/62767 without copying its full
+    implementation: wrap `FusedMMInputNorm.__init__` once and re-register
+    its processor-derived weight/bias buffers with `persistent=False`. Their
+    initialized values and device movement are preserved; the buffers no
+    longer participate in sharded checkpoint requirements or dummy weight
+    initialization. Learned-weight validation remains strict.
+    
+    Register the patch before model construction in the common worker path
+    so it covers 310P as well as the other Ascend devices. It is safe to
+    apply on the verified upstream main that already includes the fix.
+    Document removal once every supported vLLM baseline contains upstream
+    commit `90c4a1a73eecea0428ee4303ad96c9fdeaac3f80` or an equivalent
+    backport. The process-local wrapper is installed once; no per-request
+    mutable state is introduced.
+    
+    The existing Qwen3VL-8B-310p nightly commands, weights and
+    accuracy/performance thresholds are unchanged. Device-side image
+    normalization remains enabled. This is the runtime-fix alternative to
+    the CPU-normalization configuration workaround in #20003.
+    
+    ### Does this PR introduce _any_ user-facing change?
+    
+    Yes. Legacy Qwen3-VL sharded checkpoints can retain default device-side
+    normalization without requiring processor-derived normalization
+    constants in the checkpoint.
+    
+    ### How was this patch tested?
+    
+    - Isolated `VllmConfig` construction by mocking
+    `NPUPlatform.check_and_update_config` only during configuration
+    creation. This avoids unrelated Ascend logging/device initialization and
+    cross-test global-config pollution; normalizer and loader assertions
+    still use the real implementations. The prior CPU jobs both stopped in
+    fixture setup with a mocked log path; CPU CI must rerun on commit
+    `85bea4a8acc98169ad8a2552ccb8aeecd2684ee2`.
+    
+    - Added eight parametrized CPU regressions in
+    `tests/ut/patch/worker/test_patch_mm_input_norm.py`, exercising both
+    persistent (v0.32) and nonpersistent (fixed upstream) constructor
+    contracts: real safetensors legacy-shard loading, rejection of a missing
+    learned parameter, dummy loading preserving constants, float32/float16
+    normalization over the full byte range, and repeated patch installation.
+    - Passed local Ruff check and format check, Python byte compilation,
+    `git diff --check`, `tools/check_long_functions.py`, and
+    `tools/check_symbolic_meta.py`.
+    - Executed the actual nightly dispatcher with `Qwen3VL-8B-310p`: only
+    `dispatch_310p=true`.
+    - Runtime UT cannot run on this Windows host: the available Python
+    environment lacks pytest, torch and vLLM. PR CPU CI runs against both
+    the verified vLLM main and v0.32.0.
+    - Attempted required `bash format.sh ci`; stopped after prolonged lack
+    of progress installing the actionlint environment. Full Linux
+    pre-commit/mypy validation remains pending CI.
+    - Real 310P accuracy/performance validation requested through `/nightly
+    Qwen3VL-8B-310p --vllm-ref v0.32.0` to exercise the unfixed upstream
+    release plus this patch; results are pending. Checkpoints exported with
+    the old persistent buffers are not covered by this legacy-shard
+    regression.
+    - AI assistance was used to implement and prepare this change.
+    
+    ### Checklist
+    
+    - [x] Boundary / edge-case coverage: both upstream persistence contracts
+    and full byte-range channel-distinct inputs.
+    - [x] Regression test added for the original legacy-shard failure.
+    - [x] Error / failure path coverage: genuinely missing learned weights
+    still fail.
+    - [x] Meaningful tests use the upstream normalizer, dummy loader and
+    safetensors loader.
+    - [ ] Real 310P accuracy/performance and full Linux CI results pending.
+    
+    - vLLM main:
+    https://github.com/vllm-project/vllm/commit/544f182d9f0c9bfe8bd7645525951d5e3692a542
+    
+    ---------
+    
+    Signed-off-by: zhao-stack <80399320+zhao-stack@users.noreply.github.com>
+
+diff --git a/tests/ut/patch/worker/test_patch_mm_input_norm.py b/tests/ut/patch/worker/test_patch_mm_input_norm.py
+new file mode 100644
+index 000000000..7e75a33d6
+--- /dev/null
++++ b/tests/ut/patch/worker/test_patch_mm_input_norm.py
+@@ -0,0 +1,80 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Ascend project
++
++from types import SimpleNamespace
++from unittest.mock import Mock, patch
++
++import pytest
++import torch
++from safetensors.torch import save_file
++from vllm.config import VllmConfig, set_current_vllm_config
++from vllm.config.load import LoadConfig
++from vllm.model_executor.layers.fusion.mm_input_norm import FusedMMInputNorm
++from vllm.model_executor.model_loader.dummy_loader import DummyModelLoader
++from vllm.model_executor.model_loader.sharded_state_loader import ShardedStateLoader
++
++from vllm_ascend.patch.worker.patch_mm_input_norm import patch_mm_input_norm
++
++
++@pytest.fixture(params=[True, False], ids=["v032-persistent", "upstream-nonpersistent"])
++def norm(request, monkeypatch):
++    original_init = FusedMMInputNorm.__init__
++
++    def init(self, *args, **kwargs):
++        original_init(self, *args, **kwargs)
++        # Exercise both upstream contracts even when CI already has #62767.
++        for name in ("weight", "bias"):
++            self.register_buffer(name, getattr(self, name), persistent=request.param)
++
++    monkeypatch.setattr(FusedMMInputNorm, "__init__", init)
++    patch_mm_input_norm()
++    patched_init = FusedMMInputNorm.__init__
++    patch_mm_input_norm()
++    assert FusedMMInputNorm.__init__ is patched_init
++    # Config construction must not initialize Ascend logging or device state.
++    with patch("vllm_ascend.platform.NPUPlatform.check_and_update_config"):
++        vllm_config = VllmConfig()
++    with set_current_vllm_config(vllm_config), torch.device("cpu"):
++        yield FusedMMInputNorm([0.2, 0.4, 0.6], [0.25, 0.5, 0.75], 1 / 255)
++
++
++def test_legacy_shard_loads_and_missing_parameter_still_fails(norm, tmp_path, monkeypatch):
++    model = torch.nn.Module()
++    model.visual = torch.nn.Module()
++    model.visual.input_norm = norm
++    model.visual.proj = torch.nn.Linear(2, 2, bias=False)
++    legacy_state = {"visual.proj.weight": torch.ones(2, 2)}
++    save_file(legacy_state, tmp_path / "model-rank-0-part-0.safetensors")
++    loader = ShardedStateLoader(LoadConfig(load_format="sharded_state"))
++    # Rank resolution is the only mocked part of the real safetensors loader.
++    monkeypatch.setattr(
++        ShardedStateLoader,
++        "_render_default_pattern",
++        staticmethod(lambda *args, **kwargs: "model-rank-0-part-*.safetensors"),
++    )
++    config = SimpleNamespace(model=str(tmp_path), model_weights=None)
++    loader.load_weights(model, config)
++    torch.testing.assert_close(model.visual.proj.weight, legacy_state["visual.proj.weight"])
++    assert set(model.state_dict()) == set(legacy_state)
++    assert set(dict(norm.named_buffers())) == {"weight", "bias"}
++
++    model.visual.other = torch.nn.Linear(2, 2, bias=False)
++    with pytest.raises(ValueError, match=r"Missing keys.*visual.other.weight"):
++        loader.load_weights(model, config)
++
++
++def test_dummy_loading_preserves_normalization(norm):
++    weight, bias = norm.weight.clone(), norm.bias.clone()
++    DummyModelLoader(LoadConfig(load_format="dummy")).load_weights(norm, Mock())
++    torch.testing.assert_close(norm.weight, weight, rtol=0, atol=0)
++    torch.testing.assert_close(norm.bias, bias, rtol=0, atol=0)
++
++
++@pytest.mark.parametrize("dtype", [torch.float32, torch.float16])
++def test_device_normalization_matches_processor_transform(norm, dtype):
++    # Full byte range and different channels catch missing/double normalization.
++    pixels = torch.arange(256, dtype=torch.uint8).repeat(3).reshape(1, -1)
++    mean = torch.tensor([0.2, 0.4, 0.6]).view(1, 3, 1)
++    std = torch.tensor([0.25, 0.5, 0.75]).view(1, 3, 1)
++    expected = ((pixels.float().reshape(1, 3, -1) / 255 - mean) / std).reshape_as(pixels)
++    torch.testing.assert_close(norm(pixels, dtype), expected.to(dtype))
+diff --git a/vllm_ascend/patch/__init__.py b/vllm_ascend/patch/__init__.py
+index 8ce753fd8..438878960 100644
+--- a/vllm_ascend/patch/__init__.py
++++ b/vllm_ascend/patch/__init__.py
+@@ -1091,6 +1091,23 @@
+ #    Future Plan:
+ #       Remove this patch when upstream supports MiniMax-M2 fp8 loading on NPU.
+ #
++# ** 11. File: worker/patch_mm_input_norm.py **
++# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
++#   1. `vllm.model_executor.layers.fusion.mm_input_norm.FusedMMInputNorm`
++#    Why:
++#       v0.32.0 persists processor-derived normalization buffers, so legacy
++#       sharded checkpoints fail with missing visual.input_norm.weight/bias.
++#       Dummy loading can also overwrite these constants.
++#    How:
++#       Wrap construction once and register weight/bias as nonpersistent
++#       buffers, preserving device normalization and strict weight validation.
++#       Applying this on upstream main with the fix retains the same behavior.
++#    Related PR:
++#       https://github.com/vllm-project/vllm/pull/62767
++#    Future Plan:
++#       Remove when all supported vLLM baselines contain commit
++#       90c4a1a73eecea0428ee4303ad96c9fdeaac3f80 (or an equivalent backport).
++#
+ #
+ # ** 14. File: worker/patch_qwen3_5.py**
+ # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+diff --git a/vllm_ascend/patch/worker/__init__.py b/vllm_ascend/patch/worker/__init__.py
+index 1c5aa0213..88715675e 100644
+--- a/vllm_ascend/patch/worker/__init__.py
++++ b/vllm_ascend/patch/worker/__init__.py
+@@ -29,6 +29,9 @@ if HAS_TRITON:
+ # worker before model loading resolves kv_cache_dtype. No-op on kvquant_27.
+ import vllm_ascend.patch.worker.patch_kv_cache_dtype  # noqa
+ 
++# Apply before model construction on every device, including 310P.
++import vllm_ascend.patch.worker.patch_mm_input_norm  # noqa
++
+ import vllm_ascend.patch.worker.patch_distributed  # noqa
+ import vllm_ascend.patch.worker.patch_minimax_m2  # noqa
+ import vllm_ascend.patch.worker.patch_mamba_utils  # noqa
+diff --git a/vllm_ascend/patch/worker/patch_mm_input_norm.py b/vllm_ascend/patch/worker/patch_mm_input_norm.py
+new file mode 100644
+index 000000000..2f5a51095
+--- /dev/null
++++ b/vllm_ascend/patch/worker/patch_mm_input_norm.py
+@@ -0,0 +1,27 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Ascend project
++"""Backport the buffer persistence fix from vLLM #62767 to v0.32.0."""
++
++from functools import wraps
++
++from vllm.model_executor.layers.fusion.mm_input_norm import FusedMMInputNorm
++
++
++def patch_mm_input_norm() -> None:
++    original_init = FusedMMInputNorm.__init__
++    if getattr(original_init, "_ascend_nonpersistent_norm", False):
++        return
++
++    @wraps(original_init)
++    def init(self, *args, **kwargs) -> None:
++        original_init(self, *args, **kwargs)
++        # These constants come from the processor, not the checkpoint. Keep
++        # their values/device while excluding them from sharded/dummy loading.
++        self.register_buffer("weight", self.weight, persistent=False)
++        self.register_buffer("bias", self.bias, persistent=False)
++
++    init._ascend_nonpersistent_norm = True  # type: ignore[attr-defined]
++    FusedMMInputNorm.__init__ = init
++
++
++patch_mm_input_norm()

@@ -1,0 +1,234 @@
+commit 6924c08898695c949519e4381b3823ef9cdff4eb
+Author:     Liuchenbing-2026 <liuchen2026fly@163.com>
+AuthorDate: Fri Oct 30 15:54:53 2026 +0800
+Commit:     GitHub <noreply@github.com>
+CommitDate: Fri Oct 30 15:54:53 2026 +0800
+
+    [BugFix][Quantization] Release ModelSlim MoE reload metadata references (#17344)
+    
+    ### What this PR does / why we need it?
+    
+    The ModelSlim MoE loader wrapper closes over a bound method, retaining
+    its layer through vLLM reload metadata. Return a method bound to the
+    owning layer so the existing reload sanitizer can break that reference;
+    preserve the plain-callable path and weight-name mapping.
+    
+    Fixes https://github.com/vllm-project/vllm-ascend/issues/18679
+    
+    ### Does this PR introduce _any_ user-facing change?
+    
+    Discarded MoE layers and their weight tensors can be collected after
+    reload metadata is recorded. Weight-name mapping, forwarded arguments
+    and loader return values are unchanged.
+    
+    ### How was this patch tested?
+    
+    - vLLM main:
+    https://github.com/vllm-project/vllm/commit/544f182d9f0c9bfe8bd7645525951d5e3692a542
+    
+    ---------
+    
+    Signed-off-by: Liuchenbing-2026 <Liuchenbing-2026@users.noreply.github.com>
+    Signed-off-by: liuchenbing <chenliumail@163.com>
+    Signed-off-by: Liuchenbing-2026 <liuchen2026fly@163.com>
+    Co-authored-by: Liuchenbing-2026 <Liuchenbing-2026@users.noreply.github.com>
+    Co-authored-by: liuchenbing <chenliumail@163.com>
+
+diff --git a/tests/ut/quantization/configs/test_modelslim_config.py b/tests/ut/quantization/configs/test_modelslim_config.py
+index c94d4db8e..8d2747571 100644
+--- a/tests/ut/quantization/configs/test_modelslim_config.py
++++ b/tests/ut/quantization/configs/test_modelslim_config.py
+@@ -1,8 +1,10 @@
++import gc
+ import json
+ import os
+ import tempfile
++import weakref
+ from pathlib import Path
+-from types import SimpleNamespace
++from types import MethodType, SimpleNamespace
+ from unittest.mock import MagicMock, patch
+ 
+ import torch
+@@ -10,6 +12,7 @@ from vllm.model_executor.layers.attention import Attention
+ from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
+ from vllm.model_executor.layers.fused_moe import RoutedExperts
+ from vllm.model_executor.layers.linear import LinearBase
++from vllm.model_executor.model_loader.reload import layerwise
+ from vllm.model_executor.models.utils import WeightsMapper
+ 
+ from tests.ut.base import TestBase
+@@ -290,6 +293,66 @@ class TestAscendModelSlimConfig(TestBase):
+             return_success=True,
+         )
+ 
++    def test_modelslim_moe_weight_loader_binds_to_owning_layer(self):
++        class MoELayer(torch.nn.Module):
++            def __init__(self):
++                super().__init__()
++                self.calls = []
++
++            def weight_loader(self, param, loaded_weight, weight_name, shard_id, expert_id, return_success=False):
++                self.calls.append(weight_name)
++                return True
++
++        MoELayer.weight_loader.supports_moe_loading = True  # type: ignore[attr-defined]
++        layer = MoELayer()
++        mapped_loader = _make_modelslim_moe_weight_loader(layer.weight_loader)
++
++        # vLLM's sanitize_layer_refs can only drop the layer reference when the
++        # attribute is a bound method of that same layer.
++        self.assertIsInstance(mapped_loader, MethodType)
++        self.assertIs(mapped_loader.__self__, layer)
++        self.assertIs(mapped_loader.supports_moe_loading, True)
++        # The remaining `functools.wraps` metadata must also survive the copy.
++        self.assertEqual(mapped_loader.__name__, "weight_loader")
++        self.assertEqual(mapped_loader.__module__, MoELayer.weight_loader.__module__)
++        # `functools.wraps` would store the bound method back in `__wrapped__`.
++        self.assertFalse(hasattr(mapped_loader, "__wrapped__"))
++
++        param = torch.nn.Parameter(torch.empty(1))
++        result = mapped_loader(
++            param=param,
++            loaded_weight=torch.empty(1),
++            weight_name="model.layers.0.mlp.experts.w2_scale_bias",
++            shard_id="w2",
++            expert_id=0,
++            return_success=True,
++        )
++
++        self.assertTrue(result)
++        self.assertEqual(layer.calls, ["model.layers.0.mlp.experts.w2_scale"])
++
++    def test_modelslim_moe_weight_loader_does_not_retain_layer_via_reload_metadata(self):
++        class Expert(torch.nn.Module):
++            def __init__(self):
++                super().__init__()
++                self.weight = torch.nn.Parameter(torch.empty(1024, dtype=torch.int8), requires_grad=False)
++                self.weight_loader = _make_modelslim_moe_weight_loader(self._load_weight)
++                self.weight.weight_loader = self.weight_loader
++
++            def _load_weight(self, *args, **kwargs):
++                return None
++
++        layer = Expert()
++        layer_ref = weakref.ref(layer)
++        weight_ref = weakref.ref(layer.weight)
++        layerwise.record_metadata_for_reloading(layer)
++
++        del layer
++        gc.collect()
++
++        self.assertIsNone(layer_ref())
++        self.assertIsNone(weight_ref())
++
+     def test_get_quant_method_for_c8_kv_cache_attention(self):
+         c8_config = AscendModelSlimConfig(
+             {
+diff --git a/vllm_ascend/quantization/configs/modelslim_config.py b/vllm_ascend/quantization/configs/modelslim_config.py
+index b8f97193e..c78fb12a4 100644
+--- a/vllm_ascend/quantization/configs/modelslim_config.py
++++ b/vllm_ascend/quantization/configs/modelslim_config.py
+@@ -27,6 +27,7 @@ import os
+ from collections.abc import Callable
+ from copy import deepcopy
+ from functools import wraps
++from types import MethodType
+ from typing import Any, Optional
+ 
+ import regex as re
+@@ -76,13 +77,53 @@ _MXFP_C8_UNUSED_FA_SUFFIXES = (
+ )
+ 
+ 
++def _map_modelslim_moe_weight_name(weight_name: str) -> str:
++    """Rewrite a ModelSlim MoE scale-bias name to the upstream scale path."""
++    prefix, separator, param_name = weight_name.rpartition(".")
++    mapped_name = _MOE_WEIGHT_LOADER_NAME_MAP.get(param_name, param_name)
++    return f"{prefix}{separator}{mapped_name}"
++
++
+ def _make_modelslim_moe_weight_loader(
+     weight_loader: Callable[..., bool | None],
+ ) -> Callable[..., bool | None]:
+-    """Map ModelSlim MoE scale-bias names to the upstream scale path."""
++    """Map ModelSlim MoE scale-bias names to the upstream scale path.
++
++    When ``weight_loader`` is a bound method, the mapped loader is bound to the
++    same owning layer instead of closing over the bound method. vLLM copies
++    parameter attributes into ``LAYERWISE_INFO`` reload metadata while building
++    the meta tensors, and ``sanitize_layer_refs`` only breaks the
++    ``metadata -> tensor -> weight_loader -> layer`` cycle for attributes that
++    are bound methods of that layer. A plain closure keeps the discarded layer
++    (and its real weights) alive through its closure/``__wrapped__`` cell.
++    """
++    if not isinstance(weight_loader, MethodType):
++        # Preserve the existing interface for callables without a bound owner.
++        @wraps(weight_loader)
++        def plain_weight_loader(
++            param: torch.nn.Parameter,
++            loaded_weight: torch.Tensor,
++            weight_name: str,
++            shard_id: str,
++            expert_id: int,
++            return_success: bool = False,
++        ) -> bool | None:
++            return weight_loader(
++                param=param,
++                loaded_weight=loaded_weight,
++                weight_name=_map_modelslim_moe_weight_name(weight_name),
++                shard_id=shard_id,
++                expert_id=expert_id,
++                return_success=return_success,
++            )
++
++        return plain_weight_loader
++
++    owner = weight_loader.__self__
++    unbound_loader = weight_loader.__func__
+ 
+-    @wraps(weight_loader)
+     def modelslim_moe_weight_loader(
++        self: Any,
+         param: torch.nn.Parameter,
+         loaded_weight: torch.Tensor,
+         weight_name: str,
+@@ -90,19 +131,32 @@ def _make_modelslim_moe_weight_loader(
+         expert_id: int,
+         return_success: bool = False,
+     ) -> bool | None:
+-        prefix, separator, param_name = weight_name.rpartition(".")
+-        mapped_name = _MOE_WEIGHT_LOADER_NAME_MAP.get(param_name, param_name)
+-        mapped_weight_name = f"{prefix}{separator}{mapped_name}"
+-        return weight_loader(
++        return unbound_loader(
++            self,
+             param=param,
+             loaded_weight=loaded_weight,
+-            weight_name=mapped_weight_name,
++            weight_name=_map_modelslim_moe_weight_name(weight_name),
+             shard_id=shard_id,
+             expert_id=expert_id,
+             return_success=return_success,
+         )
+ 
+-    return modelslim_moe_weight_loader
++    # Copy the metadata by hand: `functools.wraps` would also set
++    # `__wrapped__` to the bound method and reintroduce the layer reference.
++    # Preserve its `__dict__` merge semantics for loader flags such as
++    # `supports_moe_loading` without retaining the bound method.
++    modelslim_moe_weight_loader.__module__ = getattr(
++        unbound_loader, "__module__", modelslim_moe_weight_loader.__module__
++    )
++    modelslim_moe_weight_loader.__name__ = getattr(unbound_loader, "__name__", modelslim_moe_weight_loader.__name__)
++    modelslim_moe_weight_loader.__qualname__ = getattr(
++        unbound_loader, "__qualname__", modelslim_moe_weight_loader.__qualname__
++    )
++    modelslim_moe_weight_loader.__doc__ = getattr(unbound_loader, "__doc__", None)
++    modelslim_moe_weight_loader.__annotations__ = getattr(unbound_loader, "__annotations__", {})
++    modelslim_moe_weight_loader.__dict__.update(getattr(unbound_loader, "__dict__", {}))
++
++    return MethodType(modelslim_moe_weight_loader, owner)
+ 
+ 
+ # The config filename that ModelSlim generates after quantizing a model.

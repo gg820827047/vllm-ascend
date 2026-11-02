@@ -1,0 +1,411 @@
+commit d16dc393675c49b8e6df8dfe05f75a87dd650732
+Author:     qijiajin <qijiajin1@huawei.com>
+AuthorDate: Sun Nov 1 15:30:55 2026 +0800
+Commit:     GitHub <noreply@github.com>
+CommitDate: Sun Nov 1 15:30:55 2026 +0800
+
+    [Ops][BugFix] Enable A5 MegaMoE for Qwen4Exp with 2560 hidden size and preserve routing for unquantized MTP drafts (#20502)
+    
+    ## Summary
+    
+    Backport the behavior of #20402 onto `releases/v0.32.0rc` (base
+    `ffca1c99b`).
+    
+    - Allow hidden size 2560 for the A5 MegaMoE Qwen3.8 Flash Next
+    configuration.
+    - Keep quantized target MoE layers on MegaMoE. When an unquantized MoE
+    layer is reached while the V2 context selected MegaMoE, select that
+    layer's communication method using the existing A5 capacity/world-size
+    policy and keep the context type in sync.
+    - Limit the draft's ordinary MC2 capacity to 512 tokens per TP rank when
+    MegaMoE's larger shared capacity was selected.
+    - For an unsupported-quantized MTP draft with sequence parallel MoE
+    enabled, skip ordinary MC2 as well. On EP4/top-k10 this selects
+    AllGather at every draft token count; without SP, the existing MC2
+    capacity policy remains in effect. The quantized target continues to use
+    FUSED_MC2, and the MegaMoE-disabled route is unchanged.
+    
+    The PR contains the #20402 code path and tests adapted to the release
+    branch. It does not include #20311 or the separate PLE INT8 runtime
+    adaptation.
+    
+    ## Validation
+    
+    - Exact PR head `33d316210` in an isolated Ascend container worktree:
+    `python -m pytest -q tests/ut/test_ascend_forward_context.py` — 59
+    passed. The SP regression covers 1, 1024, and 4096 tokens for the
+    unquantized draft, and verifies that the target remains on FUSED_MC2.
+    - Earlier release-branch validation: 87 targeted unit cases passed (A5
+    config, draft capacity, per-layer route, MegaMoE-disabled path).
+    - Changed files: `ruff check`, `ruff format --check`, and `git diff
+    --check` passed.
+    - `bash format.sh ci` was attempted in the Ascend container but could
+    not initialize `ruff-pre-commit`: the configured proxy refused the
+    GitHub connection. The focused Ruff checks above passed.
+    - The combined development runtime on 8 A5 NPUs reproduced
+    `MoeDistributeDispatchV3 Get WinSize failed` before the SP route fix.
+    After applying this route fix, P/D proxy smoke requests completed
+    (32/32), and two full GPQA Diamond runs completed (198/198 requests
+    each; 88.89% and 91.92% accuracy with `temperature=1.0`). This runtime
+    also contains #20311 and PLE INT8 changes, so this is integration
+    evidence, not a standalone E2E test of this release PR.
+    
+    ## Integration status
+    
+    The SP draft communication fix is included in this PR. Direct E2E
+    validation of the exact `releases/v0.32.0rc` PR stack remains pending;
+    the 8-card P/D run used the combined development runtime. The PR remains
+    draft.
+    
+    - vLLM main:
+    https://github.com/vllm-project/vllm/commit/544f182d9f0c9bfe8bd7645525951d5e3692a542
+    
+    ---------
+    
+    Signed-off-by: qijiajin <qijiajin1@huawei.com>
+
+diff --git a/release_notes/fragments/20402.yaml b/release_notes/fragments/20402.yaml
+new file mode 100644
+index 000000000..53b43fad6
+--- /dev/null
++++ b/release_notes/fragments/20402.yaml
+@@ -0,0 +1,5 @@
++pr: 20402
++entries:
++  - category: bugfix
++    text: Enabled A5 MegaMoE for Qwen4Exp models with a 2560 hidden size while preserving capacity-based MC2/AllGather routing for unquantized MTP drafts.
++    hardware: [A5]
+diff --git a/tests/ut/ops/test_fused_moe.py b/tests/ut/ops/test_fused_moe.py
+index ff9cea4e8..7d7a3923f 100644
+--- a/tests/ut/ops/test_fused_moe.py
++++ b/tests/ut/ops/test_fused_moe.py
+@@ -954,8 +954,30 @@ def test_hash_router_chunks_unaligned_input_ids_for_sequence_parallel(monkeypatc
+ @pytest.mark.parametrize("return_with_event", [False, True])
+ @pytest.mark.parametrize("use_v2,v2_eplb", [(False, False), (True, False), (True, True)])
+ @pytest.mark.parametrize("is_sequence_parallel", [False, True])
++@pytest.mark.parametrize(
++    "mega_moe,runner_type,quant_type,a5_support,selected_comm_type,expected_comm_type,num_tokens",
++    [
++        (False, "draft", QuantType.NONE, True, MoECommType.MC2, MoECommType.MC2, 128),
++        (True, "draft", QuantType.NONE, True, MoECommType.FUSED_MC2, MoECommType.MC2, 128),
++        (True, "draft", QuantType.NONE, True, MoECommType.FUSED_MC2, MoECommType.ALLGATHER, 129),
++        (True, "generate", QuantType.NONE, True, MoECommType.FUSED_MC2, MoECommType.FUSED_MC2, 128),
++        (True, "draft", QuantType.NONE, False, MoECommType.MC2, MoECommType.MC2, 128),
++        (True, "draft", QuantType.W8A8MXFP, True, MoECommType.FUSED_MC2, MoECommType.FUSED_MC2, 128),
++    ],
++)
+ def test_routed_experts_forward_impl_runs_current_flow(
+-    monkeypatch, return_with_event, use_v2, v2_eplb, is_sequence_parallel
++    monkeypatch,
++    return_with_event,
++    use_v2,
++    v2_eplb,
++    is_sequence_parallel,
++    mega_moe,
++    runner_type,
++    quant_type,
++    a5_support,
++    selected_comm_type,
++    expected_comm_type,
++    num_tokens,
+ ):
+     """Verify routed-expert forward preserves the current dispatch flow."""
+     _disable_force_eplb(monkeypatch)
+@@ -969,6 +991,7 @@ def test_routed_experts_forward_impl_runs_current_flow(
+     finalized = torch.randn(2, 4)
+     expert_load = torch.zeros(4, dtype=torch.int32)
+     quant_method = AscendUnquantizedFusedMoEMethod.__new__(AscendUnquantizedFusedMoEMethod)
++    quant_method.quant_method = SimpleNamespace(quant_type=quant_type)
+     quant_method.apply = MagicMock(
+         return_value=SimpleNamespace(
+             routed_out=routed_out,
+@@ -1033,14 +1056,30 @@ def test_routed_experts_forward_impl_runs_current_flow(
+         "_EXTRA_CTX",
+         SimpleNamespace(
+             in_profile_run=False,
+-            moe_comm_type=MoECommType.MC2,
++            moe_comm_type=selected_comm_type,
+             moe_comm_method=moe_comm_method,
++            use_mega_moe=mega_moe,
++            max_tokens_across_dp=num_tokens,
+             eplb_heat_collection_status=False,
+         ),
+     )
+     monkeypatch.setattr(routed_experts_module, "get_forward_context", lambda: SimpleNamespace(all_moe_layers=None))
+-    monkeypatch.setattr(routed_experts_module, "get_moe_comm_method", lambda *_: moe_comm_method)
+-    monkeypatch.setattr(routed_experts_module, "get_current_vllm_config", lambda: None)
++    get_moe_comm_method = MagicMock(return_value=moe_comm_method)
++    monkeypatch.setattr(routed_experts_module, "get_moe_comm_method", get_moe_comm_method)
++    select_moe_comm_method = MagicMock(return_value=expected_comm_type)
++    monkeypatch.setattr(routed_experts_module, "select_moe_comm_method", select_moe_comm_method)
++    monkeypatch.setattr(
++        routed_experts_module,
++        "get_current_hardware_profile",
++        lambda: SimpleNamespace(supports=lambda capability: a5_support),
++    )
++    vllm_config = SimpleNamespace(model_config=SimpleNamespace(runner_type=runner_type))
++    routed_experts._vllm_config = vllm_config
++    monkeypatch.setattr(
++        routed_experts_module,
++        "get_current_vllm_config",
++        lambda: pytest.fail("forward_impl must use the config saved at layer initialization"),
++    )
+     monkeypatch.setattr(routed_experts_module, "get_moe_num_logical_experts", lambda *args, **kwargs: 3)
+     monkeypatch.setattr(routed_experts_module, "get_ascend_config", lambda: SimpleNamespace(enable_force_eplb=False))
+     record_expert_tokens = MagicMock()
+@@ -1066,11 +1105,19 @@ def test_routed_experts_forward_impl_runs_current_flow(
+         assert not fused_moe_events.has_fine_grained_stage_events
+     else:
+         assert result is finalized
++    get_moe_comm_method.assert_called_once_with(expected_comm_type, routed_experts.moe_config)
++    assert routed_experts_module._EXTRA_CTX.moe_comm_type == expected_comm_type
++    if mega_moe and runner_type == "draft" and quant_type == QuantType.NONE and a5_support:
++        select_moe_comm_method.assert_called_once_with(
++            num_tokens, vllm_config, is_draft_model=True, draft_moe_quant_type=QuantType.NONE
++        )
++    else:
++        select_moe_comm_method.assert_not_called()
+     moe_comm_method.prepare.assert_called_once_with(
+         hidden_states=hidden_states,
+         router_logits=router_logits,
+         replace_allreduce=is_sequence_parallel,
+-        quant_type=QuantType.NONE,
++        quant_type=quant_type,
+     )
+     quant_method.apply.assert_called_once()
+     assert quant_method.apply.call_args.kwargs["layer"] is routed_experts
+diff --git a/tests/ut/test_ascend_config.py b/tests/ut/test_ascend_config.py
+index 9bccddf7f..ddffe5533 100644
+--- a/tests/ut/test_ascend_config.py
++++ b/tests/ut/test_ascend_config.py
+@@ -1412,6 +1412,24 @@ class TestSubconfigPydanticTypeValidation(TestBase):
+ 
+ 
+ class TestUpstreamConfigCompatibility(TestBase):
++    @patch(
++        "vllm_ascend.ascend_config.get_current_hardware_profile",
++        return_value=get_hardware_profile(AscendDeviceType.A5),
++    )
++    def test_a5_megamoe_qwen4exp_hidden_size_2560(self, _mock_profile):
++        text_config = SimpleNamespace(hidden_size=2560, moe_intermediate_size=640, num_experts_per_tok=10)
++        model_config = SimpleNamespace(
++            architectures=["Qwen4ExpForConditionalGeneration"],
++            hf_text_config=text_config,
++            get_num_experts=lambda: 512,
++        )
++        parallel_config = SimpleNamespace(world_size_across_dp=4, pipeline_parallel_size=1)
++        vllm_config = SimpleNamespace(model_config=model_config, parallel_config=parallel_config)
++
++        self.assertTrue(AscendConfig._is_megamoe_supported_by_config(vllm_config))
++        with patch.object(text_config, "hidden_size", 2688):
++            self.assertFalse(AscendConfig._is_megamoe_supported_by_config(vllm_config))
++
+     @patch(
+         "vllm_ascend.ascend_config.get_current_hardware_profile",
+         return_value=get_hardware_profile(AscendDeviceType.A5),
+diff --git a/tests/ut/test_ascend_forward_context.py b/tests/ut/test_ascend_forward_context.py
+index 3e7a253c0..c322130d5 100644
+--- a/tests/ut/test_ascend_forward_context.py
++++ b/tests/ut/test_ascend_forward_context.py
+@@ -41,6 +41,7 @@ def _make_vllm_config(
+     kv_connector: str | None = None,
+     kv_role: str | None = None,
+     recompute_scheduler_enable: bool = False,
++    use_sequence_parallel_moe: bool = False,
+ ):
+     hf_text_config_attrs: dict[str, object] = {"top_k_experts": top_k_experts}
+     if quant_type is not None:
+@@ -55,6 +56,7 @@ def _make_vllm_config(
+     )
+     parallel_config = SimpleNamespace(
+         enable_expert_parallel=enable_expert_parallel,
++        use_sequence_parallel_moe=use_sequence_parallel_moe,
+         world_size_across_dp=world_size,
+         pipeline_parallel_size=pipeline_parallel_size,
+         tensor_parallel_size=tensor_parallel_size,
+@@ -159,6 +161,21 @@ def test_set_mc2_tokens_capacity_without_cudagraph_aligns_per_tp_rank():
+     assert afc.get_mc2_tokens_capacity() == 600
+ 
+ 
++@pytest.mark.parametrize("enable_fused_mc2", [0, 1])
++def test_set_mc2_tokens_capacity_without_megamoe_uses_ordinary_limit(monkeypatch, enable_fused_mc2):
++    monkeypatch.setattr(
++        afc,
++        "get_ascend_config",
++        lambda: SimpleNamespace(enable_prefill_mc2=False, enable_fused_mc2=enable_fused_mc2),
++    )
++    monkeypatch.setattr(afc, "use_cann_megamoe", lambda _: False)
++    vllm_config = _make_vllm_config(tensor_parallel_size=2)
++
++    afc.set_mc2_tokens_capacity(vllm_config, max_num_reqs=2000, uniform_decode_query_len=3)
++
++    assert afc.get_mc2_tokens_capacity() == 512 * 2
++
++
+ def test_set_mc2_tokens_capacity_with_cudagraph_uses_capture_size_and_aligns(monkeypatch):
+     monkeypatch.setattr(
+         afc,
+@@ -500,6 +517,64 @@ def test_select_moe_comm_method_a5_preserves_draft_quant_guard(monkeypatch, num_
+     )
+ 
+ 
++@pytest.mark.parametrize(
++    ("num_tokens", "expected"),
++    [(2048, MoECommType.MC2), (2049, MoECommType.ALLGATHER), (4096, MoECommType.ALLGATHER)],
++)
++def test_select_moe_comm_method_a5_unquantized_draft_four_cards_topk_ten(monkeypatch, num_tokens, expected):
++    _patch_select_moe_comm_method_deps(
++        monkeypatch,
++        device_type=AscendDeviceType.A5,
++        capacity=4096,
++        enable_fused_mc2=1,
++    )
++    monkeypatch.setattr(afc, "is_mega_moe_supported", lambda: True)
++    vllm_config = _make_vllm_config(world_size=4, tensor_parallel_size=4, top_k_experts=10)
++
++    assert (
++        afc.select_moe_comm_method(num_tokens, vllm_config, is_draft_model=True, draft_moe_quant_type=QuantType.NONE)
++        == expected
++    )
++
++
++@pytest.mark.parametrize("num_tokens", [1, 1024, 4096])
++def test_select_moe_comm_method_a5_sp_unquantized_draft_uses_allgather(monkeypatch, num_tokens):
++    _patch_select_moe_comm_method_deps(
++        monkeypatch, device_type=AscendDeviceType.A5, capacity=4096, ep_world_size=4, enable_fused_mc2=1
++    )
++    monkeypatch.setattr(afc, "is_mega_moe_supported", lambda: True)
++    config = _make_vllm_config(world_size=4, tensor_parallel_size=2, top_k_experts=10, use_sequence_parallel_moe=True)
++    assert afc.select_moe_comm_method(num_tokens, config) == MoECommType.FUSED_MC2
++    assert (
++        afc.select_moe_comm_method(num_tokens, config, is_draft_model=True, draft_moe_quant_type=QuantType.NONE)
++        == MoECommType.ALLGATHER
++    )
++
++
++@pytest.mark.parametrize("enable_fused_mc2", [0, 1])
++@pytest.mark.parametrize(
++    ("num_tokens", "expected"),
++    [(1024, MoECommType.MC2), (1025, MoECommType.ALLGATHER)],
++)
++def test_select_moe_comm_method_a5_draft_without_megamoe_keeps_ordinary_capacity(
++    monkeypatch, enable_fused_mc2, num_tokens, expected
++):
++    _patch_select_moe_comm_method_deps(
++        monkeypatch,
++        device_type=AscendDeviceType.A5,
++        capacity=1024,
++        ep_world_size=4,
++        enable_fused_mc2=enable_fused_mc2,
++    )
++    monkeypatch.setattr(afc, "is_mega_moe_supported", lambda: False)
++    vllm_config = _make_vllm_config(world_size=4, tensor_parallel_size=2, top_k_experts=10)
++
++    assert (
++        afc.select_moe_comm_method(num_tokens, vllm_config, is_draft_model=True, draft_moe_quant_type=QuantType.NONE)
++        == expected
++    )
++
++
+ def test_select_moe_comm_method_310p_uses_allgather(monkeypatch):
+     _patch_select_moe_comm_method_deps(
+         monkeypatch,
+diff --git a/vllm_ascend/ascend_config.py b/vllm_ascend/ascend_config.py
+index c6e6de6e1..bd4d1a687 100644
+--- a/vllm_ascend/ascend_config.py
++++ b/vllm_ascend/ascend_config.py
+@@ -1065,7 +1065,7 @@ class AscendConfig:
+             hidden_size = vllm_config.model_config.get_hidden_size()
+         if hidden_size is None:
+             return False
+-        supported_hidden_sizes = {1024, 2048, 3072, 4096, 5120, 6144, 7168, 8192}
++        supported_hidden_sizes = {1024, 2048, 2560, 3072, 4096, 5120, 6144, 7168, 8192}
+         if is_kimi_k3:
+             supported_hidden_sizes.add(3584)
+         if int(hidden_size) not in supported_hidden_sizes:
+diff --git a/vllm_ascend/ascend_forward_context.py b/vllm_ascend/ascend_forward_context.py
+index 84dc3ad97..1574ce973 100644
+--- a/vllm_ascend/ascend_forward_context.py
++++ b/vllm_ascend/ascend_forward_context.py
+@@ -355,6 +355,7 @@ def _select_capacity_and_world_size_moe_comm_method(
+     is_draft_model: bool = False,
+     draft_moe_quant_type: QuantType = QuantType.NONE,
+ ) -> MoECommType:
++    skip_draft_mc2 = False
+     if get_ascend_config().enable_fused_mc2 == 1:
+         if is_mega_moe_supported():
+             if is_draft_model and draft_moe_quant_type not in A5_SUPPORT_MEGA_MOE_QUANT_TYPES:
+@@ -362,7 +363,14 @@ def _select_capacity_and_world_size_moe_comm_method(
+                 # quantized weight layouts. An unquantized (or unsupported-quantized)
+                 # MTP draft MoE layer must skip FUSED_MC2 and fall through to the
+                 # original MoE path (MC2/ALLGATHER/ALLTOALL) below.
+-                pass
++                # The shared capacity is sized for MegaMoE, whose per-rank limit
++                # is larger than the ordinary MC2 dispatch limit.
++                mc2_tokens_capacity = min(
++                    mc2_tokens_capacity,
++                    _MC2_TOKENS_PER_RANK_LIMIT * vllm_config.parallel_config.tensor_parallel_size,
++                )
++                # Ordinary MC2 dispatch fails CANN WinSize tiling for SP draft.
++                skip_draft_mc2 = getattr(vllm_config.parallel_config, "use_sequence_parallel_moe", False)
+             else:
+                 return MoECommType.FUSED_MC2
+     num_experts_per_tok = getattr(
+@@ -371,7 +379,7 @@ def _select_capacity_and_world_size_moe_comm_method(
+         getattr(vllm_config.model_config.hf_text_config, "top_k_experts", 1),
+     )
+     world_size = vllm_config.parallel_config.world_size_across_dp
+-    if (num_tokens is None or num_tokens <= mc2_tokens_capacity) and world_size > 1:
++    if not skip_draft_mc2 and (num_tokens is None or num_tokens <= mc2_tokens_capacity) and world_size > 1:
+         return MoECommType.MC2
+     if world_size <= num_experts_per_tok:
+         return MoECommType.ALLGATHER
+diff --git a/vllm_ascend/ops/fused_moe/routed_experts.py b/vllm_ascend/ops/fused_moe/routed_experts.py
+index 8f530e741..07650cd94 100644
+--- a/vllm_ascend/ops/fused_moe/routed_experts.py
++++ b/vllm_ascend/ops/fused_moe/routed_experts.py
+@@ -30,7 +30,7 @@ from vllm.model_executor.layers.fused_moe.unquantized_fused_moe_method import Un
+ from vllm.model_executor.utils import replace_parameter
+ 
+ from vllm_ascend.ascend_config import get_ascend_config
+-from vllm_ascend.ascend_forward_context import _EXTRA_CTX, use_cann_megamoe
++from vllm_ascend.ascend_forward_context import _EXTRA_CTX, select_moe_comm_method, use_cann_megamoe
+ from vllm_ascend.device.hardware_profile import HardwareCapability, get_current_hardware_profile
+ from vllm_ascend.distributed.eplb.eplb_state import AscendEplbLayerState
+ from vllm_ascend.eplb.adaptor.vllm_adaptor import VllmEplbAdaptor
+@@ -417,6 +417,7 @@ class AscendRoutedExperts(RoutedExperts):  # type: ignore[no-redef]
+         self.router: FusedMoERouter | None = None
+         ascend_config = get_ascend_config()
+         vllm_config = get_current_vllm_config()
++        self._vllm_config = vllm_config
+         self.n_shared_experts = n_shared_experts
+         self.mix_placement = getattr(ascend_config, "mix_placement", False)
+         self.enable_npugraph_ex_static_kernel = ascend_config.ascend_compilation_config.enable_static_kernel
+@@ -696,7 +697,26 @@ class AscendRoutedExperts(RoutedExperts):  # type: ignore[no-redef]
+         enable_force_load_balance = _EXTRA_CTX.in_profile_run
+ 
+         lora_context = getattr(self, "_ascend_moe_lora_context", None)
+-        moe_comm_method = get_moe_comm_method(_EXTRA_CTX.moe_comm_type, self.moe_config)
++        comm_type = _EXTRA_CTX.moe_comm_type
++        if (
++            getattr(_EXTRA_CTX, "use_mega_moe", False)
++            and self._vllm_config.model_config.runner_type == "draft"
++            and self.quant_type == QuantType.NONE
++            and get_current_hardware_profile().supports(HardwareCapability.CANN_MEGAMOE_MXFP)
++        ):
++            # V2 selects the target model's FUSED_MC2 route before entering the
++            # unquantized MTP draft. Select this layer's capacity-based route.
++            num_tokens = _EXTRA_CTX.max_tokens_across_dp
++            if num_tokens is None:
++                num_tokens = _EXTRA_CTX.num_tokens
++            comm_type = select_moe_comm_method(
++                num_tokens,
++                self._vllm_config,
++                is_draft_model=True,
++                draft_moe_quant_type=self.quant_type,
++            )
++        _EXTRA_CTX.moe_comm_type = comm_type
++        moe_comm_method = get_moe_comm_method(comm_type, self.moe_config)
+         _EXTRA_CTX.moe_comm_method = moe_comm_method
+         assert moe_comm_method is not None
+         if lora_context is not None:

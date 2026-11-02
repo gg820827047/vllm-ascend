@@ -1,0 +1,595 @@
+commit b4094366cd542c0645d352beaddad52375bcd5b1
+Author:     CXY-Katrina <katrina.cxy@gmail.com>
+AuthorDate: Sun Nov 1 15:07:39 2026 +0800
+Commit:     GitHub <noreply@github.com>
+CommitDate: Sun Nov 1 15:07:39 2026 +0800
+
+    [BugFix][Model] Backport MiniMax-M3 prompt reasoning boundary fix (#20468)
+    
+    ### What this PR does / why we need it?
+    
+    Backport
+    [vllm-project/vllm#63492](https://github.com/vllm-project/vllm/pull/63492)
+    to `releases/v0.32.0rc` (base:
+    `ffca1c99bb28d9c92dd5dcf327f8b242404a5055`). The vLLM `v0.32.0`
+    MiniMax-M3 parser does not contain that fix.
+    
+    MiniMax-M3.1-Flash prompts contain literal `<mm:think></mm:think>`
+    instructions and may contain a previous assistant turn prefixed with
+    `</mm:think>`. Checking the entire prompt incorrectly marks the new
+    turn's reasoning as finished. Streamed responses then expose
+    reasoning/markers in `delta.content`, and structured-output constraints
+    can start before reasoning is complete.
+    
+    - Register a platform patch so the serving process receives the fix.
+    - Wrap only `MiniMaxM3ReasoningParser.is_reasoning_end` and
+    `is_reasoning_end_streaming`, restricting their input to the last `]~b]`
+    message boundary, as upstream does. Retain the original parsing and
+    state handling.
+    - Preserve output-only IDs, tokenizers without the message-boundary
+    token, and non-streaming extraction. Skip patching when the upstream
+    `_last_message_ids` helper already exists; repeated loading is also a
+    no-op.
+    - Add 29 regression/compatibility cases and a manual HTTP E2E client for
+    single-turn, multi-turn and JSON Schema requests.
+    
+    Architectural/removal plan: this is a temporary parser-only backport,
+    with no model runner or NPU kernel changes. Remove it when all supported
+    vLLM versions include #63492. The additional backward scan is over CPU
+    token IDs and stops at the last message boundary; output-only IDs
+    require a linear scan, as in upstream. No device synchronization or
+    tensor transfer is added. Hardware performance has not been measured.
+    
+    ### Does this PR introduce _any_ user-facing change?
+    
+    Yes. With `--reasoning-parser minimax_m3`, prompt/history markers no
+    longer prematurely terminate the current reasoning phase. Streamed
+    reasoning remains separate from content, and structured-output
+    reasoning-end detection uses the current message. A release-note
+    fragment is included in this PR.
+    
+    ### How was this patch tested?
+    
+    - Hardware validation on 177.11.21.1 (8 x Ascend950DT), PR commit
+    `84e6fcce0efb10c9819fe1687e5e03d3db3a5b4e`: **29 regression tests
+    passed; all 6 HTTP requests passed** using the client below. Single-turn
+    returned `391`, multi-turn returned `Berlin.`, and JSON Schema returned
+    `{"answer":391}`, in both streaming and non-streaming modes. All
+    responses finished with `stop`, separated reasoning from content, and
+    contained no leaked reasoning markers.
+    - The dedicated MiniMax image reports vLLM `0.30.0` (commit
+    `ced6857afa0ea7b2e3f0846a62e1394e90f15607`); its original MiniMax parser
+    is byte-identical to vLLM `v0.32.0` (Git blob
+    `d49f9311f46026fa43650c3c8f07ec76edbc73fc`). This validates the parser
+    backport in the model image, not the entire release branch. Only the
+    patched service was exercised for HTTP validation; deterministic checks
+    with the real model tokenizer confirmed the incorrect pre-patch `True`
+    becomes `False` for both single-turn and multi-turn prompts.
+    - Normal platform import automatically loaded the registered patch. No
+    manual patch invocation was used during service startup. The validation
+    container was stopped afterward.
+    - Isolated source-level validation on Windows against **unmodified vLLM
+    v0.32.0** `minimax_m3_reasoning_parser.py`, `basic_parsers.py`, and
+    `abs_reasoning_parsers.py`: **51 passed** (22 existing upstream tests +
+    29 new tests). Unrelated import dependencies and protocol containers
+    were stubbed; the parser and its base implementations were real upstream
+    source. This is not a full installed-vLLM or NPU test.
+    - Deterministic before/after checks: both prompt-only `is_reasoning_end`
+    and prompt-prefixed/open-reasoning `is_reasoning_end_streaming` returned
+    the incorrect `True` before the patch and the expected `False`
+    afterward.
+    - Focused Ruff checks and `git diff --check`: passed.
+    - `python tests/e2e/models/minimax_m3_reasoning_client.py --help`:
+    passed.
+    
+    ```bash
+    python -m pytest -sv tests/ut/patch/platform/test_patch_minimax_m3_reasoning.py
+    ```
+    
+    #### Actual model A/B verification on Ascend
+    
+    Use an already working MiniMax-M3.1-Flash Ascend deployment with the
+    same weights, template, vLLM version and serving options for both runs.
+    Follow the [release branch deployment
+    guide](https://github.com/vllm-project/vllm-ascend/blob/releases/v0.32.0rc/docs/source/tutorials/models/MiniMax-M3.1-Flash.md#5-online-service-deployment)
+    for the hardware-specific full launch command. That guide uses dedicated
+    model images and Ascend-adapted W8A8/MXFP8 weights; the official NVFP4
+    checkpoint is not a drop-in Ascend substitute. Do not replace that
+    image's model adaptation with a generic source installation just to test
+    this parser fix.
+    
+    The examples below target the guide's endpoint/model name:
+    `http://127.0.0.1:11223/v1` and `minimax-m3.1-flash`. Keep
+    `--reasoning-parser minimax_m3` in the launch command. If using tool
+    calls, also keep `--enable-auto-tool-choice --tool-call-parser
+    minimax_m3`.
+    
+    **A. Before applying the patch**, start the service with your existing
+    working launch command and run this from the PR checkout:
+    
+    ```bash
+    curl --fail --silent --show-error http://127.0.0.1:11223/health
+    python tests/e2e/models/minimax_m3_reasoning_client.py \
+      --base-url http://127.0.0.1:11223/v1 --model minimax-m3.1-flash
+    ```
+    
+    For a raw streamed reproduction:
+    
+    ```bash
+    curl --fail-with-body --no-buffer http://127.0.0.1:11223/v1/chat/completions \
+      -H 'Content-Type: application/json' \
+      -d '{"model":"minimax-m3.1-flash","messages":[{"role":"user","content":"What is 17 * 23? Give only the number in your final answer."}],"stream":true,"temperature":0,"max_tokens":4096,"chat_template_kwargs":{"reasoning_effort":"low"}}'
+    ```
+    
+    Affected behavior: `delta.content` may contain `<mm:think>...
+    </mm:think>` or a leading `</mm:think>`, while reasoning is absent.
+    Non-streaming normally separates the fields correctly. The client prints
+    both responses and fails on leaked markers. Generation is
+    model-dependent; use the deterministic reproduction above as the
+    reliable parser regression signal.
+    
+    **B. Restart the service with this PR installed and rerun the client.**
+    Normal installations automatically load the patch through platform
+    registration; no manual apply step is needed. The installation snippet
+    below is only for an existing dedicated model image that does not yet
+    include this PR. To preserve the dedicated image's existing model
+    implementation, run the following from the PR checkout inside that
+    container instead of reinstalling the entire repository:
+    
+    After the fix:
+    
+    - The client completes all six requests (three scenarios, each
+    non-streaming and streaming).
+    - `content` has no `<mm:think>`/`</mm:think>` tags. When the model emits
+    a reasoning block, its text is reported in `reasoning`; an immediate
+    closing tag may legitimately produce empty reasoning.
+    - The JSON Schema case yields `{"answer":391}`. The client prints
+    reasoning separately. JSON validity alone does not prove the grammar's
+    activation timing; the deterministic end-check regression covers that
+    condition.
+    - A length-limited response is reported as incomplete, rather than
+    counted as a pass. Tool-call scenarios reported by upstream are not
+    covered by this manual client.
+    
+    ---
+    
+    ### Checklist
+    
+    #### Testing
+    
+    - [x] **Boundary / edge-case coverage**: empty input, empty final
+    message, boundary token ID zero, split markers, missing boundary token,
+    continued assistant messages.
+    - [x] **Regression test**: prompt/history markers and prompt-prefixed
+    streaming checks.
+    - [x] **Error / failure path coverage**: missing reasoning-marker
+    vocabulary still raises; the E2E client rejects incomplete responses and
+    marker leakage.
+    - [x] **Meaningful & reliable tests**: real upstream parser behavior and
+    unchanged extraction/state precedence, plus idempotence/upstream-fix
+    guards.
+    
+    - vLLM main:
+    https://github.com/vllm-project/vllm/commit/544f182d9f0c9bfe8bd7645525951d5e3692a542
+    
+    ---------
+    
+    Signed-off-by: CXY-Katrina <katrina.cxy@gmail.com>
+
+diff --git a/release_notes/fragments/20468.yaml b/release_notes/fragments/20468.yaml
+new file mode 100644
+index 000000000..782b9f867
+--- /dev/null
++++ b/release_notes/fragments/20468.yaml
+@@ -0,0 +1,4 @@
++pr: 20468
++entries:
++  - category: bugfix
++    text: Fixed MiniMax-M3 reasoning-end detection when prompt instructions or earlier turns contain thinking markers, preventing reasoning tags from leaking into streamed content and structured-output constraints from starting too early.
+diff --git a/tests/e2e/models/minimax_m3_reasoning_client.py b/tests/e2e/models/minimax_m3_reasoning_client.py
+new file mode 100644
+index 000000000..4578483b9
+--- /dev/null
++++ b/tests/e2e/models/minimax_m3_reasoning_client.py
+@@ -0,0 +1,98 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""Manually check a running MiniMax-M3 service before/after the parser patch.
++
++python tests/e2e/models/minimax_m3_reasoning_client.py \
++    --base-url http://127.0.0.1:11223/v1 --model minimax-m3.1-flash
++"""
++
++import argparse
++import json
++import urllib.request
++
++
++def check_completion(base_url, payload, streaming):
++    request = urllib.request.Request(
++        base_url.rstrip("/") + "/chat/completions",
++        data=json.dumps(dict(payload, stream=streaming)).encode(),
++        headers={"Content-Type": "application/json"},
++    )
++    reasoning, content = "", ""
++    finish_reason = None
++    with urllib.request.urlopen(request, timeout=300) as response:
++        if streaming:
++            for line in response:
++                line = line.decode().strip()
++                if not line.startswith("data:"):
++                    continue
++                data = line[5:].strip()
++                if data == "[DONE]":
++                    break
++                event = json.loads(data)
++                if "error" in event:
++                    raise RuntimeError(event["error"])
++                for choice in event.get("choices", []):
++                    delta = choice.get("delta", {})
++                    reasoning += delta.get("reasoning") or delta.get("reasoning_content") or ""
++                    content += delta.get("content") or ""
++                    finish_reason = choice.get("finish_reason") or finish_reason
++        else:
++            result = json.load(response)
++            choice = result["choices"][0]
++            reasoning = choice["message"].get("reasoning") or choice["message"].get("reasoning_content") or ""
++            content = choice["message"].get("content") or ""
++            finish_reason = choice["finish_reason"]
++    print(json.dumps(dict(stream=streaming, reasoning=reasoning, content=content, finish_reason=finish_reason)))
++    assert finish_reason == "stop", "Incomplete response; check generation budget/server logs"
++    assert content.strip(), "No visible answer"
++    assert "<mm:think>" not in content and "</mm:think>" not in content, "Reasoning markers leaked into content"
++    if "response_format" in payload:
++        assert json.loads(content) == {"answer": 391}
++    # A model may legitimately emit a leading closer with no reasoning. Report
++    # reasoning above instead of requiring a nonempty field for every request.
++
++
++def main():
++    parser = argparse.ArgumentParser(description=__doc__)
++    parser.add_argument("--base-url", default="http://127.0.0.1:11223/v1")
++    parser.add_argument("--model", default="minimax-m3.1-flash")
++    args = parser.parse_args()
++    single_turn = [{"role": "user", "content": "What is 17 * 23? Give only the number in your final answer."}]
++    multi_turn = [
++        {"role": "user", "content": "What is the capital of France?"},
++        {"role": "assistant", "content": "Paris."},
++        {"role": "user", "content": "And Germany?"},
++    ]
++    schema = {
++        "type": "json_schema",
++        "json_schema": {
++            "name": "answer",
++            "strict": True,
++            "schema": {
++                "type": "object",
++                "properties": {"answer": {"type": "integer"}},
++                "required": ["answer"],
++                "additionalProperties": False,
++            },
++        },
++    }
++    for name, messages, extra in (
++        ("single-turn", single_turn, {}),
++        ("multi-turn", multi_turn, {}),
++        ("structured-output", single_turn, {"response_format": schema}),
++    ):
++        print(name)
++        payload = dict(
++            model=args.model,
++            messages=messages,
++            max_tokens=4096,
++            temperature=0,
++            chat_template_kwargs={"reasoning_effort": "low"},
++            **extra,
++        )
++        for streaming in (False, True):
++            check_completion(args.base_url, payload, streaming)
++
++
++if __name__ == "__main__":
++    main()
+diff --git a/tests/ut/patch/platform/test_patch_minimax_m3_reasoning.py b/tests/ut/patch/platform/test_patch_minimax_m3_reasoning.py
+new file mode 100644
+index 000000000..1307e6c0c
+--- /dev/null
++++ b/tests/ut/patch/platform/test_patch_minimax_m3_reasoning.py
+@@ -0,0 +1,202 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++
++import runpy
++from pathlib import Path
++
++import pytest
++from vllm.reasoning.minimax_m3_reasoning_parser import MiniMaxM3ReasoningParser
++
++PATCH_PATH = Path(__file__).resolve().parents[4] / "vllm_ascend/patch/platform/patch_minimax_m3_reasoning.py"
++PROMPT = (
++    "]~b]system\nWrap reasoning in <mm:think></mm:think> tags or begin after </mm:think>.[e~[\n"
++    "]~b]user\nCapital of France?[e~[\n"
++    "]~b]ai\n</mm:think>Paris.[e~[\n"
++    "]~b]user\nAnd Germany?[e~[\n"
++    "]~b]ai\n"
++)
++
++
++class MiniMaxTokenizer:
++    """Tiny tokenizer; message boundary ID zero also checks truthiness errors."""
++
++    def __init__(self, message_boundary=True, split_markers=False):
++        self.special_tokens = (("]~b]",) if message_boundary else ()) + ("<mm:think>", "</mm:think>")
++        self.vocab = {token: i for i, token in enumerate(self.special_tokens)}
++        self.split_markers = split_markers
++
++    def get_vocab(self):
++        return self.vocab.copy()
++
++    def encode(self, text, **kwargs):
++        ids = []
++        while text:
++            token = text[0]
++            for special in self.special_tokens:
++                if text.startswith(special) and (special == "]~b]" or not self.split_markers):
++                    token = special
++                    break
++            ids.append(self.vocab.setdefault(token, len(self.vocab)))
++            text = text[len(token) :]
++        return ids
++
++    def decode(self, ids, **kwargs):
++        tokens = {value: key for key, value in self.vocab.items()}
++        return "".join(tokens[token_id] for token_id in ids)
++
++
++@pytest.fixture
++def patched_parser():
++    # Load only this patch, without unrelated device/platform initialization.
++    names = ("_last_message_ids", "is_reasoning_end", "is_reasoning_end_streaming")
++    originals = {name: getattr(MiniMaxM3ReasoningParser, name, None) for name in names}
++    namespace = runpy.run_path(str(PATCH_PATH))
++    try:
++        yield MiniMaxM3ReasoningParser, namespace
++    finally:
++        for name, original in originals.items():
++            if original is None:
++                delattr(MiniMaxM3ReasoningParser, name)
++            else:
++                setattr(MiniMaxM3ReasoningParser, name, original)
++
++
++@pytest.mark.parametrize("split_markers", [False, True])
++@pytest.mark.parametrize(
++    ("suffix", "expected"),
++    [("", False), ("<mm:think>ab", False), ("<mm:think>a</mm:think>", True), ("</mm:think>Berlin", True)],
++)
++def test_prompt_markers_do_not_end_reasoning(patched_parser, split_markers, suffix, expected):
++    parser_cls, _ = patched_parser
++    tokenizer = MiniMaxTokenizer(split_markers=split_markers)
++    parser = parser_cls(tokenizer)
++    assert parser.is_reasoning_end(tokenizer.encode(PROMPT + suffix)) is expected
++
++
++@pytest.mark.parametrize("split_markers", [False, True])
++def test_streaming_end_check_ignores_prompt_markers(patched_parser, split_markers):
++    parser_cls, _ = patched_parser
++    tokenizer = MiniMaxTokenizer(split_markers=split_markers)
++    parser = parser_cls(tokenizer)
++    open_ids = tokenizer.encode("<mm:think>ab")
++    closed_ids = tokenizer.encode("</mm:think>")
++    input_ids = tokenizer.encode(PROMPT) + open_ids
++    assert not parser.is_reasoning_end_streaming(input_ids, iter(open_ids[-1:]))
++    assert parser.is_reasoning_end_streaming(input_ids + closed_ids, iter(closed_ids))
++
++
++@pytest.mark.parametrize("message_boundary", [False, True])
++@pytest.mark.parametrize(
++    ("text", "expected"),
++    [("", False), ("<mm:think>", False), ("<mm:think>abc", False), ("</mm:think>", True)],
++)
++def test_output_only_ids_unchanged(patched_parser, message_boundary, text, expected):
++    parser_cls, _ = patched_parser
++    tokenizer = MiniMaxTokenizer(message_boundary=message_boundary)
++    parser = parser_cls(tokenizer)
++    ids = tokenizer.encode(text)
++    assert parser.is_reasoning_end(ids) is expected
++    assert parser.is_reasoning_end_streaming(ids, ids[-1:]) is expected
++
++
++def test_missing_boundary_token_preserves_prompt_behavior(patched_parser):
++    parser_cls, _ = patched_parser
++    tokenizer = MiniMaxTokenizer(message_boundary=False)
++    parser = parser_cls(tokenizer)
++    assert parser.is_reasoning_end(tokenizer.encode(PROMPT))
++
++
++def test_continued_message_and_empty_last_message(patched_parser):
++    parser_cls, _ = patched_parser
++    tokenizer = MiniMaxTokenizer()
++    parser = parser_cls(tokenizer)
++    assert parser.is_reasoning_end(tokenizer.encode("]~b]ai\n</mm:think>partial answer"))
++    ids = tokenizer.encode(PROMPT + "</mm:think>answer[e~[]~b]")
++    assert not parser.is_reasoning_end(ids)
++    assert not parser.is_reasoning_end_streaming(ids, [])
++
++
++@pytest.mark.parametrize(
++    "attribute", ["_reasoning_ended_streaming", "_reasoning_active_streaming", "_pending_marker_streaming"]
++)
++def test_streaming_state_takes_precedence(patched_parser, attribute, monkeypatch):
++    parser_cls, _ = patched_parser
++    tokenizer = MiniMaxTokenizer()
++    parser = parser_cls(tokenizer)
++    setattr(parser, attribute, True)
++    monkeypatch.setattr(parser, "_last_message_ids", lambda _: pytest.fail("State fast paths must not scan token IDs"))
++    ids = tokenizer.encode(PROMPT + "</mm:think>")
++    assert parser.is_reasoning_end_streaming(ids, []) is (attribute == "_reasoning_ended_streaming")
++
++
++def test_nonstreaming_extraction_unchanged(patched_parser):
++    parser_cls, _ = patched_parser
++    parser = parser_cls(MiniMaxTokenizer())
++    assert parser.extract_reasoning("<mm:think>plan</mm:think>Berlin", None) == ("plan", "Berlin")
++    assert parser.extract_reasoning("</mm:think>Berlin", None) == (None, "Berlin")
++
++
++@pytest.mark.parametrize(
++    ("chunks", "expected_reasoning"),
++    [(["<mm:think>", "plan", "</mm:think>", "Berlin"], "plan"), (["</mm:think>", "Berlin"], "")],
++)
++def test_streaming_extraction_after_prompt_check(patched_parser, chunks, expected_reasoning):
++    parser_cls, _ = patched_parser
++    tokenizer = MiniMaxTokenizer()
++    parser = parser_cls(tokenizer)
++    assert not parser.is_reasoning_end(tokenizer.encode(PROMPT))
++    previous_text = ""
++    previous_ids: list[int] = []
++    reasoning, content = "", ""
++    for chunk in chunks:
++        delta_ids = tokenizer.encode(chunk)
++        current_text, current_ids = previous_text + chunk, previous_ids + delta_ids
++        delta = parser.extract_reasoning_streaming(
++            previous_text, current_text, chunk, previous_ids, current_ids, delta_ids
++        )
++        if delta is not None:
++            reasoning += delta.reasoning or ""
++            content += delta.content or ""
++        previous_text, previous_ids = current_text, current_ids
++    assert reasoning == expected_reasoning
++    assert content == "Berlin"
++
++
++def test_missing_reasoning_token_still_raises(patched_parser):
++    parser_cls, _ = patched_parser
++    tokenizer = MiniMaxTokenizer()
++    del tokenizer.vocab["</mm:think>"]
++    with pytest.raises(RuntimeError, match="could not locate"):
++        parser_cls(tokenizer)
++
++
++def test_patch_is_idempotent(patched_parser):
++    parser_cls, namespace = patched_parser
++    methods = (parser_cls.is_reasoning_end, parser_cls.is_reasoning_end_streaming)
++    namespace["_patch_minimax_m3_reasoning"]()
++    runpy.run_path(str(PATCH_PATH))
++    assert (parser_cls.is_reasoning_end, parser_cls.is_reasoning_end_streaming) == methods
++
++
++def test_upstream_fix_is_not_overwritten(patched_parser, monkeypatch):
++    _, namespace = patched_parser
++
++    class FixedParser:
++        def _last_message_ids(self, input_ids):
++            return input_ids
++
++        def is_reasoning_end(self, input_ids):
++            return False
++
++        def is_reasoning_end_streaming(self, input_ids, delta_ids):
++            return False
++
++    patch = namespace["_patch_minimax_m3_reasoning"]
++    monkeypatch.setitem(patch.__globals__, "MiniMaxM3ReasoningParser", FixedParser)
++    methods = (FixedParser._last_message_ids, FixedParser.is_reasoning_end, FixedParser.is_reasoning_end_streaming)
++    patch()
++    assert (
++        FixedParser._last_message_ids,
++        FixedParser.is_reasoning_end,
++        FixedParser.is_reasoning_end_streaming,
++    ) == methods
+diff --git a/vllm_ascend/patch/__init__.py b/vllm_ascend/patch/__init__.py
+index 62ee03b30..9a3c908f9 100644
+--- a/vllm_ascend/patch/__init__.py
++++ b/vllm_ascend/patch/__init__.py
+@@ -211,6 +211,22 @@
+ #       a backend-neutral router configuration object or MoE factory extension
+ #       hook that carries vision routing metadata into the Ascend runner.
+ #
++# ** File: platform/patch_minimax_m3_reasoning.py **
++# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
++#   1. `vllm.reasoning.minimax_m3_reasoning_parser.MiniMaxM3ReasoningParser`
++#    Why:
++#       Prompt instructions and earlier assistant turns can contain </mm:think>.
++#       Treating these as the current turn's reasoning end leaks reasoning into
++#       streamed content and starts structured-output constraints too early.
++#    How:
++#       Scope both reasoning-end checks to tokens after the last ]~b] message
++#       boundary. Keep output-only IDs and non-streaming extraction unchanged.
++#       Skip the backport when the upstream helper already exists.
++#    Related PR (if no, explain why):
++#       https://github.com/vllm-project/vllm/pull/63492
++#    Future Plan:
++#       Remove when all supported vLLM versions include the upstream fix.
++#
+ # ** File: platform/patch_glm53_reasoning.py**
+ # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+ #   1. `vllm.parser.glm47_moe.Glm47MoeParser.__init__`
+diff --git a/vllm_ascend/patch/platform/__init__.py b/vllm_ascend/patch/platform/__init__.py
+index 7ce09f058..b8eca7e2b 100644
+--- a/vllm_ascend/patch/platform/__init__.py
++++ b/vllm_ascend/patch/platform/__init__.py
+@@ -20,6 +20,7 @@ import vllm_ascend.patch.platform.patch_distributed  # noqa
+ import vllm_ascend.patch.platform.patch_glm53_reasoning  # noqa
+ import vllm_ascend.patch.platform.patch_kv_cache_utils  # noqa
+ import vllm_ascend.patch.platform.patch_mamba_block_aligned_split  # noqa
++import vllm_ascend.patch.platform.patch_minimax_m3_reasoning  # noqa
+ import vllm_ascend.patch.platform.patch_mla_prefill_backend  # noqa
+ import vllm_ascend.patch.platform.patch_parallel_config  # noqa
+ import vllm_ascend.patch.platform.patch_pp_mtp  # noqa
+diff --git a/vllm_ascend/patch/platform/patch_minimax_m3_reasoning.py b/vllm_ascend/patch/platform/patch_minimax_m3_reasoning.py
+new file mode 100644
+index 000000000..f124653b7
+--- /dev/null
++++ b/vllm_ascend/patch/platform/patch_minimax_m3_reasoning.py
+@@ -0,0 +1,50 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""Backport vllm-project/vllm#63492 to the MiniMax-M3 reasoning parser.
++
++Remove when all supported vLLM versions include the upstream fix.
++"""
++
++from collections.abc import Iterable, Sequence
++from functools import wraps
++
++from vllm.reasoning.minimax_m3_reasoning_parser import MiniMaxM3ReasoningParser
++
++
++def _last_message_ids(self: MiniMaxM3ReasoningParser, input_ids: Sequence[int]) -> Sequence[int]:
++    # Every message, including the generation prompt, starts with ]~b].
++    # Earlier messages may contain reasoning markers in instructions or history.
++    message_begin_token_id = self.vocab.get("]~b]")
++    if message_begin_token_id is not None:
++        for i in range(len(input_ids) - 1, -1, -1):
++            if input_ids[i] == message_begin_token_id:
++                return input_ids[i + 1 :]
++    return input_ids
++
++
++def _patch_minimax_m3_reasoning() -> None:
++    # Upstream #63492 introduces this helper alongside both end-check fixes.
++    # Also makes repeated application of this backport a no-op.
++    if hasattr(MiniMaxM3ReasoningParser, "_last_message_ids"):
++        return
++
++    original_is_reasoning_end = MiniMaxM3ReasoningParser.is_reasoning_end
++    original_is_reasoning_end_streaming = MiniMaxM3ReasoningParser.is_reasoning_end_streaming
++
++    @wraps(original_is_reasoning_end)
++    def is_reasoning_end(self, input_ids: Sequence[int]) -> bool:
++        return original_is_reasoning_end(self, self._last_message_ids(input_ids))
++
++    @wraps(original_is_reasoning_end_streaming)
++    def is_reasoning_end_streaming(self, input_ids: Sequence[int], delta_ids: Iterable[int]) -> bool:
++        # Preserve upstream's state fast paths before scanning accumulated IDs.
++        if not (self._reasoning_ended_streaming or self._reasoning_active_streaming or self._pending_marker_streaming):
++            input_ids = self._last_message_ids(input_ids)
++        return original_is_reasoning_end_streaming(self, input_ids, delta_ids)
++
++    MiniMaxM3ReasoningParser._last_message_ids = _last_message_ids
++    MiniMaxM3ReasoningParser.is_reasoning_end = is_reasoning_end
++    MiniMaxM3ReasoningParser.is_reasoning_end_streaming = is_reasoning_end_streaming
++
++
++_patch_minimax_m3_reasoning()

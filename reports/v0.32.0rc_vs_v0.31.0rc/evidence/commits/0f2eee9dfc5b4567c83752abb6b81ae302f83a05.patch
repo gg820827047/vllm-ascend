@@ -1,0 +1,799 @@
+commit 0f2eee9dfc5b4567c83752abb6b81ae302f83a05
+Author:     YuhanBai <yuhan.bai0830@gmail.com>
+AuthorDate: Sat Oct 31 14:38:55 2026 +0800
+Commit:     GitHub <noreply@github.com>
+CommitDate: Sat Oct 31 14:38:55 2026 +0800
+
+    [BugFix] Fix request-major sampling masks for speculative decoding on Ascend (#19866)
+    
+    ### What this PR does / why we need it?
+    
+    Fix Ascend sampling-mask packing for the upstream request-major API. A
+    speculative-decoding request can commit multiple tokens in one round,
+    and each token needs the mask from its corresponding logits row. The
+    previous one-row-per-request implementation cannot accept the updated
+    arguments or represent these outputs correctly.
+    
+    This PR accepts `cu_num_logits` and `rows_per_request`, reads row
+    `cu_num_logits[req_idx] + slot_idx`, and allocates `num_requests *
+    rows_per_request` output slots. Inactive slots receive zero
+    masks/counts. Device-side offsets and sampled counts remain dynamic
+    during graph replay, without adding host synchronization.
+    
+    It preserves the zero-width compact-token-ID fallback and its
+    explanatory comments, so upstream decodes the exact packed mask. It also
+    adds integration coverage adapted from upstream
+    `test_replay_on_off_preserves_rejection_sampling_and_rng`.
+    
+    ### Does this PR introduce _any_ user-facing change?
+    
+    Yes, it corrects existing sampling-mask replay behavior with the
+    request-major upstream API, including multiple committed tokens during
+    speculative decoding. There are no new configuration options, response
+    fields or schema changes.
+    
+    This revision targets the API exercised with vLLM 0.32.0 and vLLM main
+    at 544f182d9f0c9bfe8bd7645525951d5e3692a542.
+    
+    ### How was this patch tested?
+    
+    **Functional NPU regression: 36 passed, 0 failed, 0 skipped.**
+    
+    The pushed implementation was validated on Ascend950DT. The 28 packing
+    cases cover ragged request-major offsets, inactive slots, empty batches,
+    invalid row counts, nonfinite logits, non-contiguous input, chunk
+    concatenation/slicing, processed top-k/top-p support and graph replay
+    with updated device metadata.
+    
+    The 8 rejection/RNG integration cases use real Ascend
+    rejection-sampling, logprob and packing kernels. They cover immediate
+    rejection, rejection at the second draft position and full acceptance,
+    with single/chunked verification, two seed configurations and two
+    logprob settings. Replay on/off preserves committed tokens, counts,
+    valid logprobs, selected ranks and global NPU RNG state without
+    resetting RNG between passes; emitted masks match finite processed-logit
+    supports.
+    
+    Reproduce from the vLLM-Ascend checkout with the patch applied:
+    
+    ```bash
+    python -m pytest -v \
+      tests/e2e/nightly/single_node/ops/singlecard_ops/triton/test_sampling_mask.py
+    ```
+    
+    **End-to-end server scripts and observed outputs (MTP off/on).**
+    
+    These are the successful results fromvLLM `0.32.0+empty` .
+    
+    **MTP disabled — `start_non_mtp.sh`:**
+    
+    ```bash
+    #!/bin/bash
+    export VLLM_USE_V2_MODEL_RUNNER=1
+    export HCCL_BUFFSIZE=512
+    
+    vllm serve /data/Qwen3.5-35B-A3B \
+     --served-model-name auto \
+     --max-num-seqs 64 \
+     --max-model-len 4096 --max-num-batched-tokens 2048 \
+     --trust-remote-code \
+     --tensor-parallel-size 2 \
+     --data-parallel-size 1 \
+     --host 127.0.0.1 \
+     --port 21006 \
+     --enable-expert-parallel \
+     --gpu-memory-utilization 0.9 \
+     --logprobs-mode processed_logprobs --max-logprobs 256 \
+     --enable-scale-out \
+     --return-sampling-mask \
+     --compilation-config '{"cudagraph_mode":"FULL_DECODE_ONLY"}' 2>&1 | tee server.non_mtp.log
+    ```
+    
+    **MTP enabled — `start_mtp.sh`:**
+    
+    ```bash
+    #!/bin/bash
+    export VLLM_USE_V2_MODEL_RUNNER=1
+    export HCCL_BUFFSIZE=512
+    
+    vllm serve /data/Qwen3.5-35B-A3B \
+     --served-model-name auto \
+     --max-num-seqs 64 \
+     --max-model-len 4096 \
+     --max-num-batched-tokens 2048 \
+     --trust-remote-code \
+     --tensor-parallel-size 2 \
+     --data-parallel-size 1 \
+     --host 127.0.0.1 \
+     --port 21007 \
+     --enable-expert-parallel \
+     --gpu-memory-utilization 0.9 \
+     --logprobs-mode processed_logprobs --max-logprobs 256 \
+     --enable-scale-out \
+     --return-sampling-mask \
+     --compilation-config '{"cudagraph_mode":"FULL_DECODE_ONLY"}' \
+     --cudagraph-capture-sizes 3 6 12 24 48 96 192 \
+     --speculative-config '{"method":"mtp","num_speculative_tokens":2,"enable_adaptive_verification":false}' 2>&1 | tee server.mtp.log
+    ```
+    
+    **Client request**, after the selected service becomes healthy:
+    
+    ```bash
+    cat > request.json <<'JSON'
+    {
+      "token_ids": [
+        785,
+        6722,
+        315,
+        9625,
+        374
+      ],
+      "sampling_params": {
+        "temperature": 1.0,
+        "top_k": 20,
+        "top_p": 1.0,
+        "max_tokens": 32,
+        "logprobs": 256,
+        "seed": 7,
+        "ignore_eos": true
+      },
+      "output_mode": "tokens",
+      "stream": false
+    }
+    JSON
+    
+    # MTP disabled: run against the first service.
+    curl -sS -X POST http://127.0.0.1:21006/inference/v1/generate \
+      -H 'Content-Type: application/json' \
+      --data-binary @request.json -o response.non_mtp.json
+    
+    # After switching to the MTP-enabled service:
+    curl -sS -X POST http://127.0.0.1:21007/inference/v1/generate \
+      -H 'Content-Type: application/json' \
+      --data-binary @request.json -o response.mtp.json
+    ```
+    
+    **Operator performance.**
+    
+    The baseline is the optimized Ascend implementation from #17193.
+    
+    Only the seven published #17193 configurations were used. I reran the
+    current PR for 10 rounds per configuration (70 new rounds), using the
+    same input construction and msprof settings as the retained baseline
+    measurements. Every application passed exact packed-mask/count checks
+    against an independent CPU reference.
+    
+    Hardware: Ascend950DT; vLLM `0.32.0+empty`, torch-npu `2.10.0.post7`,
+    Triton-Ascend `3.6.0`, and CANN `9.2.0-B100` toolkit/ATB environment.
+    All sampled current/rated frequencies were 1650.
+    
+    Measurements are mean target-kernel `Task Duration(us)`, excluding
+    Python wrappers, allocation, input preparation and the pre-kernel
+    contiguous copy. msprof settings: `launch-count=10`,
+    `launch-skip-before-match=6`, `warm-up=5`, and
+    `MemoryDetail,Occupancy,PipeUtilization,Roofline`. The input values were
+    reconstructed from the public configurations; #17193 did not publish its
+    complete profiling inputs.
+    
+    | Case | #17193 baseline (µs) | Current PR (µs) | Change |
+    | --- | ---: | ---: | ---: |
+    | b1_v17_active1_colstride1_rows1 | 3.138 | 3.382 | +7.77% |
+    | b8_v8191_active1_colstride1_rows1 | 6.256 | 6.147 | -1.74% |
+    | b8_v8192_active1_colstride1_rows1 | 5.625 | 5.622 | -0.05% |
+    | b8_v8193_active1_colstride1_rows1 | 6.999 | 6.905 | -1.34% |
+    | b8_v8193_active0_colstride1_rows1 | 6.993 | 6.456 | -7.68% |
+    | b32_v151936_active1_colstride2_rows1 | 55.587 | 54.774 | -1.46% |
+    | b128_v151936_active1_colstride1_rows1 | 106.454 | 104.746 | -1.61% |
+    
+    Change = `(current PR / baseline - 1) × 100%`; positive means slower.
+    B1/V17 is +7.77% in this cross-batch comparison (about 0.244 µs). The
+    two V151936 cases are -1.46% and -1.61%.
+    The seven current-PR runs completed successfully and passed their
+    independent correctness checks.
+    
+    ---
+    
+    ### Checklist
+    
+    #### Testing
+    
+    - [x] **Boundary / edge-case coverage**: Empty batches, inactive slots,
+    ragged offsets, packing boundaries and strided inputs.
+    - [x] **Regression test**: Request-major packing and integrated replay
+    on/off rejection-sampling/RNG coverage.
+    - [x] **Error / failure path coverage**: Invalid `rows_per_request` and
+    forced rejection paths.
+    - [x] **Meaningful & reliable tests**: Real NPU behavior checked against
+    independent expectations and replay-disabled execution.
+    - [ ] **Performance impact**: Manual hardware results are provided
+    above; an automated performance regression gate has not been
+    added/configured.
+    
+    
+    - vLLM main:
+    https://github.com/vllm-project/vllm/commit/544f182d9f0c9bfe8bd7645525951d5e3692a542
+    
+    ---------
+    
+    Signed-off-by: YuhanBai <yuhan.bai0830@gmail.com>
+
+diff --git a/tests/e2e/nightly/single_node/ops/singlecard_ops/triton/test_sampling_mask.py b/tests/e2e/nightly/single_node/ops/singlecard_ops/triton/test_sampling_mask.py
+index c567526dc..8b3846f74 100644
+--- a/tests/e2e/nightly/single_node/ops/singlecard_ops/triton/test_sampling_mask.py
++++ b/tests/e2e/nightly/single_node/ops/singlecard_ops/triton/test_sampling_mask.py
+@@ -1,7 +1,8 @@
+ # SPDX-License-Identifier: Apache-2.0
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+-"""Regression tests for sampling-mask packing on non-contiguous logits."""
++"""Regression tests for request-major sampling masks on Ascend."""
+ 
++import numpy as np
+ import pytest
+ import torch
+ from vllm.config import VllmConfig
+@@ -14,30 +15,24 @@ from vllm_ascend.device.hardware import AscendDeviceType
+ from vllm_ascend.ops.triton.triton_utils import init_device_properties_triton
+ from vllm_ascend.ops.triton.v2.sample.sampling_mask import sampling_mask_from_logits_npu
+ 
+-_HAS_COMPACT_IDS = "token_ids" in SamplingMaskTensors._fields
+ 
+-
+-def _from_logits(logits, num_sampled_tokens, max_num_kept=512):
+-    if _HAS_COMPACT_IDS:
+-        return sampling_mask_from_logits_npu(
+-            SamplingMaskTensors,
+-            logits,
+-            num_sampled_tokens,
+-            max_num_kept=max_num_kept,
+-        )
++def _from_logits(logits, num_sampled_tokens, max_num_kept=512, cu_num_logits=None, rows_per_request=1):
++    if cu_num_logits is None:
++        cu_num_logits = torch.arange(len(num_sampled_tokens) + 1, dtype=torch.int32, device=logits.device)
+     return sampling_mask_from_logits_npu(
+         SamplingMaskTensors,
+         logits,
++        cu_num_logits,
+         num_sampled_tokens,
++        max_num_kept,
++        rows_per_request,
+     )
+ 
+ 
+ def _to_nested_list(tensors, num_sampled_tokens):
+     cpu_tensors = tensors.to_cpu_nonblocking()
+     torch.npu.synchronize()
+-    if _HAS_COMPACT_IDS:
+-        assert tensors.token_ids.shape == (len(num_sampled_tokens), 0)
+-        return cpu_tensors.tolists().to_nested_list()
++    assert tensors.token_ids.shape == (len(num_sampled_tokens) * tensors.rows_per_request, 0)
+     return cpu_tensors.tolists(num_sampled_tokens.cpu().numpy()).to_nested_list()
+ 
+ 
+@@ -62,7 +57,7 @@ def test_sampling_mask_matches_finite_support(max_num_kept):
+ 
+     num_sampled = torch.ones(len(sizes), dtype=torch.int32)
+     num_sampled[[1, 9]] = 0
+-    num_sampled[-1] = 2
++    num_sampled[-1] = 1
+     expected[1] = expected[9] = []
+     sampled_flags = num_sampled.tolist()
+ 
+@@ -83,11 +78,151 @@ def test_sampling_mask_matches_finite_support(max_num_kept):
+     )
+ 
+     result = _to_nested_list(tensors, num_sampled)
+-    if not _HAS_COMPACT_IDS:
+-        expected = [row for row, sampled in zip(expected, sampled_flags) if sampled]
+     assert result == expected
+ 
+ 
++def _ragged_logits(vocab_size, rows_per_request, strided=False):
++    spans = [rows_per_request + 2, rows_per_request, rows_per_request + 3, 0]
++    cu = np.array([2, *[2 + sum(spans[:i]) for i in range(1, 5)]], dtype=np.int32)
++    sampled = np.array([rows_per_request, rows_per_request - 1, 0, 0], dtype=np.int32)
++    cpu = torch.full((int(cu[-1]), vocab_size), -float("inf"))
++    for row in range(cpu.shape[0]):
++        indices = (torch.arange(min(vocab_size, 23)) * 97 + row * 13) % vocab_size
++        cpu[row, indices] = 1.0
++    cpu[int(cu[0]) + rows_per_request - 1] = 0.0
++    if vocab_size > 9:
++        cpu[int(cu[0]), 0] = float("nan")
++        cpu[int(cu[0]), 1] = float("inf")
++    if strided:
++        base = torch.empty((cpu.shape[0], vocab_size * 2), device="npu")
++        logits = base[:, ::2]
++        logits.copy_(cpu.to("npu"))
++    else:
++        logits = cpu.to("npu")
++    return logits, cpu, cu, sampled
++
++
++def _assert_request_major(tensors, cpu_logits, cu, sampled):
++    rows_per_request = tensors.rows_per_request
++    expected_rows = []
++    for req in range(len(sampled)):
++        for slot in range(rows_per_request):
++            if slot < sampled[req]:
++                source = cpu_logits[int(cu[req]) + slot].numpy()
++                expected_rows.append(np.flatnonzero(np.isfinite(source)).tolist())
++            else:
++                expected_rows.append([])
++    cpu = tensors.to_cpu_nonblocking()
++    torch.npu.synchronize()
++    assert cpu.token_ids.shape == (len(sampled) * rows_per_request, 0)
++    assert cpu.counts.tolist() == [len(row) for row in expected_rows]
++    bits = np.unpackbits(cpu.packed_mask.numpy(), axis=1, count=cpu.vocab_size, bitorder="little")
++    assert [np.flatnonzero(row).tolist() for row in bits] == expected_rows
++    csr = cpu.tolists(sampled)
++    if rows_per_request == 1:
++        expected = expected_rows
++        assert csr.cu_num_generated_tokens is None
++    else:
++        expected = [
++            expected_rows[req * rows_per_request + slot]
++            for req in range(len(sampled))
++            for slot in range(int(sampled[req]))
++        ]
++        assert csr.cu_num_generated_tokens == np.cumsum(np.r_[0, sampled]).tolist()
++    assert csr.to_nested_list() == expected
++    for req, count in enumerate(sampled):
++        for kept in range(int(count) + 1):
++            wanted = expected_rows[req * rows_per_request : req * rows_per_request + kept]
++            assert csr.slice_request(req, kept).to_nested_list() == wanted
++
++
++@pytest.mark.skipif(
++    get_ascend_device_type() not in (AscendDeviceType.A2, AscendDeviceType.A3, AscendDeviceType.A5),
++    reason="Requires Ascend A2/A3/A5",
++)
++@pytest.mark.parametrize("rows_per_request", [1, 2, 4])
++@pytest.mark.parametrize("vocab_size", [9, 4097, 248320])
++@pytest.mark.parametrize("strided", [False, True])
++def test_sampling_mask_request_major_ragged_rows(rows_per_request, vocab_size, strided):
++    """Counts select committed slots; row offsets may contain gaps and empty spans."""
++    init_device_properties_triton()
++    logits, cpu, cu, sampled = _ragged_logits(vocab_size, rows_per_request, strided)
++    tensors = _from_logits(
++        logits,
++        torch.from_numpy(sampled).to("npu"),
++        max_num_kept=8,
++        cu_num_logits=torch.from_numpy(cu).to("npu"),
++        rows_per_request=rows_per_request,
++    )
++    assert tensors.rows_per_request == rows_per_request
++    _assert_request_major(tensors, cpu, cu, sampled)
++
++
++@pytest.mark.skipif(
++    get_ascend_device_type() not in (AscendDeviceType.A2, AscendDeviceType.A3, AscendDeviceType.A5),
++    reason="Requires Ascend A2/A3/A5",
++)
++def test_sampling_mask_request_major_chunk_cat():
++    """Chunk-local request metadata retains offsets into the shared logits tensor."""
++    init_device_properties_triton()
++    logits, cpu, cu, sampled = _ragged_logits(4097, 3)
++    chunks = []
++    for lo, hi in [(0, 1), (1, 4)]:
++        chunks.append(
++            _from_logits(
++                logits,
++                torch.from_numpy(sampled[lo:hi]).to("npu"),
++                cu_num_logits=torch.from_numpy(cu[lo : hi + 1]).to("npu"),
++                rows_per_request=3,
++            )
++        )
++    _assert_request_major(SamplingMaskTensors.cat(chunks), cpu, cu, sampled)
++
++
++@pytest.mark.skipif(
++    get_ascend_device_type() not in (AscendDeviceType.A2, AscendDeviceType.A3, AscendDeviceType.A5),
++    reason="Requires Ascend A2/A3/A5",
++)
++def test_sampling_mask_empty_request_batch():
++    tensors = _from_logits(
++        torch.empty((0, 9), device="npu"),
++        torch.empty(0, dtype=torch.int32, device="npu"),
++        cu_num_logits=torch.zeros(1, dtype=torch.int32, device="npu"),
++        rows_per_request=3,
++    )
++    assert tensors.packed_mask.shape == (0, 2)
++    assert tensors.counts.shape == (0,)
++    assert tensors.rows_per_request == 3
++    assert _to_nested_list(tensors, torch.empty(0, dtype=torch.int32, device="npu")) == []
++
++
++@pytest.mark.skipif(
++    get_ascend_device_type() not in (AscendDeviceType.A2, AscendDeviceType.A3, AscendDeviceType.A5),
++    reason="Requires Ascend A2/A3/A5",
++)
++def test_sampling_mask_graph_replay_updates_row_metadata():
++    """A captured layout must read new device offsets/counts on replay."""
++    init_device_properties_triton()
++    logits, cpu, cu, sampled = _ragged_logits(4097, 3)
++    cu_device = torch.from_numpy(cu).to("npu")
++    sampled_device = torch.from_numpy(sampled).to("npu")
++    for _ in range(3):
++        _from_logits(logits, sampled_device, cu_num_logits=cu_device, rows_per_request=3)
++    torch.npu.synchronize()
++    graph = torch.npu.NPUGraph()
++    with torch.npu.graph(graph):
++        tensors = _from_logits(logits, sampled_device, cu_num_logits=cu_device, rows_per_request=3)
++    graph.replay()
++    _assert_request_major(tensors, cpu, cu, sampled)
++    changed_cu = cu.copy()
++    changed_cu[0] += 1
++    changed_sampled = np.array([1, 2, 1, 0], dtype=np.int32)
++    cu_device.copy_(torch.from_numpy(changed_cu))
++    sampled_device.copy_(torch.from_numpy(changed_sampled))
++    graph.replay()
++    _assert_request_major(tensors, cpu, changed_cu, changed_sampled)
++
++
+ @pytest.mark.skipif(
+     get_ascend_device_type() not in (AscendDeviceType.A2, AscendDeviceType.A3, AscendDeviceType.A5),
+     reason="Requires Ascend A2/A3/A5",
+@@ -157,9 +292,6 @@ def test_sampling_mask_non_contiguous_vocab_dimension():
+     )
+     expected_ids = list(range(64))
+     result = _to_nested_list(tensors, num_sampled)
+-    if _HAS_COMPACT_IDS:
+-        expected = [expected_ids, [], expected_ids, []]
+-    else:
+-        expected = [expected_ids] * 2
++    expected = [expected_ids, [], expected_ids, []]
+ 
+     assert result == expected
+diff --git a/vllm_ascend/ops/triton/docs/v2/sample/sampling_mask.md b/vllm_ascend/ops/triton/docs/v2/sample/sampling_mask.md
+index 6c0f26146..a423c51b4 100644
+--- a/vllm_ascend/ops/triton/docs/v2/sample/sampling_mask.md
++++ b/vllm_ascend/ops/triton/docs/v2/sample/sampling_mask.md
+@@ -2,34 +2,37 @@
+ 
+ ## Description
+ 
+-- **Function**: identifies finite logits for active requests, packs the boolean
+-  keep mask into bytes, and counts the kept vocabulary entries.
++- **Function**: identifies finite logits for committed tokens, packs the boolean
++  keep mask into request-major output rows, and counts the kept vocabulary entries.
+ - **Python entry point**: `sampling_mask_from_logits_npu` in
+   `vllm_ascend/ops/triton/v2/sample/sampling_mask.py`.
+ - **Triton kernel**: `_pack_sampling_mask_kernel_ascend`.
+ - **Integration**: `vllm_ascend/patch/worker/patch_triton.py` binds the
+   wrapper directly as `SamplingMaskTensors.from_logits`.
+ 
+-For request row `r` and vocabulary index `i`, the keep condition is:
++For request `r`, output slot `s` and vocabulary index `i`, the keep condition is:
+ 
+ ```text
+-keep[r, i] = isfinite(logits[r, i]) and num_sampled_tokens[r] > 0
++output_row = r * rows_per_request + s
++source_row = cu_num_logits[r] + s
++is_active = s < num_sampled_tokens[r]
++keep[output_row, i] = is_active and isfinite(logits[source_row, i])
+ ```
+ 
+-The output bit layout shared by both supported interfaces is:
++The output bit layout is:
+ 
+ ```text
+-packed_mask[r, i // 8] bit (i % 8) = keep[r, i]
+-counts[r] = sum_i keep[r, i]
++packed_mask[output_row, i // 8] bit (i % 8) = keep[output_row, i]
++counts[output_row] = sum_i keep[output_row, i]
+ ```
+ 
+-An inactive request therefore has a zero mask and a zero count. Vocabulary
+-tails that are not divisible by eight are masked and do not contribute bits or
+-counts.
++An inactive slot has a zero mask and count. Its logits load is masked and
++filled with negative infinity, so slots without a source row are not read.
++Vocabulary tails that are not divisible by eight do not contribute bits or counts.
+ 
+ ## Data flow
+ 
+-The kernel processes one request per Triton program and scans its vocabulary in
++The kernel processes one reserved output row per Triton program and scans its vocabulary in
+ 4096-element blocks:
+ 
+ ```text
+@@ -54,27 +57,32 @@ non-contiguous vocabulary input.
+ 
+ ## Parameters and outputs
+ 
++`num_output_rows = num_reqs * rows_per_request`. Source logits may have a
++different row count, with each request starting at its cumulative offset.
++
+ | Name | Input/Output/Attribute | Shape | Data type | Description |
+ | --- | --- | --- | --- | --- |
+-| `logits` | Input | `[num_reqs, vocab_size]` | floating point | Per-request logits. NaN, `+inf`, and `-inf` entries are excluded. |
+-| `num_sampled_tokens` | Input | `[num_reqs]` | integer | A row is active only when its value is greater than zero. |
+-| `packed_mask` | Output | `[num_reqs, ceil(vocab_size / 8)]` | uint8 | Little-bit-order packed finite-logit mask. |
+-| `counts` | Output | `[num_reqs]` | int32 | Number of set bits in each row. |
++| `logits` | Input | `[num_logits, vocab_size]` | floating point | Processed logits. NaN, `+inf`, and `-inf` entries are excluded. |
++| `cu_num_logits` | Input | `[num_reqs + 1]` or longer | integer | Cumulative source-row offsets; chunk offsets may start above zero. |
++| `num_sampled_tokens` | Input | `[num_reqs]` | integer | Committed-token count per request; slots below this count are active. |
++| `max_num_kept` | Attribute | scalar | Python int | Accepted for upstream compatibility; compact IDs remain unsupported. |
++| `rows_per_request` | Attribute/Output metadata | scalar | Python int | Reserved slots per request; defaults to 1 and is retained for decoding. |
++| `token_ids` | Output | `[num_output_rows, 0]` | int32 | Zero-width buffer selecting exact packed-mask decoding. |
++| `packed_mask` | Output | `[num_output_rows, ceil(vocab_size / 8)]` | uint8 | Little-bit-order packed finite-logit mask. |
++| `counts` | Output | `[num_output_rows]` | int32 | Number of set bits in each row. |
+ | `vocab_size` | Output metadata | scalar | Python int | Original vocabulary size used when unpacking the mask. |
+ 
+-The wrapper accepts both dependency-baseline calling conventions:
++The wrapper follows the upstream request-major calling convention:
+ 
+ ```text
+-SamplingMaskTensors.from_logits(logits, num_sampled_tokens)
+-SamplingMaskTensors.from_logits(logits, num_sampled_tokens, max_num_kept)
++SamplingMaskTensors.from_logits(
++    logits, cu_num_logits, num_sampled_tokens, max_num_kept, rows_per_request=1)
+ ```
+ 
+-Without `max_num_kept`, it returns the three-field
+-`SamplingMaskTensors(packed_mask, counts, vocab_size)`. When the argument is
+-provided, it returns the four-field
+-`SamplingMaskTensors(token_ids, packed_mask, counts, vocab_size)` with a
+-zero-width `token_ids` tensor. The upstream `tolists()` method consequently
+-uses the exact packed mask for every non-empty row.
++It returns the five-field
++`SamplingMaskTensors(token_ids, packed_mask, counts, vocab_size, rows_per_request)`
++with zero-width `token_ids`. The upstream `tolists()` method consequently uses
++exact packed-mask decoding for non-empty rows.
+ 
+ Compact token-ID generation is temporarily unsupported on Ascend because its
+ `tl.cumsum`-based dynamic scatter can hang with Triton-Ascend 3.2.2. The wrapper
+@@ -98,7 +106,11 @@ inputs are passed through without a copy.
+ 
+ ## Constraints
+ 
+-- `logits` is a rank-2 tensor and `num_sampled_tokens` has one entry per row.
++- The caller supplies rank-2 `logits`, rank-1 sampled counts with one entry per
++  request, and rank-1 cumulative offsets with at least `num_reqs + 1` entries.
++- The caller ensures positive integer `rows_per_request`, valid logits spans,
++  and committed counts bounded by both the reserved slots and the span length.
++  The wrapper follows upstream without extra type, rank or offset-length checks.
+ - The operator is inference-only and has no backward path.
+ - The vocabulary size may be non-aligned to both 4096 elements and eight bits;
+   masked tail lanes are supported.
+@@ -107,10 +119,10 @@ inputs are passed through without a copy.
+   provide the required integer count on affected Triton-Ascend versions.
+ - The wrapper-level contiguous copy is separate from the Triton kernel launch;
+   kernel-only profiling does not include that copy cost.
+-- Both the release dependency's three-field bitmask interface and the verified
+-  main dependency's four-field compact-ID plus bitmask interface are supported.
+-  Supplying `max_num_kept` selects the four-field return structure; both
+-  interfaces launch `_pack_sampling_mask_kernel_ascend`.
++- The upstream request-major API and five-field return structure are required;
++  legacy three-/four-field interface adapters are not provided.
++- Empty batches skip the kernel launch. Device-side offsets/counts can change
++  during graph replay while the captured layouts and `rows_per_request` stay fixed.
+ 
+ ## Origin and differences
+ 
+@@ -124,9 +136,9 @@ inputs are passed through without a copy.
+ - **Performance adaptation**: replaces per-element variable shifts and a
+   scalar-heavy `[512, 8]` axis-1 reduction with an `[8, 512]` vector reduction
+   using compile-time bit weights.
+-- The packed bit order, active-row semantics, count values, and final decoded
+-  token IDs are unchanged. The four-field structure remains compatible, while
+-  its compact `token_ids` optimization is replaced by the exact bitmask fallback.
++- The packed bit order, finite-support counts and final decoded token IDs are
++  unchanged. Request-major row mapping additionally supports multiple committed
++  tokens; the compact `token_ids` optimization remains an exact bitmask fallback.
+ 
+ ## Test cases
+ 
+@@ -135,9 +147,9 @@ over-2048, full-vocabulary, randomly sparse, and inactive rows with a vocabulary
+ size not divisible by eight. It also mirrors vLLM v0.29.0's processed top-k and
+ top-p support test, retains the large stride-2 UB-overflow regression, adds NaN
+ and positive infinity exclusions, checks exact counts and decoded token IDs,
+-and verifies that the caller's non-contiguous `logits` view is unchanged. With
+-the later four-field main interface, it additionally validates the zero-width
+-compact buffer and exact bitmask fallback.
++and verifies that the caller's non-contiguous `logits` view is unchanged.
++Request-major cases also cover ragged offsets, inactive slots, empty batches,
++concatenation/slicing and graph replay with updated device metadata.
+ 
+ ```bash
+ pytest -sv tests/e2e/nightly/single_node/ops/singlecard_ops/triton/test_sampling_mask.py
+diff --git a/vllm_ascend/ops/triton/v2/sample/sampling_mask.py b/vllm_ascend/ops/triton/v2/sample/sampling_mask.py
+index 75924c74f..1133400e7 100644
+--- a/vllm_ascend/ops/triton/v2/sample/sampling_mask.py
++++ b/vllm_ascend/ops/triton/v2/sample/sampling_mask.py
+@@ -1,6 +1,6 @@
+ # SPDX-License-Identifier: Apache-2.0
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+-"""Ascend compatibility kernel for sampling-mask packing."""
++"""Ascend kernel for request-major sampling-mask packing."""
+ 
+ from __future__ import annotations
+ 
+@@ -14,6 +14,7 @@ if TYPE_CHECKING:
+     from vllm.v1.worker.gpu.sample.output import SamplingMaskTensors
+ 
+ _BLOCK_SIZE = 4096
++_BITS_PER_BYTE = 8
+ 
+ 
+ @triton.jit
+@@ -21,91 +22,99 @@ def _pack_sampling_mask_kernel_ascend(
+     logits_ptr,
+     logits_row_stride,
+     logits_col_stride,
++    cu_num_logits_ptr,
+     num_sampled_tokens_ptr,
+     packed_mask_ptr,
+     packed_mask_row_stride,
+     counts_ptr,
+     vocab_size,
++    ROWS_PER_REQUEST: tl.constexpr,
+     BLOCK_SIZE: tl.constexpr,
+ ):
+-    req_idx = tl.program_id(0)
+-    is_active = tl.load(num_sampled_tokens_ptr + req_idx) > 0
++    output_row = tl.program_id(0)
++    req_idx = output_row // ROWS_PER_REQUEST
++    slot_idx = output_row % ROWS_PER_REQUEST
++    is_active = slot_idx < tl.load(num_sampled_tokens_ptr + req_idx)
++    source_row = tl.load(cu_num_logits_ptr + req_idx) + slot_idx
+     count = tl.zeros((), dtype=tl.int32)
+ 
+     for start_idx in range(0, vocab_size, BLOCK_SIZE):
+         offsets = start_idx + tl.arange(0, BLOCK_SIZE)
+-        valid = offsets < vocab_size
++        # Guard the load: inactive slots may have no source logits row.
++        load_mask = (offsets < vocab_size) & is_active
+         logits = tl.load(
+-            logits_ptr + req_idx * logits_row_stride + offsets * logits_col_stride,
+-            mask=valid,
++            logits_ptr + source_row * logits_row_stride + offsets * logits_col_stride,
++            mask=load_mask,
+             other=-float("inf"),
+         )
+-        keep = (logits > -float("inf")) & (logits < float("inf")) & is_active
++        keep = (logits > -float("inf")) & (logits < float("inf"))
+         keep_i32 = keep.to(tl.int32)
+         # Triton-Ascend reduces an i1 tensor as a boolean. Cast before the sum
+         # so counts contains the number of finite logits, not the tile count.
+         count += tl.sum(keep_i32)
+ 
+-        keep = tl.trans(tl.reshape(keep_i32, (BLOCK_SIZE // 8, 8)))
++        bits = tl.trans(tl.reshape(keep_i32, (BLOCK_SIZE // 8, 8)))
+         bit_weights = (1 << tl.arange(0, 8))[:, None]
+-        packed = tl.sum(keep * bit_weights, axis=0).to(tl.uint8)
++        packed = tl.sum(bits * bit_weights, axis=0).to(tl.uint8)
+         byte_offsets = start_idx // 8 + tl.arange(0, BLOCK_SIZE // 8)
+         tl.store(
+-            packed_mask_ptr + req_idx * packed_mask_row_stride + byte_offsets,
++            packed_mask_ptr + output_row * packed_mask_row_stride + byte_offsets,
+             packed,
+             mask=byte_offsets < tl.cdiv(vocab_size, 8),
+         )
+ 
+-    tl.store(counts_ptr + req_idx, count)
++    tl.store(counts_ptr + output_row, count)
+ 
+ 
+ def sampling_mask_from_logits_npu(
+     cls: type[SamplingMaskTensors],
+     logits: torch.Tensor,
++    cu_num_logits: torch.Tensor,
+     num_sampled_tokens: torch.Tensor,
+-    max_num_kept: int | None = None,
++    max_num_kept: int,
++    rows_per_request: int = 1,
+ ) -> SamplingMaskTensors:
+-    """Pack sampling masks after making strided vocab loads NPU-friendly."""
++    """Pack committed supports into fixed request-major output slots.
++
++    The caller supplies valid device-side row offsets and sampled counts,
++    with each count bounded by rows_per_request and its logits span.
++    Compact IDs remain zero-width to use upstream's exact packed-mask fallback.
++    """
++    num_reqs = num_sampled_tokens.shape[0]
+     if logits.stride(1) != 1:
+         logits = logits.contiguous()
+ 
+-    num_reqs, vocab_size = logits.shape
+-    packed_width = (vocab_size + 7) // 8
++    vocab_size = logits.shape[1]
++    num_output_rows = num_reqs * rows_per_request
++    packed_width = triton.cdiv(vocab_size, _BITS_PER_BYTE)
+     packed_mask = torch.empty(
+-        (num_reqs, packed_width),
++        (num_output_rows, packed_width),
+         dtype=torch.uint8,
+         device=logits.device,
+     )
+-    counts = torch.empty(num_reqs, dtype=torch.int32, device=logits.device)
+-    _pack_sampling_mask_kernel_ascend[(num_reqs,)](
+-        logits,
+-        logits.stride(0),
+-        logits.stride(1),
+-        num_sampled_tokens,
+-        packed_mask,
+-        packed_mask.stride(0),
+-        counts,
+-        vocab_size,
+-        BLOCK_SIZE=_BLOCK_SIZE,
+-    )
+-
+-    if max_num_kept is not None:
+-        # The four-field API normally returns compact token IDs in addition to
+-        # the packed mask. Keep token_ids zero-width so upstream tolists()
+-        # falls back to the exact packed mask for every non-empty row. This
+-        # avoids the cumsum-based dynamic scatter that hangs on TA 3.2.2.
+-        logger.warning_once(
+-            "The four-field SamplingMaskTensors compact token-ID path is "
+-            "temporarily unsupported on Ascend; falling back to packed-mask "
+-            "decoding. Sampling results remain unchanged, but CPU decoding "
+-            "may be slower.",
+-            scope="process",
++    counts = torch.empty(num_output_rows, dtype=torch.int32, device=logits.device)
++    if num_output_rows:
++        _pack_sampling_mask_kernel_ascend[(num_output_rows,)](
++            logits,
++            logits.stride(0),
++            logits.stride(1),
++            cu_num_logits,
++            num_sampled_tokens,
++            packed_mask,
++            packed_mask.stride(0),
++            counts,
++            vocab_size,
++            ROWS_PER_REQUEST=rows_per_request,
++            BLOCK_SIZE=_BLOCK_SIZE,
+         )
+-        token_ids = torch.empty(
+-            (num_reqs, 0),
+-            dtype=torch.int32,
+-            device=logits.device,
+-        )
+-        return cls(token_ids, packed_mask, counts, vocab_size)
+ 
+-    return cls(packed_mask, counts, vocab_size)
++    # Keep compact token IDs zero-width so upstream tolists() decodes the exact
++    # packed mask for every non-empty row. This avoids the cumsum-based dynamic
++    # scatter that hangs on Triton-Ascend 3.2.2, but may increase CPU decoding work.
++    logger.warning_once(
++        "Compact sampling-mask token IDs are temporarily unsupported on Ascend; "
++        "falling back to exact packed-mask decoding, which may increase CPU work.",
++        scope="process",
++    )
++    token_ids = torch.empty((num_output_rows, 0), dtype=torch.int32, device=logits.device)
++    return cls(token_ids, packed_mask, counts, vocab_size, rows_per_request)
+diff --git a/vllm_ascend/patch/__init__.py b/vllm_ascend/patch/__init__.py
+index 73e65f303..f6075d582 100644
+--- a/vllm_ascend/patch/__init__.py
++++ b/vllm_ascend/patch/__init__.py
+@@ -1459,17 +1459,22 @@
+ #       keep mask directly also returns one per tile instead of the finite-logit
+ #       count on Triton-Ascend. The upstream row-wise bit packing additionally
+ #       lowers to scalar-heavy variable shifts and width-8 reductions.
++#       Speculative decoding also requires a separate mask for each committed
++#       token in the upstream request-major output layout.
+ #    How:
+ #       Make logits contiguous only when the vocabulary dimension is strided,
+ #       cast the keep mask to int32 before reducing it, and use a 4096-element
+-#       tile to keep the corrected reduction within the NPU UB limit. Support
+-#       both the release three-field bitmask API and the verified-main
+-#       four-field compact-ID plus bitmask API with the same packing kernel.
+-#       For the four-field API, return a zero-width `token_ids` tensor so its
+-#       existing `tolists()` method uses the exact bitmask fallback. Pack bits by
+-#       transposing `[512, 8]` to `[8, 512]`, multiplying by compile-time bit
+-#       weights, and reducing the contiguous 8-row axis so the backend emits
+-#       vector transpose, multiply, and reduction instructions.
++#       tile to keep the corrected reduction within the NPU UB limit. Accept
++#       `cu_num_logits` and `rows_per_request` for the upstream request-major
++#       API, reading logits row `cu_num_logits[req_idx] + slot_idx` and writing
++#       output row `req_idx * rows_per_request + slot_idx`. Mask inactive-slot
++#       loads so their masks and counts are zero. Read offsets and sampled counts
++#       on device for graph replay, and skip the kernel launch for empty batches.
++#       Return the five-field `SamplingMaskTensors`, including `rows_per_request`,
++#       with zero-width `token_ids` so upstream `tolists()` uses the exact bitmask
++#       fallback. Pack bits by transposing `[512, 8]` to `[8, 512]`, multiplying
++#       by compile-time bit weights, and reducing the contiguous 8-row axis so
++#       the backend emits vector transpose, multiply, and reduction instructions.
+ #    Test:
+ #       Regression coverage is in
+ #       `tests/e2e/nightly/single_node/ops/singlecard_ops/triton/test_sampling_mask.py`.

@@ -1,0 +1,205 @@
+commit b1618932d89bd8d13ea4ef3485aca3251b837494
+Author:     Foriv <82882366+Foriv@users.noreply.github.com>
+AuthorDate: Thu Oct 29 20:48:42 2026 +0800
+Commit:     GitHub <noreply@github.com>
+CommitDate: Thu Oct 29 20:48:42 2026 +0800
+
+    [BugFix][Ops] Initialize A5 scatter core count before sort decision (#19775)
+    
+    ### What this PR does / why we need it?
+    
+    `ScatterNdUpdateSk` on A5 evaluates `SkCeilDiv(indicesAxis_,
+    totalCoreNum_)` during shape parsing, before `GetPlatformInfo()`
+    initializes the core count. The local helper has no zero-divisor guard,
+    so nonempty inputs can terminate the process with `SIGFPE` during Host
+    tiling, before kernel launch.
+    
+    Move the SIMD sort decision into `UpdateSimdSortDecision()` and call it
+    from `DoOpTiling()`, after platform initialization and before the
+    existing SIMD/mask dispatch. This matches the initialization-order fix
+    in [cann/ops-nn PR
+    #12579](https://gitcode.com/cann/ops-nn/pull/12579/discuss), which was
+    merged into `master` on 2026-10-28 (final upstream head:
+    `adb6dba58a5ffdae20ab4bb1a3949dfee8414e34`). The merged upstream
+    decision and call order are equivalent to this PR, with the local
+    `SkCeilDiv` helper retained. Related upstream report: [ops-nn issue
+    #7250](https://gitcode.com/cann/ops-nn/issues/7250).
+    
+    The existing sorting threshold, kernel implementation and arch22 path
+    are unchanged. This fixes the initialization dependency; it does not
+    redesign the heuristic for different split modes or claim a measured
+    performance gain.
+    
+    ### Does this PR introduce _any_ user-facing change?
+    
+    Yes. Fixes an A5 `ScatterNdUpdateSk` Host-tiling divide-by-zero crash.
+    No API changes.
+    
+    ### How was this patch tested?
+    
+    - **Actual A5 regression: 6 passed, 0 failed, 0 skipped** on Ascend950PR
+    / CANN 9.2.0, Python 3.11.10, PyTorch 2.10.0+cpu with torch_npu
+    2.10.0.post7, and vLLM 0.31.0. Rebuilt only `scatter_nd_update_sk` from
+    PR commit `b7da6129aaee0f5938ce5b1d20bb7eee7b80bdce` using `bash
+    build.sh --pkg --ops=scatter_nd_update_sk --soc=ascend950
+    --vendor_name=custom` and installed it into an isolated vendor
+    directory. The tests used the PR's original test functions, parameters,
+    assertions and repository conftest. The existing compatible PyTorch
+    bridge was reused; this was a fresh native OPP build, not a new full
+    wheel build.
+    - The six previously skipped cases comprise 4 unique-index cases (`a=77,
+    b=128`: FP16/int32, BF16/int64, FP32/int32, int8/int64) and 2
+    duplicate-index cases (FP16/int32 and BF16/int64), all with
+    `contiguous=True`. JUnit and call reports confirm all six executed.
+    Source-file hashes match the fixed Git commit. Loaded-library maps and
+    API symbol address checks identify the new `libcust_opapi.so` (SHA256
+    prefix `906a7512ccab`) and Host tiling library (prefix `efc7c43a092f`).
+    The observer did not replace the operator, inputs or assertions.
+    
+      ```bash
+    
+    TEST=tests/e2e/nightly/single_node/ops/singlecard_ops/test_scatter_nd_update_sk.py
+    pytest -sv \
+    "$TEST::test_scatter_nd_update_sk[True-var_dtype0-idx_dtype0-77-128]" \
+    "$TEST::test_scatter_nd_update_sk[True-var_dtype1-idx_dtype1-77-128]" \
+    "$TEST::test_scatter_nd_update_sk[True-var_dtype2-idx_dtype2-77-128]" \
+    "$TEST::test_scatter_nd_update_sk[True-var_dtype3-idx_dtype3-77-128]" \
+    
+    "$TEST::test_scatter_nd_update_sk_duplicate_indices[True-var_dtype0-idx_dtype0]"
+    \
+    
+    "$TEST::test_scatter_nd_update_sk_duplicate_indices[True-var_dtype1-idx_dtype1]"
+      ```
+    
+    - Native Host regression: compiled baseline and changed production
+    tiling against the CANN 9.2 SDK and its 56-AIV platform configuration.
+    The baseline `var=[77,128], indices=[19,1]` exits with `SIGFPE` (-8);
+    the fix passes 8 Host cases, including the 64/65-indices-per-core
+    boundary, SplitAfter, SIMT and deterministic tiling.
+    - `git diff --check`, Python compilation, Ruff checks/formatting passed.
+    A targeted AST comparison verified that re-enabling the tests changes
+    only the two defect-related skip branches and the unused `is_950`
+    import; parameter sets, reference assertions, FP8 capability guards and
+    the shared timeout protection remain unchanged. The earlier full-tree
+    format attempt on Windows encountered tool/environment failures; full
+    repository CI checks remain required before merge.
+    
+    ---
+    
+    ### Checklist
+    
+    #### Testing
+    
+    - [x] **Boundary / edge-case coverage**: Host regression covers the
+    sorting threshold boundary and distinct tiling paths.
+    - [x] **Regression test**: Re-enabled the 6 existing A5 cases skipped
+    for this Host crash and verified all six pass on actual A5 hardware.
+    - [ ] **Error / failure path coverage**
+    - [x] **Meaningful & reliable tests**: Existing tests check real
+    custom-op output against a CPU reference.
+    - [ ] **Performance impact**: This validation checks correctness only;
+    no performance benchmark or speedup is claimed.
+    
+    - vLLM main:
+    https://github.com/vllm-project/vllm/commit/544f182d9f0c9bfe8bd7645525951d5e3692a542
+    
+    ---------
+    
+    Signed-off-by: Foriv <2293567056@qq.com>
+
+diff --git a/csrc/moe/scatter_nd_update_sk/op_host/scatter_nd_update_sk_tiling_arch35.cpp b/csrc/moe/scatter_nd_update_sk/op_host/scatter_nd_update_sk_tiling_arch35.cpp
+index 05cca6bf4..1c035e944 100644
+--- a/csrc/moe/scatter_nd_update_sk/op_host/scatter_nd_update_sk_tiling_arch35.cpp
++++ b/csrc/moe/scatter_nd_update_sk/op_host/scatter_nd_update_sk_tiling_arch35.cpp
+@@ -332,16 +332,6 @@ ge::graphStatus ScatterNdUpdateSkTilingRegbase::CalculateDerivedParams(const ger
+         isSimdNonDeterminstic_ = 1;
+     }
+ 
+-    // SIMD 排序条件
+-    // 1. indicesAxis_ > varInAxis_：索引数量大于原始索引数量，表示高重复度
+-    // 2. 单核 indices 数量 > MIN_INDICES_PER_CORE_FOR_SIMD_SORT(64)：批次足够大
+-    int64_t estimatedIndicesPerCore = SkCeilDiv(indicesAxis_, totalCoreNum_);
+-    bool highDuplication = (indicesAxis_ > varInAxis_);
+-    bool enoughBatchPerCore = (estimatedIndicesPerCore > MIN_INDICES_PER_CORE_FOR_SIMD_SORT);
+-    if (isSimdNonDeterminstic_ == 1 && highDuplication && enoughBatchPerCore) {
+-        isSimdWithSort_ = 1;
+-    }
+-
+     if (indicesAxis_ / varInAxis_ >= SIMT_SORT_LIMIT) {
+         isSimtWithSort_ = 1;
+     }
+@@ -931,6 +921,18 @@ void ScatterNdUpdateSkTilingRegbase::CalculateMask()
+         isMask_ = 1;
+     }
+ }
++
++void ScatterNdUpdateSkTilingRegbase::UpdateSimdSortDecision()
++{
++    // GetPlatformInfo() has initialized and validated totalCoreNum_ at this stage.
++    int64_t estimatedIndicesPerCore = SkCeilDiv(indicesAxis_, totalCoreNum_);
++    bool highDuplication = (indicesAxis_ > varInAxis_);
++    bool enoughBatchPerCore = (estimatedIndicesPerCore > MIN_INDICES_PER_CORE_FOR_SIMD_SORT);
++    if (isSimdNonDeterminstic_ == 1 && highDuplication && enoughBatchPerCore) {
++        isSimdWithSort_ = 1;
++    }
++}
++
+ ge::graphStatus ScatterNdUpdateSkTilingRegbase::DoOpTiling()
+ {
+     if (outputStorageShapeSize_ < INT32_MAX) {
+@@ -941,6 +943,8 @@ ge::graphStatus ScatterNdUpdateSkTilingRegbase::DoOpTiling()
+         outOfSetDtype_ = ge::DataType::DT_INT64;
+     }
+ 
++    UpdateSimdSortDecision();
++
+     if (isSimdNonDeterminstic_ == 1) {
+         CalculateMask();
+         if (isMask_ == 1) {
+diff --git a/csrc/moe/scatter_nd_update_sk/op_host/scatter_nd_update_sk_tiling_regbase.h b/csrc/moe/scatter_nd_update_sk/op_host/scatter_nd_update_sk_tiling_regbase.h
+index 04ca2a2fc..1daee5a54 100644
+--- a/csrc/moe/scatter_nd_update_sk/op_host/scatter_nd_update_sk_tiling_regbase.h
++++ b/csrc/moe/scatter_nd_update_sk/op_host/scatter_nd_update_sk_tiling_regbase.h
+@@ -57,6 +57,7 @@ protected:
+     void CalcDeterministicUpdateSplit(int64_t ubBlock);
+     void CalcDeterministicIndicesSplit(int64_t ubBlock);
+     void CalculateMask();
++    void UpdateSimdSortDecision();
+     uint64_t GetTilingKey() const override;
+     void ComputeCoreSplitAfterAxis();
+     void InitFactors(int64_t halfUbSize, int64_t indicesSize, int64_t alignNum);
+diff --git a/tests/e2e/nightly/single_node/ops/singlecard_ops/test_scatter_nd_update_sk.py b/tests/e2e/nightly/single_node/ops/singlecard_ops/test_scatter_nd_update_sk.py
+index c330e1fff..f8eaa1fff 100644
+--- a/tests/e2e/nightly/single_node/ops/singlecard_ops/test_scatter_nd_update_sk.py
++++ b/tests/e2e/nightly/single_node/ops/singlecard_ops/test_scatter_nd_update_sk.py
+@@ -9,7 +9,7 @@ import torch
+ import torch_npu  # noqa: F401
+ 
+ from vllm_ascend.attention.indexer import AscendSFAIndexerBackend
+-from vllm_ascend.device.device_config import check_ascend_device_type, is_950
++from vllm_ascend.device.device_config import check_ascend_device_type
+ from vllm_ascend.device.device_op import DeviceOperator
+ from vllm_ascend.device.hardware_profile import DeviceAdaptorFamily, HardwareCapability, get_current_hardware_profile
+ from vllm_ascend.utils import bootstrap_custom_op_env
+@@ -94,10 +94,6 @@ def test_a5_cache_destination_layout(dtype, width, count, row_gap):
+     [True],
+ )
+ def test_scatter_nd_update_sk(a: int, b: int, var_dtype, idx_dtype, contiguous: bool):
+-    if is_950() and (a, b) == (77, 128):
+-        # x86_64 A5 SIGFPE: CalculateDerivedParams divides before GetPlatformInfo initializes the core count.
+-        pytest.skip("A5 host tiling uses the core count before platform initialization")
+-
+     n = max(1, a // 4)
+ 
+     # unique indices in [0, a)
+@@ -141,10 +137,6 @@ def test_scatter_nd_update_sk(a: int, b: int, var_dtype, idx_dtype, contiguous:
+ def test_scatter_nd_update_sk_duplicate_indices(var_dtype, idx_dtype, contiguous: bool):
+     """Duplicated indices take the sort path; the result is deterministic when
+     all updates for the same index are identical."""
+-    if is_950() and var_dtype in (torch.float16, torch.bfloat16):
+-        # Reproduced on x86_64 A5; the affected two dtypes use the same host tiling path.
+-        pytest.skip("A5 host tiling uses the core count before platform initialization")
+-
+     a, b, n = 32, 64, 8
+     row = 7  # duplicated target row
+     indices_cpu = torch.full((n, 1), row, dtype=idx_dtype)

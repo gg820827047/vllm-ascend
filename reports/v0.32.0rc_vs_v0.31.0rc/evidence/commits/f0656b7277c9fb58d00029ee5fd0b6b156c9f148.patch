@@ -1,0 +1,387 @@
+commit f0656b7277c9fb58d00029ee5fd0b6b156c9f148
+Author:     ivyilike <102584127+ivyilike@users.noreply.github.com>
+AuthorDate: Fri Oct 30 17:15:06 2026 +0800
+Commit:     GitHub <noreply@github.com>
+CommitDate: Fri Oct 30 17:15:06 2026 +0800
+
+    [Performance] Optimize EP gather and reduce operations for uniform SP layout and DP=1 (#19515)
+    
+    ### What this PR does / why we need it?
+    On FlashComm SP-MoE topologies (dp=1, TP8/EP8), every MoE layer calls
+    the `vllm::maybe_all_gather_and_maybe_unpad` custom op 3x and
+    `vllm::maybe_pad_and_reduce` 1x.
+    
+    Profiling (torch profiler, eager prefill) shows these ops account for
+    ~23% of the prefill step, and the time is dominated not by the
+    collectives but by identity tensor reconstruction inside the ops:
+    
+    - **AG side**: when `local_sizes` is uniform (dp=1 always is:
+    `ceil(N/tp)` repeated), the code gathers into a `(tp, N, d)` buffer and
+    then does `view + 8x select + cat(8 complete slices)` — a bit-identical
+    copy of the gathered tensor (one extra `aten::empty` +
+    `CatArrayBatchedCopy`).
+    - **RS side**: symmetrically, `_maybe_pad_and_reduce` allocates
+    `zeros((tp, max_len), ...)` and copies all rows in (one `fill` + one
+    full-tensor copy), then `reduce_scatter(...).narrow` slices off padding
+    that is zero-width for dp=1 — an identity rebuild.
+    
+    This PR adds fast paths:
+    
+    1. **Uniform `local_sizes`**: AG returns the gathered tensor directly
+    (row-major identity of the cat); RS calls `reduce_scatter(x, 0)`
+    directly (the trailing `narrow` is a no-op when uniform).
+    2. **dp=1 without `local_sizes`** (legacy chunked path): AG replaces
+    `empty + row-copy` with a zero-copy view slice of the fresh gather
+    output; RS replaces `zeros + copy` with a single `F.pad`.
+    3. The non-uniform path (dp>1 with uneven split across DP ranks) is kept
+    unchanged.
+    
+    Semantics are unchanged: for uniform sizes the removed ops were provably
+    identity operations; outputs are bit-identical, and the -1/zero padding
+    contract is untouched.
+    
+    <img width="789" height="164" alt="844107522522248460"
+    src="https://github.com/user-attachments/assets/7ba1565e-ea36-4d8b-b70a-8601ac5e2e9f"
+    />
+    
+    Per-op profile (same topology, steady-state prefill step):
+    
+    | Op | Before | After | Delta |
+    |---|---|---|---|
+    | `vllm::maybe_all_gather_and_maybe_unpad` (per call) | 670 us | 367 us
+    | -45% |
+    |  `vllm::maybe_pad_and_reduce` (per call) | 1.870 ms | 397 us | -78% |
+    
+    The remaining 367 us per AG call is the collective itself plus host
+    framework, confirming the reconstruction overhead (not the collective)
+    was what got removed.
+    
+    ### Profile
+    Before:
+    <img width="1585" height="1009" alt="743823986025482892"
+    src="https://github.com/user-attachments/assets/12a1a61d-4dec-4854-b68a-5aee98773535"
+    />
+    <img width="1604" height="1013" alt="219293533889532030"
+    src="https://github.com/user-attachments/assets/13e1ccdd-735b-47b1-b4fa-2c0067355291"
+    />
+    After:
+    <img width="1587" height="987" alt="93134382429337369"
+    src="https://github.com/user-attachments/assets/d0c01520-2201-435f-a2ce-de985027d7a8"
+    />
+    <img width="1615" height="1016" alt="370771006875538968"
+    src="https://github.com/user-attachments/assets/896b1db5-7ad0-4e6b-bc1e-09c975fbc2bf"
+    />
+    
+    ### Does this PR introduce _any_ user-facing change?
+    No. No config or API change; performance-only, outputs bit-identical.
+    
+    ### How was this patch tested?
+    - New unit tests in `tests/ut/ops/test_register_custom_ops.py`: uniform
+    AG/RS pass-through, dp=1 and dp=2 no-`local_sizes` fast paths, and
+    uneven-size cases guarding the unchanged slow path.
+    - Trace verification on a steady-state prefill step: after the patch the
+    op subtrees no longer contain `aten::cat` / `aten::zeros(fill)` /
+    `aten::select` and contain no extra `aten::copy_`; only the collective
+    and host framework remain.
+    - E2E benchmark above; long-run stability run on the same topology.
+    
+    Env: 8x Ascend 910B, DeepSeek-V4.1-Flash W4A8, TP8/EP8, dp=1, FlashComm
+    v1, FULL_DECODE_ONLY. Dataset: 46.5k-token shared prefix + 3.5k random
+    suffix, 350 output tokens, concurrency 6, server-side sampling.
+    
+    | Metric | Before | After | Delta |
+    | Metric | Before | After | Delta |
+    | ------------------------------------ | -------- | -------- | ----- |
+    | Mean TTFT (ms)                       | 2534.87  | 2509.38  | -1.0% |
+    | Median TTFT (ms)                     | 2398.52  | 2385.69  | -0.5% |
+    | P99 TTFT (ms)                        | 8432.48  | 8362.36  | -0.8% |
+    | Mean TPOT (ms)                       | 34.91    | 32.66    | -6.4% |
+    | Median TPOT (ms)                     | 34.44    | 32.23    | -6.4% |
+    | P99 TPOT (ms)                        | 38.60    | 36.35    | -5.8% |
+    | Mean E2EL (ms)                       | 14719.05 | 13908.99 | -5.5% |
+    | Median E2EL (ms)                     | 14444.76 | 13626.27 | -5.7% |
+    | P99 E2EL (ms)                        | 19844.93 | 19002.31 | -4.2% |
+    | Output token throughput (tok/s)      | 140.06   | 148.23   | +5.8% |
+    | Peak output token throughput (tok/s) | 199.00   | 204.00   | +2.5% |
+    
+    ---
+    
+    ### Checklist
+    
+    #### Testing
+    
+    - [ ] **Boundary / edge-case coverage**: I reviewed whether this change
+    involves
+    boundary conditions (e.g. empty input, single/zero element, min/max
+    values,
+    off-by-one, sequence-length limits, integer overflow). Where applicable,
+    I
+    added unit tests covering these edge cases in `tests/ut/` or
+    `tests/e2e/`.
+    - [ ] **Regression test**: If this PR fixes a bug, I added a regression
+    test
+      that would fail without the fix.
+    - [ ] **Error / failure path coverage**: I covered abnormal paths
+    (exceptions,
+    timeouts, out-of-range, division by zero) in addition to the happy path.
+    - [ ] **Meaningful & reliable tests**: New tests assert real behavior
+    and are
+      not written merely to satisfy CI.
+    - [ ] **Performance impact**: If this PR touches a performance-sensitive
+    path,
+      I attached benchmark results and added performance regression tests.
+    
+    
+    - vLLM main:
+    https://github.com/vllm-project/vllm/commit/544f182d9f0c9bfe8bd7645525951d5e3692a542
+    
+    ---------
+    
+    Signed-off-by: gcw_OTyZJ2Ko <wanwanpeng377@gmail.com>
+
+diff --git a/tests/ut/ops/test_register_custom_ops.py b/tests/ut/ops/test_register_custom_ops.py
+index 7efaae1fc..9edf5f16a 100644
+--- a/tests/ut/ops/test_register_custom_ops.py
++++ b/tests/ut/ops/test_register_custom_ops.py
+@@ -62,6 +62,50 @@ def test_sp_ep_reduce_scatter_pads_local_chunks(monkeypatch):
+     assert result.shape == (3, 4)
+ 
+ 
++class _EpGroupUniform:
++    """Uniform SP layout (ceil-div + repeat_interleave): 2 EP ranks, equal sizes."""
++
++    world_size = 2
++    rank_in_group = 0
++
++    def all_gather(self, x: torch.Tensor, dim: int) -> torch.Tensor:
++        assert dim == 0
++        assert x.shape == (2, 4)
++        return torch.arange(16, dtype=x.dtype).view(4, 4)
++
++    def reduce_scatter(self, x: torch.Tensor, dim: int) -> torch.Tensor:
++        assert dim == 0
++        assert x.shape == (4, 4)
++        return x[:2]
++
++
++def _patch_uniform_sp_context(monkeypatch):
++    context = SimpleNamespace(
++        dp_metadata=SimpleNamespace(get_chunk_sizes_across_dp_rank=lambda: [2, 2]),
++        is_draft_model=False,
++    )
++    monkeypatch.setattr(custom_ops, "_EXTRA_CTX", context)
++    monkeypatch.setattr(custom_ops, "get_forward_context", lambda: context)
++    monkeypatch.setattr(custom_ops, "get_ep_group", _EpGroupUniform)
++
++
++def test_uniform_sp_all_gather_skips_identity_reassembly(monkeypatch):
++    _patch_uniform_sp_context(monkeypatch)
++
++    gathered = custom_ops._maybe_all_gather_and_maybe_unpad_impl(torch.empty(2, 4))
++
++    assert gathered.shape == (4, 4)
++    assert torch.equal(gathered, torch.arange(16, dtype=gathered.dtype).view(4, 4))
++
++
++def test_uniform_sp_reduce_scatter_skips_identity_pad(monkeypatch):
++    _patch_uniform_sp_context(monkeypatch)
++
++    result = custom_ops._maybe_pad_and_reduce_impl(torch.arange(16).view(4, 4))
++
++    assert result.shape == (2, 4)
++
++
+ def test_sp_ep_reduce_scatter_draft_model_keeps_ep_layout(monkeypatch):
+     _patch_sp_ep_context(monkeypatch)
+     custom_ops._EXTRA_CTX.is_draft_model = True
+@@ -168,6 +212,94 @@ def test_sp_ep_pcp_token_order_and_round_trip(monkeypatch, dp_size, pcp_size, sp
+         assert custom_ops._maybe_pad_and_reduce_fake(gathered).shape == chunks[rank].shape
+ 
+ 
++class _EpGroupDp1:
++    """FlashComm DP=1 + MoE sequence parallelism: 8 EP ranks, SP tail padding."""
++
++    world_size = 8
++    rank_in_group = 4
++
++    def all_gather(self, x: torch.Tensor, dim: int) -> torch.Tensor:
++        assert dim == 0
++        assert x.shape == (2, 4)
++        return torch.arange(64, dtype=x.dtype).view(16, 4)
++
++    def reduce_scatter(self, x: torch.Tensor, dim: int) -> torch.Tensor:
++        assert dim == 0
++        assert x.shape == (16, 4)
++        return x[:2]
++
++
++class _EpGroupDp2:
++    world_size = 8
++    rank_in_group = 0
++
++    def all_gather(self, x: torch.Tensor, dim: int) -> torch.Tensor:
++        assert dim == 0
++        assert x.shape == (16, 4)
++        return torch.arange(128, dtype=x.dtype).view(32, 4)
++
++    def reduce_scatter(self, x: torch.Tensor, dim: int) -> torch.Tensor:
++        assert dim == 0
++        assert x.shape == (32, 4)
++        return x[:8]
++
++
++def _patch_dp_context_without_sp_layout(monkeypatch, num_tokens_across_dp, padded_length, ep_group):
++    # dp_metadata exists (SP-MoE) but the chunked_sizes context is never set,
++    # so _get_ep_local_sizes returns None and the fallback branch runs.
++    context = SimpleNamespace(
++        dp_metadata=SimpleNamespace(num_tokens_across_dp_cpu=torch.tensor(num_tokens_across_dp)),
++        is_draft_model=False,
++        padded_length=padded_length,
++    )
++    monkeypatch.setattr(custom_ops, "_EXTRA_CTX", context)
++    monkeypatch.setattr(custom_ops, "get_forward_context", lambda: context)
++    monkeypatch.setattr(custom_ops, "get_dp_group", lambda: SimpleNamespace(world_size=len(num_tokens_across_dp)))
++    monkeypatch.setattr(custom_ops, "get_ep_group", ep_group)
++
++
++def test_dp1_flashcomm_all_gather_trims_sp_tail(monkeypatch):
++    _patch_dp_context_without_sp_layout(monkeypatch, [10], 16, _EpGroupDp1)
++
++    gathered = custom_ops._maybe_all_gather_and_maybe_unpad_impl(torch.empty(2, 4))
++
++    assert gathered.shape == (10, 4)
++    assert torch.equal(gathered, torch.arange(64, dtype=gathered.dtype).view(16, 4)[:10])
++
++
++def test_dp1_flashcomm_reduce_scatter_skips_redundant_pad(monkeypatch):
++    _patch_dp_context_without_sp_layout(monkeypatch, [16], 16, _EpGroupDp1)
++
++    # Already padded_length rows: reduce-scatter must receive the tensor as-is.
++    result = custom_ops._maybe_pad_and_reduce_impl(torch.arange(64).view(16, 4))
++
++    assert result.shape == (2, 4)
++
++
++def test_dp1_flashcomm_reduce_scatter_pads_sp_tail(monkeypatch):
++    _patch_dp_context_without_sp_layout(monkeypatch, [10], 16, _EpGroupDp1)
++
++    result = custom_ops._maybe_pad_and_reduce_impl(torch.arange(40).view(10, 4))
++
++    assert result.shape == (2, 4)
++
++
++def test_dp_gather_and_reduce_scatter_without_sp_layout(monkeypatch):
++    _patch_dp_context_without_sp_layout(monkeypatch, [10, 12], 16, _EpGroupDp2)
++
++    gathered = custom_ops._maybe_all_gather_and_maybe_unpad_impl(torch.empty(16, 4))
++    expected = torch.cat(
++        [
++            torch.arange(128, dtype=gathered.dtype).view(32, 4)[0:10],
++            torch.arange(128, dtype=gathered.dtype).view(32, 4)[16:28],
++        ]
++    )
++    assert torch.equal(gathered, expected)
++
++    reduced = custom_ops._maybe_pad_and_reduce_impl(gathered)
++    assert reduced.shape == (8, 4)
++
++
+ def test_sp_ep_returns_none_for_inconsistent_topology(monkeypatch):
+     metadata = SimpleNamespace(get_chunk_sizes_across_dp_rank=lambda: [2, 2, 2])
+     monkeypatch.setattr(custom_ops, "get_dp_group", lambda: SimpleNamespace(world_size=2))
+diff --git a/vllm_ascend/ops/register_custom_ops.py b/vllm_ascend/ops/register_custom_ops.py
+index 14df1d8c2..33bcbeef6 100644
+--- a/vllm_ascend/ops/register_custom_ops.py
++++ b/vllm_ascend/ops/register_custom_ops.py
+@@ -68,19 +68,32 @@ def _maybe_all_gather_and_maybe_unpad_impl(x: torch.Tensor) -> torch.Tensor:
+     x = ep_group.all_gather(x, 0)
+     if dp_metadata is not None:
+         if local_sizes is not None:
+-            x = x.view(len(local_sizes), max(local_sizes), *x.shape[1:])
+-            x = torch.cat([x[idx, :size] for idx, size in enumerate(local_sizes)], dim=0)
++            # Uniform SP layout (ceil-div + repeat_interleave, the common
++            # SP-MoE case): every rank holds the same token count, so the
++            # gathered rows are already the global tokens in EP rank order
++            # and the re-assembly below would be an identity copy — run it
++            # only for genuinely uneven layouts.
++            if not all(size == local_sizes[0] for size in local_sizes):
++                max_local_size = max(local_sizes)
++                x = x.view(len(local_sizes), max_local_size, *x.shape[1:])
++                x = torch.cat([x[idx, :size] for idx, size in enumerate(local_sizes)], dim=0)
+         else:
+-            num_tokens_across_dp_cpu = dp_metadata.num_tokens_across_dp_cpu
+-            result = torch.empty((num_tokens_across_dp_cpu.sum(), *x.shape[1:]), device=x.device, dtype=x.dtype)
+             dp_size = get_dp_group().world_size
+-            x = x.view(dp_size, _EXTRA_CTX.padded_length, *x.shape[1:])
+-            offset = 0
+-            for idx in range(dp_size):
+-                num_tokens_dp = int(num_tokens_across_dp_cpu[idx])
+-                result[offset : offset + num_tokens_dp] = x[idx, :num_tokens_dp]
+-                offset += num_tokens_dp
+-            x = result
++            num_tokens_across_dp_cpu = dp_metadata.num_tokens_across_dp_cpu
++            if dp_size == 1:
++                # FlashComm topology (DP=1 + MoE sequence parallelism): the
++                # gathered tensor already holds the global tokens in EP rank
++                # order, so trimming the SP tail padding needs no copy.
++                x = x[: int(num_tokens_across_dp_cpu[0])]
++            else:
++                result = torch.empty((num_tokens_across_dp_cpu.sum(), *x.shape[1:]), device=x.device, dtype=x.dtype)
++                x = x.view(dp_size, _EXTRA_CTX.padded_length, *x.shape[1:])
++                offset = 0
++                for idx in range(dp_size):
++                    num_tokens_dp = int(num_tokens_across_dp_cpu[idx])
++                    result[offset : offset + num_tokens_dp] = x[idx, :num_tokens_dp]
++                    offset += num_tokens_dp
++                x = result
+ 
+     return x
+ 
+@@ -96,20 +109,37 @@ def _maybe_pad_and_reduce_impl(x: torch.Tensor) -> torch.Tensor:
+     ep_group = get_ep_group()
+     local_sizes = _get_ep_local_sizes(dp_metadata, ep_group)
+     if local_sizes is not None:
+-        max_local_size = max(local_sizes)
+-        padded_x = x.new_zeros((len(local_sizes), max_local_size, *x.shape[1:]))
+-        offset = 0
+-        for idx, size in enumerate(local_sizes):
+-            padded_x[idx, :size] = x[offset : offset + size]
+-            offset += size
+-        reduced = ep_group.reduce_scatter(padded_x.view(-1, *x.shape[1:]), 0)
+-        # The collective needs equal-sized chunks, while the next
+-        # sequence-parallel layer expects this rank's original token count.
+-        return reduced[: local_sizes[ep_group.rank_in_group]]
++        # Non-uniform layout: pad each rank's shard to the common length
++        # before the collective, then trim the result back to this rank's
++        # original token count.
++        if not all(size == local_sizes[0] for size in local_sizes):
++            max_local_size = max(local_sizes)
++            padded_x = x.new_zeros((len(local_sizes), max_local_size, *x.shape[1:]))
++            offset = 0
++            for idx, size in enumerate(local_sizes):
++                padded_x[idx, :size] = x[offset : offset + size]
++                offset += size
++            reduced = ep_group.reduce_scatter(padded_x.view(-1, *x.shape[1:]), 0)
++            # The collective needs equal-sized chunks, while the next
++            # sequence-parallel layer expects this rank's original token count.
++            return reduced[: local_sizes[ep_group.rank_in_group]]
++        # Uniform SP layout: x is already the (world_size * max_local_size,
++        # ...) buffer that reduce_scatter consumes, and the per-rank trim
++        # above would be a no-op — skip the identity pad/rebuild.
++        return ep_group.reduce_scatter(x, 0)
+ 
+     # Pad each DP shard back to the common length before EP reduce-scatter.
+     dp_size = get_dp_group().world_size
+     num_tokens_across_dp_cpu = dp_metadata.num_tokens_across_dp_cpu
++    if dp_size == 1:
++        # FlashComm topology (DP=1 + MoE sequence parallelism): all ranks hold
++        # the same global token count, so only the SP tail needs padding
++        # instead of rebuilding the full padded buffer.
++        padded_length = _EXTRA_CTX.padded_length
++        if x.shape[0] != padded_length:
++            x = torch.nn.functional.pad(x, (0, 0) * (x.ndim - 1) + (0, padded_length - x.shape[0]))
++        return ep_group.reduce_scatter(x, 0)
++
+     padded_x = x.new_zeros((dp_size, _EXTRA_CTX.padded_length, *x.shape[1:]))
+     offset = 0
+     for idx in range(dp_size):

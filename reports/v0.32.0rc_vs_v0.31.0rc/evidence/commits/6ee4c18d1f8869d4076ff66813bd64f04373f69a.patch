@@ -1,0 +1,351 @@
+commit 6ee4c18d1f8869d4076ff66813bd64f04373f69a
+Author:     FORFuture37 <861574119@qq.com>
+AuthorDate: Sun Nov 1 15:07:23 2026 +0800
+Commit:     GitHub <noreply@github.com>
+CommitDate: Sun Nov 1 15:07:23 2026 +0800
+
+    [BugFix] Backport ViT mRoPE 16-token blocks to v0.32.0rc (#20445)
+    
+    ### What this PR does / why we need it?
+    
+    Backport #19129 onto `releases/v0.32.0rc`, starting from
+    ffca1c99bb28d9c92dd5dcf327f8b242404a5055. Reapply commits 9e0488b and
+    9bfa732 with the release branch's worker import structure and ordering
+    preserved.
+    
+    Fix the MiniMax-M3 ViT mRoPE UB capacity compilation failure on Ascend
+    A5 by using 16-token blocks for the launch grid and BLOCK_N, reusing the
+    upstream Triton kernel unchanged. Preserve metadata, output
+    layout/dtype, BLOCK_D and num_warps=8. Replace the legacy function and
+    its already-loaded MiniMax vision-tower alias during worker
+    initialization, before model construction; later imports receive the
+    patched function.
+    
+    This temporary patch targets the legacy-function interface. After
+    upgrading to the pluggable VitMropeSetup interface from
+    vllm-project/vllm#63017, replace it with Ascend registration and remove
+    the patch.
+    
+    ### Does this PR introduce _any_ user-facing change?
+    
+    Yes. Fixes the reported MiniMax-M3 startup failure on Ascend A5 with the
+    legacy-function interface. No new configuration or environment
+    variables. Release note: `release_notes/fragments/20445.yaml` (YAML
+    parsing passed).
+    
+    ### How was this patch tested?
+    
+    - `py -3.12 tests/ut/patch/worker/test_patch_mrope_vit_setup.py`: passed
+    on the release-based branch; covers block boundaries and preloaded model
+    aliases, launch parameters, metadata, output shape and unchanged kernel
+    identity.
+    - Ruff lint and format checks passed for the patch and both test files.
+    - `git diff origin/releases/v0.32.0rc --check`: passed.
+    - Model accuracy validation completed: TextVQA score **72.4805**.
+    
+    - vLLM main:
+    https://github.com/vllm-project/vllm/commit/544f182d9f0c9bfe8bd7645525951d5e3692a542
+    
+    ---------
+    
+    Signed-off-by: y30084614 <yuanjie68@h-partners.com>
+    Co-authored-by: y30084614 <yuanjie68@h-partners.com>
+
+diff --git a/release_notes/fragments/20445.yaml b/release_notes/fragments/20445.yaml
+new file mode 100644
+index 000000000..cf751b971
+--- /dev/null
++++ b/release_notes/fragments/20445.yaml
+@@ -0,0 +1,6 @@
++pr: 20445
++entries:
++  - category: bugfix
++    text: Fixed MiniMax-M3 ViT mRoPE setup UB capacity compilation failures on Ascend A5 with the legacy vLLM function interface by using 16-token blocks.
++    model: minimax-m3
++    hardware: [A5]
+diff --git a/tests/e2e/nightly/single_node/ops/singlecard_ops/triton/test_mrope_vit_setup.py b/tests/e2e/nightly/single_node/ops/singlecard_ops/triton/test_mrope_vit_setup.py
+new file mode 100644
+index 000000000..d58bad740
+--- /dev/null
++++ b/tests/e2e/nightly/single_node/ops/singlecard_ops/triton/test_mrope_vit_setup.py
+@@ -0,0 +1,87 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++
++import pytest
++import torch
++from vllm.triton_utils import triton
++
++from vllm_ascend.ops.triton.triton_utils import init_device_properties_triton
++from vllm_ascend.patch.worker.patch_mrope_vit_setup import _vit_mrope_setup_kernel, vit_mrope_setup
++
++
++def _reference_positions(grids, merge):
++    positions = []
++    for t, h, w in grids:
++        axes = torch.meshgrid(torch.arange(t), torch.arange(h), torch.arange(w), indexing="ij")
++        positions.append(
++            torch.stack(axes, dim=-1)
++            .reshape(t, h // merge, merge, w // merge, merge, 3)
++            .permute(0, 1, 3, 2, 4, 5)
++            .reshape(-1, 3)
++        )
++    return torch.cat(positions).float()
++
++
++@pytest.mark.parametrize(
++    "grids,merge",
++    [
++        ([[1, 1, 1]], 1),
++        ([[1, 1, 17]], 1),
++        ([[1, 1, 33]], 1),
++        ([[1, 5, 7], [2, 3, 5]], 1),
++        ([[1, 2, 2], [3, 6, 10]], 2),
++        ([[0, 4, 4], [2, 4, 8], [0, 4, 4]], 2),
++        ([[1, 48, 48]], 2),
++        ([[4, 48, 64]], 2),
++    ],
++)
++@pytest.mark.parametrize("sections", [(21, 21, 21), (16, 24, 24), (0, 16, 16), (32, 32, 32)])
++@torch.inference_mode()
++def test_vit_mrope_setup(grids, merge, sections):
++    """Compile on NPU and compare both the kernel and patched public entry point."""
++    init_device_properties_triton()
++    inv_cpu = [torch.linspace(0.001, 1.0, size) for size in sections]
++    inv = [freq.to("npu") for freq in inv_cpu]
++    positions = _reference_positions(grids, merge)
++    n = positions.shape[0]
++    half_rot = sum(sections)
++    cu = [0]
++    for t, h, w in grids:
++        cu.append(cu[-1] + t * h * w)
++    metadata = torch.tensor(cu + [d for grid in grids for d in grid], dtype=torch.int32, device="npu")
++    # NaN sentinels detect missing writes and writes outside axis sections.
++    cos = torch.full((3, n, half_rot), float("nan"), dtype=torch.float32, device="npu")
++    sin = torch.full_like(cos, float("nan"))
++    _vit_mrope_setup_kernel[(triton.cdiv(n, 16),)](
++        *inv,
++        cos,
++        sin,
++        metadata[: len(cu)],
++        metadata[len(cu) :],
++        n,
++        len(grids),
++        half_t=sections[0],
++        half_h=sections[1],
++        half_w=sections[2],
++        spatial_merge=merge,
++        BLOCK_N=16,
++        BLOCK_D=triton.next_power_of_2(half_rot),
++        num_warps=8,
++    )
++    public_cos, public_sin = vit_mrope_setup(*inv, grids, merge)
++    cos, sin, public_cos, public_sin = [value.cpu() for value in (cos, sin, public_cos, public_sin)]
++    start = 0
++    for axis, size in enumerate(sections):
++        end = start + size
++        freq = positions[:, axis, None] * inv_cpu[axis]
++        for actual, expected in (
++            (cos, freq.cos()),
++            (sin, freq.sin()),
++            (public_cos, freq.cos()),
++            (public_sin, freq.sin()),
++        ):
++            torch.testing.assert_close(actual[axis, :, start:end], expected, atol=1e-5, rtol=1e-5)
++        for output in (cos, sin):
++            assert output[axis, :, :start].isnan().all()
++            assert output[axis, :, end:].isnan().all()
++        start = end
+diff --git a/tests/ut/patch/worker/test_patch_mrope_vit_setup.py b/tests/ut/patch/worker/test_patch_mrope_vit_setup.py
+new file mode 100644
+index 000000000..1c500b238
+--- /dev/null
++++ b/tests/ut/patch/worker/test_patch_mrope_vit_setup.py
+@@ -0,0 +1,67 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++
++import importlib.util
++import sys
++import types
++import unittest
++from pathlib import Path
++from unittest.mock import MagicMock, patch
++
++
++class TestVitMropeSetupPatch(unittest.TestCase):
++    def test_launch_grid_matches_block_size(self):
++        target = "vllm.model_executor.layers.rotary_embedding.mrope_vit_setup"
++        model = "vllm.models.minimax_m3.common.vision_tower"
++        for n in (1, 16, 17, 32, 33, 65):
++            for model_loaded in (False, True):
++                with self.subTest(n=n, model_loaded=model_loaded):
++                    modules = {}
++                    names = [target, "vllm.triton_utils", "vllm.utils.torch_utils"]
++                    if model_loaded:
++                        names.append(model)
++                    for name in names:
++                        parts = name.split(".")
++                        for end in range(1, len(parts) + 1):
++                            key = ".".join(parts[:end])
++                            if key not in modules:
++                                modules[key] = types.ModuleType(key)
++                                modules[key].__path__ = []
++                            if end > 1:
++                                setattr(modules[".".join(parts[: end - 1])], parts[end - 1], modules[key])
++                    torch = MagicMock()
++                    modules["torch"] = torch
++                    kernel = MagicMock()
++                    upstream = modules[target]
++                    vars(upstream)["_vit_mrope_setup_kernel"] = kernel
++                    vars(modules["vllm.triton_utils"])["triton"] = types.SimpleNamespace(
++                        cdiv=lambda x, y: (x + y - 1) // y,
++                        next_power_of_2=lambda x: 1 << (x - 1).bit_length(),
++                    )
++                    copy = MagicMock()
++                    vars(modules["vllm.utils.torch_utils"])["async_tensor_h2d"] = copy
++                    path = Path(__file__).resolve().parents[4] / "vllm_ascend/patch/worker/patch_mrope_vit_setup.py"
++                    spec = importlib.util.spec_from_file_location("_test_vit_mrope_patch", path)
++                    assert spec is not None and spec.loader is not None
++                    module = importlib.util.module_from_spec(spec)
++                    with patch.dict(sys.modules, modules):
++                        spec.loader.exec_module(module)
++                        self.assertIs(upstream.vit_mrope_setup, module.vit_mrope_setup)
++                        self.assertIs(upstream._vit_mrope_setup_kernel, kernel)
++                        if model_loaded:
++                            self.assertIs(modules[model].vit_mrope_setup, module.vit_mrope_setup)
++                        inv = MagicMock()
++                        inv.numel.return_value = 21
++                        upstream.vit_mrope_setup(inv, inv, inv, [[1, 1, n]], 1)
++                    kernel.__getitem__.assert_called_once_with(((n + 15) // 16,))
++                    args, kwargs = kernel.__getitem__.return_value.call_args
++                    self.assertEqual(args[7:9], (n, 1))
++                    self.assertEqual(kwargs["BLOCK_N"], 16)
++                    self.assertEqual(kwargs["BLOCK_D"], 64)
++                    self.assertEqual(kwargs["num_warps"], 8)
++                    self.assertEqual(copy.call_args.args[0], [0, n, 1, 1, n])
++                    self.assertEqual(torch.empty.call_args.args, (3, n, 63))
++
++
++if __name__ == "__main__":
++    unittest.main()
+diff --git a/vllm_ascend/patch/__init__.py b/vllm_ascend/patch/__init__.py
+index f6075d582..62ee03b30 100644
+--- a/vllm_ascend/patch/__init__.py
++++ b/vllm_ascend/patch/__init__.py
+@@ -1841,3 +1841,20 @@
+ #       Remove this patch when upstream provides a backend capability hook for
+ #       enabling MoE sequence parallelism with DP=1.
+ #
++# ** File: worker/patch_mrope_vit_setup.py **
++# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
++#   1. `vllm.model_executor.layers.rotary_embedding.mrope_vit_setup`
++#    Why:
++#       Reduce ViT mRoPE setup UB pressure on Ascend A5.
++#    How:
++#       Copy the upstream vit_mrope_setup wrapper and change BLOCK_N from 32
++#       to 16, using the same value for the launch grid divisor. Keep the
++#       upstream kernel unchanged. Rebind the MiniMax vision tower alias if
++#       it is already loaded; subsequent imports use the patched wrapper.
++#    Related PR (if no, explain why):
++#       https://github.com/vllm-project/vllm/pull/58526
++#       https://github.com/vllm-project/vllm/pull/58673
++#    Future Plan:
++#       Remove once upstream supports a backend-specific setup block size
++#       suitable for Ascend UB capacity.
++#
+diff --git a/vllm_ascend/patch/worker/__init__.py b/vllm_ascend/patch/worker/__init__.py
+index 26e6ce567..e73377f67 100644
+--- a/vllm_ascend/patch/worker/__init__.py
++++ b/vllm_ascend/patch/worker/__init__.py
+@@ -24,6 +24,7 @@ from vllm_ascend.device.hardware_profile import HardwareCapability, get_current_
+ # the AscendC patch must be imported first.
+ if HAS_TRITON:
+     import vllm_ascend.patch.worker.patch_ascend_ops  # noqa
++    import vllm_ascend.patch.worker.patch_mrope_vit_setup  # noqa
+     import vllm_ascend.patch.worker.patch_triton  # noqa
+ 
+ 
+diff --git a/vllm_ascend/patch/worker/patch_mrope_vit_setup.py b/vllm_ascend/patch/worker/patch_mrope_vit_setup.py
+new file mode 100644
+index 000000000..d7a2b1279
+--- /dev/null
++++ b/vllm_ascend/patch/worker/patch_mrope_vit_setup.py
+@@ -0,0 +1,77 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++
++import sys
++
++import torch
++import vllm.model_executor.layers.rotary_embedding.mrope_vit_setup as mrope_vit_setup
++from vllm.model_executor.layers.rotary_embedding.mrope_vit_setup import _vit_mrope_setup_kernel
++from vllm.triton_utils import triton
++from vllm.utils.torch_utils import async_tensor_h2d
++
++
++def vit_mrope_setup(
++    inv_freq_t: torch.Tensor,
++    inv_freq_h: torch.Tensor,
++    inv_freq_w: torch.Tensor,
++    grid_thw: list[list[int]],
++    spatial_merge_size: int,
++) -> tuple[torch.Tensor, torch.Tensor]:
++    """(3, total_N, half_rot_dim) fp32 cos/sin t/h/w planes for triton_mrope.
++
++    One fused kernel: positions are computed arithmetically from the grids
++    and the rotation comes from the per-axis inv_freq, so there is no
++    cos/sin cache to size or grow.
++
++    Args:
++        inv_freq_t: t-axis inverse frequencies, (t_dim // 2,).
++        inv_freq_h: h-axis inverse frequencies, (h_dim // 2,).
++        inv_freq_w: w-axis inverse frequencies, (w_dim // 2,).
++        grid_thw: per-grid [t, h, w] patch counts (host metadata).
++        spatial_merge_size: spatial merge factor of the ViT.
++
++    """
++    device = inv_freq_t.device
++    cu = [0]
++    for t, h, w in grid_thw:
++        cu.append(cu[-1] + t * h * w)
++    n = cu[-1]
++    g = len(grid_thw)
++    # grid_thw is per-request host metadata, so one H2D is unavoidable;
++    # pack cu_seqlens and grids into a single pinned async copy.
++    buf = async_tensor_h2d(cu + [d for grid in grid_thw for d in grid], device=device, dtype=torch.int32)
++    cu_seqlens = buf[: g + 1]
++    grids = buf[g + 1 :].view(g, 3)
++
++    half_t = inv_freq_t.numel()
++    half_h = inv_freq_h.numel()
++    half_w = inv_freq_w.numel()
++    half_rot = half_t + half_h + half_w
++    cos = torch.empty(3, n, half_rot, device=device, dtype=torch.float32)
++    sin = torch.empty(3, n, half_rot, device=device, dtype=torch.float32)
++    block_n = 16
++    _vit_mrope_setup_kernel[(triton.cdiv(n, block_n),)](
++        inv_freq_t,
++        inv_freq_h,
++        inv_freq_w,
++        cos,
++        sin,
++        cu_seqlens,
++        grids,
++        n,
++        g,
++        half_t=half_t,
++        half_h=half_h,
++        half_w=half_w,
++        spatial_merge=spatial_merge_size,
++        BLOCK_N=block_n,
++        BLOCK_D=triton.next_power_of_2(half_rot),
++        num_warps=8,
++    )
++    return cos, sin
++
++
++mrope_vit_setup.vit_mrope_setup = vit_mrope_setup
++# Update the existing model alias if loaded; later imports see the patched module.
++if "vllm.models.minimax_m3.common.vision_tower" in sys.modules:
++    vars(sys.modules["vllm.models.minimax_m3.common.vision_tower"])["vit_mrope_setup"] = vit_mrope_setup

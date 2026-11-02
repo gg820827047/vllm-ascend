@@ -1,0 +1,187 @@
+commit 31f9175f324182466877d0ab9006e75ea6a401f3
+Author:     lijiahang226 <216526138+lijiahang226@users.noreply.github.com>
+AuthorDate: Wed Oct 28 15:08:31 2026 +0800
+Commit:     GitHub <noreply@github.com>
+CommitDate: Wed Oct 28 15:08:31 2026 +0800
+
+    [BugFix][Model] Honor BF16 KDA recurrent-state configuration for GLM-5.3-Flash (#18857)
+    
+    ### What this PR does / why we need it?
+    
+    Honor `mamba_ssm_cache_dtype` for GLM KDA recurrent state by passing it
+    directly to the upstream `MambaStateDtypeCalculator.kda_state_dtype` in
+    both layer allocation and model-level cache sizing. This makes explicit
+    BF16 requests take effect consistently and avoids duplicating the
+    upstream dtype policy.
+    
+    Refs #15665.
+    
+    ### Does this PR introduce _any_ user-facing change?
+    
+    Yes. `--mamba-ssm-cache-dtype bfloat16` selects BF16 KDA recurrent-state
+    storage. `auto` and explicit `float32` retain FP32, and unsupported FP16
+    state is rejected. BF16 storage can affect numerical results and
+    automatically selected cache geometry.
+    
+    ### How was this patch tested?
+    
+    - `tests/ut/models/test_glm5next_kda_state_dtype.py` covers dtype
+    selection, model/layer cache-spec consistency, page sizing, and
+    rejection of unsupported state dtypes.
+    - Existing `tests/ut/models/test_glm5next_kda_contracts.py` coverage
+    includes FP32 and BF16 state.
+    - Local Ruff lint/format, Python compilation, release-note YAML parsing,
+    and `git diff --check` passed.
+    - Latest head `201ffbbdd`: [Linux
+    pre-commit](https://github.com/vllm-project/vllm-ascend/actions/runs/39575229458/job/119138985799)
+    passed, including mypy for Python 3.10, 3.11, and 3.12.
+    - CPU UT passed on both dependencies: [verified vLLM
+    main](https://github.com/vllm-project/vllm-ascend/actions/runs/39575229458/job/119141388298):
+    **11,999 passed, 78 skipped**;
+    [v0.31.0](https://github.com/vllm-project/vllm-ascend/actions/runs/39575229458/job/119141388243):
+    **11,995 passed, 82 skipped**. The 19 KDA dtype and operator-contract
+    cases passed in each matrix.
+    - Downstream hardware CI has not completed; the workflow is still
+    selecting tests.
+    - Full-model BF16 numerical accuracy and NPU execution were not
+    revalidated for this review update; CPU interface tests do not establish
+    model accuracy.
+    
+    - vLLM main:
+    https://github.com/vllm-project/vllm/commit/a98247ab4db686ee03c66d5feb3c761e52a2f8ab
+    
+    ---------
+    
+    Signed-off-by: Li Jiahang <216526138+lijiahang226@users.noreply.github.com>
+
+diff --git a/release_notes/fragments/18857.yaml b/release_notes/fragments/18857.yaml
+new file mode 100644
+index 000000000..7ea2b9fd3
+--- /dev/null
++++ b/release_notes/fragments/18857.yaml
+@@ -0,0 +1,7 @@
++pr: 18857
++entries:
++  - category: bugfix
++    text: >-
++      GLM-5.3-Flash now honors --mamba-ssm-cache-dtype bfloat16 for KDA recurrent
++      state storage, with consistent model cache sizing and layer allocation.
++      The default auto setting continues to use FP32 state.
+diff --git a/tests/ut/models/test_glm5next_kda_contracts.py b/tests/ut/models/test_glm5next_kda_contracts.py
+index c8f3bede1..4bcd10795 100644
+--- a/tests/ut/models/test_glm5next_kda_contracts.py
++++ b/tests/ut/models/test_glm5next_kda_contracts.py
+@@ -14,11 +14,12 @@ import vllm_ascend.ops.kda as kda_ops
+     "accepted,qkv_padding,direct_output",
+     [(None, 0, False), (None, 64, False), ([1, 2, 1], 0, False), ([1, 2, 1], 64, False), (None, 64, True)],
+ )
+-def test_recurrent_raw_gates_rollback_slots_and_padding(monkeypatch, accepted, qkv_padding, direct_output):
++@pytest.mark.parametrize("state_dtype", [torch.float32, torch.bfloat16])
++def test_recurrent_raw_gates_rollback_slots_and_padding(monkeypatch, accepted, qkv_padding, direct_output, state_dtype):
+     q, k, v = (torch.ones(1, 4, 1, 128 + qkv_padding * i, dtype=torch.bfloat16)[..., :128] for i in (1, 2, 3))
+     gate = q * 2
+     beta = torch.zeros(1, 4, 1, dtype=torch.bfloat16)
+-    state = torch.zeros(8, 1, 128, 128)
++    state = torch.zeros(8, 1, 128, 128, dtype=state_dtype)
+     starts = torch.tensor([0, 1, 3], dtype=torch.int32)
+     slots = torch.tensor([[2, 3], [5, 6], [0, 0]], dtype=torch.int32)
+     accepted_tensor = None if accepted is None else torch.tensor(accepted, dtype=torch.int32)
+diff --git a/tests/ut/models/test_glm5next_kda_state_dtype.py b/tests/ut/models/test_glm5next_kda_state_dtype.py
+new file mode 100644
+index 000000000..b095f39da
+--- /dev/null
++++ b/tests/ut/models/test_glm5next_kda_state_dtype.py
+@@ -0,0 +1,61 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++
++from types import SimpleNamespace
++
++import pytest
++import torch
++from vllm.config import CacheConfig
++
++from vllm_ascend.models.glm5next.kda import Glm5NextLinearAttention
++from vllm_ascend.models.glm5next.model import Glm5NextForCausalLM, Glm5NextForConditionalGeneration
++
++
++def make_layer_and_config(ssm_dtype, conv_dtype="auto"):
++    cache_config = CacheConfig(
++        mamba_cache_dtype=conv_dtype,
++        mamba_ssm_cache_dtype=ssm_dtype,
++        mamba_block_size=512,
++        mamba_cache_mode="align",
++    )
++    config = SimpleNamespace(
++        model_config=SimpleNamespace(dtype=torch.bfloat16),
++        cache_config=cache_config,
++        speculative_config=SimpleNamespace(num_speculative_tokens=5),
++        num_speculative_tokens=5,
++    )
++    layer = Glm5NextLinearAttention.__new__(Glm5NextLinearAttention)
++    torch.nn.Module.__init__(layer)
++    layer.model_config, layer.cache_config = config.model_config, cache_config
++    layer.tp_size, layer.num_heads, layer.head_dim, layer.conv_size, layer.num_spec = 1, 64, 128, 4, 5
++    return layer, config
++
++
++@pytest.mark.parametrize(
++    ("ssm_dtype", "conv_dtype", "expected_conv", "expected"),
++    [
++        ("auto", "auto", torch.bfloat16, torch.float32),
++        ("float32", "auto", torch.bfloat16, torch.float32),
++        ("bfloat16", "auto", torch.bfloat16, torch.bfloat16),
++        ("bfloat16", "float32", torch.float32, torch.bfloat16),
++    ],
++)
++def test_kda_state_dtype_matches_model_and_cache_spec(ssm_dtype, conv_dtype, expected_conv, expected):
++    layer, config = make_layer_and_config(ssm_dtype, conv_dtype)
++    want = (expected_conv, expected)
++    assert layer.get_state_dtype() == want
++    assert Glm5NextForCausalLM.get_mamba_state_dtype_from_config(config) == want
++    assert Glm5NextForConditionalGeneration.get_mamba_state_dtype_from_config(config) == want
++    spec = layer.get_kv_cache_spec(config)
++    assert spec.dtypes == want
++    state_bytes = 64 * 128 * 128 * torch.empty((), dtype=expected).element_size()
++    conv_bytes = 3 * 64 * 128 * (3 + 5) * torch.empty((), dtype=expected_conv).element_size()
++    assert spec.page_size_bytes == state_bytes + conv_bytes
++
++
++def test_kda_rejects_unsupported_recurrent_state_dtype():
++    layer, config = make_layer_and_config("float16")
++    with pytest.raises(ValueError, match="KDA recurrent state supports only"):
++        layer.get_state_dtype()
++    with pytest.raises(ValueError, match="KDA recurrent state supports only"):
++        Glm5NextForCausalLM.get_mamba_state_dtype_from_config(config)
+diff --git a/vllm_ascend/models/glm5next/kda.py b/vllm_ascend/models/glm5next/kda.py
+index 0f491f448..d9792ee88 100644
+--- a/vllm_ascend/models/glm5next/kda.py
++++ b/vllm_ascend/models/glm5next/kda.py
+@@ -204,7 +204,11 @@ class Glm5NextLinearAttention(GatedDeltaNetAttention):
+     ) -> tuple[torch.dtype, torch.dtype]:
+         if self.model_config is None or self.cache_config is None:
+             raise ValueError("model_config and cache_config must be set")
+-        return MambaStateDtypeCalculator.kda_state_dtype(self.model_config.dtype, self.cache_config.mamba_cache_dtype)
++        return MambaStateDtypeCalculator.kda_state_dtype(
++            self.model_config.dtype,
++            self.cache_config.mamba_cache_dtype,
++            self.cache_config.mamba_ssm_cache_dtype,
++        )
+ 
+     def get_state_shape(
+         self,
+diff --git a/vllm_ascend/models/glm5next/model.py b/vllm_ascend/models/glm5next/model.py
+index 448819bb6..4ab2633cf 100644
+--- a/vllm_ascend/models/glm5next/model.py
++++ b/vllm_ascend/models/glm5next/model.py
+@@ -902,7 +902,9 @@ class Glm5NextForCausalLM(nn.Module, HasInnerState, SupportsPP, MixtureOfExperts
+         vllm_config: "VllmConfig",
+     ) -> tuple[torch.dtype, torch.dtype]:
+         return MambaStateDtypeCalculator.kda_state_dtype(
+-            vllm_config.model_config.dtype, vllm_config.cache_config.mamba_cache_dtype
++            vllm_config.model_config.dtype,
++            vllm_config.cache_config.mamba_cache_dtype,
++            vllm_config.cache_config.mamba_ssm_cache_dtype,
+         )
+ 
+     @classmethod

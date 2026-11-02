@@ -1,0 +1,189 @@
+commit 9d39709ecd74c8b74143508876f2710b372ca7bf
+Author:     vrooml <41864085+vrooml@users.noreply.github.com>
+AuthorDate: Thu Oct 22 21:16:52 2026 +0800
+Commit:     GitHub <noreply@github.com>
+CommitDate: Thu Oct 22 21:16:52 2026 +0800
+
+    [BugFix] Preserve GLM-Next shared-pool KV budget (#19457)
+    
+    ### What this PR does / why we need it?
+    
+    GLM-5.3-Flash MRV1 fails the 1M-context KV capacity check after #19079
+    correctly classifies KPool attention as SFA. This sets
+    `use_sparse=True`, bypasses the generic hybrid-backing exemption, and
+    triggers a per-layer discount even though the GLM-Next planner already
+    accounts for physical sharing. The failing nightly applies a factor of
+    `30916608 / 112386048 = 0.2751`, leaving about 6.23-6.39 GiB for
+    admission instead of the 7.57 GiB required.
+    
+    Extend the existing DeepSeek V4/V4.1 shared-pool exemption to cache
+    specs marked `model_version="glm5_next"`, using the same implementation
+    approach as #19494. Both model runners consume the GLM-Next
+    physical-slot planner, so this exemption belongs to the shared-pool
+    layout rather than a runner-specific branch. The current default MRV2
+    hybrid path already preserves its budget through the later generic
+    exemption.
+    
+    Keep SFA classification, cache geometry, deployment YAMLs, and all
+    pre-existing test functions intact. Add one parameterized regression
+    covering BF16/packed int8 main caches and sparse routing
+    enabled/disabled, with exactly the physical budget needed for a
+    1,048,576-token context.
+    
+    Related failure: [Nightly-A3 GLM
+    job](https://github.com/vllm-project/vllm-ascend/actions/runs/39632677145/job/119582689564).
+    
+    ### Does this PR introduce _any_ user-facing change?
+    
+    Yes. GLM-Next retains its physical shared-pool KV budget instead of
+    receiving an unnecessary per-layer reduction, addressing the
+    GLM-5.3-Flash MRV1 startup capacity failure without reducing
+    `max_model_len` or changing deployment configuration.
+    
+    ### How was this patch tested?
+    
+    **CPU regression tests in the reproduced nightly image, without NPU
+    devices:**
+    
+    ```bash
+    TORCH_DEVICE_BACKEND_AUTOLOAD=0 python3 -m pytest -q -p no:cacheprovider \
+      tests/ut/models/test_glm5next_cache_config.py \
+      tests/ut/worker/test_worker_v1.py \
+      -k 'glm or budget_scaling or shared_tuple_layout or multi_group_budget'
+    ```
+    
+    - Current implementation: **13 passed**, including all four new BF16/C8
+    x sparse-on/off cases and the existing GLM, generic scaling, and
+    DeepSeek shared-pool tests.
+    - Unmodified main-base worker with the four new cases: **2 failed, 2
+    passed**. Both sparse cases reproduce the erroneous budget reduction;
+    both non-sparse controls pass.
+    - The new cases assert the complete planner budget, 1M physical
+    capacity, and the sum of physical allocation descriptor sizes. All
+    pre-existing test functions and `tests/ut/worker/test_worker_v1.py`
+    remain unchanged.
+    - Ruff check/format check, Python source compilation, and `git diff
+    --check` pass. `bash format.sh ci` stops because `pre-commit` is
+    unavailable locally; full hooks remain for CI.
+    
+    **Earlier A3 decoder evidence:**
+    
+    The original nightly MRV1 failed the 7.57 GiB admission check. The
+    earlier MRV1-only implementation of this PR passed all eight decoder
+    health checks in 445.24 s with 22.74 GiB of KV budget. Unmodified MRV2
+    passed all eight in 450.25 s with 23.32-23.33 GiB. These runs used the
+    same nightly image and GLM weights, DP8/TP2, 1M context, int8 KV, MTP5,
+    and decode graph capture.
+    
+    Those hardware results establish the diagnosis and the earlier
+    implementation; they are not a hardware rerun of the current shared
+    exemption. NPU startup with the final implementation, full PD requests,
+    accuracy, and throughput/latency validation remain pending before merge.
+    
+    ---
+    
+    ### Checklist
+    
+    - [x] Regression: sparse failures reproduced on the baseline; 13 related
+    tests pass with the fix.
+    - [x] Boundary coverage: BF16/C8, sparse on/off, and the exact physical
+    budget for 1M context.
+    - [x] Focused diff: existing deployment YAMLs and pre-existing test
+    functions are unchanged.
+    
+    - vLLM main:
+    https://github.com/vllm-project/vllm/commit/a98247ab4db686ee03c66d5feb3c761e52a2f8ab
+    
+    ---------
+    
+    Signed-off-by: vrooml <41864085+vrooml@users.noreply.github.com>
+    Co-authored-by: YanpengDing <dingyanpeng18@163.com>
+
+diff --git a/tests/ut/models/test_glm5next_cache_config.py b/tests/ut/models/test_glm5next_cache_config.py
+index 087cbe05d..98d5c4d97 100644
+--- a/tests/ut/models/test_glm5next_cache_config.py
++++ b/tests/ut/models/test_glm5next_cache_config.py
+@@ -16,7 +16,7 @@ from vllm.v1.kv_cache_interface import (
+     MLAAttentionSpec,
+ )
+ 
+-from vllm_ascend.core.kv_cache_interface import AscendIndexerKPoolTailSpec
++from vllm_ascend.core.kv_cache_interface import AscendIndexerKPoolTailSpec, AscendMLAAttentionSpec
+ from vllm_ascend.models.glm5next.cache_config import (
+     _get_glm5_next_cache_layout,
+     get_glm5_next_kv_cache_config,
+@@ -198,3 +198,47 @@ def test_misaligned_logical_block_is_rejected():
+     )
+     with pytest.raises(ValueError, match="divisible"):
+         get_glm5_next_kv_cache_groups(make_config(), specs)
++
++
++@pytest.mark.parametrize("use_sparse", [False, True])
++@pytest.mark.parametrize("packed_main", [False, True])
++def test_worker_preserves_glm5_next_physical_pool_budget(monkeypatch, use_sparse, packed_main):
++    from vllm_ascend.worker.worker import NPUWorker
++
++    config = make_config()
++    config.model_config.max_model_len = 1048576
++    config.model_config.hf_text_config = SimpleNamespace(model_type="glm5_next", index_topk=2048, index_kpool=16)
++    config.cache_config.get_resolved_kv_cache_layout = lambda: SimpleNamespace(
++        is_layer_compact=True, is_block_compact=True
++    )
++    specs = make_specs()
++    if packed_main:
++        specs["model.layers.3.attn"] = AscendMLAAttentionSpec(
++            block_size=512,
++            num_kv_heads=1,
++            head_size=528,
++            dtype=torch.int8,
++            cache_sparse_sfa_c8=True,
++            model_version="glm5_next",
++            indexes_kv_by_block_stride=True,
++        )
++    groups = get_glm5_next_kv_cache_groups(config, specs)
++    # Supply exactly enough physical memory for the configured context. The
++    # generic discount incorrectly makes this valid shared pool fail admission.
++    required = get_glm5_next_max_memory_usage(config, groups)
++    worker = NPUWorker.__new__(NPUWorker)
++    worker.vllm_config = config
++    worker.model_config = config.model_config
++    worker.get_kv_cache_spec = lambda: specs
++    worker.model_runner = SimpleNamespace(
++        use_sparse=use_sparse,
++        use_compress=False,
++        supports_standardized_shared_kv_backing=True,
++    )
++    monkeypatch.setattr("vllm_ascend.worker.worker.get_kv_cache_groups", lambda *_args: groups)
++    budget = worker._scale_kv_cache_memory_for_multi_group(required)
++
++    assert budget == required
++    plan = get_glm5_next_kv_cache_config(config, groups, budget)
++    assert plan.num_blocks * get_glm5_next_pool_bytes_per_block(groups) == required
++    assert sum(tensor.size for tensor in plan.kv_cache_tensors) == required
+diff --git a/vllm_ascend/worker/worker.py b/vllm_ascend/worker/worker.py
+index da32b330b..767c19488 100644
+--- a/vllm_ascend/worker/worker.py
++++ b/vllm_ascend/worker/worker.py
+@@ -760,16 +760,17 @@ class NPUWorker(WorkerBase):
+         kv_cache_groups = get_kv_cache_groups(self.vllm_config, kv_cache_spec)
+         if not kv_cache_groups:
+             return available_memory
+-        # vLLM #51718 removed the DSV4-specific packed planner. Ascend restores
+-        # that shared-tuple layout in patch_kv_cache_utils, so DSV4 already fits
+-        # all groups in one physical budget and must not take the generic
+-        # per-layer multi-group scale below.
++        # Ascend's DSV4/V4.1 and GLM-Next planners already account for shared
++        # physical storage across all groups. Their budgets must not take the
++        # generic per-layer scale, including when the runner uses sparse SFA.
+         for group in kv_cache_groups:
+             group_spec = group.kv_cache_spec
+             specs = (
+                 group_spec.kv_cache_specs.values() if isinstance(group_spec, UniformTypeKVCacheSpecs) else (group_spec,)
+             )
+-            if any(getattr(spec, "model_version", None) in {"deepseek_v4", "deepseek_v41"} for spec in specs):
++            if any(
++                getattr(spec, "model_version", None) in {"deepseek_v4", "deepseek_v41", "glm5_next"} for spec in specs
++            ):
+                 return available_memory
+ 
+         # vLLM #51718 overlays KV cache groups in one standardized backing

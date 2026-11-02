@@ -1,0 +1,182 @@
+commit aaee31aec52cce1ff6a4a5e68955b37310a5fe9e
+Author:     0hujun <96733800+0hujun@users.noreply.github.com>
+AuthorDate: Tue Oct 27 15:25:21 2026 +0800
+Commit:     GitHub <noreply@github.com>
+CommitDate: Tue Oct 27 15:25:21 2026 +0800
+
+    [BugFix] Strip stream_options on decode path when stream is false (#19622)
+    
+    ### What this PR does / why we need it?
+    fix #19619
+    
+    In
+    `examples/disaggregated_prefill_v1/load_balance_proxy_server_example.py`,
+    the
+    Prefill-Decode disaggregation proxy forwards requests to two backend
+    roles:
+    
+    - **Prefill** via `send_request_to_service` -> `build_prefill_request`,
+    which forces
+      `stream=False` and pops `stream_options` (`:834`).
+    - **Decode** via `stream_service_response`, which forwarded `req_data`
+    **as-is** without
+      stripping `stream_options`.
+    
+    `build_prefill_request` operates on a copy, so the original `req_data`
+    still carries
+    `stream_options` when handed to `stream_service_response`. When a client
+    sends a
+    **non-streaming** request with `stream_options`, the decoder receives
+    `stream=false + stream_options` and returns:
+    
+    ```
+    Stream options can only be defined when stream=True`. (parameter=stream_options)
+    ```
+    
+    Reproducing request:
+    
+    ```json
+    {
+      "model": "glm5.3",
+      "messages": [{"role": "user", "content": "hello"}],
+      "stream": false,
+      "stream_options": {
+        "include_usage": true
+      }
+    }
+    ```
+    
+    **Fix**: in `stream_service_response`, copy `req_data` and pop
+    `stream_options` only
+    when `stream` is falsy. Streaming requests keep `stream_options` (valid
+    for
+    `stream=true`); non-streaming requests have it stripped before reaching
+    the decoder.
+    Both decode call sites (initial pre-opened stream `:1065` and recompute
+    retry `:1130`)
+    go through this function, so both are covered.
+    
+    This is safe because the proxy reconstructs usage information itself
+    (`update_cached_tokens_in_chunk` at `:1157`, `completion_tokens`
+    accounting at `:1171`)
+    and does not rely on the backend's `stream_options={include_usage}`
+    final usage chunk.
+    
+    Fixes #<issue_number>
+    
+    ### Does this PR introduce _any_ user-facing change?
+    
+    No. This only affects the example proxy server
+    (`examples/disaggregated_prefill_v1/`).
+    Non-streaming requests that previously failed with a 400 error now
+    succeed; streaming
+    behavior is unchanged.
+    
+    ### How was this patch tested?
+    
+    Manual verification with a PD disaggregation deployment:
+    
+    1. Start one prefiller and one decoder vLLM backend.
+    2. Start the proxy:
+       ```bash
+       python load_balance_proxy_server_example.py \
+         --host 0.0.0.0 --port 9000 \
+         --prefiller-hosts 127.0.0.1 --prefiller-ports 8100 \
+         --decoder-hosts 127.0.0.1 --decoder-ports 8200
+       ```
+    3. Send a non-streaming request with `stream_options` (previously
+    failed):
+       ```bash
+       curl -X POST http://127.0.0.1:9000/v1/chat/completions \
+         -H "Content-Type: application/json" \
+         -d '{
+           "model": "glm5.3",
+           "messages": [{"role": "user", "content": "hello"}],
+           "stream": false,
+           "stream_options": {"include_usage": true}
+         }'
+       ```
+    - Before: HTTP 400, `Stream options can only be defined when
+    stream=True`.
+       - After: HTTP 200 with a valid completion response.
+    4. Send a streaming request with `stream_options` (regression check):
+       ```bash
+       curl -X POST http://127.0.0.1:9000/v1/chat/completions \
+         -H "Content-Type: application/json" \
+         -d '{
+           "model": "glm5.3",
+           "messages": [{"role": "user", "content": "hello"}],
+           "stream": true,
+           "stream_options": {"include_usage": true}
+         }'
+       ```
+       - Streaming output and final usage chunk are delivered as before.
+    
+    No unit tests were added because this is an example script (not part of
+    the
+    `vllm_ascend` package tested by `pytest`). The change is a 3-line guard
+    validated
+    manually end-to-end.
+    
+    ---
+    
+    ### Checklist
+    
+    #### Testing
+    
+    - [ ] **Boundary / edge-case coverage**: Reviewed. Edge cases
+    considered:
+    `stream` absent (treated as falsy -> pop), `stream=true` (keep
+    `stream_options`),
+      `stream=false` (pop), `stream_options` absent (pop is a no-op).
+    - [ ] **Regression test**: Manual regression check performed for the
+    streaming path
+    (step 4 above) to confirm `stream_options` is preserved when
+    `stream=true`.
+    - [x] **Error / failure path coverage**: The fixed path is itself an
+    error/failure path
+      (400 from decode backend on invalid `stream_options`).
+    - [x] **Meaningful & reliable tests**: Manual end-to-end verification on
+    a real PD
+      deployment.
+    - [ ] **Performance impact**: Not applicable. A shallow `dict.copy()`
+    per decode request
+      is negligible compared to network I/O.
+    
+    ---
+    
+    ## Diff
+    
+    ```diff
+    --- a/examples/disaggregated_prefill_v1/load_balance_proxy_server_example.py
+    +++ b/examples/disaggregated_prefill_v1/load_balance_proxy_server_example.py
+    @@ -872,6 +872,9 @@ async def stream_service_response(
+     ):
+         headers = auth_headers(request_id)
+    +    req_data = req_data.copy()
+    +    if not req_data.get("stream", False):
+    +        req_data.pop("stream_options", None)
+         max_attempts = max(1, max_retries)
+         for attempt in range(1, max_attempts + 1):
+             first_chunk_sent = False
+    ```
+    
+    - vLLM main:
+    https://github.com/vllm-project/vllm/commit/c0b6f74bee518aeaf5d72b200a0216e72fbb5e7c
+    
+    Signed-off-by: 0hujun <96733800+0hujun@users.noreply.github.com>
+
+diff --git a/examples/disaggregated_prefill_v1/load_balance_proxy_server_example.py b/examples/disaggregated_prefill_v1/load_balance_proxy_server_example.py
+index 0462e9e61..2cfc14f20 100644
+--- a/examples/disaggregated_prefill_v1/load_balance_proxy_server_example.py
++++ b/examples/disaggregated_prefill_v1/load_balance_proxy_server_example.py
+@@ -872,6 +872,9 @@ async def stream_service_response(
+ ):
+     headers = auth_headers(request_id)
+     max_attempts = max(1, max_retries)
++    req_data = req_data.copy()
++    if not req_data.get("stream", False):
++        req_data.pop("stream_options", None)
+     for attempt in range(1, max_attempts + 1):
+         first_chunk_sent = False
+         try:

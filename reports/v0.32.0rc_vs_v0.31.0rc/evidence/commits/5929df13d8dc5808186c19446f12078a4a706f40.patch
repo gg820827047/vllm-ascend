@@ -1,0 +1,3726 @@
+commit 5929df13d8dc5808186c19446f12078a4a706f40
+Author:     tangdafu <43084046+tangdafu@users.noreply.github.com>
+AuthorDate: Sat Oct 31 12:31:42 2026 +0800
+Commit:     GitHub <noreply@github.com>
+CommitDate: Sat Oct 31 12:31:42 2026 +0800
+
+    [Refactor][Attention] Unify PCP O-proj weight switching (#18744)
+    
+    ### What this PR does / why we need it?
+    
+    Unifies MRV2 DSA-PCP and SFA-PCP O-projection execution in a shared
+    `ParallelOProjection` component. It owns checkpoint partitioning,
+    temporary full-weight views, exchange buffers, collectives and output
+    reductions while retaining native grouped and quantized kernels.
+    Full-weight, local-weight and token-exchange modes share weight
+    restoration after each forward.
+    
+    Preserves current PCP/DCP cache mappings and NoPE padding behavior. This
+    revision follows main's removal of legacy DSA-CP (#19493): obsolete
+    implementations and their test files remain deleted, with lifecycle and
+    precision coverage aligned to the supported PCP/DCP classes.
+    
+    ### Does this PR introduce any user-facing change?
+    
+    No new user-facing API, environment variable or configuration option.
+    The existing PCP O-projection sharding switch remains supported.
+    
+    ### How was this patch tested?
+    
+    Current validation head: `80ab94490591c9c672acc710c855ff45d05fa994`.
+    
+    This CI follow-up changes only four collective mock targets in
+    `test_dsa_v1.py` and `test_dsa_v41_cp.py` to `torch.distributed`. Legacy
+    DSA-CP removal also removed the old `dsa_cp.dist` import alias, while
+    the shared `ParallelOProjection` uses the same public PyTorch
+    distributed module. Production source, test parameter combinations,
+    assertions and numerical thresholds are unchanged.
+    
+    - Current-head pre-commit: **success**
+    ([job](https://github.com/vllm-project/vllm-ascend/actions/runs/41048926329/job/124039856361)).
+    - Current-head cpu-ut (vllm@544f182d9f0c9bfe8bd7645525951d5e3692a542) /
+    cpu-ut card-: **success**
+    ([job](https://github.com/vllm-project/vllm-ascend/actions/runs/41048926329/job/124042119082)).
+    - Current-head cpu-ut (vllm@v0.32.0) / cpu-ut card-: **success**
+    ([job](https://github.com/vllm-project/vllm-ascend/actions/runs/41048926329/job/124042118977)).
+    - Verified full log for cpu-ut
+    (vllm@544f182d9f0c9bfe8bd7645525951d5e3692a542) / cpu-ut card-: `14276
+    passed, 109 skipped, 27 warnings in 317.51s (0:05:17)`; all 80
+    previously failing node IDs are explicitly `PASSED`, with no new
+    failures.
+    - Verified full log for cpu-ut (vllm@v0.32.0) / cpu-ut card-: `14260
+    passed, 125 skipped, 27 warnings in 311.57s (0:05:11)`; all 80
+    previously failing node IDs are explicitly `PASSED`, with no new
+    failures.
+    
+    - On previous head `c46d5b364`, each full CPU lane failed the same 80
+    cases: 16 static-quantization bias cases and 64 V4.1 PCP fixture
+    consumers, all with the removed `dsa_cp.dist` attribute. [Failed
+    CI](https://github.com/vllm-project/vllm-ascend/actions/runs/41040806884).
+    - Local before/after reproduction: the original 36-case dense-reference
+    projection oracle and 16-case static-quantization bias oracle failed
+    before the mock fix and all 52 passed afterward. These checks use real
+    production projection, weight-switch and quantized-apply bodies with
+    platform initialization, device operations and collective boundaries
+    isolated. They are not full-module or NPU runs.
+    - AST checks confirm every assertion in both complete test files is
+    unchanged; only their mock targets differ. Ruff 0.14.0 check/format,
+    Codespell, Python syntax and `git diff --check` passed.
+    - `bash format.sh ci` was run locally. Its code/style hooks passed;
+    Windows lacks `/bin/bash` for two shell hooks, ShellCheck and a
+    resolvable `python3` command for two system hooks. The aligned Linux
+    pre-commit result above is authoritative for the full check.
+    - Earlier source-level validation on the previous head recorded 113
+    lifecycle/DCP/NoPE cases, 69 selected attention/cache cases, 42
+    weight/cache cases and 9 Mooncake tests with 2 subtests; these groups
+    overlap. Eight full-platform-constructor cases remained for aligned CI.
+    Current-head full CPU results above supersede those isolated checks for
+    repository CPU coverage.
+    - No NPU end-to-end, device graph-replay or performance rerun is claimed
+    for this CI-only fixture fix. Hardware CI coverage remains separate.
+    
+    - vLLM main:
+    https://github.com/vllm-project/vllm/commit/544f182d9f0c9bfe8bd7645525951d5e3692a542
+    
+    Signed-off-by: t00911734 <tangdafu@huawei.com>
+    Co-authored-by: t00911734 <tangdafu@huawei.com>
+
+diff --git a/tests/ut/attention/test_dsa_v1.py b/tests/ut/attention/test_dsa_v1.py
+index f16fa7859..973ddab78 100644
+--- a/tests/ut/attention/test_dsa_v1.py
++++ b/tests/ut/attention/test_dsa_v1.py
+@@ -49,9 +49,10 @@ from vllm_ascend.models.deepseek_v4.indexer import (
+     AscendIndexerMetadata,
+     IndexerOverlapPlan,
+ )
+-from vllm_ascend.ops.linear import AscendRowParallelLinear
++from vllm_ascend.ops.linear import AscendRowParallelLinear, AscendUnquantizedLinearMethod
+ from vllm_ascend.quantization.method_adapters import AscendLinearMethod
+ from vllm_ascend.quantization.methods.w8a8.w8a8_static import AscendW8A8LinearMethod
++from vllm_ascend.weight_switch import ParallelOProjection, WeightSwitchConfig
+ from vllm_ascend.worker.device_metadata import (
+     DeviceMetadataStage,
+     DeviceMetadataTask,
+@@ -1036,6 +1037,14 @@ def _make_impl(
+             "vllm_ascend.attention.context_parallel.dsa_cp.enable_pcp_o_proj_weight_sharding",
+             return_value=False,
+         ),
++        patch(
++            "vllm_ascend.attention.context_parallel.dsa_cp.get_pcp_group",
++            return_value=SimpleNamespace(world_size=2, rank_in_group=0),
++        ),
++        patch(
++            "vllm_ascend.attention.context_parallel.dsa_cp.get_tp_group",
++            return_value=SimpleNamespace(world_size=1, rank_in_group=0),
++        ),
+     ):
+         return impl_cls(
+             n_heads=1,
+@@ -1050,7 +1059,10 @@ def _make_impl(
+             n_local_groups=1,
+             window_size=16,
+             compress_ratio=1,
+-            vllm_config=SimpleNamespace(cache_config=SimpleNamespace(cache_dtype="auto")),
++            vllm_config=SimpleNamespace(
++                cache_config=SimpleNamespace(cache_dtype="auto"),
++                parallel_config=SimpleNamespace(prefill_context_parallel_size=2, decode_context_parallel_size=1),
++            ),
+             wq_a=linear,
+             wq_b=linear,
+             wkv=linear,
+@@ -2066,6 +2078,22 @@ def test_pcp_graph_metadata_restores_mtp_query_offsets():
+     assert torch.equal(replace_kwargs["query_start_loc_cpu"], expected_query_start_loc)
+ 
+ 
++def _attach_parallel_o_proj(impl, pcp_group, *, tp_group=None, decode_sharded=False):
++    impl._parallel_o_proj = ParallelOProjection(
++        impl.n_local_heads * impl.head_dim,
++        impl.wo_b,
++        config=WeightSwitchConfig.from_group(pcp_group, shard_axis="input"),
++        tp_group=tp_group or SimpleNamespace(world_size=1, rank_in_group=0),
++        pool=impl.o_proj_full_pools,
++        pool_key="dsa_pcp_o_proj",
++        project_full=AscendDSAImpl._forward_o_proj.__get__(impl),
++        decode_sharded=decode_sharded,
++        input_layer=impl.wo_a,
++        input_projection=impl._wo_a_bmm,
++        num_input_groups=impl.n_local_groups,
++    )
++
++
+ @pytest.mark.parametrize("local_num_actual_tokens", [2, 0], ids=["local_tokens", "empty_rank"])
+ @pytest.mark.parametrize("shard_o_proj", [False, True])
+ @pytest.mark.parametrize("global_prefill,decode_sharded", [(True, False), (True, True), (False, True)])
+@@ -2078,8 +2106,10 @@ def test_pcp_forward_updates_global_caches_before_local_attention(
+     """Exercise batched cache preparation, local attention, and empty ranks."""
+     impl = _make_impl(AscendDSAPCPImpl)
+     impl.enable_pcp_o_proj_weight_sharding = shard_o_proj
+-    impl._pcp_decode_sharded = decode_sharded
+-    impl.pcp_o_proj_weight_switch_config = MagicMock()
++    impl._parallel_o_proj.enabled = shard_o_proj
++    impl._parallel_o_proj._weight_switch_enabled = shard_o_proj
++    impl._parallel_o_proj.decode_sharded = decode_sharded
++    impl._parallel_o_proj.config = MagicMock()
+     events = []
+     weight_switches = []
+     for _ in range(2):
+@@ -2099,7 +2129,7 @@ def test_pcp_forward_updates_global_caches_before_local_attention(
+         method.all_gather_weight.side_effect = gather
+         method.wait_weight_all_gather.side_effect = wait
+         weight_switches.append((MagicMock(), method, state))
+-    impl._pcp_o_proj_weight_switches = tuple(weight_switches)
++    impl._parallel_o_proj._weight_switch_states = tuple(weight_switches)
+     impl.compress_ratio = 4
+     impl.compressor = SimpleNamespace(
+         state_cache=SimpleNamespace(prefix="compressor.state_cache"),
+@@ -2281,10 +2311,11 @@ def test_pcp_decode_delegates_to_standard_cache_preparation():
+     )
+     attn_metadata = {"swa_cache": metadata}
+     impl.enable_pcp_o_proj_weight_sharding = True
+-    impl._pcp_o_proj_use_full_weight = True
+-    impl._pcp_decode_sharded = False
+-    impl._pcp_o_proj_weight_switches = None
+-    impl._get_pcp_o_proj_weight_switches = MagicMock(return_value=())
++    impl._parallel_o_proj.enabled = True
++    impl._parallel_o_proj.set_mode(use_full_weight=True, exchange_tokens=False)
++    impl._parallel_o_proj.decode_sharded = False
++    impl._parallel_o_proj._weight_switch_states = None
++    impl._parallel_o_proj.enable = MagicMock()
+ 
+     with (
+         patch.object(
+@@ -2293,9 +2324,9 @@ def test_pcp_decode_delegates_to_standard_cache_preparation():
+             autospec=True,
+             return_value=False,
+         ) as prepare_standard_caches,
+-        impl._o_proj_batch(needs_global_metadata=False, has_prefill=False),
++        impl._parallel_o_proj.batch(needs_global_metadata=False, has_prefill=False),
+     ):
+-        assert not impl._pcp_o_proj_use_full_weight
++        assert not impl._parallel_o_proj.uses_full_weight
+         assert not impl._prepare_caches_before_attention(
+             "layer",
+             torch.empty((4, 4)),
+@@ -2304,23 +2335,61 @@ def test_pcp_decode_delegates_to_standard_cache_preparation():
+         )
+ 
+     prepare_standard_caches.assert_called_once()
+-    impl._get_pcp_o_proj_weight_switches.assert_called_once()
++    impl._parallel_o_proj.enable.assert_called_once()
+ 
+ 
+ @pytest.mark.parametrize("global_prefill", [False, True])
+ def test_disabled_pcp_o_projection_context_needs_no_shard_state(global_prefill):
+     impl = _make_impl(AscendDSAPCPImpl)
+-    assert not hasattr(impl, "_pcp_o_proj_weight_switches")
++    assert impl._parallel_o_proj._weight_switch_states is None
+     assert not hasattr(impl, "_pcp_decode_sharded")
+     with (
+         pytest.raises(RuntimeError, match="injected failure"),
+-        impl._o_proj_batch(needs_global_metadata=True, has_prefill=global_prefill),
++        impl._parallel_o_proj.batch(needs_global_metadata=True, has_prefill=global_prefill),
+     ):
+-        assert not impl._pcp_o_proj_use_full_weight
+-        assert not impl._pcp_o_proj_use_activation_exchange
++        assert not impl._parallel_o_proj.uses_full_weight
++        assert not impl._parallel_o_proj.exchanges_tokens
+         raise RuntimeError("injected failure")
+ 
+ 
++def test_dsa_pcp_exchange_buffer_uses_attention_output_width():
++    impl = AscendDSAPCPImpl.__new__(AscendDSAPCPImpl)
++    impl.n_local_heads = 32
++    impl.n_local_groups = 2
++    impl.head_dim = 512
++    impl.o_proj_full_pools = {}
++    impl.wo_a = SimpleNamespace(
++        input_size=32 * 512,
++        input_size_per_partition=32 * 512,
++        output_size_per_partition=1234,
++        weight=torch.empty(1),
++    )
++    impl.wo_b = SimpleNamespace(
++        input_size=4096,
++        input_size_per_partition=4096,
++        output_size_per_partition=4096,
++        weight=torch.empty(1),
++    )
++    group = SimpleNamespace(world_size=2, rank_in_group=0, device_group=object())
++    impl.vllm_config = SimpleNamespace(
++        num_speculative_tokens=0,
++        scheduler_config=SimpleNamespace(max_num_seqs=4),
++        compilation_config=SimpleNamespace(max_cudagraph_capture_size=16, cudagraph_capture_sizes=None),
++        model_config=SimpleNamespace(dtype=torch.float32),
++    )
++    _attach_parallel_o_proj(impl, group)
++
++    impl._parallel_o_proj._prepare_exchange_buffers(impl.vllm_config)
++
++    assert impl._parallel_o_proj.input_layer is impl.wo_a
++    assert impl._parallel_o_proj.o_proj is impl.wo_b
++    assert impl._parallel_o_proj.input_size == 32 * 512
++    assert impl._parallel_o_proj.output_size == 4096
++    assert impl._parallel_o_proj.all_gather_input.shape == (16, 32 * 512)
++    assert impl._parallel_o_proj.all_gather_output.shape == (32, 32 * 512)
++    assert impl._parallel_o_proj.reduce_scatter_input.shape == (32, 4096)
++
++
+ @pytest.mark.parametrize("tp_size", [1, 2])
+ @pytest.mark.parametrize("reduce_results", [False, True])
+ @pytest.mark.parametrize("quant_bias_value", [0, 64])
+@@ -2372,6 +2441,9 @@ def test_pcp_local_o_projection_adds_static_quant_bias_once(tp_size, reduce_resu
+                 num_speculative_tokens=0,
+                 model_config=SimpleNamespace(dtype=torch.bfloat16),
+             )
++            layer.input_size_per_partition = 2
++            _attach_parallel_o_proj(impl, pcp_group, tp_group=tp_group, decode_sharded=decode_sharded)
++            impl._parallel_o_proj._weight_switch_enabled = True
+ 
+             def exchange(destination, source, *, group):
+                 destination.copy_(source.repeat(2, 1))
+@@ -2394,20 +2466,18 @@ def test_pcp_local_o_projection_adds_static_quant_bias_once(tp_size, reduce_resu
+                 patch.object(torch.ops.vllm, "quantize", create=True, side_effect=lambda x, *args: x.to(torch.int8)),
+                 patch("torch_npu.npu_transpose_batchmatmul", create=True, side_effect=lambda x, *args, **kwargs: x),
+                 patch("torch_npu.npu_quant_matmul", create=True, side_effect=quant_matmul),
+-                patch(
+-                    "vllm_ascend.attention.context_parallel.dsa_cp.dist.all_gather_into_tensor", side_effect=exchange
+-                ) as ag,
+-                patch(
+-                    "vllm_ascend.attention.context_parallel.dsa_cp.dist.reduce_scatter_tensor", side_effect=scatter
+-                ) as rs,
++                patch.object(torch.distributed, "all_gather_into_tensor", side_effect=exchange) as ag,
++                patch.object(torch.distributed, "reduce_scatter_tensor", side_effect=scatter) as rs,
+             ):
+                 result = torch.empty((1, 2), dtype=torch.bfloat16)
+                 inputs = torch.zeros((1, 2, 2), dtype=torch.bfloat16)
+                 if decode_sharded:
+-                    impl._initialize_pcp_o_proj_exchange_buffers()
+-                    impl._forward_o_proj_with_sharded_tokens(inputs, result)
++                    impl._parallel_o_proj._prepare_exchange_buffers(impl.vllm_config)
++                    impl._parallel_o_proj.set_mode(use_full_weight=False, exchange_tokens=True)
++                    impl._forward_o_proj(inputs, result)
+                 else:
+-                    impl._forward_o_proj_with_local_weights(inputs, result)
++                    impl._parallel_o_proj.set_mode(use_full_weight=False, exchange_tokens=False)
++                    impl._forward_o_proj(inputs, result)
+                 partial_outputs.append(result)
+             assert tp_group.all_reduce.call_count == int(reduce_results and tp_size > 1)
+             assert pcp_group.all_reduce.call_count == int(not decode_sharded)
+@@ -2415,6 +2485,146 @@ def test_pcp_local_o_projection_adds_static_quant_bias_once(tp_size, reduce_resu
+     assert torch.equal(torch.stack(partial_outputs).sum(0), torch.full((1, 2), quant_bias_value, dtype=torch.bfloat16))
+ 
+ 
++@pytest.mark.parametrize("quantized", [False, True])
++@pytest.mark.parametrize("reduce_results", [False, True])
++@pytest.mark.parametrize("skip_bias_add", [False, True])
++@pytest.mark.parametrize("decode_sharded", [False, True])
++def test_pcp_o_projection_preserves_ordinary_bias_and_collective_order(
++    quantized, reduce_results, skip_bias_add, decode_sharded
++):
++    """Apply ordinary bias once with PCP before TP and deferred TP summation."""
++    peers = torch.arange(1, 17, dtype=torch.float32).reshape(2, 2, 2, 2)
++    all_rows = torch.cat(tuple(peers)) if decode_sharded else peers[0]
++    bias = torch.tensor([13.0, 17.0])
++    by_owner: dict[int, list[torch.Tensor]] = {0: [], 1: []}
++
++    def contribution(tp_rank, pcp_rank):
++        return all_rows[:, pcp_rank] * (1 + 2 * tp_rank + pcp_rank)
++
++    full_sum = sum(contribution(tp_rank, pcp_rank) for tp_rank in range(2) for pcp_rank in range(2))
++    for pcp_rank in range(2):
++        for tp_rank in range(2):
++            events: list[str] = []
++            partial = contribution(tp_rank, pcp_rank)
++            after_pcp = sum(contribution(tp_rank, rank) for rank in range(2))
++            tp_input = after_pcp.chunk(2)[pcp_rank] if decode_sharded else after_pcp
++            after_tp = (full_sum.chunk(2)[pcp_rank] if decode_sharded else full_sum) if reduce_results else tp_input
++
++            def reduce_tp(value, *, events=events, tp_input=tp_input, after_tp=after_tp):
++                events.append("tp")
++                torch.testing.assert_close(value, tp_input)
++                return after_tp
++
++            def reduce_pcp(value, *, events=events, partial=partial, after_pcp=after_pcp):
++                events.append("pcp")
++                torch.testing.assert_close(value, partial)
++                return after_pcp
++
++            def gather(destination, source, *, group, events=events, pcp_rank=pcp_rank):
++                events.append("gather")
++                torch.testing.assert_close(source, peers[pcp_rank].flatten(1))
++                destination.copy_(all_rows.flatten(1))
++
++            def scatter(
++                destination, source, *, group, events=events, partial=partial, after_pcp=after_pcp, pcp_rank=pcp_rank
++            ):
++                events.append("scatter")
++                torch.testing.assert_close(source, partial)
++                destination.copy_(after_pcp.chunk(2)[pcp_rank])
++
++            def grouped_matmul(value, weight, *, events=events, **kwargs):
++                events.append("wo_a")
++                return torch.bmm(value.transpose(0, 1), weight).transpose(0, 1)
++
++            def unquantized_gemm(value, weight, ordinary_bias, *, events=events):
++                events.append("wo_b")
++                assert ordinary_bias is None
++                return torch.nn.functional.linear(value, weight)
++
++            def quantized_gemm(value, weight, scale, *, bias, output_dtype, events=events):
++                events.append("wo_b")
++                # ModelSlim's quantization correction is independent of the
++                # ordinary output bias tested here.
++                assert bias is None or not torch.count_nonzero(bias)
++                return torch.nn.functional.linear(value.to(output_dtype), weight.to(output_dtype))
++
++            tp_group = SimpleNamespace(world_size=2, rank_in_group=tp_rank, all_reduce=reduce_tp)
++            pcp_group = SimpleNamespace(
++                world_size=2, rank_in_group=pcp_rank, device_group=object(), all_reduce=reduce_pcp
++            )
++            vllm_config = SimpleNamespace(
++                scheduler_config=SimpleNamespace(max_num_seqs=2),
++                compilation_config=SimpleNamespace(max_cudagraph_capture_size=2, cudagraph_capture_sizes=None),
++                num_speculative_tokens=0,
++                model_config=SimpleNamespace(dtype=torch.float32),
++            )
++            if quantized:
++                method = object.__new__(AscendW8A8LinearMethod)
++                method.quant_method = "modelslim"
++                method = AscendLinearMethod(method)
++            else:
++                method = AscendUnquantizedLinearMethod()
++            output_layer = SimpleNamespace(
++                quant_method=method,
++                weight=torch.eye(2, dtype=torch.int8 if quantized else torch.float32) * (1 + 2 * tp_rank + pcp_rank),
++                bias=bias,
++                reduce_results=reduce_results,
++                skip_bias_add=skip_bias_add,
++                input_size_per_partition=2,
++                output_size_per_partition=2,
++                params_dtype=torch.float32,
++                quant_bias=torch.zeros(2, dtype=torch.int32),
++                deq_scale=torch.ones(2),
++                aclnn_input_scale=torch.ones(2),
++                aclnn_input_scale_reciprocal=torch.ones(2),
++                aclnn_input_offset=torch.zeros(2),
++            )
++            projection = ParallelOProjection(
++                4,
++                output_layer,
++                config=WeightSwitchConfig.from_group(pcp_group, shard_axis="input"),
++                tp_group=tp_group,
++                pool={},
++                pool_key="dsa_bias_regression",
++                project_full=MagicMock(side_effect=AssertionError("local projection must use resident weights")),
++                decode_sharded=decode_sharded,
++                input_layer=SimpleNamespace(weight=torch.eye(2).unsqueeze(0)),
++                input_projection=lambda value, kernel=grouped_matmul: kernel(value, torch.eye(2).unsqueeze(0)),
++                num_input_groups=2,
++            )
++            projection._weight_switch_enabled = True
++            projection.set_mode(use_full_weight=False, exchange_tokens=decode_sharded)
++            if decode_sharded:
++                projection._prepare_exchange_buffers(vllm_config)
++            with (
++                patch("torch_npu.npu_transpose_batchmatmul", create=True, side_effect=grouped_matmul),
++                patch.object(torch.ops.vllm, "unquantized_gemm", create=True, side_effect=unquantized_gemm),
++                patch.object(
++                    torch.ops.vllm, "quantize", create=True, side_effect=lambda value, *args: value.to(torch.int8)
++                ),
++                patch("torch_npu.npu_quant_matmul", create=True, side_effect=quantized_gemm),
++                patch("torch.distributed.all_gather_into_tensor", side_effect=gather),
++                patch("torch.distributed.reduce_scatter_tensor", side_effect=scatter),
++            ):
++                inputs = peers[pcp_rank] if decode_sharded else peers[0]
++                output = torch.empty(2, 2)
++                assert projection.forward(inputs, output) is output
++            expected = after_tp
++            if not skip_bias_add and (reduce_results or tp_rank == 0):
++                expected = expected + bias
++            torch.testing.assert_close(output, expected)
++            expected_events = (["gather"] if decode_sharded else []) + ["wo_a", "wo_b"]
++            expected_events.append("scatter" if decode_sharded else "pcp")
++            if reduce_results:
++                expected_events.append("tp")
++            assert events == expected_events
++            by_owner[pcp_rank].append(output)
++    for pcp_rank, outputs in by_owner.items():
++        combined = outputs[0] if reduce_results else sum(outputs)
++        expected = full_sum.chunk(2)[pcp_rank] if decode_sharded else full_sum
++        torch.testing.assert_close(combined, expected if skip_bias_add else expected + bias)
++
++
+ @pytest.mark.parametrize("tp_size", [2, 8])
+ @pytest.mark.parametrize("decode_capacity,scheduler_capacity", [(4, 6), (6, 4), (6, 6)])
+ def test_o_proj_capacity_tracks_decode_graph_not_profile_budget(tp_size, decode_capacity, scheduler_capacity):
+diff --git a/tests/ut/attention/test_dsa_v41_cp.py b/tests/ut/attention/test_dsa_v41_cp.py
+index 88a16a536..0779797db 100644
+--- a/tests/ut/attention/test_dsa_v41_cp.py
++++ b/tests/ut/attention/test_dsa_v41_cp.py
+@@ -16,6 +16,7 @@ from unittest.mock import Mock
+ import numpy as np
+ import pytest
+ import torch
++import vllm.distributed as vllm_distributed
+ from vllm.config import CUDAGraphMode
+ from vllm.v1.kv_cache_interface import CircularBufferSpec
+ 
+@@ -30,7 +31,7 @@ from vllm_ascend.ops.cv_linear import CVLinearWrapper
+ from vllm_ascend.ops.linear import AscendUnquantizedLinearMethod
+ from vllm_ascend.quantization.methods import AscendW8A8DynamicLinearMethod
+ from vllm_ascend.quantization.methods.w8a8.w8a8_mxfp8 import AscendW8A8MXFP8DSDynamicLinearMethod
+-from vllm_ascend.weight_switch import WeightSwitchConfig
++from vllm_ascend.weight_switch import ParallelOProjection, WeightSwitchConfig
+ from vllm_ascend.worker.v2.pcp_manager import AscendPCPAttentionContext
+ 
+ 
+@@ -113,18 +114,29 @@ def _projector(
+     projector.head_dim = width
+     projector.support_fp8_attention = False
+     projector.enable_pcp_o_proj_weight_sharding = sharding
+-    projector._pcp_decode_sharded = decode_sharded
+-    projector._pcp_o_proj_weight_switches = None
+     projector.wo_a_pcp_weight_method = projector.wo_a.quant_method
+     projector.wo_b_pcp_weight_method = projector.wo_b.quant_method
+     group = SimpleNamespace(world_size=world, rank_in_group=rank, device_group=object())
+-    projector.pcp_o_proj_weight_switch_config = WeightSwitchConfig.from_group(group)
+     projector.vllm_config = SimpleNamespace(
+         num_speculative_tokens=speculative_tokens,
+         scheduler_config=SimpleNamespace(max_num_seqs=4),
+         compilation_config=compilation_config,
+         model_config=SimpleNamespace(dtype=torch.float32),
+     )
++    projector._parallel_o_proj = ParallelOProjection(
++        world * width,
++        projector.wo_b,
++        config=WeightSwitchConfig.from_group(group),
++        tp_group=SimpleNamespace(world_size=1, rank_in_group=0),
++        pool={},
++        pool_key="dsa_pcp_o_proj",
++        project_full=dsa_cp.dsa_v1.AscendDSAImpl._forward_o_proj.__get__(projector),
++        decode_sharded=decode_sharded,
++        input_layer=projector.wo_a,
++        input_projection=projector._wo_a_bmm,
++        num_input_groups=world,
++    )
++    projector._parallel_o_proj.enabled = sharding
+     monkeypatch.setattr(dsa_cp.AscendDSAPCPImpl, "o_proj_full_pools", {})
+ 
+     def matmul(value, weight, **kwargs):
+@@ -149,18 +161,18 @@ def _projector(
+ 
+     def exchange(destination, source, *, group):
+         events.append("exchange")
+-        assert group is projector.pcp_o_proj_weight_switch_config.group.device_group
+-        assert source.data_ptr() == projector._pcp_o_proj_ag_in_buf.data_ptr()
+-        assert destination.data_ptr() == projector._pcp_o_proj_ag_out_buf.data_ptr()
++        assert group is projector._parallel_o_proj.config.group.device_group
++        assert source.data_ptr() == projector._parallel_o_proj.all_gather_input.data_ptr()
++        assert destination.data_ptr() == projector._parallel_o_proj.all_gather_output.data_ptr()
+         peers = projector.peer_inputs
+         torch.testing.assert_close(source, peers[rank])
+         destination.copy_(torch.cat(peers))
+ 
+     def scatter(destination, source, *, group):
+         events.append("scatter")
+-        assert group is projector.pcp_o_proj_weight_switch_config.group.device_group
+-        assert source.data_ptr() == projector._pcp_o_proj_rs_in_buf.data_ptr()
+-        assert destination.data_ptr() == projector._pcp_o_proj_rs_out_buf.data_ptr()
++        assert group is projector._parallel_o_proj.config.group.device_group
++        assert source.data_ptr() == projector._parallel_o_proj.reduce_scatter_input.data_ptr()
++        assert destination.data_ptr() == projector._parallel_o_proj.reduce_scatter_output.data_ptr()
+         destination.copy_(reduce(source).chunk(world)[rank])
+ 
+     group.all_reduce = reduce
+@@ -170,12 +182,12 @@ def _projector(
+     monkeypatch.setattr(importlib.import_module("vllm_ascend.distributed.utils"), "all_gather_async", gather_weight)
+     monkeypatch.setattr(dsa_cp, "get_pcp_group", lambda: group)
+     monkeypatch.setattr(dsa_cp, "get_tp_group", lambda: SimpleNamespace(world_size=1, rank_in_group=0))
+-    monkeypatch.setattr(dsa_cp.dist, "all_gather_into_tensor", exchange)
+-    monkeypatch.setattr(dsa_cp.dist, "reduce_scatter_tensor", scatter)
++    monkeypatch.setattr(torch.distributed, "all_gather_into_tensor", exchange)
++    monkeypatch.setattr(torch.distributed, "reduce_scatter_tensor", scatter)
+     monkeypatch.setattr(dsa_cp.dsa_v1, "oproj_tp_enable", lambda: False)
+     monkeypatch.setattr(torch.ops.vllm, "unquantized_gemm", torch.nn.functional.linear, raising=False)
+     if sharding and decode_sharded:
+-        projector._initialize_pcp_o_proj_exchange_buffers()
++        projector._parallel_o_proj._prepare_exchange_buffers(projector.vllm_config)
+     return projector
+ 
+ 
+@@ -737,7 +749,7 @@ class TestPCPBatchLifecycle:
+         state.impl.forward(state.attn, None, torch.zeros_like(profile_output), profile_output)
+         assert torch.count_nonzero(profile_output) == 0
+         assert state.events == (["project", "reduce"] if sharding else [])
+-        switches = state.projector._pcp_o_proj_weight_switches or ()
++        switches = state.projector._parallel_o_proj._weight_switch_states or ()
+         addresses = [
+             (layer.weight.data_ptr(), part.gather_output.data_ptr())
+             for layer, _, weight in switches
+@@ -771,8 +783,9 @@ class TestPCPBatchLifecycle:
+     def test_failed_prefill_drains_both_weight_gathers_and_restores_decode(self, runtime, monkeypatch, stage):
+         state = runtime()
+         projector = state.projector
+-        with projector._o_proj_batch(needs_global_metadata=False, has_prefill=False):
+-            switches = projector._get_pcp_o_proj_weight_switches()
++        with projector._parallel_o_proj.batch(needs_global_metadata=False, has_prefill=False):
++            switches = projector._parallel_o_proj._weight_switch_states
++        assert switches is not None and len(switches) == 2
+         addresses = [layer.weight.data_ptr() for layer, _, _ in switches]
+ 
+         def fail(*args, **kwargs):
+@@ -911,6 +924,8 @@ class TestPCPProjectionPartition:
+         tp_group = SimpleNamespace(world_size=tp_size, rank_in_group=tp_rank)
+         monkeypatch.setattr(dsa_cp, "get_pcp_group", lambda: group)
+         monkeypatch.setattr(dsa_cp, "get_tp_group", lambda: tp_group)
++        monkeypatch.setattr(vllm_distributed, "get_pcp_group", lambda: group)
++        monkeypatch.setattr(vllm_distributed, "get_tp_group", lambda: tp_group)
+         impl = dsa_cp.AscendDSAPCPImpl.__new__(dsa_cp.AscendDSAPCPImpl)
+         impl.n_local_groups = pcp_size
+         impl.wo_a, impl.wo_b = torch.nn.Module(), torch.nn.Module()
+@@ -945,7 +960,20 @@ class TestPCPProjectionPartition:
+                     parameter.weight_loader = lambda parameter, value: parameter.data.copy_(value)
+                     layer.register_parameter(attr, parameter)
+                     checkpoints.append((layer, parameter, full, 0))
+-        impl._prepare_pcp_o_proj_weight_shards()
++        impl._parallel_o_proj = ParallelOProjection(
++            pcp_size * 4,
++            impl.wo_b,
++            config=WeightSwitchConfig.from_group(group),
++            tp_group=tp_group,
++            pool={},
++            pool_key="dsa_pcp_o_proj",
++            project_full=dsa_cp.dsa_v1.AscendDSAImpl._forward_o_proj.__get__(impl),
++            decode_sharded=False,
++            input_layer=impl.wo_a,
++            input_projection=impl._wo_a_bmm,
++            num_input_groups=pcp_size,
++        )
++        impl._parallel_o_proj.prepare_weight_load(SimpleNamespace())
+         composed_rank = tp_rank * pcp_size + pcp_rank
+         for layer, parameter, full, axis in checkpoints:
+             parameter.weight_loader(parameter, full)
+@@ -955,10 +983,10 @@ class TestPCPProjectionPartition:
+             assert layer.tp_group is tp_group
+         assert impl.n_local_groups == pcp_size
+         assert impl.wo_a.n_local_groups == 1
+-        assert impl.pcp_o_proj_weight_switch_config.group is group
++        assert impl._parallel_o_proj.config.group is group
+         impl.wo_a.quant_method.supports_weight_switch = False
+         with pytest.raises(RuntimeError, match="weight-switch capable"):
+-            impl._get_pcp_weight_switch_method(impl.wo_a)
++            impl._parallel_o_proj._resolve_o_proj_weight_switch_method(impl.wo_a)
+ 
+     @pytest.mark.parametrize("world,rank", [(2, 0), (2, 1), (4, 3)])
+     @pytest.mark.parametrize("decode_sharded", [False, True])
+@@ -1017,7 +1045,7 @@ class TestPCPProjectionPartition:
+             projector.reference_input = peers[rank]
+             expected = torch.nn.functional.linear(peers[rank], dense_weight)
+             output = torch.full_like(expected, -777)
+-            with projector._o_proj_batch(needs_global_metadata=decode_sharded, has_prefill=False):
++            with projector._parallel_o_proj.batch(needs_global_metadata=decode_sharded, has_prefill=False):
+                 assert projector._forward_o_proj(peers[rank].view(rows, world, width), output) is output
+             torch.testing.assert_close(output, expected)
+             assert events.count("exchange") == events.count("scatter") == int(decode_sharded)
+@@ -1045,8 +1073,9 @@ class TestPCPProjectionPartition:
+             hidden = torch.tensor([values])
+             output = torch.empty_like(hidden)
+             impl = dsa_v41_cp.AscendDSAV41PCPImpl.__new__(dsa_v41_cp.AscendDSAV41PCPImpl)
+-            with projector._o_proj_batch(needs_global_metadata=True, has_prefill=True):
+-                projector._maybe_all_gather_pcp_o_proj_weights()
++            with projector._parallel_o_proj.batch(needs_global_metadata=True, has_prefill=True):
++                if projector._parallel_o_proj.uses_full_weight:
++                    projector._parallel_o_proj.all_gather_weights()
+                 impl._project_output(attn, hidden.view(1, 2, 2), hidden, None, projected=output)
+             outputs.append(output[0, 0].item())
+         assert outputs == [3.0, 30.0]
+@@ -1062,8 +1091,8 @@ class TestPCPProjectionPartition:
+         full_weight = torch.eye(2).repeat(2, 1, 1)
+         full_scale = torch.cat((projector.wo_a.weight_scale, projector.wo_a.weight_scale + 1))
+         expected_parts = {}
+-        with projector._o_proj_batch(needs_global_metadata=False, has_prefill=False):
+-            switches = projector._get_pcp_o_proj_weight_switches()
++        with projector._parallel_o_proj.batch(needs_global_metadata=False, has_prefill=False):
++            switches = projector._parallel_o_proj._weight_switch_states or ()
+             for layer, _, weight in switches:
+                 for name, part in weight.gather_parts.items():
+                     full = (
+@@ -1094,8 +1123,9 @@ class TestPCPProjectionPartition:
+         )
+         addresses = [getattr(layer, name).data_ptr() for layer, _, weight in switches for name in weight.gather_parts]
+         for has_prefill in (True, False, True):
+-            with projector._o_proj_batch(needs_global_metadata=has_prefill, has_prefill=has_prefill):
+-                projector._maybe_all_gather_pcp_o_proj_weights()
++            with projector._parallel_o_proj.batch(needs_global_metadata=has_prefill, has_prefill=has_prefill):
++                if projector._parallel_o_proj.uses_full_weight:
++                    projector._parallel_o_proj.all_gather_weights()
+                 output = torch.empty_like(projector.reference_input)
+                 projector._forward_o_proj(projector.reference_input.view(2, 2, 2), output)
+                 torch.testing.assert_close(output, projector.reference_input)
+diff --git a/tests/ut/attention/test_o_proj_forward_lifecycle.py b/tests/ut/attention/test_o_proj_forward_lifecycle.py
+new file mode 100644
+index 000000000..7658526f7
+--- /dev/null
++++ b/tests/ut/attention/test_o_proj_forward_lifecycle.py
+@@ -0,0 +1,359 @@
++# SPDX-License-Identifier: Apache-2.0
++
++from types import SimpleNamespace
++from unittest.mock import Mock
++
++import pytest
++import torch
++
++from vllm_ascend.attention.attention_v1 import AscendAttentionState
++from vllm_ascend.attention.context_parallel.dsa_cp import AscendDSAPCPImpl
++from vllm_ascend.attention.context_parallel.sfa_cp import (
++    AscendSFADCPImpl,
++    AscendSFADCPMetadata,
++    AscendSFAPCPDCPImpl,
++    AscendSFAPCPImpl,
++)
++from vllm_ascend.attention.dsa_v1 import AscendDSASWABackend
++from vllm_ascend.attention.sfa_v1 import AscendSFABackend, AscendSFAImpl
++from vllm_ascend.weight_switch import (
++    OProjectionMode,
++    ParallelOProjection,
++    WeightSwitchConfig,
++    WeightSwitchGatherSpec,
++    WeightSwitchMixin,
++)
++
++
++class _LinearMethod(WeightSwitchMixin):
++    supports_weight_switch = True
++    weight_switch_gather_specs = (WeightSwitchGatherSpec("weight", gather_dim=1),)
++
++
++def _make_projection(layer):
++    group = SimpleNamespace(world_size=2, rank_in_group=0)
++    return ParallelOProjection(
++        layer.input_size_per_partition,
++        layer,
++        config=WeightSwitchConfig.from_group(group, shard_axis="input"),
++        tp_group=group,
++        pool={},
++        pool_key="lifecycle_test",
++        project_full=lambda inputs, output: output,
++        decode_sharded=False,
++    )
++
++
++@pytest.fixture(
++    params=[AscendSFAPCPImpl, AscendSFAPCPDCPImpl],
++    ids=["pcp", "pcp_dcp"],
++)
++def sfa_impl(request, monkeypatch):
++    impl = request.param.__new__(request.param)
++    impl.o_proj_full_pools = {}
++    impl.tp_size = 2
++    impl.enable_pcp_o_proj_weight_sharding = True
++    impl.is_pcp_decode_sharded = False
++    impl.o_proj = torch.nn.Module()
++    impl.o_proj.input_size = 4
++    impl.o_proj.input_size_per_partition = 2
++    impl.o_proj.output_size = impl.o_proj.output_size_per_partition = 3
++    impl.o_proj.weight = torch.nn.Parameter(torch.arange(6.0).reshape(3, 2), requires_grad=False)
++    impl.o_proj.quant_method = _LinearMethod()
++    impl._parallel_o_proj = _make_projection(impl.o_proj)
++    impl._parallel_o_proj.enabled = True
++    impl._parallel_o_proj.enable()
++    impl.waits = Mock()
++
++    def gather(state, config):
++        assert not state.handles
++        state.handles.append(SimpleNamespace(wait=impl.waits))
++        state.gather_parts["weight"].full_tensor.fill_(1)
++
++    monkeypatch.setattr(impl.o_proj.quant_method, "all_gather_weight", gather)
++    return impl
++
++
++def _metadata(attn_state, *, global_prefill=False):
++    lengths = torch.tensor([1])
++    slots = torch.tensor([0])
++    metadata = object.__new__(AscendSFADCPMetadata)
++    vars(metadata).update(
++        attn_state=attn_state,
++        pcp_has_global_prefill=global_prefill,
++        num_prefills=int(global_prefill),
++        num_input_tokens=1,
++        cum_query_lens=lengths,
++        seq_lens=lengths,
++        slot_mapping=slots,
++        pcp_slot_mapping=slots,
++        dcp_context=SimpleNamespace(slot_mapping=slots),
++    )
++
++    return metadata
++
++
++def _prepare_forward(impl, metadata, hidden):
++    context = impl._get_parallel_forward_context(metadata, 1, hidden)
++    assert not hasattr(context, "gather_full_o_proj")
++
++
++def test_sfa_prefill_decode_and_profile_share_one_mode(sfa_impl, monkeypatch):
++    entry_modes: list[bool] = []
++    modes: list[bool] = []
++    local_address = sfa_impl.o_proj.weight.data_ptr()
++    weight_state = sfa_impl._parallel_o_proj._weight_switch_states[0][2]
++
++    def forward(impl, name, hidden, cache, metadata, output):
++        entry_modes.append(impl._parallel_o_proj.uses_full_weight)
++        if metadata is None:
++            return output.zero_()
++        _prepare_forward(impl, metadata, hidden)
++        modes.append(impl._parallel_o_proj.uses_full_weight)
++        if impl._parallel_o_proj.uses_full_weight:
++            with impl._parallel_o_proj.use_full_weights():
++                assert impl.o_proj.weight.data_ptr() == weight_state.gather_parts["weight"].full_tensor.data_ptr()
++        else:
++            assert impl.o_proj.weight.data_ptr() == local_address
++        return output
++
++    monkeypatch.setattr(AscendSFAImpl, "forward", forward)
++    hidden = torch.empty(1, 4)
++    output = torch.empty_like(hidden)
++    for state in (
++        AscendAttentionState.ChunkedPrefill,
++        AscendAttentionState.DecodeOnly,
++        AscendAttentionState.SpecDecoding,
++    ):
++        assert sfa_impl.forward("layer", hidden, (), _metadata(state), output) is output
++        assert not sfa_impl._parallel_o_proj.uses_full_weight
++        assert not weight_state.handles
++        assert sfa_impl.o_proj.weight.data_ptr() == local_address
++    assert modes == [True, False, False]
++    sfa_impl.forward("layer", hidden, (), None, output)
++    assert not sfa_impl._parallel_o_proj.uses_full_weight
++    assert sfa_impl.waits.call_count == 1
++    assert entry_modes == ([True, False, False, False] if isinstance(sfa_impl, AscendSFAPCPImpl) else [False] * 4)
++
++
++@pytest.mark.parametrize("sfa_impl", [AscendSFAPCPImpl, AscendSFAPCPDCPImpl], indirect=True)
++@pytest.mark.parametrize(
++    "state,global_prefill,decode_sharded,switch_enabled,expected_mode",
++    [
++        (AscendAttentionState.DecodeOnly, False, False, True, OProjectionMode.LOCAL_WEIGHT),
++        (AscendAttentionState.DecodeOnly, False, True, True, OProjectionMode.EXCHANGE_TOKENS),
++        (AscendAttentionState.SpecDecoding, False, True, True, OProjectionMode.EXCHANGE_TOKENS),
++        (AscendAttentionState.ChunkedPrefill, False, False, True, OProjectionMode.FULL_WEIGHT),
++        (AscendAttentionState.ChunkedPrefill, False, True, True, OProjectionMode.FULL_WEIGHT),
++        (AscendAttentionState.DecodeOnly, True, True, True, OProjectionMode.FULL_WEIGHT),
++        (None, False, True, True, OProjectionMode.LOCAL_WEIGHT),
++        (AscendAttentionState.ChunkedPrefill, False, True, False, OProjectionMode.LOCAL_WEIGHT),
++    ],
++    ids=[
++        "replicated_decode",
++        "sharded_decode",
++        "sharded_spec_decode",
++        "prefill",
++        "prefill_with_sharded_decode",
++        "short_global_prefill",
++        "profile",
++        "switch_disabled",
++    ],
++)
++def test_sfa_pcp_forward_selects_batch_mode_before_attention(
++    sfa_impl, monkeypatch, state, global_prefill, decode_sharded, switch_enabled, expected_mode
++):
++    sfa_impl.is_pcp_decode_sharded = decode_sharded
++    sfa_impl.enable_pcp_o_proj_weight_sharding = switch_enabled
++    if not switch_enabled:
++        sfa_impl._parallel_o_proj = _make_projection(sfa_impl.o_proj)
++    projection = sfa_impl._parallel_o_proj
++    projection.decode_sharded = decode_sharded
++    entry_modes: list[OProjectionMode] = []
++    local_address = sfa_impl.o_proj.weight.data_ptr()
++
++    def forward(impl, name, hidden, cache, metadata, output):
++        entry_modes.append(projection.mode)
++        if metadata is not None:
++            _prepare_forward(impl, metadata, hidden)
++            assert projection.mode is expected_mode
++        return output.zero_()
++
++    monkeypatch.setattr(AscendSFAImpl, "forward", forward)
++    hidden = torch.empty(1, 4)
++    output = torch.full((1, 3), float("nan"))
++    metadata = None if state is None else _metadata(state, global_prefill=global_prefill)
++    assert sfa_impl.forward("layer", hidden, (), metadata, output) is output
++    assert torch.count_nonzero(output) == 0
++    assert entry_modes == [expected_mode]
++    assert projection.mode is OProjectionMode.LOCAL_WEIGHT
++    assert all(not switch_state.handles for _, _, switch_state in projection._weight_switch_states or ())
++    assert sfa_impl.o_proj.weight.data_ptr() == local_address
++    assert sfa_impl.waits.call_count == int(expected_mode is OProjectionMode.FULL_WEIGHT)
++
++
++@pytest.mark.parametrize("stage", ["before_projection", "projection"])
++def test_failed_sfa_prefill_restores_local_weights_and_next_decode(sfa_impl, monkeypatch, stage):
++    failure = RuntimeError("injected attention failure")
++    local_address = sfa_impl.o_proj.weight.data_ptr()
++    weight_state = sfa_impl._parallel_o_proj._weight_switch_states[0][2]
++
++    def forward(impl, name, hidden, cache, metadata, output):
++        _prepare_forward(impl, metadata, hidden)
++        if metadata.attn_state == AscendAttentionState.DecodeOnly:
++            assert not impl._parallel_o_proj.uses_full_weight
++            assert not weight_state.handles
++            return output
++        assert impl._parallel_o_proj.uses_full_weight
++        if stage == "before_projection":
++            assert weight_state.handles
++            raise failure
++        with impl._parallel_o_proj.use_full_weights():
++            assert impl.o_proj.weight.data_ptr() != local_address
++            raise failure
++
++    monkeypatch.setattr(AscendSFAImpl, "forward", forward)
++    hidden = torch.empty(1, 4)
++    output = torch.empty_like(hidden)
++    with pytest.raises(RuntimeError) as caught:
++        sfa_impl.forward("layer", hidden, (), _metadata(AscendAttentionState.ChunkedPrefill), output)
++    assert caught.value is failure
++    assert not sfa_impl._parallel_o_proj.uses_full_weight
++    assert not weight_state.handles
++    assert sfa_impl.o_proj.weight.data_ptr() == local_address
++    assert sfa_impl.waits.call_count == 1
++    sfa_impl.forward("layer", hidden, (), _metadata(AscendAttentionState.DecodeOnly), output)
++
++
++def test_all_gather_requires_prepared_switches_without_enabling():
++    layer = torch.nn.Module()
++    layer.input_size_per_partition = 2
++    layer.output_size_per_partition = 3
++    projection = _make_projection(layer)
++    projection.enable = Mock(side_effect=AssertionError("all-gather must not enable"))
++    method = Mock()
++    state = SimpleNamespace(handles=[])
++    projection._weight_switch_states = ((layer, method, state),)
++    projection._weight_switch_enabled = True
++    projection.set_mode(use_full_weight=True, exchange_tokens=False)
++
++    projection.all_gather_weights()
++
++    projection.enable.assert_not_called()
++    method.all_gather_weight.assert_called_once_with(state, projection.config)
++
++
++def test_dsa_cleanup_waits_every_layer_without_hiding_attention_failure(monkeypatch):
++    layer = torch.nn.Module()
++    layer.input_size_per_partition = 2
++    layer.output_size_per_partition = 3
++    projection = _make_projection(layer)
++    projection._weight_switch_enabled = True
++    attention_failure = RuntimeError("attention failed")
++    first = SimpleNamespace(handles=[SimpleNamespace(wait=Mock(side_effect=RuntimeError("wait failed")))])
++    second_wait = Mock()
++    second = SimpleNamespace(handles=[SimpleNamespace(wait=second_wait)])
++    projection._weight_switch_states = tuple((torch.nn.Module(), _LinearMethod(), state) for state in (first, second))
++
++    with pytest.raises(RuntimeError) as caught, projection.forward_context():
++        projection.set_mode(use_full_weight=True, exchange_tokens=False)
++        raise attention_failure
++    assert caught.value is attention_failure
++    second_wait.assert_called_once_with()
++    assert not first.handles and not second.handles
++    assert not projection.uses_full_weight
++    assert projection.mode is OProjectionMode.LOCAL_WEIGHT
++
++
++@pytest.mark.parametrize(
++    "backend,implementation",
++    [(AscendDSASWABackend, AscendDSAPCPImpl), (AscendSFABackend, AscendSFAPCPImpl)],
++)
++def test_upstream_backend_capability_accepts_the_selected_pcp_implementation(backend, implementation, monkeypatch):
++    monkeypatch.setattr(backend, "get_impl_cls", staticmethod(lambda: implementation))
++    assert backend.supports_pcp()
++
++
++@pytest.mark.parametrize("fail", [False, True])
++def test_native_sfa_dcp_forward_needs_no_projection_component(monkeypatch, fail):
++    impl = AscendSFADCPImpl.__new__(AscendSFADCPImpl)
++    failure = RuntimeError("native DCP attention failed")
++    output = torch.empty(1, 3)
++
++    def forward(owner, name, hidden, cache, metadata, result):
++        assert owner is impl
++        assert not hasattr(owner, "_parallel_o_proj")
++        if fail:
++            raise failure
++        return result.zero_()
++
++    monkeypatch.setattr(AscendSFAImpl, "forward", forward)
++    if fail:
++        with pytest.raises(RuntimeError) as caught:
++            impl.forward("layer", torch.empty(1, 4), (), None, output)
++        assert caught.value is failure
++    else:
++        assert impl.forward("layer", torch.empty(1, 4), (), None, output) is output
++
++
++@pytest.mark.parametrize("switch_enabled", [False, True])
++@pytest.mark.parametrize("impl_cls", [AscendSFADCPImpl, AscendSFAPCPDCPImpl])
++def test_sfa_variant_constructors_and_postload_cooperate(impl_cls, switch_enabled, monkeypatch):
++    from vllm_ascend.attention.context_parallel import common_cp, sfa_cp
++
++    group = SimpleNamespace(world_size=2, rank_in_group=0, device_group=object())
++    owner = torch.nn.Module()
++    config = SimpleNamespace(
++        parallel_config=SimpleNamespace(cp_kv_cache_interleave_size=1),
++        model_config=SimpleNamespace(hf_text_config=SimpleNamespace(index_topk=4), dtype=torch.float32),
++        compilation_config=SimpleNamespace(static_forward_context={"layer": owner}),
++    )
++    base_calls = []
++    loaded = []
++
++    def initialize_base(impl, *args, **kwargs):
++        base_calls.append(impl)
++        impl.vllm_config = config
++        impl.layer_name = "layer"
++        impl.tp_size, impl.num_heads = 2, 2
++        impl.enable_mlapo = True
++        impl.is_pcp_decode_sharded = False
++        impl.q_proj = torch.nn.Linear(4, 4, bias=False)
++        impl.o_proj = torch.nn.Module()
++        impl.o_proj.input_size, impl.o_proj.input_size_per_partition = 8, 4
++        impl.o_proj.output_size = impl.o_proj.output_size_per_partition = 3
++        impl.o_proj.weight = torch.nn.Parameter(torch.ones(3, 4), requires_grad=False)
++        impl.o_proj.weight.input_dim = 1
++        impl.o_proj.weight.weight_loader = Mock()
++        impl.o_proj.quant_method = _LinearMethod()
++        impl.o_proj_full_pools = {}
++
++    def process_base(impl, dtype):
++        loaded.append(impl)
++        return "loaded"
++
++    monkeypatch.setattr(AscendSFAImpl, "__init__", initialize_base)
++    monkeypatch.setattr(AscendSFAImpl, "process_weights_after_loading", process_base)
++    monkeypatch.setattr(sfa_cp, "enable_pcp_o_proj_weight_sharding", lambda: switch_enabled)
++    for module in (common_cp, sfa_cp):
++        for name in ("get_tp_group", "get_pcp_group", "get_dcp_group"):
++            monkeypatch.setattr(module, name, lambda: group, raising=False)
++    impl = impl_cls(2, 4, 1.0, 1, None, None, "auto", None, "decoder", None)
++    assert base_calls == [impl]
++    has_component = impl_cls is not AscendSFADCPImpl
++    assert hasattr(impl, "_parallel_o_proj") == has_component
++    if has_component:
++        assert impl._parallel_o_proj.enabled == switch_enabled
++        assert impl._parallel_o_proj.project_full.__self__ is impl
++        assert impl._parallel_o_proj.project_full.__func__ is AscendSFAImpl._finalize_o_proj
++    assert impl.process_weights_after_loading(torch.float32) == "loaded"
++    states = impl._parallel_o_proj._weight_switch_states if has_component else None
++    assert (states is not None) == (has_component and switch_enabled)
++    assert impl.process_weights_after_loading(torch.float32) == "loaded"
++    assert loaded == [impl, impl]
++    if has_component:
++        assert impl._parallel_o_proj._weight_switch_states is states
++    if isinstance(impl, AscendSFADCPImpl):
++        assert not impl.enable_mlapo
++        assert owner._dcp_sfa_remap_order is impl._remap_order
++        assert owner._dcp_sfa_remap_invalid_index is impl._remap_invalid_index
+diff --git a/tests/ut/attention/test_sfa_cp.py b/tests/ut/attention/test_sfa_cp.py
+index 4221e2339..eb57b7b53 100644
+--- a/tests/ut/attention/test_sfa_cp.py
++++ b/tests/ut/attention/test_sfa_cp.py
+@@ -7,6 +7,7 @@ from unittest.mock import MagicMock, Mock, patch
+ 
+ import pytest
+ import torch
++import vllm.distributed as vllm_distributed
+ from vllm.config.compilation import CUDAGraphMode
+ from vllm.v1.attention.ops.pcp import _gather_prefill_cache_inputs
+ 
+@@ -37,6 +38,7 @@ from vllm_ascend.weight_switch import (
+     WeightSwitchLoadState,
+     WeightSwitchMixin,
+ )
++from vllm_ascend.weight_switch.o_proj import OProjectionMode, ParallelOProjection
+ 
+ 
+ @pytest.mark.parametrize("first_block_id", [0, 3])
+@@ -176,16 +178,14 @@ def _make_pcp_o_proj_impl(
+             cudagraph_capture_sizes=capture_sizes,
+         ),
+     )
+-    impl._o_proj_weight_switch_enabled = False
+     pcp_group = SimpleNamespace(world_size=2, rank_in_group=1)
+-    impl.o_proj_weight_switch_config = WeightSwitchConfig.from_group(pcp_group, shard_axis="input")
+-    impl.o_proj_weight_load_state = WeightSwitchLoadState(
++    load_state = WeightSwitchLoadState(
+         input_size_per_partition_before=4,
+         input_size_per_partition_after=2,
+     )
+     impl.o_proj = SimpleNamespace(
+         input_size=8,
+-        input_size_per_partition=2,
++        input_size_per_partition=4,
+         output_size=3,
+         output_size_per_partition=3,
+         weight=torch.nn.Parameter(
+@@ -198,7 +198,11 @@ def _make_pcp_o_proj_impl(
+         tp_rank=0,
+         skip_bias_add=False,
+     )
+-    load_state = impl.o_proj_weight_load_state
++
++    def prepare_load(*_args):
++        impl.o_proj.input_size_per_partition = 2
++        return load_state
++
+     with (
+         patch.object(AscendSFAImpl, "__init__", return_value=None),
+         patch("vllm_ascend.attention.context_parallel.sfa_cp.enable_pcp_o_proj_weight_sharding", return_value=True),
+@@ -207,7 +211,13 @@ def _make_pcp_o_proj_impl(
+             "vllm_ascend.attention.context_parallel.sfa_cp.get_tp_group",
+             return_value=SimpleNamespace(world_size=2, rank_in_group=0),
+         ),
+-        patch.object(impl.o_proj.quant_method, "prepare_layer_for_parallel_weight_load", return_value=load_state),
++        patch.object(vllm_distributed, "get_pcp_group", return_value=pcp_group),
++        patch.object(
++            vllm_distributed,
++            "get_tp_group",
++            return_value=SimpleNamespace(world_size=2, rank_in_group=0),
++        ),
++        patch.object(impl.o_proj.quant_method, "prepare_layer_for_parallel_weight_load", side_effect=prepare_load),
+     ):
+         AscendSFAPCPImpl.__init__(impl)
+     return impl
+@@ -217,14 +227,18 @@ def _make_pcp_o_proj_impl(
+ def test_sfa_pcp_decode_buffers_exist_before_forward_with_activation_dtype(activation_dtype):
+     impl = _make_pcp_o_proj_impl(sharded_decode=True, activation_dtype=activation_dtype, weight_dtype=torch.int8)
+     assert impl.o_proj.weight.dtype == torch.int8
++    projection = impl._parallel_o_proj
++    assert projection.o_proj is impl.o_proj
++    assert projection.input_size == 4
++    assert projection.output_size == 3
+     expected_shapes = {
+-        "_pcp_o_proj_ag_in_buf": (4, 4),
+-        "_pcp_o_proj_ag_out_buf": (8, 4),
+-        "_pcp_o_proj_rs_in_buf": (8, 3),
+-        "_pcp_o_proj_rs_out_buf": (4, 3),
++        "all_gather_input": (4, 4),
++        "all_gather_output": (8, 4),
++        "reduce_scatter_input": (8, 3),
++        "reduce_scatter_output": (4, 3),
+     }
+     for name, shape in expected_shapes.items():
+-        buffer = getattr(impl, name)
++        buffer = getattr(impl._parallel_o_proj, name)
+         assert buffer.shape == shape
+         assert buffer.dtype == activation_dtype
+         assert buffer.device.type == "cpu"
+@@ -249,36 +263,44 @@ def test_sfa_pcp_decode_buffers_cover_verification_tokens_and_graph_padding(
+         max_capture_size=max_capture_size,
+         capture_sizes=capture_sizes,
+     )
+-    assert impl._pcp_o_proj_token_capacity == expected_capacity
+-    assert impl._pcp_o_proj_ag_in_buf.shape == (expected_capacity, 4)
+-    assert impl._pcp_o_proj_ag_out_buf.shape == (2 * expected_capacity, 4)
+-    assert impl._pcp_o_proj_rs_in_buf.shape == (2 * expected_capacity, 3)
+-    assert impl._pcp_o_proj_rs_out_buf.shape == (expected_capacity, 3)
++    assert impl._parallel_o_proj.token_capacity == expected_capacity
++    assert impl._parallel_o_proj.all_gather_input.shape == (expected_capacity, 4)
++    assert impl._parallel_o_proj.all_gather_output.shape == (2 * expected_capacity, 4)
++    assert impl._parallel_o_proj.reduce_scatter_input.shape == (2 * expected_capacity, 3)
++    assert impl._parallel_o_proj.reduce_scatter_output.shape == (expected_capacity, 3)
+ 
+ 
+ def test_sfa_pcp_decode_buffers_are_shared_across_compatible_layers():
+     with (
+         patch.object(AscendSFAPCPImpl, "o_proj_full_pools", {}),
+-        patch("vllm_ascend.attention.context_parallel.sfa_cp.torch.empty", wraps=torch.empty) as allocate,
++        patch("vllm_ascend.weight_switch.o_proj.torch.empty", wraps=torch.empty) as allocate,
+     ):
+         first = _make_pcp_o_proj_impl(sharded_decode=True)
+         second = _make_pcp_o_proj_impl(sharded_decode=True)
+ 
+         assert allocate.call_count == 4
+         buffers = [
+-            value for name, value in vars(first).items() if name.startswith("_pcp_o_proj_") and name.endswith("_buf")
++            value
++            for name, value in vars(first._parallel_o_proj).items()
++            if name in {"all_gather_input", "all_gather_output", "reduce_scatter_input", "reduce_scatter_output"}
++            and isinstance(value, torch.Tensor)
+         ]
+         assert len({buffer.data_ptr() for buffer in buffers}) == 4
+-        for name, buffer in vars(first).items():
+-            if name.startswith("_pcp_o_proj_") and name.endswith("_buf"):
+-                assert getattr(second, name) is buffer
+-
+-        first._enable_o_proj_full_weight_switch()
+-        second._enable_o_proj_full_weight_switch()
+-        assert first.o_proj_weight_state.gather_parts["weight"].full_tensor.data_ptr() == (
+-            second.o_proj_weight_state.gather_parts["weight"].full_tensor.data_ptr()
++        for name, buffer in vars(first._parallel_o_proj).items():
++            if name in {
++                "all_gather_input",
++                "all_gather_output",
++                "reduce_scatter_input",
++                "reduce_scatter_output",
++            } and isinstance(buffer, torch.Tensor):
++                assert getattr(second._parallel_o_proj, name) is buffer
++
++        first._parallel_o_proj.enable()
++        second._parallel_o_proj.enable()
++        assert first._parallel_o_proj._weight_switch_states[0][2].gather_parts["weight"].full_tensor.data_ptr() == (
++            second._parallel_o_proj._weight_switch_states[0][2].gather_parts["weight"].full_tensor.data_ptr()
+         )
+-        assert first.o_proj_weight_state.gather_parts["weight"].full_tensor.data_ptr() not in {
++        assert first._parallel_o_proj._weight_switch_states[0][2].gather_parts["weight"].full_tensor.data_ptr() not in {
+             buffer.data_ptr() for buffer in buffers
+         }
+ 
+@@ -289,9 +311,14 @@ def test_sfa_pcp_decode_buffer_pool_separates_dtype_and_shape(changed_config):
+         first = _make_pcp_o_proj_impl(sharded_decode=True)
+         second = _make_pcp_o_proj_impl(sharded_decode=True, **changed_config)
+ 
+-        for name, buffer in vars(first).items():
+-            if name.startswith("_pcp_o_proj_") and name.endswith("_buf"):
+-                assert getattr(second, name).data_ptr() != buffer.data_ptr()
++        for name, buffer in vars(first._parallel_o_proj).items():
++            if name in {
++                "all_gather_input",
++                "all_gather_output",
++                "reduce_scatter_input",
++                "reduce_scatter_output",
++            } and isinstance(buffer, torch.Tensor):
++                assert getattr(second._parallel_o_proj, name).data_ptr() != buffer.data_ptr()
+ 
+ 
+ def test_sfa_pcp_decode_buffer_pool_uses_weight_device():
+@@ -302,7 +329,7 @@ def test_sfa_pcp_decode_buffer_pool_uses_weight_device():
+ 
+     with (
+         patch.object(AscendSFAPCPImpl, "o_proj_full_pools", {}),
+-        patch("vllm_ascend.attention.context_parallel.sfa_cp.torch.empty", side_effect=allocate) as allocate_mock,
++        patch("vllm_ascend.weight_switch.o_proj.torch.empty", side_effect=allocate) as allocate_mock,
+         patch("torch.nn.Parameter") as parameter,
+     ):
+         parameter.return_value = SimpleNamespace(device=torch.device("npu:0"))
+@@ -316,14 +343,23 @@ def test_sfa_pcp_decode_buffer_pool_uses_weight_device():
+         assert [call.kwargs["device"] for call in allocate_mock.call_args_list] == (
+             [torch.device("npu:0")] * 4 + [torch.device("npu:1")] * 4
+         )
+-        for name, buffer in vars(first).items():
+-            if name.startswith("_pcp_o_proj_") and name.endswith("_buf"):
+-                assert getattr(second, name) is not buffer
+-                assert getattr(same_device, name) is buffer
++        for name, buffer in vars(first._parallel_o_proj).items():
++            if name in {
++                "all_gather_input",
++                "all_gather_output",
++                "reduce_scatter_input",
++                "reduce_scatter_output",
++            } and isinstance(buffer, torch.Tensor):
++                assert getattr(second._parallel_o_proj, name) is not buffer
++                assert getattr(same_device._parallel_o_proj, name) is buffer
+ 
+ 
+ def test_sfa_pcp_weight_switch_does_not_install_loader_when_disabled() -> None:
+     pcp_group = SimpleNamespace(world_size=2, rank_in_group=0)
++    impl = AscendSFAPCPImpl.__new__(AscendSFAPCPImpl)
++    impl.o_proj = SimpleNamespace(input_size_per_partition=4, output_size_per_partition=3)
++    impl.is_pcp_decode_sharded = False
++    impl.vllm_config = SimpleNamespace()
+     with (
+         patch.object(AscendSFAImpl, "__init__", return_value=None),
+         patch(
+@@ -331,14 +367,15 @@ def test_sfa_pcp_weight_switch_does_not_install_loader_when_disabled() -> None:
+             return_value=False,
+         ),
+         patch("vllm_ascend.attention.context_parallel.sfa_cp.get_pcp_group", return_value=pcp_group),
+-        patch.object(AscendSFAPCPImpl, "_get_o_proj_weight_switch_method") as get_method,
++        patch("vllm_ascend.attention.context_parallel.sfa_cp.get_tp_group", return_value=SimpleNamespace()),
++        patch.object(ParallelOProjection, "prepare_weight_load") as prepare_load,
+     ):
+-        impl = AscendSFAPCPImpl()
++        AscendSFAPCPImpl.__init__(impl)
+ 
+     assert not impl.enable_pcp_o_proj_weight_sharding
+-    assert impl.o_proj_weight_switch_config.group is pcp_group
+-    assert not hasattr(impl, "o_proj_weight_load_state")
+-    get_method.assert_not_called()
++    assert impl._parallel_o_proj.config.group is pcp_group
++    assert not impl._parallel_o_proj._load_prepared
++    prepare_load.assert_not_called()
+ 
+ 
+ def test_sfa_dcp_extends_v1_backend() -> None:
+@@ -589,6 +626,7 @@ def test_sfa_pcp_dcp_empty_local_prefill_uses_global_kv_view(global_has_prefill:
+ 
+ def test_sfa_pcp_dcp_empty_local_prefill_joins_dcp_kv_gather() -> None:
+     impl = AscendSFAPCPDCPImpl.__new__(AscendSFAPCPDCPImpl)
++    impl.qk_rope_head_dim = 64
+     impl.dcp_group = object()
+     impl.enable_sparse_sfa_c8 = True
+     impl.enable_sparse_sfa_turboquant = False
+@@ -954,7 +992,7 @@ def test_native_pcp_dcp_packed_kv_preserves_gathered_payload_addresses(
+     impl.indexer = Mock(return_value=torch.zeros(len(local), 1, 1, dtype=torch.int32))
+     impl._execute_sparse_flash_attention_process = Mock(return_value=hidden)
+     impl._v_up_proj = lambda values: values
+-    impl._finalize_o_proj = lambda values, output, gather_full_o_proj: output.copy_(values)
++    impl._finalize_o_proj = lambda values, output: output.copy_(values)
+ 
+     def quantize(values, *_args, **_kwargs):
+         rows = len(values)
+@@ -1039,31 +1077,33 @@ def test_sfa_pcp_o_proj_switch_slices_the_tp_local_weight_by_pcp_rank() -> None:
+     AscendSFAPCPImpl.o_proj_full_pools.clear()
+     impl = _make_pcp_o_proj_impl()
+ 
+-    impl._enable_o_proj_full_weight_switch()
++    impl._parallel_o_proj.enable()
+ 
+-    assert impl._o_proj_weight_switch_enabled
++    assert impl._parallel_o_proj._weight_switch_enabled
+     torch.testing.assert_close(
+         impl.o_proj.weight,
+         torch.tensor([[2.0, 3.0], [6.0, 7.0], [10.0, 11.0]]),
+     )
+-    assert impl.o_proj_weight_state.gather_parts["weight"].full_tensor.shape == (3, 4)
++    assert impl._parallel_o_proj._weight_switch_states[0][2].gather_parts["weight"].full_tensor.shape == (3, 4)
+ 
+ 
+ def test_sfa_pcp_prefill_gathers_weight_and_restores_local_view() -> None:
+     impl = _make_pcp_o_proj_impl()
+-    impl._enable_o_proj_full_weight_switch()
++    impl._parallel_o_proj.enable()
+ 
+     local_weight_ptr = impl.o_proj.weight.data_ptr()
+-    full_weight = impl.o_proj_weight_state.gather_parts["weight"].full_tensor
++    full_weight = impl._parallel_o_proj._weight_switch_states[0][2].gather_parts["weight"].full_tensor
+     full_weight.copy_(torch.arange(12, dtype=torch.float32).view(3, 4))
+ 
+-    def fake_finalize(_self, _attn_output, output, _gather_full_o_proj):
+-        assert impl.o_proj.weight.data_ptr() == full_weight.data_ptr()
++    def fake_project(_attn_output, output):
++        assert impl.o_proj.weight.data_ptr() == full_weight_tensor.data_ptr()
+         output.fill_(7)
+         return output
+ 
+-    with patch.object(AscendSFAImpl, "_finalize_o_proj", new=fake_finalize):
+-        result = impl._finalize_o_proj(torch.empty(1, 4), torch.empty(1, 3), gather_full_o_proj=True)
++    full_weight_tensor = full_weight
++    impl._parallel_o_proj.set_mode(use_full_weight=True, exchange_tokens=False)
++    with patch.object(impl._parallel_o_proj, "project_full", side_effect=fake_project):
++        result = impl._finalize_o_proj(torch.empty(1, 4), torch.empty(1, 3))
+ 
+     assert result.tolist() == [[7.0, 7.0, 7.0]]
+     assert impl.o_proj.weight.data_ptr() == local_weight_ptr
+@@ -1072,16 +1112,17 @@ def test_sfa_pcp_prefill_gathers_weight_and_restores_local_view() -> None:
+ def test_sfa_pcp_decode_projects_local_weight_then_reduces_pcp_and_tp() -> None:
+     pcp_group = SimpleNamespace(world_size=2, rank_in_group=0)
+     impl = _make_pcp_o_proj_impl()
+-    impl.o_proj_weight_switch_config = WeightSwitchConfig.from_group(pcp_group, shard_axis="input")
+-    impl._enable_o_proj_full_weight_switch()
++    impl._parallel_o_proj.config = WeightSwitchConfig.from_group(pcp_group, shard_axis="input")
++    impl._parallel_o_proj.enable()
+ 
+     full_weight = torch.arange(12, dtype=torch.float32).view(3, 4)
+     input_ = torch.tensor([[1.0, 2.0, 3.0, 4.0]])
+     expected = torch.nn.functional.linear(input_, full_weight, impl.o_proj.bias)
+     pcp_group.all_reduce = lambda _: torch.nn.functional.linear(input_, full_weight, bias=None)
+     tp_group = SimpleNamespace(world_size=2, rank_in_group=0, all_reduce=lambda x: x)
+-    with patch("vllm_ascend.attention.context_parallel.sfa_cp.get_tp_group", return_value=tp_group):
+-        result = impl._finalize_o_proj(input_, torch.empty_like(expected), gather_full_o_proj=False)
++    impl._parallel_o_proj.set_mode(use_full_weight=False, exchange_tokens=False)
++    impl._parallel_o_proj.tp_group = tp_group
++    result = impl._finalize_o_proj(input_, torch.empty_like(expected))
+ 
+     torch.testing.assert_close(result, expected)
+ 
+@@ -1094,27 +1135,27 @@ def test_sfa_pcp_decode_projects_local_weight_then_reduces_pcp_and_tp() -> None:
+ def test_sfa_pcp_sharded_decode_preserves_token_owners(rank, tp_size, padding, quantized, num_speculative_tokens):
+     group = SimpleNamespace(world_size=2, rank_in_group=rank, device_group=object(), all_reduce=Mock())
+     impl = _make_pcp_o_proj_impl(sharded_decode=True, num_speculative_tokens=num_speculative_tokens)
+-    impl.o_proj_weight_switch_config = WeightSwitchConfig.from_group(group, shard_axis="input")
++    impl._parallel_o_proj.config = WeightSwitchConfig.from_group(group, shard_axis="input")
+     weight = torch.arange(12, dtype=torch.float32).view(3, 4)
+     impl.o_proj.weight = torch.nn.Parameter(weight[:, rank * 2 : (rank + 1) * 2].clone(), requires_grad=False)
+-    impl._enable_o_proj_full_weight_switch()
++    impl._parallel_o_proj.enable()
+     quant_bias = torch.tensor([0.25, 0.5, 0.75]) if quantized else torch.zeros(3)
+     if quantized:
+         method = MagicMock(spec=AscendLinearScheme)
+ 
+-        def apply(layer, x, bias=None, tp_rank=0):
+-            return torch.nn.functional.linear(x, layer.weight) + (quant_bias if tp_rank == 0 else 0)
++        def apply_weight_shard(layer, x, *, bias_rank=0):
++            return torch.nn.functional.linear(x, layer.weight) + (quant_bias if bias_rank == 0 else 0)
+ 
+-        method.apply.side_effect = apply
+-        impl._get_o_proj_weight_switch_method = Mock(return_value=method)
++        method.apply_weight_shard.side_effect = apply_weight_shard
++        impl.o_proj.quant_method = method
+     buffer_names = (
+-        "_pcp_o_proj_ag_in_buf",
+-        "_pcp_o_proj_ag_out_buf",
+-        "_pcp_o_proj_rs_in_buf",
+-        "_pcp_o_proj_rs_out_buf",
++        "all_gather_input",
++        "all_gather_output",
++        "reduce_scatter_input",
++        "reduce_scatter_output",
+     )
+-    buffer_ptrs = tuple(getattr(impl, name).data_ptr() for name in buffer_names)
+-    for num_rows in [1, 2, impl._pcp_o_proj_token_capacity]:
++    buffer_ptrs = tuple(getattr(impl._parallel_o_proj, name).data_ptr() for name in buffer_names)
++    for num_rows in [1, 2, impl._parallel_o_proj.token_capacity]:
+         inputs = [torch.arange(num_rows * 4, dtype=torch.float32).view(num_rows, 4) + 1 + i * 20 for i in range(2)]
+         if padding:
+             inputs[1][-1].zero_()
+@@ -1140,18 +1181,124 @@ def test_sfa_pcp_sharded_decode_preserves_token_owners(rank, tp_size, padding, q
+         expected = full_projection[rank * num_rows : (rank + 1) * num_rows] + impl.o_proj.bias
+         if tp_size > 1:
+             expected += 3
++        impl._parallel_o_proj.set_mode(use_full_weight=False, exchange_tokens=True)
++        impl._parallel_o_proj.tp_group = tp_group
+         with (
+-            patch("vllm_ascend.attention.context_parallel.sfa_cp.dist.all_gather_into_tensor", side_effect=gather),
+-            patch("vllm_ascend.attention.context_parallel.sfa_cp.dist.reduce_scatter_tensor", side_effect=scatter),
+-            patch("vllm_ascend.attention.context_parallel.sfa_cp.get_tp_group", return_value=tp_group),
++            patch("vllm_ascend.weight_switch.o_proj.dist.all_gather_into_tensor", side_effect=gather),
++            patch("vllm_ascend.weight_switch.o_proj.dist.reduce_scatter_tensor", side_effect=scatter),
+         ):
+-            actual = impl._finalize_o_proj(inputs[rank], torch.empty_like(expected), gather_full_o_proj=False)
++            actual = impl._finalize_o_proj(inputs[rank], torch.empty_like(expected))
+         torch.testing.assert_close(actual, expected)
+-        assert tuple(getattr(impl, name).data_ptr() for name in buffer_names) == buffer_ptrs
++        assert tuple(getattr(impl._parallel_o_proj, name).data_ptr() for name in buffer_names) == buffer_ptrs
+         group.all_reduce.assert_not_called()
+         assert tp_group.all_reduce.call_count == int(tp_size > 1)
+         if quantized:
+-            assert method.apply.call_args.kwargs["tp_rank"] == (0 if rank == 0 else 1)
++            assert method.apply_weight_shard.call_args.kwargs["bias_rank"] == (0 if rank == 0 else 1)
++
++
++@pytest.mark.parametrize("tp_size", [1, 2])
++@pytest.mark.parametrize("reduce_results", [False, True])
++@pytest.mark.parametrize("skip_bias_add", [False, True])
++@pytest.mark.parametrize("sharded_decode", [False, True])
++def test_sfa_pcp_ordinary_bias_is_added_once_when_tp_reduction_is_deferred(
++    tp_size, reduce_results, skip_bias_add, sharded_decode
++):
++    """The decoder's deferred TP sum must receive one complete ordinary bias."""
++    num_rows = 2
++    inputs = torch.arange(2 * num_rows * 4 * tp_size, dtype=torch.float32).view(2 * num_rows, 4 * tp_size) / 8
++    weight = torch.arange(3 * 4 * tp_size, dtype=torch.float32).view(3, 4 * tp_size) / 16
++    bias = torch.tensor([0.5, 1.0, 1.5])
++    owner_outputs: dict[int, list[torch.Tensor]] = {0: [], 1: []}
++    for pcp_rank in range(2):
++        for tp_rank in range(tp_size):
++            impl = _make_pcp_o_proj_impl(sharded_decode=sharded_decode)
++            layer = impl.o_proj
++            layer.input_size = 4 * tp_size
++            layer.reduce_results = reduce_results
++            layer.skip_bias_add = skip_bias_add
++            layer.tp_size = tp_size
++            layer.tp_rank = tp_rank
++            layer.bias = torch.nn.Parameter(bias.clone(), requires_grad=False)
++            tp_weight = weight[:, tp_rank * 4 : (tp_rank + 1) * 4]
++            layer.weight = torch.nn.Parameter(
++                tp_weight[:, pcp_rank * 2 : (pcp_rank + 1) * 2].clone(), requires_grad=False
++            )
++            all_tp_inputs = inputs[:, tp_rank * 4 : (tp_rank + 1) * 4]
++            local_inputs = (
++                all_tp_inputs[pcp_rank * num_rows : (pcp_rank + 1) * num_rows]
++                if sharded_decode
++                else all_tp_inputs[:num_rows]
++            )
++            tp_projection = torch.nn.functional.linear(all_tp_inputs, tp_weight)
++            full_projection = torch.nn.functional.linear(inputs, weight)
++            local_slice = (
++                slice(pcp_rank * num_rows, (pcp_rank + 1) * num_rows) if sharded_decode else slice(0, num_rows)
++            )
++            events: list[str] = []
++
++            local_partial = torch.nn.functional.linear(local_inputs[:, pcp_rank * 2 : (pcp_rank + 1) * 2], layer.weight)
++            global_partial = torch.nn.functional.linear(
++                all_tp_inputs[:, pcp_rank * 2 : (pcp_rank + 1) * 2], layer.weight
++            )
++
++            def reduce_pcp(partial, expected=local_partial, reduced=tp_projection[:num_rows], events=events):
++                events.append("pcp")
++                torch.testing.assert_close(partial, expected)
++                return reduced.clone()
++
++            def gather(destination, source, *, group, expected=local_inputs, gathered=all_tp_inputs, events=events):
++                events.append("gather")
++                torch.testing.assert_close(source, expected)
++                destination.copy_(gathered)
++
++            def scatter(
++                destination,
++                source,
++                *,
++                group,
++                expected=global_partial,
++                reduced=tp_projection[local_slice],
++                events=events,
++            ):
++                events.append("pcp")
++                torch.testing.assert_close(source, expected)
++                destination.copy_(reduced)
++
++            def reduce_tp(
++                partial, expected=tp_projection[local_slice], reduced=full_projection[local_slice], events=events
++            ):
++                events.append("tp")
++                torch.testing.assert_close(partial, expected)
++                return reduced.clone()
++
++            pcp_group = SimpleNamespace(
++                world_size=2, rank_in_group=pcp_rank, device_group=object(), all_reduce=Mock(side_effect=reduce_pcp)
++            )
++            tp_group = SimpleNamespace(
++                world_size=tp_size, rank_in_group=tp_rank, all_reduce=Mock(side_effect=reduce_tp)
++            )
++            executor = impl._parallel_o_proj
++            executor.config = WeightSwitchConfig.from_group(pcp_group, shard_axis="input")
++            executor.tp_group = tp_group
++            executor.enable()
++            executor.set_mode(use_full_weight=False, exchange_tokens=sharded_decode)
++            with (
++                patch("vllm_ascend.weight_switch.o_proj.dist.all_gather_into_tensor", side_effect=gather),
++                patch("vllm_ascend.weight_switch.o_proj.dist.reduce_scatter_tensor", side_effect=scatter),
++            ):
++                actual = impl._finalize_o_proj(local_inputs, torch.empty(num_rows, 3))
++            assert events == (["gather", "pcp"] if sharded_decode else ["pcp"]) + (
++                ["tp"] if reduce_results and tp_size > 1 else []
++            )
++            assert tp_group.all_reduce.call_count == int(reduce_results and tp_size > 1)
++            expected_partial = full_projection[local_slice] if reduce_results else tp_projection[local_slice]
++            if not skip_bias_add and (reduce_results or tp_rank == 0):
++                expected_partial = expected_partial + bias
++            torch.testing.assert_close(actual, expected_partial)
++            owner_outputs[pcp_rank].append(actual)
++        expected = torch.nn.functional.linear(inputs[local_slice], weight, None if skip_bias_add else bias)
++        combined = owner_outputs[pcp_rank][0] if reduce_results else torch.stack(owner_outputs[pcp_rank]).sum(0)
++        torch.testing.assert_close(combined, expected)
+ 
+ 
+ @pytest.mark.parametrize(
+@@ -1167,30 +1314,54 @@ def test_sfa_pcp_sharded_decode_preserves_token_owners(rank, tp_size, padding, q
+         (AscendAttentionState.DecodeOnly, True, False, False),
+     ],
+ )
+-def test_sfa_pcp_context_gathers_weight_for_global_prefill(
+-    attn_state, global_has_prefill, weight_switch_enabled, expected_gather
++@pytest.mark.parametrize("decode_sharded", [False, True])
++def test_sfa_pcp_forward_selects_mode_and_gathers_weight_for_global_prefill(
++    attn_state, global_has_prefill, weight_switch_enabled, expected_gather, decode_sharded
+ ) -> None:
+-    impl = AscendSFAPCPImpl.__new__(AscendSFAPCPImpl)
+-    impl._o_proj_weight_switch_enabled = weight_switch_enabled
+-    impl._all_gather_o_proj_full_weight = MagicMock()
++    impl = _make_pcp_o_proj_impl(sharded_decode=decode_sharded)
++    impl._parallel_o_proj.enable()
++    impl._parallel_o_proj.enabled = weight_switch_enabled
++    impl._parallel_o_proj._weight_switch_enabled = weight_switch_enabled
++    impl.o_proj.quant_method.all_gather_weight = MagicMock()
+     base_context = SFAForwardContext(
+         actual_seq_lengths_query=torch.empty(0),
+         actual_seq_lengths_key=torch.empty(0),
+         kv_slot_mapping=torch.empty(0),
+         topk_num_tokens=0,
+     )
++    expected_mode = (
++        OProjectionMode.LOCAL_WEIGHT
++        if not weight_switch_enabled
++        else OProjectionMode.FULL_WEIGHT
++        if expected_gather
++        else OProjectionMode.EXCHANGE_TOKENS
++        if decode_sharded
++        else OProjectionMode.LOCAL_WEIGHT
++    )
+ 
+-    with patch.object(AscendSFAImpl, "_get_parallel_forward_context", return_value=base_context):
+-        context = impl._get_parallel_forward_context(
+-            SimpleNamespace(attn_state=attn_state, pcp_has_global_prefill=global_has_prefill),
+-            1,
+-            torch.empty(1),
+-        )
+-    assert context.gather_full_o_proj is expected_gather
++    def forward(owner, layer_name, hidden, cache, metadata, output):
++        assert owner is impl
++        assert owner._parallel_o_proj.mode is expected_mode
++        assert owner._parallel_o_proj.uses_full_weight is expected_gather
++        owner.o_proj.quant_method.all_gather_weight.assert_not_called()
++        assert owner._get_parallel_forward_context(metadata, hidden.shape[0], hidden) is base_context
++        return output
++
++    hidden = torch.empty(1, 4)
++    output = torch.empty(1, 3)
++    metadata = SimpleNamespace(attn_state=attn_state, pcp_has_global_prefill=global_has_prefill)
++    with (
++        patch.object(AscendSFAImpl, "forward", forward),
++        patch.object(AscendSFAImpl, "_get_parallel_forward_context", return_value=base_context),
++    ):
++        assert impl.forward("layer", hidden, (), metadata, output) is output
++    assert impl._parallel_o_proj.mode is OProjectionMode.LOCAL_WEIGHT
+     if expected_gather:
+-        impl._all_gather_o_proj_full_weight.assert_called_once_with()
++        impl.o_proj.quant_method.all_gather_weight.assert_called_once_with(
++            impl._parallel_o_proj._weight_switch_states[0][2], impl._parallel_o_proj.config
++        )
+     else:
+-        impl._all_gather_o_proj_full_weight.assert_not_called()
++        impl.o_proj.quant_method.all_gather_weight.assert_not_called()
+ 
+ 
+ def test_sfa_dcp_builder_sizes_replicated_view_from_padded_block_table() -> None:
+@@ -1339,6 +1510,7 @@ def test_sfa_dcp_split_uses_builder_config_without_current_context(is_consumer,
+ 
+ def test_sfa_dcp_prefill_passes_contiguous_gathered_cache() -> None:
+     impl = AscendSFADCPImpl.__new__(AscendSFADCPImpl)
++    impl.qk_rope_head_dim = 64
+     impl.enable_sparse_sfa_turboquant = False
+     impl.dcp_group = Mock()
+     packed = torch.randn(2, 128, 1, 576)
+@@ -1798,3 +1970,55 @@ def test_sfa_pcp_dcp_builder_preserves_causal_multi_token_support(dcp_size):
+     with patch.object(AscendSFADCPMetadataBuilder, "__init__", init_base):
+         builder = AscendSFAPCPDCPMetadataBuilder(object(), [], config, torch.device("cpu"))
+     assert builder.pcp_indexer_slot_mapping_buf.shape == (256,)
++
++
++@pytest.mark.parametrize("impl_cls", [AscendSFAPCPImpl, AscendSFAPCPDCPImpl])
++@pytest.mark.parametrize("mode", ["prefill", "mixed", "sharded_decode", "replicated_decode"])
++def test_sfa_pcp_nope_gathers_latent_kv_without_rope(impl_cls, mode):
++    impl = impl_cls.__new__(impl_cls)
++    impl.is_pcp_decode_sharded = mode == "sharded_decode"
++    impl.qk_rope_head_dim = 0
++    impl.kv_lora_rank = 2
++    impl.enable_sparse_sfa_c8 = impl.enable_sparse_sfa_turboquant = False
++    impl.kv_a_layernorm = lambda value: value * 2
++    inputs = torch.tensor([[1.0, 2.0], [3.0, 4.0]])
++    peer_inputs = inputs + 10
++    has_prefill = mode in {"prefill", "mixed"}
++    num_decodes = 0 if mode == "prefill" else (2 if mode == "replicated_decode" else 1)
++    slots = torch.tensor([0, 1, -1, 2] if mode == "mixed" else [0, 1, 2, -1])
++    metadata = AscendSFADCPMetadata.__new__(AscendSFADCPMetadata)
++    metadata.uses_pcp_sharded_layout = True
++    metadata.num_input_tokens = inputs.shape[0]
++    metadata.pcp_slot_mapping = slots
++    metadata.num_decode_tokens = num_decodes
++    metadata.num_prefills = int(has_prefill)
++    metadata.pcp_has_global_prefill = has_prefill
++    metadata.dcp_context = SimpleNamespace(slot_mapping=slots)
++    group = SimpleNamespace(all_gather=Mock(side_effect=lambda values, dim: torch.cat((values, values + 10), dim)))
++    group.world_size = 2
++    cache = torch.full((1, 5, 1, 2), -99.0)
++
++    def scatter(target, indices, values):
++        valid = indices[:, 0] >= 0
++        target[indices[valid, 0]] = values[valid]
++        return target
++
++    with (
++        patch("vllm.v1.attention.ops.pcp.get_pcp_group", return_value=group),
++        patch("torch_npu.npu_scatter_nd_update_", side_effect=scatter),
++    ):
++        assert impl.exec_kv(inputs, None, None, (cache,), slots, metadata) == (None, None)
++
++    expected = torch.full((5, 2), -99.0)
++    expected[:2] = inputs * 2
++    if mode == "mixed":
++        expected[2] = peer_inputs[1] * 2
++    elif mode != "replicated_decode":
++        expected[2] = peer_inputs[0] * 2
++    torch.testing.assert_close(cache.view(5, 2), expected)
++    if mode == "replicated_decode":
++        group.all_gather.assert_not_called()
++    else:
++        group.all_gather.assert_called_once()
++        gathered_input = inputs[1:] if mode == "mixed" else inputs
++        torch.testing.assert_close(group.all_gather.call_args.args[0], gathered_input)
+diff --git a/tests/ut/attention/test_sfa_cp_precision.py b/tests/ut/attention/test_sfa_cp_precision.py
+index 7b01d4e68..da5da7ddd 100644
+--- a/tests/ut/attention/test_sfa_cp_precision.py
++++ b/tests/ut/attention/test_sfa_cp_precision.py
+@@ -1,12 +1,18 @@
+ # SPDX-License-Identifier: Apache-2.0
+ 
+ from types import SimpleNamespace
+-from unittest.mock import patch
++from unittest.mock import Mock, patch
+ 
+ import pytest
+ import torch
+ 
+-from vllm_ascend.attention.context_parallel.sfa_cp import AscendSFADCPImpl, AscendSFAPCPDCPImpl
++from vllm_ascend.attention.context_parallel.sfa_cp import (
++    AscendSFADCPImpl,
++    AscendSFADCPMetadata,
++    AscendSFAPCPDCPImpl,
++    DCPGatherContext,
++)
++from vllm_ascend.device.device_op import A5DeviceAdaptor, BaseDeviceAdaptor
+ 
+ 
+ def _make_impl(rank: int, interleave_size: int = 2) -> AscendSFADCPImpl:
+@@ -161,3 +167,157 @@ def test_dcp_query_gather_preserves_distinct_head_shards():
+     torch.testing.assert_close(gather.call_args.args[0], send)
+     torch.testing.assert_close(result_q, torch.cat((q, q + 1000), dim=gather_dim))
+     torch.testing.assert_close(result_rope, torch.cat((rope, rope + 1000), dim=gather_dim))
++
++
++@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.int8])
++def test_nope_dcp_prefill_gathers_one_latent_cache_at_logical_page_size(dtype):
++    impl = _make_impl(rank=0)
++    impl.qk_rope_head_dim = 0
++    impl.enable_sparse_sfa_c8 = dtype == torch.int8
++    impl.enable_sparse_sfa_turboquant = False
++    impl.dcp_group = object()
++    cache = torch.arange(2 * 256 * 8).reshape(2, 256, 1, 8).to(dtype)
++    blocks = torch.tensor([3, 1], dtype=torch.int64)
++    metadata = AscendSFADCPMetadata.__new__(AscendSFADCPMetadata)
++    metadata.num_prefills = 1
++    metadata.pcp_has_global_prefill = False
++    metadata.block_size = 128
++    metadata.dcp_context = SimpleNamespace(
++        kv_gather_block_ids=blocks, kv_gather_block_table=torch.tensor([[0, 1]]), gather_context=None
++    )
++    context = object()
++    with patch.object(impl, "_start_dcp_gather", return_value=context) as gather:
++        impl._record_dcp_kv_gather_context((cache,), metadata)
++    torch.testing.assert_close(gather.call_args.args[0], cache.view(4, 128, 1, 8)[blocks])
++    assert gather.call_args.kwargs == {"dim": 0, "split_sizes": (8,)}
++    assert metadata.dcp_context.gather_context is context
++
++
++@pytest.mark.parametrize("pcp_size", [1, 4])
++@pytest.mark.parametrize("missing_rope", [False, True])
++def test_nope_dcp_query_gather_accepts_absent_or_empty_rope(pcp_size, missing_rope):
++    from vllm_ascend.attention.context_parallel import sfa_cp
++
++    impl = _make_impl(rank=0)
++    impl.qk_rope_head_dim = 0
++    impl.dcp_group = SimpleNamespace(unique_name="dcp:0")
++    query = torch.arange(24).reshape(2, 3, 4).float()
++    rope = None if missing_rope else query[..., :0]
++    packed = query.transpose(0, 1).contiguous()
++    gathered = torch.cat((packed, packed + 1000), dim=0)
++    with (
++        patch.object(sfa_cp, "get_pcp_group", return_value=SimpleNamespace(world_size=pcp_size)),
++        patch.object(sfa_cp, "get_tp_group", return_value=SimpleNamespace(world_size=2)),
++        patch.object(sfa_cp, "all_gather_async", return_value=(gathered, None)) as gather,
++    ):
++        context = impl._start_dcp_query_gather(query, rope)
++        actual, empty_rope = impl._finish_dcp_gather(context)
++    torch.testing.assert_close(gather.call_args.args[0], packed)
++    torch.testing.assert_close(actual, torch.cat((query, query + 1000), dim=1))
++    assert empty_rope.shape == (*actual.shape[:-1], 0)
++
++
++@pytest.mark.parametrize("impl_type", [AscendSFADCPImpl, AscendSFAPCPDCPImpl])
++@pytest.mark.parametrize("prefill", [False, True])
++@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.int8])
++@pytest.mark.parametrize("padded", [False, True], ids=["valid", "poison_padding"])
++def test_nope_dcp_executes_single_cache_attention_with_existing_device_helper(impl_type, prefill, dtype, padded):
++    impl = impl_type.__new__(impl_type)
++    impl.qk_rope_head_dim = 0
++    impl.enable_sparse_sfa_turboquant = False
++    impl.scale = 0.25
++    impl.dcp_size = 2
++    impl.dcp_rank = 0
++    events = []
++    query = torch.randn(2, 2, 8, dtype=torch.bfloat16)
++    cache = torch.zeros(2, 256, 1, 8, dtype=dtype)
++    indices = torch.zeros(2, 1, 4, dtype=torch.int32)
++    lengths = torch.tensor([1 if padded else 2], dtype=torch.int32)
++    gathered = cache.view(4, 128, 1, 8) if prefill else query
++    handle = Mock()
++    handle.wait.side_effect = lambda: events.append("wait")
++    metadata = AscendSFADCPMetadata.__new__(AscendSFADCPMetadata)
++    metadata.num_prefills = int(prefill)
++    metadata.pcp_has_global_prefill = False
++    metadata.block_size = 128
++    metadata.cum_query_lens = lengths
++    metadata.dcp_context = SimpleNamespace(
++        gather_context=DCPGatherContext(
++            gathered=gathered,
++            handle=handle,
++            restore_perm=None,
++            split_sizes=(8,) if prefill else (8, 0),
++        ),
++        kv_gather_block_table=torch.tensor([[0, 1]], dtype=torch.int32),
++        block_table=torch.tensor([[0, 1]], dtype=torch.int32),
++        seq_lens=lengths,
++    )
++    impl.dcp_group = SimpleNamespace(all_gather=Mock(return_value=indices))
++    expected = torch.ones_like(query)
++    kernel_output = torch.ones_like(query)
++    softmax_max, softmax_sum = torch.zeros(1, 2, 2), torch.ones(1, 2, 2)
++    if padded:
++        expected[-1] = 0
++        kernel_output[-1] = float("nan")
++        softmax_max[:, -1] = softmax_sum[:, -1] = float("nan")
++
++    def execute(**kwargs):
++        events.append("attention")
++        assert kwargs["key"].shape == (4, 128, 1, 8)
++        assert kwargs["sparse_mode"] == (3 if prefill else 0)
++        assert kwargs["return_softmax_lse"] is not prefill
++        if dtype == torch.int8:
++            torch.testing.assert_close(kwargs["query"], query)
++            assert kwargs["rope_head_dim"] == 0
++        else:
++            assert kwargs["key_rope"] is None
++            assert kwargs["query_rope"] is None
++        return kernel_output, softmax_max, softmax_sum
++
++    def merge_output(output, lse):
++        events.append("merge")
++        torch.testing.assert_close(output, expected)
++        assert torch.isfinite(lse).all()
++        return output
++
++    op_name = "npu_kv_quant_sparse_flash_attention_vllm" if dtype == torch.int8 else "npu_sparse_flash_attention"
++    with (
++        patch.object(torch.ops._C_ascend, op_name, side_effect=execute, create=True) as attention,
++        patch("vllm_ascend.attention.context_parallel.sfa_cp.enable_sfa_dcp_force_tmajor_restore", return_value=False),
++        patch.object(impl, "_remap_sparse_indices", side_effect=lambda values: values),
++        patch.object(impl, "_merge_dcp_outputs", side_effect=merge_output) as merge,
++    ):
++        actual = impl._execute_sparse_flash_attention_process(
++            query, None, (cache,), indices, metadata, lengths, lengths
++        )
++    torch.testing.assert_close(actual, expected)
++    attention.assert_called_once()
++    assert metadata.dcp_context.gather_context is None
++    assert events == (["wait", "attention"] if prefill else ["wait", "attention", "merge"])
++    assert merge.call_count == int(not prefill)
++    impl.dcp_group.all_gather.assert_not_called()
++
++
++@pytest.mark.parametrize("return_lse", [False, True])
++def test_a5_nope_quantized_attention_accepts_absent_rope(return_lse):
++    impl = SimpleNamespace(qk_rope_head_dim=0)
++    query = torch.randn(2, 2, 8)
++    cache = torch.zeros(2, 128, 1, 8, dtype=torch.int8)
++    result = object()
++    with patch.object(
++        BaseDeviceAdaptor, "_execute_kv_quant_sparse_flash_attention_vllm", return_value=result
++    ) as execute:
++        actual = A5DeviceAdaptor._execute_kv_quant_sparse_flash_attention_vllm(
++            impl,
++            query,
++            None,
++            cache,
++            torch.zeros(1, 1),
++            torch.zeros(2, 1, 4),
++            torch.tensor([2]),
++            torch.tensor([2]),
++            return_lse=return_lse,
++        )
++    assert actual is result
++    assert execute.call_args.args[2] is None
++    assert execute.call_args.kwargs["return_lse"] is return_lse
+diff --git a/tests/ut/attention/test_sfa_nope_forward.py b/tests/ut/attention/test_sfa_nope_forward.py
+index 0fa18d073..f4127771b 100644
+--- a/tests/ut/attention/test_sfa_nope_forward.py
++++ b/tests/ut/attention/test_sfa_nope_forward.py
+@@ -1,15 +1,18 @@
+ # SPDX-License-Identifier: Apache-2.0
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+ 
++from contextlib import nullcontext
+ from types import SimpleNamespace
+-from unittest.mock import patch
++from unittest.mock import MagicMock, patch
+ 
+ import pytest
+ import torch
+ from vllm.config.compilation import CUDAGraphMode
+ 
+ import vllm_ascend.attention.sfa_v1 as sparse_mla
+-from vllm_ascend.attention.sfa_v1 import AscendSFAImpl, AscendSFAMetadata
++from vllm_ascend.attention.attention_v1 import AscendAttentionState
++from vllm_ascend.attention.context_parallel.sfa_cp import AscendSFAPCPDCPImpl, AscendSFAPCPImpl
++from vllm_ascend.attention.sfa_v1 import AscendSFAImpl, AscendSFAMetadata, PreprocessType
+ 
+ 
+ @pytest.fixture(autouse=True)
+@@ -431,3 +434,83 @@ def test_sparse_mla_full_forward_uses_real_rows_and_latent_values(graph_mode, em
+     assert latent_dim != value_dim
+     assert expected_values.shape[-1] == num_heads * value_dim
+     assert metadata.smla_metadata is None
++
++
++@pytest.mark.parametrize("graph_mode", [CUDAGraphMode.NONE, CUDAGraphMode.PIECEWISE, CUDAGraphMode.FULL])
++@pytest.mark.parametrize("actual_tokens", [0, 1, 3])
++@pytest.mark.parametrize(
++    "impl_cls,sharded_decode,global_prefill",
++    [(AscendSFAPCPImpl, False, True), (AscendSFAPCPImpl, True, False), (AscendSFAPCPDCPImpl, False, True)],
++)
++def test_nope_pcp_forward_preserves_collective_rows_on_empty_and_uneven_ranks(
++    impl_cls, sharded_decode, global_prefill, actual_tokens, graph_mode
++):
++    """Run the real forward entry; PCP peers need the same padded row count."""
++    impl = impl_cls.__new__(impl_cls)
++    impl._parallel_o_proj = SimpleNamespace(batch=lambda **kwargs: nullcontext(), uses_full_weight=False)
++    impl.qk_rope_head_dim = 0
++    impl.vllm_config = SimpleNamespace(parallel_config=SimpleNamespace(prefill_context_parallel_size=2))
++    impl.is_pcp_decode_sharded = sharded_decode
++    impl.enable_sparse_sfa_c8 = impl.enable_sparse_sfa_turboquant = False
++    impl.q_lora_rank = impl.kv_lora_rank = impl.v_head_dim = 2
++    impl.local_num_heads = 1
++    impl.preprocess_type = PreprocessType.NATIVE
++    impl.g_proj = impl.layerwise_kv_cache_hook = None
++    impl.has_indexer = True
++    impl.skip_topk = impl.use_index_cache = False
++    impl.layer_name = "layer"
++    impl._is_mtp_layer = False
++    hidden = torch.ones(4, 2)
++    metadata = SimpleNamespace(
++        cos=None,
++        sin=None,
++        num_actual_tokens=actual_tokens,
++        num_input_tokens=4,
++        uses_pcp_sharded_layout=True,
++        slot_mapping=torch.tensor([0, 1, 2, -1]),
++        pcp_has_global_prefill=global_prefill,
++        attn_state=AscendAttentionState.ChunkedPrefill if global_prefill else AscendAttentionState.DecodeOnly,
++        num_prefills=int(global_prefill and actual_tokens > 0),
++    )
++    impl._compose_sfa_kv_cache = MagicMock(return_value=(torch.empty(1),))
++    impl._get_sfa_kv_slot_mapping = MagicMock(return_value=metadata.slot_mapping)
++    impl._get_indexer_attn_metadata = MagicMock(return_value=object())
++    impl._get_parallel_forward_context = MagicMock(
++        return_value=SimpleNamespace(
++            actual_seq_lengths_query=torch.tensor([actual_tokens]),
++            actual_seq_lengths_key=torch.tensor([actual_tokens]),
++            kv_slot_mapping=metadata.slot_mapping,
++            topk_num_tokens=4,
++        )
++    )
++    impl.fused_qkv_a_proj = MagicMock(return_value=(torch.zeros(4, 4),))
++    impl.q_a_layernorm = lambda value: value
++    impl.exec_kv = MagicMock(return_value=(None, torch.zeros(4, 2)))
++    impl._store_parallel_kv = MagicMock(return_value=(None, None))
++    impl._q_proj_and_k_up_proj = MagicMock(return_value=(torch.zeros(4, 1, 2), None))
++    impl._record_query_gather_context = MagicMock()
++    impl._prepare_indexer_metadata = MagicMock()
++    impl.indexer = MagicMock(return_value=torch.zeros(4, 1, 1, dtype=torch.int32))
++    impl._execute_sparse_flash_attention_process = MagicMock(return_value=torch.ones(4, 2))
++    impl._v_up_proj = lambda value: value
++    impl._finalize_o_proj = MagicMock(side_effect=lambda value, output: output.copy_(value))
++    with (
++        patch.object(
++            sparse_mla, "get_forward_context", return_value=SimpleNamespace(cudagraph_runtime_mode=graph_mode)
++        ),
++        patch.object(sparse_mla, "wait_for_kv_layer_from_connector"),
++        patch.object(sparse_mla, "notify_kv_cache_written"),
++        patch.object(sparse_mla, "attention_transfer_window"),
++        patch.object(sparse_mla, "maybe_save_kv_layer_to_connector"),
++    ):
++        output = torch.empty_like(hidden)
++        assert impl.forward("layer", hidden, (), metadata, output) is output
++    impl._get_parallel_forward_context.assert_called_once()
++    assert impl._get_parallel_forward_context.call_args.args[1] == 4
++    assert impl.fused_qkv_a_proj.call_args.args[0].shape[0] == 4
++    impl._store_parallel_kv.assert_called_once()
++    impl._finalize_o_proj.assert_called_once()
++    assert impl._finalize_o_proj.call_args.args[0].shape[0] == 4
++    assert impl.indexer.call_args.kwargs["compute_topk"] == (actual_tokens > 0)
++    assert impl._execute_sparse_flash_attention_process.call_count == int(actual_tokens > 0)
++    torch.testing.assert_close(output, torch.full_like(output, float(actual_tokens > 0)))
+diff --git a/tests/ut/attention/test_sfa_v1.py b/tests/ut/attention/test_sfa_v1.py
+index 8a4737a16..63b695d62 100644
+--- a/tests/ut/attention/test_sfa_v1.py
++++ b/tests/ut/attention/test_sfa_v1.py
+@@ -1131,7 +1131,6 @@ class TestAscendSFAImpl(TestBase):
+             actual_seq_lengths_query=[1, 2],
+             actual_seq_lengths_key=[1, 2],
+             kv_slot_mapping=metadata.slot_mapping,
+-            gather_full_o_proj=False,
+             topk_num_tokens=2,
+         )
+         cases = (
+@@ -1182,7 +1181,7 @@ class TestAscendSFAImpl(TestBase):
+                 self.impl._get_indexcache_topk_indices = lambda _: torch.zeros(2, 1, dtype=torch.int64)
+                 self.impl._execute_sparse_flash_attention_process = lambda *_args: torch.ones(2, 4)
+                 self.impl._v_up_proj = lambda x: x
+-                self.impl._finalize_o_proj = lambda x, output, _: output.copy_(x)
++                self.impl._finalize_o_proj = lambda x, output: output.copy_(x)
+                 output = torch.empty_like(hidden)
+                 with (
+                     patch.object(sfa_v1, "wait_for_kv_layer_from_connector"),
+diff --git a/tests/ut/models/test_glm5next_kda_contracts.py b/tests/ut/models/test_glm5next_kda_contracts.py
+index 4bcd10795..5c792359c 100644
+--- a/tests/ut/models/test_glm5next_kda_contracts.py
++++ b/tests/ut/models/test_glm5next_kda_contracts.py
+@@ -45,7 +45,8 @@ def test_recurrent_raw_gates_rollback_slots_and_padding(monkeypatch, accepted, q
+     monkeypatch.setattr(kda_ops, "recurrent_kda", recurrent)
+     destination = torch.full((1, 8, 1, 128), float("nan"), dtype=q.dtype) if direct_output else None
+ 
+-    def writeback(source, target, ends):
++    def writeback(source: torch.Tensor, target: torch.Tensor, ends: torch.Tensor) -> None:
++        assert destination is not None
+         assert target is destination and ends is starts
+         assert torch.isnan(source[:, 3:]).all()
+         target.zero_()
+diff --git a/tests/ut/quantization/test_weight_switch.py b/tests/ut/quantization/test_weight_switch.py
+index cf2b23a4c..10b877a5c 100644
+--- a/tests/ut/quantization/test_weight_switch.py
++++ b/tests/ut/quantization/test_weight_switch.py
+@@ -1,12 +1,15 @@
+ # SPDX-License-Identifier: Apache-2.0
+ 
+ from types import SimpleNamespace
++from typing import Any
+ from unittest.mock import MagicMock, patch
+ 
+ import pytest
+ import torch
+ 
+ from vllm_ascend.weight_switch import (
++    OProjectionMode,
++    ParallelOProjection,
+     WeightLoadPartition,
+     WeightSwitchConfig,
+     WeightSwitchGatherSpec,
+@@ -133,6 +136,55 @@ def test_prepare_layer_for_parallel_weight_load_uses_one_composed_checkpoint_sli
+     assert state.gather_parts["weight"].full_tensor.shape == (3, 4)
+ 
+ 
++def test_parallel_projection_prepares_pcp_load_shard_before_runtime_switching() -> None:
++    class _LoadLayer(torch.nn.Module):
++        def __init__(self) -> None:
++            super().__init__()
++            self.input_size = 8
++            self.input_size_per_partition = 4
++            self.output_size = 3
++            self.output_size_per_partition = 3
++            self.weight = torch.nn.Parameter(torch.empty(3, 4), requires_grad=False)
++            self.weight.input_dim = 1
++
++            def tp_weight_loader(*args, **kwargs):
++                raise AssertionError("direct loading must not call the original TP loader")
++
++            self.weight.weight_loader = tp_weight_loader
++
++    class _LoadMethod(WeightSwitchMixin):
++        supports_weight_switch = True
++        weight_switch_gather_specs = (WeightSwitchGatherSpec("weight", gather_dim=1),)
++
++    layer = _LoadLayer()
++    layer.quant_method = _LoadMethod()
++    config = WeightSwitchConfig.from_group(SimpleNamespace(world_size=2, rank_in_group=1), shard_axis="input")
++    adapter = ParallelOProjection(
++        4,
++        layer,
++        config=config,
++        tp_group=SimpleNamespace(world_size=2, rank_in_group=0),
++        pool={},
++        pool_key="load_test",
++        project_full=MagicMock(),
++        decode_sharded=False,
++    )
++    adapter.prepare_weight_load(None)
++    assert adapter._load_prepared
++    assert layer.input_size_per_partition == 2
++    loader = layer.weight.weight_loader
++    adapter.prepare_weight_load(None)
++    assert layer.weight.weight_loader is loader
++    assert layer.input_size_per_partition == 2
++
++    layer.weight.weight_loader(layer.weight, torch.arange(24, dtype=torch.float32).reshape(3, 8))
++
++    torch.testing.assert_close(
++        layer.weight,
++        torch.tensor([[2.0, 3.0], [10.0, 11.0], [18.0, 19.0]]),
++    )
++
++
+ def test_enable_output_sharded_state_moves_gather_dim_and_reuses_pool() -> None:
+     method = _TestLinearMethod()
+     pool: dict[object, torch.Tensor] = {}
+@@ -243,3 +295,372 @@ def test_all_gather_rejects_a_second_launch_while_pending() -> None:
+ 
+     with pytest.raises(RuntimeError, match="still pending"):
+         _TestLinearMethod().all_gather_weight(state, config)
++
++
++class _ProjectionLinearMethod(WeightSwitchMixin):
++    supports_weight_switch = True
++    weight_switch_gather_specs = (WeightSwitchGatherSpec("weight", gather_dim=1),)
++    weight_switch_output_gather_specs = (WeightSwitchGatherSpec("weight", gather_dim=0),)
++
++    def apply(self, layer, inputs, bias=None):
++        return torch.nn.functional.linear(inputs, layer.weight, bias)
++
++
++def _projection_config():
++    return SimpleNamespace(
++        num_speculative_tokens=1,
++        scheduler_config=SimpleNamespace(max_num_seqs=2),
++        compilation_config=SimpleNamespace(max_cudagraph_capture_size=4, cudagraph_capture_sizes=(1, 4)),
++        model_config=SimpleNamespace(dtype=torch.float32),
++    )
++
++
++def _parallel_projection(*, pool=None, decode_sharded=True, tp_size=1, tp_rank=0, pcp_rank=0, prepare=True):
++    layer = torch.nn.Module()
++    layer.input_size = 4 * tp_size
++    layer.input_size_per_partition = 4
++    layer.output_size = layer.output_size_per_partition = 3
++    # Both PCP shards have the same coefficients, allowing the fake
++    # collectives to reproduce a complete global linear numerically.
++    layer.weight = torch.nn.Parameter(torch.arange(6.0).reshape(3, 2).repeat(1, 2), requires_grad=False)
++    layer.weight.input_dim = 1
++    layer.weight.weight_loader = MagicMock()
++    layer.quant_method = _ProjectionLinearMethod()
++    layer.reduce_results = True
++    layer.skip_bias_add = False
++    layer.bias = None
++    pcp_group = SimpleNamespace(
++        world_size=2,
++        rank_in_group=pcp_rank,
++        device_group=object(),
++        unique_name="pcp",
++        all_reduce=lambda value: value * 2,
++    )
++    tp_group = SimpleNamespace(world_size=tp_size, rank_in_group=tp_rank, all_reduce=lambda value: value * tp_size)
++
++    def project_full(inputs, output):
++        projected = torch.nn.functional.linear(inputs.flatten(1), layer.weight)
++        if layer.reduce_results:
++            projected = tp_group.all_reduce(projected)
++        if not layer.skip_bias_add and layer.bias is not None:
++            projected = projected + layer.bias
++        output.copy_(projected)
++        return output
++
++    projection = ParallelOProjection(
++        4,
++        layer,
++        config=WeightSwitchConfig.from_group(pcp_group, shard_axis="input"),
++        tp_group=tp_group,
++        pool={} if pool is None else pool,
++        pool_key="test_o_proj",
++        project_full=project_full,
++        decode_sharded=decode_sharded,
++    )
++    if prepare:
++        projection.prepare_weight_load(_projection_config())
++        # Load preparation allocates the resident shard; simulate checkpoint
++        # loading before building the runtime aliases.
++        with torch.no_grad():
++            layer.weight.copy_(torch.arange(6.0).reshape(3, 2))
++        projection.enable()
++    return projection
++
++
++def test_parallel_projection_reuses_graph_stable_buffers_and_separates_groups() -> None:
++    pool: dict[Any, torch.Tensor] = {}
++    first = _parallel_projection(pool=pool)
++    second = _parallel_projection(pool=pool)
++    assert first.token_capacity == 4
++    for name, shape in (
++        ("all_gather_input", (4, 4)),
++        ("all_gather_output", (8, 4)),
++        ("reduce_scatter_input", (8, 3)),
++        ("reduce_scatter_output", (4, 3)),
++    ):
++        assert getattr(first, name).shape == shape
++        assert getattr(first, name).data_ptr() == getattr(second, name).data_ptr()
++    second.config.group.unique_name = "another_pcp"
++    second._prepare_exchange_buffers(_projection_config())
++    assert first.all_gather_input.data_ptr() != second.all_gather_input.data_ptr()
++
++
++@pytest.mark.parametrize("pcp_rank", [0, 1])
++@pytest.mark.parametrize("exchange_tokens", [False, True])
++def test_parallel_projection_local_and_exchanged_tokens_match_global_linear(pcp_rank, exchange_tokens) -> None:
++    projection = _parallel_projection(pcp_rank=pcp_rank)
++    inputs = torch.tensor([[1.0, 2.0, 1.0, 2.0], [3.0, 4.0, 3.0, 4.0]])
++    full_weight = torch.arange(6.0).reshape(3, 2).repeat(1, 2)
++    expected = torch.nn.functional.linear(inputs, full_weight)
++    output = torch.empty(2, 3)
++    pointers = []
++
++    def gather(destination, source, *, group):
++        assert group is projection.config.group.device_group
++        remote = source + 10
++        destination.copy_(torch.cat((source, remote) if pcp_rank == 0 else (remote, source)))
++        pointers.append((source.data_ptr(), destination.data_ptr()))
++
++    def scatter(destination, source, *, group):
++        assert group is projection.config.group.device_group
++        destination.copy_(source.chunk(2)[pcp_rank] * 2)
++
++    with (
++        projection.batch(needs_global_metadata=False, has_prefill=False),
++        patch("vllm_ascend.weight_switch.o_proj.dist.all_gather_into_tensor", side_effect=gather),
++        patch("vllm_ascend.weight_switch.o_proj.dist.reduce_scatter_tensor", side_effect=scatter),
++    ):
++        projection.set_mode(use_full_weight=False, exchange_tokens=exchange_tokens)
++        assert projection.forward(inputs, output) is output
++        torch.testing.assert_close(output, expected)
++        projection.forward(inputs, output)
++        empty = projection.forward(torch.empty(0, 4), torch.empty(0, 3))
++        assert empty.shape == (0, 3)
++        if exchange_tokens:
++            assert pointers[0] == pointers[1]
++            with pytest.raises(ValueError, match="capacity"):
++                projection.forward(torch.empty(5, 4), torch.empty(5, 3))
++    assert projection.mode is OProjectionMode.LOCAL_WEIGHT
++    assert not projection.uses_full_weight
++
++
++@pytest.mark.parametrize("failure_stage", [None, "attention", "projection"])
++def test_parallel_projection_full_weights_and_failure_cleanup(failure_stage) -> None:
++    projection = _parallel_projection()
++    layer = projection.o_proj
++    parameter = layer.weight
++    address = parameter.data_ptr()
++    local_weight = parameter.detach().clone()
++    state = projection._weight_switch_states[0][2]
++    handle = MagicMock()
++    callback = projection.project_full
++
++    def gather(gather_state, config):
++        assert config is projection.config
++        part = gather_state.gather_parts["weight"]
++        part.gather_output.copy_(torch.cat((part.gather_input, part.gather_input)))
++        gather_state.handles.append(handle)
++
++    def project_full(inputs, output):
++        assert layer.weight.shape == (3, 4)
++        if failure_stage == "projection":
++            raise RuntimeError("injected projection failure")
++        return callback(inputs, output)
++
++    projection.project_full = project_full
++    inputs = torch.arange(8.0).reshape(2, 4)
++    output = torch.empty(2, 3)
++    with patch.object(layer.quant_method, "all_gather_weight", side_effect=gather):
++        if failure_stage is None:
++            with projection.batch(needs_global_metadata=True, has_prefill=True):
++                assert projection.uses_full_weight
++                projection.all_gather_weights()
++                assert projection.forward(inputs, output) is output
++            torch.testing.assert_close(output, torch.nn.functional.linear(inputs, local_weight.repeat(1, 2)))
++        else:
++            with (
++                pytest.raises(RuntimeError, match="injected"),
++                projection.batch(needs_global_metadata=True, has_prefill=True),
++            ):
++                projection.all_gather_weights()
++                if failure_stage == "attention":
++                    raise RuntimeError("injected attention failure")
++                projection.forward(inputs, output)
++    assert layer.weight is parameter
++    assert layer.weight.data_ptr() == address
++    torch.testing.assert_close(layer.weight, local_weight)
++    assert not state.handles
++    handle.wait.assert_called_once_with()
++    assert projection.mode is OProjectionMode.LOCAL_WEIGHT
++    assert not projection.uses_full_weight
++
++
++def test_parallel_projection_disabled_path_does_not_create_switches() -> None:
++    projection = _parallel_projection(prepare=False)
++    inputs = torch.arange(8.0).reshape(2, 4)
++    output = torch.empty(2, 3)
++    with projection.batch(needs_global_metadata=True, has_prefill=True):
++        projection.all_gather_weights()
++        assert not projection.uses_full_weight
++        assert projection.forward(inputs, output) is output
++    torch.testing.assert_close(output, torch.nn.functional.linear(inputs, projection.o_proj.weight))
++    assert projection._weight_switch_states is None
++    assert projection.o_proj_full_pools == {}
++
++
++@pytest.mark.parametrize("reduce_results", [False, True])
++@pytest.mark.parametrize("skip_bias_add", [False, True])
++def test_parallel_projection_adds_ordinary_bias_once_after_internal_reductions(reduce_results, skip_bias_add) -> None:
++    inputs = torch.tensor([[1.0, 2.0, 1.0, 2.0]])
++    bias = torch.tensor([7.0, 8.0, 9.0])
++    outputs = []
++    for tp_rank in range(2):
++        projection = _parallel_projection(tp_size=2, tp_rank=tp_rank, decode_sharded=False)
++        projection.o_proj.reduce_results = reduce_results
++        projection.o_proj.skip_bias_add = skip_bias_add
++        projection.o_proj.bias = torch.nn.Parameter(bias.clone(), requires_grad=False)
++        with projection.batch(needs_global_metadata=False, has_prefill=False):
++            outputs.append(projection.forward(inputs, torch.empty(1, 3)))
++    full_weight = torch.arange(6.0).reshape(3, 2).repeat(1, 2)
++    expected = torch.nn.functional.linear(inputs, full_weight) * 2
++    if not skip_bias_add:
++        expected = expected + bias
++    if reduce_results:
++        for actual in outputs:
++            torch.testing.assert_close(actual, expected)
++    else:
++        torch.testing.assert_close(sum(outputs), expected)
++
++
++def test_parallel_projection_keeps_pcp_before_tp_and_reads_current_bias() -> None:
++    projection = _parallel_projection(tp_size=2, decode_sharded=False)
++    events: list[str] = []
++
++    def pcp_reduce(value: torch.Tensor) -> torch.Tensor:
++        events.append("pcp")
++        return value * 2
++
++    def tp_reduce(value: torch.Tensor) -> torch.Tensor:
++        events.append("tp")
++        return value * 2
++
++    projection.config.group.all_reduce = pcp_reduce
++    projection.tp_group.all_reduce = tp_reduce
++    inputs = torch.tensor([[1.0, 2.0, 1.0, 2.0]])
++    baseline = torch.nn.functional.linear(inputs, projection.o_proj.weight.repeat(1, 2)) * 2
++    for bias in (torch.ones(3), torch.full((3,), 5.0)):
++        projection.o_proj.bias = torch.nn.Parameter(bias, requires_grad=False)
++        with projection.batch(needs_global_metadata=False, has_prefill=False):
++            output = projection.forward(inputs, torch.empty(1, 3))
++        torch.testing.assert_close(output, baseline + bias)
++    assert events == ["pcp", "tp", "pcp", "tp"]
++
++
++@pytest.mark.parametrize(
++    ("needs_global_metadata", "has_prefill", "decode_sharded", "mode"),
++    [
++        (True, True, True, OProjectionMode.FULL_WEIGHT),
++        (True, False, True, OProjectionMode.EXCHANGE_TOKENS),
++        (True, False, False, OProjectionMode.FULL_WEIGHT),
++        (False, False, True, OProjectionMode.LOCAL_WEIGHT),
++    ],
++)
++def test_parallel_projection_batch_selects_one_collective_mode(
++    needs_global_metadata, has_prefill, decode_sharded, mode
++):
++    projection = _parallel_projection(decode_sharded=decode_sharded)
++    with projection.batch(needs_global_metadata=needs_global_metadata, has_prefill=has_prefill):
++        assert projection.mode is mode
++        assert projection.uses_full_weight == (mode is OProjectionMode.FULL_WEIGHT)
++        assert projection.exchanges_tokens == (mode is OProjectionMode.EXCHANGE_TOKENS)
++    assert projection.mode is OProjectionMode.LOCAL_WEIGHT
++    assert not projection.uses_full_weight
++
++
++def _grouped_parallel_projection(pcp_rank=0):
++    base = _parallel_projection(pcp_rank=pcp_rank, prepare=False, decode_sharded=False)
++    input_layer = torch.nn.Module()
++    input_layer.input_size = input_layer.input_size_per_partition = 2
++    input_layer.output_size = input_layer.output_size_per_partition = 4
++    input_layer.output_partition_sizes = [4]
++    input_layer.weight = torch.nn.Parameter(torch.empty(4, 2), requires_grad=False)
++    input_layer.weight.output_dim = 0
++    input_layer.weight.weight_loader = MagicMock()
++    input_layer.quant_method = _ProjectionLinearMethod()
++    input_layer.quant_method.n_local_groups = 4
++
++    def input_projection(grouped):
++        return torch.einsum("tgi,gi->tg", grouped, input_layer.weight)
++
++    projection = ParallelOProjection(
++        8,
++        base.o_proj,
++        config=base.config,
++        tp_group=base.tp_group,
++        pool={},
++        pool_key="grouped_o_proj",
++        project_full=MagicMock(side_effect=AssertionError("local projection must not invoke the full callback")),
++        decode_sharded=False,
++        input_layer=input_layer,
++        input_projection=input_projection,
++        num_input_groups=4,
++    )
++    projection.prepare_weight_load(_projection_config())
++    with torch.no_grad():
++        input_layer.weight.copy_(torch.tensor([[1.0, 2.0], [1.0, 2.0]]))
++        projection.o_proj.weight.copy_(torch.arange(6.0).reshape(3, 2))
++    projection.enable()
++    return projection
++
++
++@pytest.mark.parametrize("pcp_rank", [0, 1])
++def test_grouped_parallel_projection_matches_two_factor_reference_and_empty_rows(pcp_rank) -> None:
++    projection = _grouped_parallel_projection(pcp_rank)
++    assert projection.input_layer.n_local_groups == 2
++    assert projection.input_layer.quant_method.n_local_groups == 2
++    assert projection.input_layer.weight.shape == (2, 2)
++    assert projection.o_proj.weight.shape == (3, 2)
++    inputs = torch.tensor([[[1.0, 2.0]] * 4, [[3.0, 4.0]] * 4])
++    first_factor = torch.tensor([[1.0, 2.0]] * 4)
++    second_factor = torch.arange(6.0).reshape(3, 2).repeat(1, 2)
++    expected = torch.nn.functional.linear(torch.einsum("tgi,gi->tg", inputs, first_factor), second_factor)
++    with projection.batch(needs_global_metadata=False, has_prefill=False):
++        output = projection.forward(inputs, torch.empty(2, 3))
++        torch.testing.assert_close(output, expected)
++        assert projection.forward(torch.empty(0, 4, 2), torch.empty(0, 3)).shape == (0, 3)
++
++
++def test_parallel_projection_cleanup_waits_all_factors_without_hiding_attention_error() -> None:
++    projection = _grouped_parallel_projection()
++    first = projection._weight_switch_states[0][2]
++    second = projection._weight_switch_states[1][2]
++    first.handles.append(SimpleNamespace(wait=MagicMock(side_effect=RuntimeError("wait failure"))))
++    second_wait = MagicMock()
++    second.handles.append(SimpleNamespace(wait=second_wait))
++    attention_error = RuntimeError("attention failed")
++    with pytest.raises(RuntimeError) as caught, projection.batch(needs_global_metadata=True, has_prefill=True):
++        raise attention_error
++    assert caught.value is attention_error
++    second_wait.assert_called_once_with()
++    assert not first.handles and not second.handles
++    assert projection.mode is OProjectionMode.LOCAL_WEIGHT
++    assert not projection.uses_full_weight
++
++
++def test_parallel_projection_rejects_wrong_input_width_before_communication() -> None:
++    projection = _parallel_projection()
++    with projection.batch(needs_global_metadata=False, has_prefill=False):
++        projection.set_mode(use_full_weight=False, exchange_tokens=True)
++        with patch("vllm_ascend.weight_switch.o_proj.dist.all_gather_into_tensor") as gather:
++            with pytest.raises(RuntimeError):
++                projection.forward(torch.empty(2, 3), torch.empty(2, 3))
++            gather.assert_not_called()
++
++
++def test_parallel_projection_can_enable_cloned_legacy_weights_without_load_sharding() -> None:
++    base = _parallel_projection(prepare=False, decode_sharded=False)
++    projection = ParallelOProjection(
++        4,
++        base.o_proj,
++        config=base.config,
++        tp_group=base.tp_group,
++        pool={},
++        pool_key="legacy_test",
++        project_full=base.project_full,
++        decode_sharded=False,
++        clone_local_tensors=True,
++    )
++    address = base.o_proj.weight.data_ptr()
++    projection.enable()
++    initial_states = projection._weight_switch_states
++    assert initial_states is None
++    projection.enabled = True
++    projection.enable()
++    states = projection._weight_switch_states
++    assert states is not None
++    state = states[0][2]
++    assert not projection._load_prepared
++    assert base.o_proj.weight.data_ptr() != address
++    assert base.o_proj.weight.data_ptr() == state.gather_parts["weight"].local_tensor.data_ptr()
++    projection.enable()
++    assert projection._weight_switch_states[0][2] is state
+diff --git a/vllm_ascend/attention/context_parallel/dsa_cp.py b/vllm_ascend/attention/context_parallel/dsa_cp.py
+index 2ee84389d..2f3723b96 100644
+--- a/vllm_ascend/attention/context_parallel/dsa_cp.py
++++ b/vllm_ascend/attention/context_parallel/dsa_cp.py
+@@ -2,13 +2,10 @@
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+ """DSA prefill context parallelism using the PCP group and MRV2 batches."""
+ 
+-from collections.abc import Generator
+-from contextlib import contextmanager
+ from dataclasses import dataclass, replace
+ from typing import TYPE_CHECKING, Any, ClassVar
+ 
+ import torch
+-import torch.distributed as dist
+ from vllm.config import VllmConfig
+ from vllm.distributed import get_pcp_group, get_tp_group
+ from vllm.logger import logger
+@@ -34,12 +31,10 @@ from vllm_ascend.core.kv_cache_interface import AscendMLAAttentionSpec
+ from vllm_ascend.device.device_op import DeviceOperator
+ from vllm_ascend.models.deepseek_v4.compressor import AscendCompressorMetadata
+ from vllm_ascend.models.deepseek_v4.indexer import AscendIndexerMetadata
+-from vllm_ascend.quantization.methods import AscendLinearScheme
+ from vllm_ascend.utils import enable_pcp_o_proj_weight_sharding
+ from vllm_ascend.weight_switch import (
+-    WeightLoadPartition,
++    ParallelOProjection,
+     WeightSwitchConfig,
+-    WeightSwitchMixin,
+ )
+ from vllm_ascend.worker.device_metadata import (
+     DeviceMetadataStage,
+@@ -520,7 +515,9 @@ class AscendDSAPCPImpl(AscendDSAImpl):
+     """Use ordinary decode updates or global PCP prefill cache updates."""
+ 
+     supports_pcp: ClassVar[bool] = True
++
+     o_proj_full_pools: ClassVar[dict[Any, torch.Tensor]] = {}
++    o_proj_weight_switch_pool_key = "dsa_pcp_o_proj"
+ 
+     def __init__(self, *args, **kwargs):
+         super().__init__(*args, **kwargs)
+@@ -529,108 +526,29 @@ class AscendDSAPCPImpl(AscendDSAImpl):
+         # cache-update work for the auxiliary stream to overlap.
+         self.multistream_dsv4_dsa_overlap = False
+ 
+-        # V4 and V4.1 share this projector; the batch context selects its O path.
+         self.enable_pcp_o_proj_weight_sharding = enable_pcp_o_proj_weight_sharding()
+-        if not self.enable_pcp_o_proj_weight_sharding:
+-            return
+-
+-        self._pcp_o_proj_weight_switches = None
+-        self._pcp_decode_sharded = is_pcp_decode_sharding_enabled(self.vllm_config)
+-        # Fall back to ordinary O weights if groups or quantization cannot be sharded.
+-        pcp_size = get_pcp_group().world_size
+-        try:
+-            if self.n_local_groups % pcp_size != 0:
+-                raise ValueError(f"n_local_groups={self.n_local_groups} is not divisible by pcp_size={pcp_size}")
+-            self._get_pcp_weight_switch_method(self.wo_a)
+-            self._get_pcp_weight_switch_method(self.wo_b)
+-        except (RuntimeError, ValueError) as exc:
+-            logger.warning_once(
+-                "DSA-PCP O-projection weight sharding is unavailable (%s); using unsharded O-projection weights.",
+-                exc,
+-            )
+-            self.enable_pcp_o_proj_weight_sharding = False
+-            return
+-
+-        # Configure PCP weight loading before the model weights are loaded.
+-        self._prepare_pcp_o_proj_weight_shards()
+-        # Sharded decode needs exchange buffers allocated before graph capture.
+-        if self._pcp_decode_sharded:
+-            self._initialize_pcp_o_proj_exchange_buffers()
+-
+-    @staticmethod
+-    def _get_pcp_weight_switch_method(layer: torch.nn.Module) -> WeightSwitchMixin:
+-        quant_method = layer.quant_method
+-        linear_method = getattr(quant_method, "quant_method", quant_method)
+-        if not isinstance(linear_method, WeightSwitchMixin) or not linear_method.supports_weight_switch:
+-            raise RuntimeError(
+-                "DSA-PCP O-proj weight sharding requires a weight-switch capable method, "
+-                f"got {type(linear_method).__name__}."
+-            )
+-        return linear_method
+-
+-    def _prepare_pcp_o_proj_weight_shards(self) -> None:
+-        pcp_group = get_pcp_group()
+-        if self.n_local_groups % pcp_group.world_size != 0:
+-            raise ValueError(
+-                "DSA-PCP O-proj weight sharding requires n_local_groups to be "
+-                "divisible by the PCP size, got "
+-                f"n_local_groups={self.n_local_groups}, pcp_size={pcp_group.world_size}."
+-            )
+-
+-        self.pcp_o_proj_weight_switch_config = WeightSwitchConfig.from_group(pcp_group)
+-        load_partition = WeightLoadPartition.from_nested_groups(get_tp_group(), pcp_group)
+-        self.wo_a_pcp_weight_method = self._get_pcp_weight_switch_method(self.wo_a)
+-        self.wo_b_pcp_weight_method = self._get_pcp_weight_switch_method(self.wo_b)
+-        self.wo_a_pcp_weight_method.prepare_layer_for_parallel_output_weight_load(
+-            self.wo_a,
+-            self.pcp_o_proj_weight_switch_config,
+-            load_partition,
+-        )
+-        self.wo_b_pcp_weight_method.prepare_layer_for_parallel_weight_load(
++        self._parallel_o_proj = ParallelOProjection(
++            self.n_local_heads * self.head_dim,
+             self.wo_b,
+-            self.pcp_o_proj_weight_switch_config,
+-            load_partition,
++            config=WeightSwitchConfig.from_group(get_pcp_group(), shard_axis="input"),
++            tp_group=get_tp_group(),
++            pool=self.o_proj_full_pools,
++            pool_key=self.o_proj_weight_switch_pool_key,
++            project_full=super()._forward_o_proj,
++            decode_sharded=is_pcp_decode_sharding_enabled(self.vllm_config),
++            input_layer=self.wo_a,
++            input_projection=self._wo_a_bmm,
++            num_input_groups=self.n_local_groups,
+         )
+-
+-        # wo_a post-processing reshapes the raw output shard into a batched
+-        # group layout. Keep its layer/method metadata aligned with the
+-        # PCP-local resident shard; the attention implementation itself keeps
+-        # the TP-local group count because runtime all-gather restores it.
+-        local_groups = self.n_local_groups // pcp_group.world_size
+-        self.wo_a.n_local_groups = local_groups
+-        if hasattr(self.wo_a_pcp_weight_method, "n_local_groups"):
+-            self.wo_a_pcp_weight_method.n_local_groups = local_groups
+-
+-    def _initialize_pcp_o_proj_exchange_buffers(self) -> None:
+-        """Allocate activation-typed collective storage before graph capture."""
+-        pcp_size = get_pcp_group().world_size
+-        compilation_config = self.vllm_config.compilation_config
+-        decode_query_len = 1 + self.vllm_config.num_speculative_tokens
+-        capacity = max(
+-            self.vllm_config.scheduler_config.max_num_seqs * decode_query_len,
+-            compilation_config.max_cudagraph_capture_size or 0,
+-            max(compilation_config.cudagraph_capture_sizes or [0]),
+-        )
+-        input_size = self.n_local_heads * self.head_dim
+-        output_size = self.wo_b.output_size_per_partition
+-        dtype = self.vllm_config.model_config.dtype
+-        device = self.wo_b.weight.device
+-        # Compatible layers share storage because O projections execute in
+-        # sequence. Forward slices the active bucket without reallocating or
+-        # sending the unused capacity; all HCCL addresses stay graph-stable.
+-        shapes = {
+-            "_pcp_o_proj_ag_in_buf": (capacity, input_size),
+-            "_pcp_o_proj_ag_out_buf": (pcp_size * capacity, input_size),
+-            "_pcp_o_proj_rs_in_buf": (pcp_size * capacity, output_size),
+-            "_pcp_o_proj_rs_out_buf": (capacity, output_size),
+-        }
+-        for name, shape in shapes.items():
+-            key = ("dsa_pcp_o_proj_decode", name, device, dtype, shape)
+-            buffer = self.o_proj_full_pools.get(key)
+-            if buffer is None:
+-                buffer = torch.empty(shape, dtype=dtype, device=device)
+-                self.o_proj_full_pools[key] = buffer
+-            setattr(self, name, buffer)
++        if self.enable_pcp_o_proj_weight_sharding:
++            try:
++                self._parallel_o_proj.prepare_weight_load(self.vllm_config)
++            except (RuntimeError, ValueError) as exc:
++                logger.warning_once(
++                    "DSA-PCP O-projection weight sharding is unavailable (%s); using unsharded O-projection weights.",
++                    exc,
++                )
++                self.enable_pcp_o_proj_weight_sharding = False
+ 
+     def forward(
+         self,
+@@ -646,13 +564,13 @@ class AscendDSAPCPImpl(AscendDSAImpl):
+         # Global prefill must select the same collectives on every rank;
+         # a one-token prefill shard can look like DecodeOnly locally.
+         has_prefill = pcp_metadata is not None and pcp_metadata.pcp_has_global_prefill
+-        with self._o_proj_batch(needs_global_metadata=pcp_metadata is not None, has_prefill=has_prefill):
++        with self._parallel_o_proj.batch(needs_global_metadata=pcp_metadata is not None, has_prefill=has_prefill):
+             result = super().forward(layer_name, hidden_states, kv_cache, attn_metadata, output)
+             # V4 returns after cache preparation on empty query ranks. They
+             # still project other owners' requests with their resident O groups.
+             # Keep this on the successful path, outside exception cleanup.
+             if (
+-                self._pcp_o_proj_use_activation_exchange
++                self._parallel_o_proj.exchanges_tokens
+                 and pcp_metadata is not None
+                 and pcp_metadata.num_actual_tokens == 0
+             ):
+@@ -661,139 +579,8 @@ class AscendDSAPCPImpl(AscendDSAImpl):
+                 output.zero_()
+             return result
+ 
+-    @contextmanager
+-    def _o_proj_batch(
+-        self,
+-        needs_global_metadata: bool,
+-        has_prefill: bool,
+-    ) -> Generator[None, None, None]:
+-        """Own the O-projection mode and weight lifetime for V4 and V4.1.
+-
+-        Callers translate their metadata into global batch facts before cache
+-        preparation. Prefill gathers weights, sharded decode exchanges
+-        activations, and replicated decode/profile uses resident local weights.
+-        """
+-        try:
+-            self._pcp_o_proj_use_activation_exchange = (
+-                self.enable_pcp_o_proj_weight_sharding
+-                and needs_global_metadata
+-                and self._pcp_decode_sharded
+-                and not has_prefill
+-            )
+-            self._pcp_o_proj_use_full_weight = (
+-                self.enable_pcp_o_proj_weight_sharding
+-                and needs_global_metadata
+-                and not self._pcp_o_proj_use_activation_exchange
+-            )
+-            # V4.1 calls O projection directly rather than DSA forward. Prepare
+-            # persistent aliases during warmup, before either caller captures.
+-            if self.enable_pcp_o_proj_weight_sharding:
+-                self._get_pcp_o_proj_weight_switches()
+-            yield
+-        finally:
+-            # An empty query rank or an early return may skip O projection.
+-            # Drain launched weight gathers and restore resident shards.
+-            if self.enable_pcp_o_proj_weight_sharding:
+-                for layer, method, state in self._pcp_o_proj_weight_switches or ():
+-                    if state.handles:
+-                        method.wait_weight_all_gather(state)
+-                    if self._pcp_o_proj_use_full_weight:
+-                        method.switch_weight(layer, state, use_full_weight=False)
+-
+-    def _maybe_all_gather_pcp_o_proj_weights(self) -> None:
+-        if not self._pcp_o_proj_use_full_weight:
+-            return
+-
+-        for _, method, state in self._get_pcp_o_proj_weight_switches():
+-            method.all_gather_weight(state, self.pcp_o_proj_weight_switch_config)
+-
+-    def _get_pcp_o_proj_weight_switches(self):
+-        if self._pcp_o_proj_weight_switches is None:
+-            weight_switches = []
+-            for name, layer, method in (
+-                ("wo_a", self.wo_a, self.wo_a_pcp_weight_method),
+-                ("wo_b", self.wo_b, self.wo_b_pcp_weight_method),
+-            ):
+-                state = method.enable_weight_switch(
+-                    layer,
+-                    self.pcp_o_proj_weight_switch_config,
+-                    pool=AscendDSAPCPImpl.o_proj_full_pools,
+-                    pool_key_prefix=(type(method).__qualname__, name, "dsa_pcp_o_proj"),
+-                )
+-                weight_switches.append((layer, method, state))
+-            self._pcp_o_proj_weight_switches = tuple(weight_switches)
+-        return self._pcp_o_proj_weight_switches
+-
+-    def _project_o_proj_with_local_weights(self, group_input: torch.Tensor) -> torch.Tensor:
+-        """Project only the O groups owned by this PCP rank, then reduce TP."""
+-        pcp_group = get_pcp_group()
+-        projected = self._wo_a_bmm(group_input).reshape(group_input.shape[0], -1)
+-        linear_method = self._get_pcp_weight_switch_method(self.wo_b)
+-        if isinstance(linear_method, AscendLinearScheme):
+-            tp_group = get_tp_group()
+-            # The complete O-projection bias belongs to only one TP/PCP shard.
+-            bias_rank = 0 if tp_group.rank_in_group == 0 and pcp_group.rank_in_group == 0 else 1
+-            bias = self.wo_b.bias if bias_rank == 0 and not self.wo_b.skip_bias_add else None
+-            partial_output = linear_method.apply(self.wo_b, projected, bias=bias, tp_rank=bias_rank)
+-            if self.wo_b.reduce_results and tp_group.world_size > 1:
+-                partial_output = tp_group.all_reduce(partial_output)
+-        else:
+-            partial_output = self.wo_b(projected)
+-        return partial_output
+-
+-    def _forward_o_proj_with_local_weights(self, o_proj_input: torch.Tensor, output: torch.Tensor) -> torch.Tensor:
+-        # Decode tokens and their KV cache updates are replicated across PCP
+-        # ranks, so each rank projects the same attention output locally.
+-        pcp_group = get_pcp_group()
+-        num_tokens = o_proj_input.shape[0]
+-        groups_per_rank = self.n_local_groups // pcp_group.world_size
+-        group_input = o_proj_input.reshape(num_tokens, self.n_local_groups, -1)
+-        group_input = group_input.narrow(1, pcp_group.rank_in_group * groups_per_rank, groups_per_rank).contiguous()
+-
+-        output[...] = pcp_group.all_reduce(self._project_o_proj_with_local_weights(group_input))
+-        return output
+-
+-    def _forward_o_proj_with_sharded_tokens(self, o_proj_input: torch.Tensor, output: torch.Tensor) -> torch.Tensor:
+-        """Gather decode tokens, project local O groups, and scatter sums."""
+-        pcp_group = get_pcp_group()
+-        num_tokens = o_proj_input.shape[0]
+-        groups_per_rank = self.n_local_groups // pcp_group.world_size
+-        group_hidden_dim = self.n_local_heads * self.head_dim // self.n_local_groups
+-        local_rows = self._pcp_o_proj_ag_in_buf[:num_tokens]
+-        local_rows.copy_(o_proj_input.reshape(num_tokens, -1))
+-        global_rows = self._pcp_o_proj_ag_out_buf[: pcp_group.world_size * num_tokens]
+-        # AllToAll reduces payload but adds a channel-packing transpose; measured
+-        # small-batch decode showed no clear benefit, so use token AllGather.
+-        dist.all_gather_into_tensor(global_rows, local_rows, group=pcp_group.device_group)
+-        # Rank-major padded rows match ReduceScatter's token ownership. Select
+-        # resident O groups after gathering to avoid packing channels to send.
+-        group_input = global_rows.view(pcp_group.world_size * num_tokens, self.n_local_groups, group_hidden_dim)
+-        group_input = group_input.narrow(1, pcp_group.rank_in_group * groups_per_rank, groups_per_rank).contiguous()
+-        partial_output = self._project_o_proj_with_local_weights(group_input)
+-        scatter_input = self._pcp_o_proj_rs_in_buf[: pcp_group.world_size * num_tokens]
+-        scatter_input.copy_(partial_output)
+-        reduced = self._pcp_o_proj_rs_out_buf[:num_tokens]
+-        dist.reduce_scatter_tensor(reduced, scatter_input, group=pcp_group.device_group)
+-        output.copy_(reduced)
+-        return output
+-
+     def _forward_o_proj(self, o_proj_input: torch.Tensor, output: torch.Tensor) -> torch.Tensor:
+-        if not self.enable_pcp_o_proj_weight_sharding:
+-            return super()._forward_o_proj(o_proj_input, output)
+-        if self._pcp_o_proj_use_activation_exchange:
+-            return self._forward_o_proj_with_sharded_tokens(o_proj_input, output)
+-        if not self._pcp_o_proj_use_full_weight:
+-            return self._forward_o_proj_with_local_weights(o_proj_input, output)
+-
+-        weight_switches = self._get_pcp_o_proj_weight_switches()
+-        for layer, method, state in weight_switches:
+-            method.wait_weight_all_gather(state)
+-            method.switch_weight(layer, state, use_full_weight=True)
+-        try:
+-            return super()._forward_o_proj(o_proj_input, output)
+-        finally:
+-            for layer, method, state in weight_switches:
+-                method.switch_weight(layer, state, use_full_weight=False)
++        return self._parallel_o_proj.forward(o_proj_input, output)
+ 
+     def _gather_and_restore_hidden_states(
+         self,
+@@ -944,7 +731,8 @@ class AscendDSAPCPImpl(AscendDSAImpl):
+         # Every rank must join the weight gathers, including ranks that return
+         # before local attention. Launch after the cache collectives to overlap
+         # local attention on nonempty ranks.
+-        self._maybe_all_gather_pcp_o_proj_weights()
++        self._parallel_o_proj.all_gather_weights()
++
+         return True
+ 
+     def _get_o_proj_input_shape(
+diff --git a/vllm_ascend/attention/context_parallel/dsa_v41_cp.py b/vllm_ascend/attention/context_parallel/dsa_v41_cp.py
+index 795d80a33..fbdaddf7b 100644
+--- a/vllm_ascend/attention/context_parallel/dsa_v41_cp.py
++++ b/vllm_ascend/attention/context_parallel/dsa_v41_cp.py
+@@ -346,7 +346,7 @@ class AscendDSAV41PCPImpl(_ReplicatedCacheImpl):
+         # Empty query ranks also join hidden and weight collectives.
+         global_hidden_states = self._gather_and_restore_hidden_states(hidden_states, metadata.swa)
+         projector = attn.dsa_attn.dsa_attn.impl
+-        projector._maybe_all_gather_pcp_o_proj_weights()
++        projector._parallel_o_proj.all_gather_weights()
+         global_metadata = self._global_layer_metadata(metadata_by_prefix)
+         return self._preprocess(attn, hidden_states, global_hidden_states, metadata, global_metadata)
+ 
+@@ -362,5 +362,5 @@ class AscendDSAV41PCPImpl(_ReplicatedCacheImpl):
+         projector = attn.dsa_attn.dsa_attn.impl
+         # V4 owns the quantized O modules and their batch-scoped collective mode.
+         # V4.1 already projects padded output even on empty query ranks.
+-        with projector._o_proj_batch(needs_global_metadata=needs_global_metadata, has_prefill=has_prefill):
++        with projector._parallel_o_proj.batch(needs_global_metadata=needs_global_metadata, has_prefill=has_prefill):
+             return super().forward(attn, positions, hidden_states, output)
+diff --git a/vllm_ascend/attention/context_parallel/sfa_cp.py b/vllm_ascend/attention/context_parallel/sfa_cp.py
+index 9d304499c..85a456716 100644
+--- a/vllm_ascend/attention/context_parallel/sfa_cp.py
++++ b/vllm_ascend/attention/context_parallel/sfa_cp.py
+@@ -1,10 +1,9 @@
+ from collections.abc import Callable
+ from dataclasses import dataclass
+ from functools import partial
+-from typing import Any, NamedTuple, TypeVar
++from typing import Any, ClassVar, NamedTuple, TypeVar
+ 
+ import torch
+-import torch.distributed as dist
+ from torch import nn
+ from vllm.config import VllmConfig
+ from vllm.distributed import get_dcp_group, get_pcp_group, get_tp_group
+@@ -34,6 +33,7 @@ from vllm_ascend.attention.sfa_v1 import (
+     AscendSFAMetadata,
+     AscendSFAMetadataBuilder,
+     SFAForwardContext,
++    _view_cache_as_operator_pages,
+     needs_pcp_kv_gather,
+ )
+ from vllm_ascend.attention.utils import (
+@@ -45,7 +45,6 @@ from vllm_ascend.device.device_op import DeviceOperator
+ from vllm_ascend.distributed.utils import all_gather_async
+ from vllm_ascend.ops.triton.dcp.sfa_dcp_query import prepare_query_head_major, unpack_query
+ from vllm_ascend.ops.triton.pcp_kv_cache import copy_pcp_kv_cache
+-from vllm_ascend.quantization.methods import AscendLinearScheme
+ from vllm_ascend.utils import (
+     enable_pcp_o_proj_weight_sharding,
+     enable_sfa_dcp_force_tmajor_restore,
+@@ -53,16 +52,14 @@ from vllm_ascend.utils import (
+     is_pd_decode_recompute_scheduler_enabled,
+ )
+ from vllm_ascend.weight_switch import (
+-    WeightLoadPartition,
++    ParallelOProjection,
+     WeightSwitchConfig,
+-    WeightSwitchMixin,
+ )
+-from vllm_ascend.weight_switch.o_proj import OProjWeightSwitchMixin
+ 
+ M = TypeVar("M", bound=AscendSFAMetadata)
+ 
+ 
+-class AscendSFAPCPImpl(OProjWeightSwitchMixin, AscendSFAImpl):
++class AscendSFAPCPImpl(AscendSFAImpl):
+     """SFA PCP implementation with PCP-sharded O-proj weights.
+ 
+     Weight switching is performed only in the PCP domain. When TP is enabled,
+@@ -71,87 +68,51 @@ class AscendSFAPCPImpl(OProjWeightSwitchMixin, AscendSFAImpl):
+     part of the row-parallel layer semantics.
+     """
+ 
+-    o_proj_full_pools: dict[Any, torch.Tensor] = {}
++    supports_pcp: ClassVar[bool] = True
++
++    o_proj_full_pools: ClassVar[dict[Any, torch.Tensor]] = {}
+     o_proj_weight_switch_pool_key = "sfa_pcp_o_proj"
+ 
+     def __init__(self, *args, **kwargs) -> None:
+         super().__init__(*args, **kwargs)
+         self.enable_pcp_o_proj_weight_sharding = enable_pcp_o_proj_weight_sharding()
+-        self._initialize_o_proj_weight_switch(WeightSwitchConfig.from_group(get_pcp_group(), shard_axis="input"))
+-        if not self.enable_pcp_o_proj_weight_sharding:
+-            return
+-        pcp_size = self.o_proj_weight_switch_config.world_size
+-        try:
+-            input_width = getattr(self.o_proj, "input_size_per_partition", None)
+-            if not isinstance(input_width, int) or input_width <= 0 or input_width % pcp_size != 0:
+-                raise ValueError(f"input_size_per_partition={input_width!r} cannot be split across pcp_size={pcp_size}")
+-            linear_method = self._get_o_proj_weight_switch_method()
+-        except (RuntimeError, ValueError) as exc:
+-            logger.warning_once(
+-                "SFA-PCP O-projection weight sharding is unavailable (%s); using unsharded O-projection weights.",
+-                exc,
+-            )
+-            self.enable_pcp_o_proj_weight_sharding = False
+-            return
+-        self.o_proj_weight_load_partition = WeightLoadPartition.from_nested_groups(
+-            get_tp_group(),
+-            get_pcp_group(),
+-        )
+-        self.o_proj_weight_load_state = linear_method.prepare_layer_for_parallel_weight_load(
++        self._parallel_o_proj = ParallelOProjection(
++            self.o_proj.input_size_per_partition,
+             self.o_proj,
+-            self.o_proj_weight_switch_config,
+-            self.o_proj_weight_load_partition,
++            config=WeightSwitchConfig.from_group(get_pcp_group(), shard_axis="input"),
++            tp_group=get_tp_group(),
++            pool=self.o_proj_full_pools,
++            pool_key=self.o_proj_weight_switch_pool_key,
++            project_full=super()._finalize_o_proj,
++            decode_sharded=self.is_pcp_decode_sharded,
+         )
+-        if self.is_pcp_decode_sharded:
+-            compilation_config = self.vllm_config.compilation_config
+-            decode_query_len = 1 + self.vllm_config.num_speculative_tokens
+-            max_decode_tokens = self.vllm_config.scheduler_config.max_num_seqs * decode_query_len
+-            self._pcp_o_proj_token_capacity = max(
+-                max_decode_tokens,
+-                compilation_config.max_cudagraph_capture_size or 0,
+-                max(compilation_config.cudagraph_capture_sizes or [0]),
+-            )
+-            capacity = self._pcp_o_proj_token_capacity
+-            input_size = self.o_proj_weight_load_state.input_size_per_partition_before
+-            output_size = self.o_proj.output_size_per_partition
+-            dtype = self.vllm_config.model_config.dtype
+-            device = self.o_proj.weight.device
+-            # Layers execute O-proj collectives sequentially, so compatible
+-            # layers can reuse these graph-stable buffers from the weight pool.
+-            buffer_shapes = {
+-                "_pcp_o_proj_ag_in_buf": (capacity, input_size),
+-                "_pcp_o_proj_ag_out_buf": (pcp_size * capacity, input_size),
+-                "_pcp_o_proj_rs_in_buf": (pcp_size * capacity, output_size),
+-                "_pcp_o_proj_rs_out_buf": (capacity, output_size),
+-            }
+-            for name, shape in buffer_shapes.items():
+-                pool_key = (self.o_proj_weight_switch_pool_key, "decode", name, device, dtype, shape)
+-                buffer = self.o_proj_full_pools.get(pool_key)
+-                if buffer is None:
+-                    buffer = torch.empty(shape, dtype=dtype, device=device)
+-                    self.o_proj_full_pools[pool_key] = buffer
+-                setattr(self, name, buffer)
++        if self.enable_pcp_o_proj_weight_sharding:
++            try:
++                self._parallel_o_proj.prepare_weight_load(self.vllm_config)
++            except (RuntimeError, ValueError) as exc:
++                logger.warning_once(
++                    "SFA-PCP O-projection weight sharding is unavailable (%s); using unsharded O-projection weights.",
++                    exc,
++                )
++                self.enable_pcp_o_proj_weight_sharding = False
+ 
+     def process_weights_after_loading(self, act_dtype: torch.dtype):
+         result = super().process_weights_after_loading(act_dtype)
+-        if self.enable_pcp_o_proj_weight_sharding:
+-            self._enable_o_proj_full_weight_switch()
++        self._parallel_o_proj.enable()
+         return result
+ 
+-    def _get_parallel_forward_context(
++    def forward(
+         self,
+-        attn_metadata: M,
+-        num_input_tokens: int,
++        layer_name,
+         hidden_states: torch.Tensor,
+-    ) -> SFAForwardContext:
+-        context = super()._get_parallel_forward_context(
+-            attn_metadata,
+-            num_input_tokens,
+-            hidden_states,
+-        )
+-        # Single-token PCP prefill shards can have DecodeOnly state.
+-        # Keep O-projection collectives consistent across the PCP group.
+-        context.gather_full_o_proj = self._o_proj_weight_switch_enabled and (
++        kv_cache: tuple[torch.Tensor, ...],
++        attn_metadata: M,
++        output: torch.Tensor | None = None,
++    ) -> torch.Tensor:
++        assert output is not None, "Output tensor must be provided."
++        # A short prefill shard can look like decode locally. Preserve the
++        # global prefill decision so every PCP rank selects the same mode.
++        has_prefill = attn_metadata is not None and (
+             attn_metadata.pcp_has_global_prefill
+             or attn_metadata.attn_state
+             not in {
+@@ -159,87 +120,26 @@ class AscendSFAPCPImpl(OProjWeightSwitchMixin, AscendSFAImpl):
+                 AscendAttentionState.SpecDecoding,
+             }
+         )
+-        if context.gather_full_o_proj:
+-            self._all_gather_o_proj_full_weight()
+-        return context
++        needs_global_metadata = attn_metadata is not None and (has_prefill or self.is_pcp_decode_sharded)
++        with self._parallel_o_proj.batch(needs_global_metadata=needs_global_metadata, has_prefill=has_prefill):
++            return super().forward(layer_name, hidden_states, kv_cache, attn_metadata, output)
+ 
+-    def _gather_o_proj_decode_tokens(self, attn_output: torch.Tensor) -> torch.Tensor:
+-        """Exchange rank-local decode rows using graph-stable buffers."""
+-        group = self.o_proj_weight_switch_config.group
+-        num_tokens = attn_output.shape[0]
+-        if num_tokens > self._pcp_o_proj_token_capacity:
+-            raise ValueError("PCP O-proj decode rows exceed the configured token/graph capacity.")
+-        local_rows = self._pcp_o_proj_ag_in_buf[:num_tokens]
+-        local_rows.copy_(attn_output)
+-        global_rows = self._pcp_o_proj_ag_out_buf[: group.world_size * num_tokens]
+-        # AllToAll reduces payload but adds a channel-packing transpose; measured
+-        # small-batch decode showed no clear benefit, so use token AllGather.
+-        dist.all_gather_into_tensor(global_rows, local_rows, group=group.device_group)
+-        return global_rows
+-
+-    def _finalize_o_proj(
++    def _get_parallel_forward_context(
+         self,
+-        attn_output: torch.Tensor,
+-        output: torch.Tensor,
+-        gather_full_o_proj: bool,
+-    ) -> torch.Tensor:
+-        if not self._o_proj_weight_switch_enabled:
+-            return super()._finalize_o_proj(attn_output, output, gather_full_o_proj)
+-        if gather_full_o_proj:
+-            with self._use_full_o_proj_weights():
+-                return super()._finalize_o_proj(attn_output, output, gather_full_o_proj)
+-
+-        # Feature-sharded weights must project the same token rows on every
+-        # PCP rank. Sharded decode exchanges rows first and scatters the summed
+-        # projection back to each owner; replicated decode only needs a sum.
+-        linear_method = self._get_o_proj_weight_switch_method()
+-        weight_part = self._get_o_proj_weight_switch_state().gather_parts.get("weight")
+-        if weight_part is None:
+-            raise RuntimeError("SFA PCP O-proj requires a gather spec for the weight attribute.")
+-        # This is the logical TP-local O-proj input width. It remains valid
+-        # even when a quantization method stores the weight in a packed layout
+-        # whose gathered storage dimension differs from the activation dimension.
+-        full_input_size = self.o_proj_weight_load_state.input_size_per_partition_before
+-        if attn_output.shape[-1] != full_input_size:
+-            raise RuntimeError(
+-                "SFA PCP O-proj input does not match the reconstructed TP-local weight: "
+-                f"input_shape={tuple(attn_output.shape)}, expected_last_dim={full_input_size}."
+-            )
+-        num_local_tokens = attn_output.shape[0]
+-        if self.is_pcp_decode_sharded:
+-            attn_output = self._gather_o_proj_decode_tokens(attn_output)
+-        local_input = WeightSwitchMixin.split_tensor_for_parallel(
+-            attn_output,
+-            self.o_proj_weight_switch_config.world_size,
+-            self.o_proj_weight_switch_config.rank,
+-            dim=-1,
++        attn_metadata: M,
++        num_input_tokens: int,
++        hidden_states: torch.Tensor,
++    ) -> SFAForwardContext:
++        context = super()._get_parallel_forward_context(
++            attn_metadata,
++            num_input_tokens,
++            hidden_states,
+         )
+-        if isinstance(linear_method, AscendLinearScheme):
+-            # W8A8's quant_bias belongs to the complete O projection. Add it
+-            # on only one rank before reducing the TP and PCP weight shards.
+-            bias_rank = 0 if get_tp_group().rank_in_group == 0 and self.o_proj_weight_switch_config.rank == 0 else 1
+-            partial_output = linear_method.apply(self.o_proj, local_input, bias=None, tp_rank=bias_rank)
+-        else:
+-            partial_output = linear_method.apply(self.o_proj, local_input, bias=None)
+-        group = self.o_proj_weight_switch_config.group
+-        if self.is_pcp_decode_sharded:
+-            scatter_input = self._pcp_o_proj_rs_in_buf[: group.world_size * num_local_tokens]
+-            scatter_input.copy_(partial_output)
+-            local_output = self._pcp_o_proj_rs_out_buf[:num_local_tokens]
+-            dist.reduce_scatter_tensor(local_output, scatter_input, group=group.device_group)
+-            partial_output = local_output
+-        else:
+-            partial_output = group.all_reduce(partial_output)
+-
+-        if self.o_proj.reduce_results and get_tp_group().world_size > 1:
+-            if not self.o_proj.skip_bias_add and get_tp_group().rank_in_group == 0 and self.o_proj.bias is not None:
+-                partial_output = partial_output + self.o_proj.bias
+-            partial_output = get_tp_group().all_reduce(partial_output)
+-        elif not self.o_proj.skip_bias_add and self.o_proj.bias is not None:
+-            partial_output = partial_output + self.o_proj.bias
++        self._parallel_o_proj.all_gather_weights()
++        return context
+ 
+-        output.copy_(partial_output)
+-        return output
++    def _finalize_o_proj(self, attn_output: torch.Tensor, output: torch.Tensor) -> torch.Tensor:
++        return self._parallel_o_proj.forward(attn_output, output)
+ 
+     def _get_sfa_kv_slot_mapping(
+         self,
+@@ -353,8 +253,8 @@ class AscendSFAPCPImpl(OProjWeightSwitchMixin, AscendSFAImpl):
+     def exec_kv(
+         self,
+         kv_no_split: torch.Tensor,
+-        cos: torch.Tensor,
+-        sin: torch.Tensor,
++        cos: torch.Tensor | None,
++        sin: torch.Tensor | None,
+         kv_cache: tuple,
+         slots: torch.Tensor,
+         attn_metadata: M,
+@@ -987,9 +887,12 @@ class AscendSFADCPImpl(DCPImplMixin, AscendSFAImpl):
+         valid_block_ids = attn_metadata.dcp_context.kv_gather_block_ids
+         block_table = attn_metadata.dcp_context.kv_gather_block_table
+         assert valid_block_ids is not None and block_table is not None
+-        kv = _index_select_kv_blocks(kv_cache[0], valid_block_ids)
++        cache = kv_cache[0]
++        if self.qk_rope_head_dim == 0:
++            cache = _view_cache_as_operator_pages(cache, attn_metadata.block_size)
++        kv = _index_select_kv_blocks(cache, valid_block_ids)
+         split_sizes: tuple[int, ...]
+-        if self.uses_packed_sfa_main_cache:
++        if self.uses_packed_sfa_main_cache or self.qk_rope_head_dim == 0:
+             # Packed SFA formats store nope, rope, and quantization data in one
+             # SFA KV cache. The remaining cache entries belong to the indexer
+             # and must not participate in the DCP SFA KV all-gather.
+@@ -1137,8 +1040,10 @@ class AscendSFADCPImpl(DCPImplMixin, AscendSFAImpl):
+     def _start_dcp_query_gather(
+         self,
+         ql_nope: torch.Tensor,
+-        q_pe: torch.Tensor,
++        q_pe: torch.Tensor | None,
+     ) -> DCPGatherContext:
++        if q_pe is None:
++            q_pe = ql_nope[..., :0]
+         assert self.dcp_group is not None, "DCP query gather requires dcp_group when dcp_size > 1."
+         if ql_nope.shape[:-1] != q_pe.shape[:-1] or ql_nope.dtype != q_pe.dtype:
+             raise RuntimeError(
+@@ -1266,6 +1171,15 @@ class AscendSFADCPImpl(DCPImplMixin, AscendSFAImpl):
+             self._record_dcp_kv_gather_context(kv_cache, attn_metadata)
+         return result
+ 
++    def _mask_nope_dcp_padding(self, output, query_lens, softmax_max=None, softmax_sum=None):
++        if self.qk_rope_head_dim == 0:
++            valid = torch.arange(output.shape[0], device=output.device) < query_lens[-1]
++            output = output.masked_fill(~valid[:, None, None], 0)
++            if softmax_max is not None:
++                softmax_max = softmax_max.masked_fill(~valid[None, :, None], 0)
++                softmax_sum = softmax_sum.masked_fill(~valid[None, :, None], 1)
++        return output, softmax_max, softmax_sum
++
+     def _execute_tq_dcp_sfa(
+         self,
+         ql_nope,
+@@ -1302,7 +1216,8 @@ class AscendSFADCPImpl(DCPImplMixin, AscendSFAImpl):
+                 sparse_mode=3,
+             )
+             assert self.turboquant is not None
+-            return self.turboquant.inverse(attn_out)
++            output = self.turboquant.inverse(attn_out)
++            return self._mask_nope_dcp_padding(output, actual_seq_lengths_query)[0]
+ 
+         # Decode attends over this rank's KV shard only, so the partial results
+         # are recombined by _merge_dcp_outputs using the LSE.
+@@ -1324,6 +1239,9 @@ class AscendSFADCPImpl(DCPImplMixin, AscendSFAImpl):
+         )
+         assert softmax_max is not None
+         assert softmax_sum is not None
++        attn_out, softmax_max, softmax_sum = self._mask_nope_dcp_padding(
++            attn_out, actual_seq_lengths_query, softmax_max, softmax_sum
++        )
+         softmax_lse = softmax_max.to(torch.float32) + torch.log(softmax_sum.to(torch.float32))
+         softmax_lse = softmax_lse.permute(1, 0, 2).reshape(softmax_lse.shape[1], -1, 1)
+         output_dtype = attn_out.dtype
+@@ -1347,6 +1265,10 @@ class AscendSFADCPImpl(DCPImplMixin, AscendSFAImpl):
+         assert attn_metadata.dcp_context is not None, "DCP SFA requires attn_metadata.dcp_context."
+         assert self.dcp_group is not None, "DCP SFA requires dcp_group when dcp_size > 1."
+         dcp_context = attn_metadata.dcp_context
++        if self.qk_rope_head_dim == 0:
++            kv_cache = (_view_cache_as_operator_pages(kv_cache[0], attn_metadata.block_size), *kv_cache[1:])
++            if q_pe is None and self.enable_sparse_sfa_turboquant:
++                q_pe = ql_nope[..., :0]
+         if self.enable_sparse_sfa_turboquant:
+             return self._execute_tq_dcp_sfa(
+                 ql_nope,
+@@ -1388,7 +1310,7 @@ class AscendSFADCPImpl(DCPImplMixin, AscendSFAImpl):
+                 sparse_mode=3,
+                 return_lse=False,
+             )
+-            return attn_output
++            return self._mask_nope_dcp_padding(attn_output, actual_seq_lengths_query)[0]
+ 
+         gather_context = dcp_context.gather_context
+         dcp_context.gather_context = None
+@@ -1423,6 +1345,9 @@ class AscendSFADCPImpl(DCPImplMixin, AscendSFAImpl):
+             sparse_mode=0,
+             return_lse=True,
+         )
++        sfa_output, softmax_max, softmax_sum = self._mask_nope_dcp_padding(
++            sfa_output, actual_seq_lengths_query, softmax_max, softmax_sum
++        )
+         softmax_lse = softmax_max + torch.log(softmax_sum)
+         softmax_lse = softmax_lse.permute(1, 0, 2).reshape(softmax_lse.shape[1], -1, 1)
+         output_dtype = sfa_output.dtype
+diff --git a/vllm_ascend/attention/sfa_v1.py b/vllm_ascend/attention/sfa_v1.py
+index e72e6599b..5c3672bb2 100644
+--- a/vllm_ascend/attention/sfa_v1.py
++++ b/vllm_ascend/attention/sfa_v1.py
+@@ -498,7 +498,6 @@ class SFAForwardContext:
+     actual_seq_lengths_key: torch.Tensor
+     kv_slot_mapping: torch.Tensor
+     topk_num_tokens: int
+-    gather_full_o_proj: bool = False
+ 
+ 
+ class AscendSFAMetadataBuilder(MLACommonMetadataBuilder[AscendSFAMetadata]):
+@@ -1711,7 +1710,6 @@ class AscendSFAImpl(MLAAttentionImpl):
+         self,
+         attn_output: torch.Tensor,
+         output: torch.Tensor,
+-        gather_full_o_proj: bool,
+     ) -> torch.Tensor:
+         output[...] = self.o_proj(attn_output)[0]
+         return output
+@@ -1824,7 +1822,7 @@ class AscendSFAImpl(MLAAttentionImpl):
+     def forward(
+         self,
+         layer_name,
+-        hidden_states: torch.Tensor,  # query in unified attn
++        hidden_states: torch.Tensor,
+         kv_cache: tuple[torch.Tensor, ...],
+         attn_metadata: M,
+         output: torch.Tensor | None = None,
+@@ -1841,7 +1839,14 @@ class AscendSFAImpl(MLAAttentionImpl):
+         if self.qk_rope_head_dim == 0:
+             num_tokens = min(hidden_states.shape[0], attn_metadata.slot_mapping.shape[0])
+             if get_forward_context().cudagraph_runtime_mode != CUDAGraphMode.FULL:
+-                num_tokens = min(num_tokens, attn_metadata.num_actual_tokens)
++                if self.vllm_config.parallel_config.prefill_context_parallel_size > 1 and needs_pcp_kv_gather(
++                    attn_metadata, self.is_pcp_decode_sharded
++                ):
++                    # Empty and uneven PCP ranks must keep the same padded
++                    # rows for KV gathers and O-projection collectives.
++                    num_tokens = min(num_tokens, attn_metadata.num_input_tokens)
++                else:
++                    num_tokens = min(num_tokens, attn_metadata.num_actual_tokens)
+             if num_tokens == 0:
+                 return output.zero_()
+             hidden_states = hidden_states[:num_tokens]
+@@ -2036,7 +2041,6 @@ class AscendSFAImpl(MLAAttentionImpl):
+         self._finalize_o_proj(
+             attn_output,
+             output[:num_input_tokens],
+-            parallel_context.gather_full_o_proj,
+         )
+ 
+         maybe_save_kv_layer_to_connector(layer_name, list(kv_cache))
+diff --git a/vllm_ascend/device/device_op.py b/vllm_ascend/device/device_op.py
+index d9e643ad1..597e9b2d3 100644
+--- a/vllm_ascend/device/device_op.py
++++ b/vllm_ascend/device/device_op.py
+@@ -522,7 +522,7 @@ class BaseDeviceAdaptor:
+         cls,
+         sfa_impl,
+         ql_nope: torch.Tensor,
+-        q_pe: torch.Tensor,
++        q_pe: torch.Tensor | None,
+         kv_cache: tuple,
+         topk_indices: torch.Tensor,
+         attn_metadata,
+@@ -594,7 +594,7 @@ class BaseDeviceAdaptor:
+     def _execute_kv_quant_sparse_flash_attention_vllm(
+         sfa_impl,
+         ql_nope: torch.Tensor,
+-        q_pe: torch.Tensor,
++        q_pe: torch.Tensor | None,
+         kv: torch.Tensor,
+         block_table: torch.Tensor,
+         topk_indices: torch.Tensor,
+@@ -606,8 +606,8 @@ class BaseDeviceAdaptor:
+     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+         # torch.cat allocates a fresh contiguous output, so no extra
+         # .contiguous() pass is needed here.
+-        query = torch.cat([ql_nope, q_pe], dim=-1)
+-        qk_rope_head_dim = getattr(sfa_impl, "qk_rope_head_dim", q_pe.shape[-1])
++        query = ql_nope.contiguous() if q_pe is None else torch.cat([ql_nope, q_pe], dim=-1)
++        qk_rope_head_dim = getattr(sfa_impl, "qk_rope_head_dim", 0 if q_pe is None else q_pe.shape[-1])
+         if return_lse or qk_rope_head_dim == 0:
+             return torch.ops._C_ascend.npu_kv_quant_sparse_flash_attention_vllm(
+                 query=query,
+@@ -627,7 +627,7 @@ class BaseDeviceAdaptor:
+                 tile_size=getattr(sfa_impl, "sfa_qsfa_tile_size", 128),
+                 key_quant_mode=2,
+                 value_quant_mode=2,
+-                rope_head_dim=getattr(sfa_impl, "qk_rope_head_dim", q_pe.shape[-1]),
++                rope_head_dim=qk_rope_head_dim,
+                 return_softmax_lse=return_lse,
+             )
+         else:
+@@ -649,7 +649,7 @@ class BaseDeviceAdaptor:
+                 tile_size=getattr(sfa_impl, "sfa_qsfa_tile_size", 128),
+                 key_quant_mode=2,
+                 value_quant_mode=2,
+-                rope_head_dim=getattr(sfa_impl, "qk_rope_head_dim", q_pe.shape[-1]),
++                rope_head_dim=qk_rope_head_dim,
+             )
+ 
+     # ===== SWA / Compressor KV Scatter =====
+@@ -1122,7 +1122,7 @@ class A5DeviceAdaptor(BaseDeviceAdaptor):
+     def _execute_kv_quant_sparse_flash_attention_vllm(
+         sfa_impl,
+         ql_nope: torch.Tensor,
+-        q_pe: torch.Tensor,
++        q_pe: torch.Tensor | None,
+         kv: torch.Tensor,
+         block_table: torch.Tensor,
+         topk_indices: torch.Tensor,
+@@ -1132,7 +1132,8 @@ class A5DeviceAdaptor(BaseDeviceAdaptor):
+         sparse_mode: int = 3,
+         return_lse: bool = False,
+     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+-        if return_lse or getattr(sfa_impl, "qk_rope_head_dim", q_pe.shape[-1]) == 0:
++        qk_rope_head_dim = getattr(sfa_impl, "qk_rope_head_dim", 0 if q_pe is None else q_pe.shape[-1])
++        if return_lse or qk_rope_head_dim == 0:
+             # RoPE0 packed C8 is implemented by the vllm-ascend custom operator
+             # (csrc/attention/kv_quant_sparse_flash_attention_vllm). The torch_npu
+             # built-in aclnn op has no RoPE0 contract: it sizes its outputs from
+@@ -1172,7 +1173,7 @@ class A5DeviceAdaptor(BaseDeviceAdaptor):
+             tile_size=getattr(sfa_impl, "sfa_qsfa_tile_size", 128),
+             key_quant_mode=2,
+             value_quant_mode=2,
+-            rope_head_dim=getattr(sfa_impl, "qk_rope_head_dim", q_pe.shape[-1]),
++            rope_head_dim=qk_rope_head_dim,
+         )
+         if return_lse:
+             raise RuntimeError(
+diff --git a/vllm_ascend/quantization/methods/base.py b/vllm_ascend/quantization/methods/base.py
+index 18cee5fea..26f5a4f79 100644
+--- a/vllm_ascend/quantization/methods/base.py
++++ b/vllm_ascend/quantization/methods/base.py
+@@ -167,6 +167,10 @@ class AscendLinearScheme(WeightSwitchMixin, ABC):
+         """
+         ...
+ 
++    def apply_weight_shard(self, layer: torch.nn.Module, x: torch.Tensor, *, bias_rank: int) -> torch.Tensor:
++        """Include complete quantized bias on just one parallel contributor."""
++        return self.apply(layer, x, bias=None, tp_rank=bias_rank)
++
+     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+         """Post-loading weight processing (transpose, format conversion, etc.).
+ 
+diff --git a/vllm_ascend/weight_switch/__init__.py b/vllm_ascend/weight_switch/__init__.py
+index d5d288f06..2cbf4eec1 100644
+--- a/vllm_ascend/weight_switch/__init__.py
++++ b/vllm_ascend/weight_switch/__init__.py
+@@ -12,6 +12,10 @@ from .linear import (
+     WeightSwitchRepeatSpec,
+     WeightSwitchState,
+ )
++from .o_proj import (
++    OProjectionMode,
++    ParallelOProjection,
++)
+ 
+ __all__ = [
+     "WeightLoadPartition",
+@@ -23,4 +27,6 @@ __all__ = [
+     "WeightSwitchRepeatPart",
+     "WeightSwitchRepeatSpec",
+     "WeightSwitchState",
++    "OProjectionMode",
++    "ParallelOProjection",
+ ]
+diff --git a/vllm_ascend/weight_switch/linear.py b/vllm_ascend/weight_switch/linear.py
+index 6f81c0552..315bba004 100644
+--- a/vllm_ascend/weight_switch/linear.py
++++ b/vllm_ascend/weight_switch/linear.py
+@@ -189,6 +189,10 @@ class WeightSwitchMixin:
+         """Apply the concrete linear method."""
+         raise NotImplementedError(f"{type(self).__name__} must implement apply().")
+ 
++    def apply_weight_shard(self, layer: torch.nn.Module, x: torch.Tensor, *, bias_rank: int) -> torch.Tensor:
++        """Compute one weight-shard contribution without ordinary bias or reduction."""
++        return self.apply(layer, x, bias=None)
++
+     def _get_weight_switch_specs(
+         self,
+         layer: torch.nn.Module,
+diff --git a/vllm_ascend/weight_switch/o_proj.py b/vllm_ascend/weight_switch/o_proj.py
+index 174993cd7..58e56fafd 100644
+--- a/vllm_ascend/weight_switch/o_proj.py
++++ b/vllm_ascend/weight_switch/o_proj.py
+@@ -1,83 +1,331 @@
+ # SPDX-License-Identifier: Apache-2.0
+-"""Single-target O-proj weight-switch lifecycle."""
++"""Parallel O-projection execution independent of the attention backend."""
+ 
+-from collections.abc import Iterator
+-from contextlib import contextmanager
+-from typing import Any
++from collections.abc import Callable, Iterator
++from contextlib import contextmanager, suppress
++from enum import Enum, auto
++from typing import TYPE_CHECKING, Any
+ 
+ import torch
++import torch.distributed as dist
+ 
+-from .linear import WeightSwitchConfig, WeightSwitchMixin, WeightSwitchState
++from .linear import (
++    WeightLoadPartition,
++    WeightSwitchConfig,
++    WeightSwitchMixin,
++    WeightSwitchState,
++)
+ 
++if TYPE_CHECKING:
++    from vllm.config import VllmConfig
+ 
+-class OProjWeightSwitchMixin:
+-    """Manage weight switching for the backend's single ``o_proj`` layer."""
+ 
+-    o_proj: Any
+-    o_proj_full_pools: dict[Any, torch.Tensor]
+-    o_proj_weight_switch_pool_key = "o_proj"
++class OProjectionMode(Enum):
++    FULL_WEIGHT = auto()
++    LOCAL_WEIGHT = auto()
++    EXCHANGE_TOKENS = auto()
+ 
+-    def _initialize_o_proj_weight_switch(
++
++class ParallelOProjection:
++    """Own O-projection loading, temporary weights, communication and bias.
++
++    A single linear projection uses the default adapter. A grouped projection
++    additionally supplies its first factor and its grouped matmul kernel.
++    Callers retain only metadata translation and weight-gather launch points.
++    """
++
++    def __init__(
+         self,
++        input_size: int,
++        output_layer: torch.nn.Module,
++        *,
+         config: WeightSwitchConfig,
++        tp_group: Any,
++        pool: dict[Any, torch.Tensor],
++        pool_key: str,
++        project_full: Callable[[torch.Tensor, torch.Tensor], torch.Tensor],
++        decode_sharded: bool,
++        input_layer: torch.nn.Module | None = None,
++        input_projection: Callable[[torch.Tensor], torch.Tensor] | None = None,
++        num_input_groups: int | None = None,
++        clone_local_tensors: bool = False,
+     ) -> None:
+-        self.o_proj_weight_switch_config = config
+-        self.o_proj_weight_state: WeightSwitchState | None = None
+-        self._o_proj_weight_switch_enabled = False
++        self.input_size = input_size
++        self.output_size = output_layer.output_size_per_partition
++        self.o_proj = output_layer
++        self.input_layer = input_layer
++        self.input_projection = input_projection
++        self.num_input_groups = num_input_groups
++        self.tp_group = tp_group
++        self.config = config
++        self.decode_sharded = decode_sharded
++        self.o_proj_full_pools = pool
++        self.o_proj_weight_switch_pool_key = pool_key
++        self.project_full = project_full
++        self.clone_local_tensors = clone_local_tensors
++        self.enabled = False
++        self.mode = OProjectionMode.LOCAL_WEIGHT
++        self.token_capacity = 0
++        self.all_gather_input: torch.Tensor | None = None
++        self.all_gather_output: torch.Tensor | None = None
++        self.reduce_scatter_input: torch.Tensor | None = None
++        self.reduce_scatter_output: torch.Tensor | None = None
++        self._weight_switch_states: tuple[tuple[torch.nn.Module, WeightSwitchMixin, WeightSwitchState], ...] | None = (
++            None
++        )
++        self._weight_switch_enabled = False
++        self._load_prepared = False
+ 
+-    def _get_o_proj_weight_switch_method(self) -> WeightSwitchMixin:
+-        quant_method = self.o_proj.quant_method
++    @staticmethod
++    def _resolve_o_proj_weight_switch_method(layer: torch.nn.Module) -> WeightSwitchMixin:
++        quant_method = getattr(layer, "quant_method", None)
+         linear_method = getattr(quant_method, "quant_method", quant_method)
+         if not isinstance(linear_method, WeightSwitchMixin) or not linear_method.supports_weight_switch:
+             raise RuntimeError(
+-                f"Weight switching requires a weight-switch capable linear method, got {type(linear_method).__name__}."
++                f"O-proj weight switching requires a weight-switch capable method, got {type(linear_method).__name__}."
+             )
+         return linear_method
+ 
+-    def _enable_o_proj_full_weight_switch(self) -> None:
+-        if self._o_proj_weight_switch_enabled:
+-            return
++    def _layers(self) -> tuple[tuple[str, torch.nn.Module, WeightSwitchMixin], ...]:
++        layers: tuple[tuple[str, torch.nn.Module], ...] = (("output_projection", self.o_proj),)
++        if self.input_layer is not None:
++            layers = (("input_projection", self.input_layer), *layers)
++        return tuple((name, layer, self._resolve_o_proj_weight_switch_method(layer)) for name, layer in layers)
+ 
+-        linear_method = self._get_o_proj_weight_switch_method()
+-        self.o_proj_weight_state = linear_method.enable_weight_switch(
+-            self.o_proj,
+-            self.o_proj_weight_switch_config,
+-            pool=self.o_proj_full_pools,
+-            pool_key_prefix=(
+-                type(linear_method).__qualname__,
+-                self.o_proj_weight_switch_pool_key,
+-            ),
+-        )
+-        self._o_proj_weight_switch_enabled = True
+-
+-    def _get_o_proj_weight_switch_state(self) -> WeightSwitchState:
+-        state = self.o_proj_weight_state
+-        if not self._o_proj_weight_switch_enabled or state is None:
+-            raise RuntimeError("O-proj weight switching has not been enabled.")
+-        return state
+-
+-    def _all_gather_o_proj_full_weight(self) -> None:
+-        self._enable_o_proj_full_weight_switch()
+-        self._get_o_proj_weight_switch_method().all_gather_weight(
+-            self._get_o_proj_weight_switch_state(),
+-            self.o_proj_weight_switch_config,
++    def prepare_weight_load(self, vllm_config: "VllmConfig") -> None:
++        groups = self.num_input_groups
++        if groups is not None and (groups <= 0 or groups % self.config.world_size != 0):
++            raise ValueError(f"O-proj groups={groups} cannot be split across world_size={self.config.world_size}.")
++        if self.input_layer is not None and (groups is None or self.input_projection is None):
++            raise ValueError("A grouped O projection requires its group count and projection kernel.")
++        if not self._load_prepared:
++            partition = WeightLoadPartition.from_nested_groups(self.tp_group, self.config.group)
++            for name, layer, method in self._layers():
++                if name == "output_projection":
++                    method.prepare_layer_for_parallel_weight_load(layer, self.config, partition)
++                else:
++                    method.prepare_layer_for_parallel_output_weight_load(layer, self.config, partition)
++            self._load_prepared = True
++        if self.input_layer is not None:
++            assert groups is not None
++            local_groups = groups // self.config.world_size
++            self.input_layer.n_local_groups = local_groups
++            method = self._resolve_o_proj_weight_switch_method(self.input_layer)
++            if hasattr(method, "n_local_groups"):
++                method.n_local_groups = local_groups
++        if self.decode_sharded:
++            self._prepare_exchange_buffers(vllm_config)
++        self.enabled = True
++
++    def enable(self) -> None:
++        if not self.enabled or self._weight_switch_enabled:
++            return
++        self._weight_switch_states = tuple(
++            (
++                layer,
++                method,
++                method.enable_weight_switch(
++                    layer,
++                    self.config,
++                    pool=self.o_proj_full_pools,
++                    pool_key_prefix=(type(method).__qualname__, name, self.o_proj_weight_switch_pool_key),
++                    clone_local_tensors=self.clone_local_tensors,
++                ),
++            )
++            for name, layer, method in self._layers()
+         )
++        self._weight_switch_enabled = True
++
++    @property
++    def uses_full_weight(self) -> bool:
++        return self.mode is OProjectionMode.FULL_WEIGHT
++
++    @property
++    def exchanges_tokens(self) -> bool:
++        return self.mode is OProjectionMode.EXCHANGE_TOKENS
++
++    def set_mode(self, *, use_full_weight: bool, exchange_tokens: bool) -> None:
++        if not self._weight_switch_enabled:
++            self.mode = OProjectionMode.LOCAL_WEIGHT
++        elif use_full_weight:
++            self.mode = OProjectionMode.FULL_WEIGHT
++        elif exchange_tokens:
++            self.mode = OProjectionMode.EXCHANGE_TOKENS
++        else:
++            self.mode = OProjectionMode.LOCAL_WEIGHT
+ 
+     @contextmanager
+-    def _use_full_o_proj_weights(self) -> Iterator[None]:
+-        linear_method = self._get_o_proj_weight_switch_method()
+-        state = self._get_o_proj_weight_switch_state()
+-        linear_method.wait_weight_all_gather(state)
+-        linear_method.switch_weight(
+-            self.o_proj,
+-            state,
+-            use_full_weight=True,
+-        )
++    def forward_context(self) -> Iterator[None]:
++        self.mode = OProjectionMode.LOCAL_WEIGHT
+         try:
+             yield
++        except BaseException:
++            with suppress(Exception):
++                self.wait_for_weights()
++            raise
++        else:
++            self.wait_for_weights()
+         finally:
+-            linear_method.switch_weight(
+-                self.o_proj,
+-                state,
+-                use_full_weight=False,
++            self.mode = OProjectionMode.LOCAL_WEIGHT
++
++    @contextmanager
++    def batch(self, *, needs_global_metadata: bool, has_prefill: bool) -> Iterator[None]:
++        with self.forward_context():
++            self.enable()
++            exchange_tokens = needs_global_metadata and self.decode_sharded and not has_prefill
++            self.set_mode(
++                use_full_weight=needs_global_metadata and not exchange_tokens, exchange_tokens=exchange_tokens
+             )
++            yield
++
++    def _require_weight_switches(self) -> tuple[tuple[torch.nn.Module, WeightSwitchMixin, WeightSwitchState], ...]:
++        if self._weight_switch_states is None:
++            raise RuntimeError("O-proj weight switching has not been prepared.")
++        return self._weight_switch_states
++
++    def all_gather_weights(self) -> None:
++        if not self.uses_full_weight:
++            return
++        switches = self._require_weight_switches()
++        try:
++            for _, method, state in switches:
++                method.all_gather_weight(state, self.config)
++        except Exception:
++            with suppress(Exception):
++                self.wait_for_weights()
++            raise
++
++    def wait_for_weights(self) -> None:
++        first_error: Exception | None = None
++        for _, method, state in self._weight_switch_states or ():
++            if not state.handles:
++                continue
++            try:
++                method.wait_weight_all_gather(state)
++            except Exception as exc:
++                if first_error is None:
++                    first_error = exc
++        if first_error is not None:
++            raise first_error
++
++    @contextmanager
++    def use_full_weights(self) -> Iterator[None]:
++        switched: list[tuple[torch.nn.Module, WeightSwitchMixin, WeightSwitchState]] = []
++        try:
++            for layer, method, state in self._require_weight_switches():
++                method.wait_weight_all_gather(state)
++                switched.append((layer, method, state))
++                method.switch_weight(layer, state, use_full_weight=True)
++            yield
++        finally:
++            for layer, method, state in reversed(switched):
++                method.switch_weight(layer, state, use_full_weight=False)
++
++    def _prepare_exchange_buffers(self, vllm_config: "VllmConfig") -> None:
++        """Allocate separate, graph-stable activation buffers before capture.
++
++        Callers may share a pool only across projections executed in sequence.
++        Weight buffers remain separate from these activation buffers.
++        """
++        config = self.config
++        dtype = vllm_config.model_config.dtype
++        device = self.o_proj.weight.device
++        compilation = vllm_config.compilation_config
++        capacity = max(
++            vllm_config.scheduler_config.max_num_seqs * (1 + vllm_config.num_speculative_tokens),
++            compilation.max_cudagraph_capture_size or 0,
++            max(compilation.cudagraph_capture_sizes or [0]),
++        )
++        self.token_capacity = capacity
++        shapes = {
++            "all_gather_input": (capacity, self.input_size),
++            "all_gather_output": (config.world_size * capacity, self.input_size),
++            "reduce_scatter_input": (config.world_size * capacity, self.output_size),
++            "reduce_scatter_output": (capacity, self.output_size),
++        }
++        for name, shape in shapes.items():
++            key = (
++                self.o_proj_weight_switch_pool_key,
++                "activation",
++                getattr(config.group, "unique_name", None),
++                name,
++                device,
++                dtype,
++                shape,
++            )
++            buffer = self.o_proj_full_pools.get(key)
++            if buffer is None:
++                buffer = torch.empty(shape, dtype=dtype, device=device)
++                self.o_proj_full_pools[key] = buffer
++            setattr(self, name, buffer)
++
++    def _gather_tokens(self, inputs: torch.Tensor) -> torch.Tensor:
++        config = self.config
++        num_tokens = inputs.shape[0]
++        if num_tokens > self.token_capacity:
++            raise ValueError("Parallel O-proj rows exceed the configured token/graph capacity.")
++        if self.all_gather_input is None or self.all_gather_output is None:
++            raise RuntimeError("Parallel O-proj exchange buffers must be prepared before forward.")
++        local_rows = self.all_gather_input[:num_tokens]
++        local_rows.copy_(inputs)
++        global_rows = self.all_gather_output[: config.world_size * num_tokens]
++        # Rank-major padded rows preserve the matching ReduceScatter owners.
++        dist.all_gather_into_tensor(global_rows, local_rows, group=config.group.device_group)
++        return global_rows
++
++    def _scatter_tokens(self, partial_output: torch.Tensor, num_tokens: int) -> torch.Tensor:
++        config = self.config
++        if self.reduce_scatter_input is None or self.reduce_scatter_output is None:
++            raise RuntimeError("Parallel O-proj exchange buffers must be prepared before forward.")
++        scatter_input = self.reduce_scatter_input[: config.world_size * num_tokens]
++        scatter_input.copy_(partial_output)
++        local_output = self.reduce_scatter_output[:num_tokens]
++        dist.reduce_scatter_tensor(local_output, scatter_input, group=config.group.device_group)
++        return local_output
++
++    def _finalize_output(self, partial_output: torch.Tensor) -> torch.Tensor:
++        layer = self.o_proj
++        if layer.reduce_results and self.tp_group.world_size > 1:
++            partial_output = self.tp_group.all_reduce(partial_output)
++        # A deferred TP reduction must receive bias from just one TP rank.
++        # Read the layer's current bias to support online weight replacement.
++        if (
++            not layer.skip_bias_add
++            and layer.bias is not None
++            and (layer.reduce_results or self.tp_group.rank_in_group == 0)
++        ):
++            partial_output = partial_output + layer.bias
++        return partial_output
++
++    def _project_local(self, inputs: torch.Tensor) -> torch.Tensor:
++        local_input = WeightSwitchMixin.split_tensor_for_parallel(
++            inputs, self.config.world_size, self.config.rank, dim=-1
++        )
++        if self.input_projection is not None:
++            assert self.num_input_groups is not None
++            local_groups = self.num_input_groups // self.config.world_size
++            group_width = self.input_size // self.num_input_groups
++            grouped = local_input.reshape(local_input.shape[0], local_groups, group_width)
++            local_input = self.input_projection(grouped).reshape(grouped.shape[0], self.o_proj.input_size_per_partition)
++        method = self._resolve_o_proj_weight_switch_method(self.o_proj)
++        bias_rank = 0 if self.tp_group.rank_in_group == 0 and self.config.rank == 0 else 1
++        return method.apply_weight_shard(self.o_proj, local_input, bias_rank=bias_rank)
++
++    def forward(self, inputs: torch.Tensor, output: torch.Tensor) -> torch.Tensor:
++        if not self._weight_switch_enabled:
++            return self.project_full(inputs, output)
++        if self.uses_full_weight:
++            with self.use_full_weights():
++                return self.project_full(inputs, output)
++
++        num_tokens = inputs.shape[0]
++        inputs = inputs.reshape(num_tokens, self.input_size)
++        if self.exchanges_tokens:
++            inputs = self._gather_tokens(inputs)
++            partial_output = self._project_local(inputs)
++            partial_output = self._scatter_tokens(partial_output, num_tokens)
++        else:
++            partial_output = self._project_local(inputs)
++            partial_output = self.config.group.all_reduce(partial_output)
++        output.copy_(self._finalize_output(partial_output))
++        return output

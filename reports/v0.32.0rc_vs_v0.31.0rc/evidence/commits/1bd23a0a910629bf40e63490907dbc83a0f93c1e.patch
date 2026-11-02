@@ -1,0 +1,153 @@
+commit 1bd23a0a910629bf40e63490907dbc83a0f93c1e
+Author:     zk123 <785396250@qq.com>
+AuthorDate: Fri Oct 30 21:21:16 2026 +0800
+Commit:     GitHub <noreply@github.com>
+CommitDate: Fri Oct 30 21:21:16 2026 +0800
+
+    [BugFix][Spec Decode] Fix sample_recovered_tokens warmup grid under-covering draft positions (#20375)
+    
+    ## What this PR does / why we need it
+    
+    Fixes a launch-grid regression introduced by the Triton JIT warmup
+    migration (#19976) that crashes PD-disaggregated speculative-decode
+    workers.
+    
+    The `SampleRecoveredTokensKernel` warmup wrapper derived the 2-D launch
+    grid's axis 1 from `q.shape[0]`, which is the **batch size** (`q` is
+    `torch.empty((batch_size, vocab_size))`), instead of `max_spec_len`. The
+    pre-refactor code launched `sample_recovered_tokens_kernel[(batch_size,
+    max_spec_len)]`. Whenever `batch_size < num_speculative_tokens` (e.g.
+    the nightly PD DSpark decode with `batch_size=1` and
+    `num_speculative_tokens=5`):
+    
+    1. Draft positions `>= batch_size` were never launched, so those
+    recovered-token slots kept `torch.empty_like` garbage (`0xa5a5a5a5...`).
+    2. The poisoned token ids fed the native `GatherV2_high_precision`
+    gather downstream with out-of-range indices: illegal GM address, SMMU
+    fault (vector-core exception, host-side error 507035), decode worker
+    dies — the nightly then surfaces this as decode 500 -> 502.
+    
+    The failure is data-dependent (it only bites when a rejection position
+    `>= batch_size` occurs while `batch_size < max_spec_len`), which is why
+    it slipped past v2-runner E2E: `sample_recovered_tokens` is only called
+    on the v1 sampling path.
+    
+    This PR passes `max_spec_len` into the wrapper launcher and restores the
+    exact pre-refactor grid `(batch_size, max_spec_len)`. `max_spec_len`
+    only affects the launch grid, not the Triton compile key, so the warmup
+    key space is unchanged; `warmup_inputs()` passes `max_spec_len=1` (any
+    positive value compiles the same binary and keeps the `(1, 1)` warmup
+    launch).
+    
+    Also audited the other five rejection wrappers from #19976: their 1-D
+    `grid_size` is passed explicitly from the original call sites
+    (derivation untouched). This was the only 2-D grid and the only
+    mis-derivation.
+    
+    ## Does this PR introduce any user-facing change?
+    
+    No. No new knobs, no log changes; it restores the pre-#19976 launch
+    behavior of `sample_recovered_tokens` and prevents decode-worker crashes
+    under speculative decoding with `batch_size < num_speculative_tokens`.
+    
+    ## How was this patch tested?
+    
+    - New regression UT `test_recovered_tokens_grid_covers_max_spec_len`:
+    patches `launch` and asserts the grid is `(batch_size, max_spec_len)`
+    for the nightly shape (`batch=1, spec=5`) without a real launch.
+    Gold-standard verified: it fails on the buggy grid and passes on the
+    fix.
+    - `tests/ut/model_executor/warmup/` +
+    `tests/ut/sample/test_rejection_sampler.py`: 38 passed.
+    - Nightly evidence: reverting #19976 stopped the `GatherV2` SMMU faults
+    from reproducing (root-cause confirmation on the nightly environment);
+    the poison value in the device dump (`0xa5a5a5a5...`) matches unwritten
+    `torch.empty_like` slots.
+    
+    - vLLM main:
+    https://github.com/vllm-project/vllm/commit/544f182d9f0c9bfe8bd7645525951d5e3692a542
+    
+    Signed-off-by: Dawn952 <zhaojunbo13@huawei.com>
+    Co-authored-by: Dawn952 <zhaojunbo13@huawei.com>
+
+diff --git a/tests/ut/model_executor/warmup/test_jit_warmup_rejection.py b/tests/ut/model_executor/warmup/test_jit_warmup_rejection.py
+index a7c2e861b..b7a0d84cd 100644
+--- a/tests/ut/model_executor/warmup/test_jit_warmup_rejection.py
++++ b/tests/ut/model_executor/warmup/test_jit_warmup_rejection.py
+@@ -76,3 +76,31 @@ def test_expand_dtype_axis_covers_runtime_dtypes():
+         torch.int64,
+         torch.float32,
+     }
++
++
++def test_recovered_tokens_grid_covers_max_spec_len():
++    """Regression for the nightly PD DSpark crash: grid axis 1 was derived
++    from q.shape[0] (== batch_size) instead of max_spec_len, so any decode
++    step with batch_size < num_speculative_tokens left recovered-token slots
++    unwritten. The garbage ids then fed out-of-bounds gathers (SMMU fault).
++    """
++    kernel = rs._SAMPLE_RECOVERED_TOKENS_KERNEL
++    batch_size, max_spec_len = 1, 5
++    cu = torch.zeros(batch_size, dtype=torch.int32)
++    q = torch.zeros((batch_size, 128), dtype=torch.float32)
++    with patch.object(kernel, "launch") as launch:
++        kernel(
++            torch.zeros((batch_size, max_spec_len), dtype=torch.int32),
++            cu,
++            torch.zeros((batch_size, max_spec_len), dtype=torch.int32),
++            None,
++            torch.zeros((batch_size, max_spec_len, 128), dtype=torch.float32),
++            q,
++            vocab_size=128,
++            no_draft_probs=True,
++            sub_block=4 * 1024,
++            max_spec_len=max_spec_len,
++        )
++    (launch_spec, _inputs) = launch.call_args[0]
++    grid, _kwargs = launch_spec
++    assert grid == (batch_size, max_spec_len), f"grid {grid} must cover all {max_spec_len} draft positions"
+diff --git a/vllm_ascend/ops/triton/reject_sample.py b/vllm_ascend/ops/triton/reject_sample.py
+index 67bd6fff3..03586cc92 100644
+--- a/vllm_ascend/ops/triton/reject_sample.py
++++ b/vllm_ascend/ops/triton/reject_sample.py
+@@ -874,6 +874,9 @@ class SampleRecoveredTokensKernel(AscendTritonJitKernel["SampleRecoveredTokensKe
+             vocab_size=compile_key.vocab_size,
+             no_draft_probs=compile_key.no_draft_probs,
+             sub_block=compile_key.sub_block,
++            # Any positive value compiles the same binary; the grid only
++            # affects launch. Keep the cheapest (1, 1) warmup launch.
++            max_spec_len=1,
+         )
+ 
+     @kernel_launcher
+@@ -889,10 +892,15 @@ class SampleRecoveredTokensKernel(AscendTritonJitKernel["SampleRecoveredTokensKe
+         vocab_size: int,
+         no_draft_probs: bool,
+         sub_block: int,
++        max_spec_len: int,
+     ) -> LaunchSpec:
+-        # 2D grid (batch_size, max_spec_len); a (1, 1) grid still compiles the
+-        # kernel, and the real grid only affects launch, not the JIT key.
+-        return (cu_num_draft_tokens.shape[0], max(1, q.shape[0])), dict(
++        # 2D grid (batch_size, max_spec_len): axis 1 must cover every draft
++        # position. q holds one row per request, so deriving axis 1 from
++        # q.shape[0] under-covers whenever batch_size < max_spec_len and
++        # leaves recovered slots unwritten (garbage token ids then feed
++        # out-of-bounds gathers downstream). A (1, 1) grid still compiles
++        # the kernel; the real grid only affects launch, not the JIT key.
++        return (cu_num_draft_tokens.shape[0], max(1, max_spec_len)), dict(
+             output_token_ids_ptr=recovered_token_ids,
+             NO_DRAFT_PROBS=no_draft_probs,
+             SUB_BLOCK=sub_block,
+diff --git a/vllm_ascend/sample/rejection_sampler.py b/vllm_ascend/sample/rejection_sampler.py
+index 1db455e6c..b0d036db7 100644
+--- a/vllm_ascend/sample/rejection_sampler.py
++++ b/vllm_ascend/sample/rejection_sampler.py
+@@ -773,6 +773,7 @@ def sample_recovered_tokens(
+             vocab_size=vocab_size,
+             no_draft_probs=draft_probs is None,
+             sub_block=4 * 1024,
++            max_spec_len=max_spec_len,
+         )
+     elif use_block_verify:
+         sample_recovered_tokens_blockwise_pytorch(

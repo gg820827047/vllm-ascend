@@ -1,0 +1,1175 @@
+commit aa6f94bad58d1f482389fcc145bd04370e4f35c0
+Author:     LifeOfCoffee <63617742+LifeOfCoffee@users.noreply.github.com>
+AuthorDate: Sat Oct 31 11:12:25 2026 +0800
+Commit:     GitHub <noreply@github.com>
+CommitDate: Sat Oct 31 11:12:25 2026 +0800
+
+    [Feature] Support Qwen3.8 QSA pooling with AscendStore (#20261)
+    
+    ## What this PR does / why we need it
+    
+    Enable AscendStore pooling for the Qwen3.8 QSA/GDN hybrid cache and
+    coordinate QSA and PLE transfers with their cache state.
+    
+    ## User-facing behavior
+    
+    Support pooling for the Qwen3.8 hybrid cache layout, including bulk
+    Memcache transfer with MTP and DRAM/SSD storage.
+    
+    ## Validation
+    
+    - Unit regression with vLLM `544f182d`: **162 passed, 1 skipped**, exit
+    0, across hybrid pooling, AscendStore transfer, Mooncake hybrid,
+    layerwise hooks, PLE format, Mamba wrapper and MRV2 tests. Diff
+    whitespace, changed-Python syntax and documented test-path checks
+    passed. The subsequent E2E-file removal changes no production code or
+    unit tests; documentation references and diff checks passed. The final
+    squashed commit has exactly the same tree as the previously validated PR
+    state; no tests were repeated for history-only squashing.
+    - Key unit-test coverage is retained: packed shared-page bytes and
+    other-owner sentinels, both backend adapters, stride/fragment
+    boundaries, private-state replay boundaries, QSA/PLE ordering,
+    shared-layer loads, state-row ranges and deferred MTP finalization. The
+    standalone two-card Mooncake E2E test has been removed as requested; no
+    automated native NPU E2E coverage is added by this PR. Its documentation
+    command was removed too.
+    - The deferred-save reproducer fails before the forwarding fix and
+    passes afterward.
+    - Real A3 TP8 validation with vLLM
+    [544f182d](https://github.com/vllm-project/vllm/commit/544f182d9f0c9bfe8bd7645525951d5e3692a542),
+    toolkit 9.2 and transformer operators 9.3:
+    - FULL graph capture: **8/8**; concurrent generation: **32/32** nonempty
+    responses.
+    - A 9,217-token prompt restored twice: each replay reports **8,192
+    external hit tokens**, **160 completed backend GET keys**, **0 local
+    prefix-hit tokens**, and the same output as the cold request.
+    - DRAM/SSD pressure test: after 32 distinct salted prompts, restoring
+    the original prompt reports **64 SSD GET hits**, **64 SSD-to-DRAM rewarm
+    operations**, **351,371,264 bytes rewarmed**, **0 rewarm failures**, and
+    the same output. Cumulative async SSD flush reached **22,059,614,208
+    bytes**.
+    - The SSD backend is a dedicated **1 TiB sparse file mapped through
+    loop**, not a dedicated raw SSD. Logical capacity is not preallocated
+    physical space.
+    - These hardware results use the earlier #16981 runtime stack plus the
+    identical wrapper fix, not the entire rebased PR head. They do not
+    establish full validation of the rebased dependency or all hardware
+    paths.
+    - The earlier MTP/three-tier GPQA run was stopped at the user's request
+    after 68/198 cases to restart with rebased code; it has no final score.
+    A fresh **GPQA Diamond 198 cold + natural external-replay subset** is
+    running on fixed source `27ebd066`, after its own concurrency, external
+    restore and SSD-readback prechecks passed. That running service has not
+    been changed to the latest PR source; its results must not be presented
+    as validation of the latest packed-page source tree. Earlier bulk
+    pooling scored 179/198 on a different configuration.
+    - Full PR-head CI, independent review and model/NPU validation of the
+    latest packed-page source remain outstanding. CPU regression does not
+    replace them.
+    
+    ## Bulk three-tier startup configuration
+    
+    This is the bulk configuration used for the successful MTP and
+    SSD-rewarm checks. It uses `use_layerwise=false`. The separate layerwise
+    path requires PIECEWISE; this FULL_DECODE_ONLY example does not claim
+    layerwise compatibility.
+    
+    Install the matching vLLM build, vLLM-Ascend native extensions, FLA
+    runtime and transformer 9.3 operators first. Source the toolkit 9.2,
+    Ascend IR and ATB environments and configure the installed FLA/custom
+    operator paths for the target environment. Map eight available host NPUs
+    to container device IDs 0–7 and provide a reachable HCCL interface.
+    
+    ### Dedicated file-backed storage
+    
+    Create a new, exclusively owned backing file on a filesystem with
+    sufficient physical free space:
+    
+    ```bash
+    # Choose a NEW path; do not reuse another workload's file or device.
+    export SSD_IMAGE=/path/to/new-dedicated-cache.img
+    test ! -e "$SSD_IMAGE" || exit 1
+    truncate -s 1T "$SSD_IMAGE"
+    export SSD_LOOP="$(sudo losetup --find --show "$SSD_IMAGE")"
+    sudo losetup "$SSD_LOOP"  # Verify the exact backing file before use.
+    ```
+    
+    Pass only this owned loop device into the container and put its
+    container path in `ubsio.disk.path`. A sparse 1 TiB image does not
+    reserve 1 TiB of physical capacity. Monitor actual filesystem free
+    space; the validation supervisor is configured to stop work below 200
+    GiB free. Release only this workload's processes and detach its loop
+    device after all users of the device exit.
+    
+    ### Memcache local configuration
+    
+    Replace placeholders with reachable addresses and the exclusively owned
+    device path:
+    
+    ```ini
+    ock.mmc.meta_service_url = tcp://<HOST_IP>:25250
+    ock.mmc.local_service.config_store_url = tcp://<HOST_IP>:25251
+    ock.mmc.local_service.protocol = device_sdma
+    ock.mmc.local_service.dram.size = 1GB
+    ock.mmc.local_service.max.dram.size = 1024GB
+    ock.mmc.log_level = info
+    ock.mmc.local_service.storage.enabled = true
+    ubsio.disk.path = <OWNED_LOOP_DEVICE_IN_CONTAINER>
+    ubsio.mem.size_in_gb = 10
+    ubsio.standalone.device_count = 8
+    ubsio.standalone.force_new_disk = true
+    ```
+    
+    `dram.size=1GB` is per die. `ubsio.mem.size_in_gb=10` is the separate
+    UBSIO memory setting; it does not replace the Memcache DRAM limit.
+    `force_new_disk=true` is for first initialization of this new,
+    disposable owned device; it must not be used to reopen storage whose
+    contents need to be preserved. No explicit
+    `ock.mmc.local_service.world_size` override is required by this example.
+    
+    ### Memcache MetaService configuration
+    
+    ```ini
+    ock.mmc.meta_service_url = tcp://<HOST_IP>:25250
+    ock.mmc.meta_service.config_store_url = tcp://<HOST_IP>:25251
+    ock.mmc.meta_service.metrics_url = http://<HOST_IP>:25252
+    ock.mmc.log_level = info
+    ock.mmc.evict_threshold_high = 70
+    ock.mmc.evict_threshold_low = 60
+    ```
+    
+    Start the matching installed MetaService in a separate process:
+    
+    ```bash
+    export MMC_META_CONFIG_PATH=/path/to/mmc-meta.conf
+    /path/to/python -c 'from memcache_hybrid import MetaService; MetaService.main()'
+    ```
+    
+    ### vLLM startup
+    
+    ```bash
+    #!/usr/bin/env bash
+    set -eo pipefail
+    
+    # Source the installed CANN 9.2, Ascend IR and ATB environments first.
+    export MODEL_PATH=/path/to/Qwen3.8-Flash-Next-w8a8
+    export VLLM_PYTHON=/path/to/python
+    export VLLM_ASCEND_SRC=/path/to/vllm-ascend
+    export MMC_LOCAL_CONFIG_PATH=/path/to/mmc-local.conf
+    export HOST_IP=YOUR_HOST_IP
+    export NETWORK_IFACE=YOUR_NETWORK_INTERFACE
+    
+    # Python/native dependencies and custom operator vendors must be installed
+    # and discoverable in this environment.
+    export PYTHONPATH="$VLLM_ASCEND_SRC:${PYTHONPATH:-}"
+    export ASCEND_RT_VISIBLE_DEVICES=0,1,2,3,4,5,6,7
+    export VLLM_USE_V2_MODEL_RUNNER=1
+    export SOC_VERSION=ascend910_9382
+    export PYTHONUNBUFFERED=1 PYTHONDONTWRITEBYTECODE=1
+    export VLLM_LOGGING_LEVEL=INFO PYTHONHASHSEED=0
+    export ACL_OP_INIT_MODE=1 ASCEND_ENABLE_USE_FABRIC_MEM=1
+    export VLLM_HOST_IP="$HOST_IP" HCCL_IF_IP="$HOST_IP"
+    export GLOO_SOCKET_IFNAME="$NETWORK_IFACE"
+    export TP_SOCKET_IFNAME="$NETWORK_IFACE"
+    export HCCL_SOCKET_IFNAME="$NETWORK_IFACE"
+    export OMP_NUM_THREADS=1 VLLM_WORKER_MULTIPROC_METHOD=spawn
+    export VLLM_ALLOW_INSECURE_SERIALIZATION=1
+    
+    exec "$VLLM_PYTHON" -m vllm.entrypoints.cli.main serve "$MODEL_PATH" \
+      --host 0.0.0.0 --port 8097 --served-model-name Qwen3.8-Flash-Next-w8a8 \
+      --trust-remote-code --quantization ascend --tensor-parallel-size 8 --data-parallel-size 1 \
+      --max-model-len 139264 --max-num-seqs 32 --max-num-batched-tokens 8192 \
+      --gpu-memory-utilization 0.90 \
+      --no-enable-prefix-caching \
+      --async-scheduling \
+      --enable-expert-parallel \
+      --compilation-config '{"cudagraph_capture_sizes":[1,2,4,8,12,16,20,24,28,32],"cudagraph_mode":"FULL_DECODE_ONLY"}' \
+      --additional-config '{"enable_cpu_binding":true,"ascend_compilation_config":{"fuse_norm_quant":false}}' \
+      --speculative-config '{"method":"qwen3_5_mtp","num_speculative_tokens":3,"enforce_eager":true}' \
+      --kv-transfer-config '{"kv_connector":"AscendStoreConnector","kv_role":"kv_both","kv_connector_extra_config":{"backend":"memcache","lookup_rpc_port":25138,"use_layerwise":false,"load_async":false}}'
+    ```
+    
+    The runtime normalizes the deprecated `qwen3_5_mtp` spelling to `mtp`.
+    The earlier `--mamba-cache-mode align` argument is deprecated and has no
+    effect in this vLLM version, so it is omitted here. Local prefix caching
+    is disabled; successful replay must therefore be supported by
+    external-hit and completed backend-GET evidence.
+    
+    GPQA client settings: concurrency 32, `max_tokens=131072`, thinking
+    enabled, temperature 1.0, top-k 20, top-p 0.95, seed 101, fixed 198
+    cases and option ordering, and a fresh per-question cache salt. Final
+    results are pending; sampling, MTP, graph mode and cache-capacity
+    differences limit comparisons with earlier runs.
+    
+    
+    - vLLM main:
+    https://github.com/vllm-project/vllm/commit/544f182d9f0c9bfe8bd7645525951d5e3692a542
+    
+    ---------
+    
+    Signed-off-by: LifeOfCoffee <lcyzhyx@163.com>
+
+diff --git a/docs/qwen38_mooncake_basic_pooling.md b/docs/qwen38_mooncake_basic_pooling.md
+new file mode 100644
+index 000000000..94f621524
+--- /dev/null
++++ b/docs/qwen38_mooncake_basic_pooling.md
+@@ -0,0 +1,100 @@
++# Qwen3.8 Next cache pooling
++
++## Layout and supported paths
++
++QSA K/V and GDN convolution/recurrent state use shared physical pages with
++**disjoint live block IDs**. Raw and compressed indexer slabs remain separate;
++PLE and hidden state use private banks. Views may have a physical block stride
++larger than their payload. Transfers must preserve that stride and leave other
++owners, unused blocks and padding unchanged.
++
++Use Model Runner V2 with `AscendStoreConnector`. The adaptation supports bulk
++transfers and the existing Mooncake block-key/Memcache GVA layerwise paths.
++Other connectors retain their existing allocation path. Layerwise QSA opens
++its transfer window after both indexer and main-KV updates; PLE waits before
++reading its convolution state. Owners sharing a physical layer wait for one
++load, then copy their own state rows. GDN has two rows per layer; PLE has one.
++
++Private raw-indexer state is reconstructed by replay. Lookup must first select
++a restorable common boundary. With transfer granularity 1536, a 9216-token
++prompt queries at 7680, while 9217 can query at 9216. Layouts whose necessary
++state is all externally cacheable retain the existing lookup behavior.
++
++MRV2 with MTP defers save finalization until after draft generation.
++`MambaCopyKVConnector.finalize_step()` forwards to the wrapped connector so
++that deferred saves complete and metadata is cleared.
++
++## Configuration
++
++Install matching vLLM/vLLM-Ascend builds, native extensions and backend runtime.
++Enable V2 and configure the existing connector:
++
++```bash
++export VLLM_USE_V2_MODEL_RUNNER=1
++```
++
++```json
++{
++  "kv_connector": "AscendStoreConnector",
++  "kv_role": "kv_both",
++  "kv_connector_extra_config": {
++    "backend": "memcache",
++    "use_layerwise": false,
++    "load_async": false
++  }
++}
++```
++
++Bulk MTP validation used FULL_DECODE_ONLY; layerwise requires PIECEWISE.
++`load_async=true` uses the existing receive-completion and per-layer wait
++paths. Asynchronous graph-mode restoration and arbitrary layer reuse/offload
++settings require separate validation. The adaptation does not add recovery
++for incomplete external reads.
++
++For Mooncake, configure `backend="mooncake"`, matching master/client versions
++and the deployment's metadata, master and transport settings. One tested
++Ascend setup required explicit device RoCE:
++
++```bash
++unset ASCEND_ENABLE_USE_FABRIC_MEM
++export ASCEND_GLOBAL_RESOURCE_CONFIG='{"comm_resource_config.protocol_desc":["roce:device"],"store.comm_resource_config.protocol_desc":["roce:device"]}'
++export MOONCAKE_CONFIG_PATH=/path/to/mooncake.json
++```
++
++That setup used matching 0.3.14rc1 master/client; it does not establish that
++HCCS fails on other machines. Size layerwise read leases for the complete
++transfer/compute session; a lease timeout is not a cache-layout failure.
++
++## Regression tests
++
++Run the focused CPU suite:
++
++```bash
++python -m pytest -q \
++  tests/ut/distributed/ascend_store/test_qsa_basic_pooling.py \
++  tests/ut/distributed/ascend_store/test_ascend_store_connector.py \
++  tests/ut/distributed/ascend_store/test_mooncake_hybrid.py \
++  tests/ut/models/qwen4_exp/test_qsa_layerwise_hooks.py \
++  tests/ut/models/qwen4_exp/test_ple_internal_format.py \
++  tests/ut/worker/test_mamba_kv_connector.py \
++  tests/ut/worker/test_model_runner_v2_mamba.py
++```
++
++Coverage includes actual packed shared-page views, both backend adapters,
++dense/padded strides, partial/full fragments, reordered block IDs, overwritten
++source/destination bytes and whole-backing sentinels. Scheduler tests cover
++restoration boundaries; model and wrapper tests cover load/update/save order,
++shared-layer deduplication, per-owner state rows and deferred MTP finalization.
++
++CPU mocks do not establish native cross-process transfer correctness or
++model-level restoration. Those checks require deployment-specific hardware
++validation; this PR does not add a standalone NPU E2E test.
++
++## Validation boundary
++
++Earlier model results used a previous dependency/layout stack. They do not
++validate the current packed-page layout. Report hardware and GPQA results
++against the exact tested source revision and runtime in the PR. Distinguish
++external restoration from recomputation using zero local hits, actual backend
++reads and matching output. For SSD, require SSD hits and rewarm bytes after
++eviction; configuration or SSD writes alone do not prove a readback.
+diff --git a/tests/ut/distributed/ascend_store/test_ascend_store_connector.py b/tests/ut/distributed/ascend_store/test_ascend_store_connector.py
+index 56876ba7e..0800a7b8a 100644
+--- a/tests/ut/distributed/ascend_store/test_ascend_store_connector.py
++++ b/tests/ut/distributed/ascend_store/test_ascend_store_connector.py
+@@ -742,6 +742,56 @@ class TestAscendStoreConnectorLayerwise(unittest.TestCase):
+             self.assertEqual(call_order, ["load", "copy:layers.0.linear_attn"])
+             self.assertIsNone(connector._mamba_state)
+ 
++    def _make_shared_layer_connector(self, mamba_state=True):
++        from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.layerwise.layerwise_cache_layout import (
++            get_physical_layer_index,
++        )
++
++        connector = AscendStoreConnector.__new__(AscendStoreConnector)
++        connector.use_layerwise = True
++        connector._mamba_copy_bufs = None
++        connector._mamba_state = MagicMock()
++        connector._loaded_layer = None
++        connector.connector_worker = MagicMock()
++        connector.connector_worker._extract_physical_layer_index.side_effect = lambda name: get_physical_layer_index(
++            name, 4
++        )
++        if not mamba_state:
++            connector._mamba_state = None
++        return connector
++
++    def test_ple_and_attention_share_one_load_but_copy_each_owner(self):
++        connector = self._make_shared_layer_connector()
++        worker = connector.connector_worker
++        order = []
++        worker.wait_for_layer_load.side_effect = lambda: order.append("load")
++        connector._mamba_state.do_mamba_copy_for_layer.side_effect = lambda name: order.append(name)
++        connector.wait_for_layer_load("layers.1.ple")
++        connector.wait_for_layer_load("layers.1.linear_attn")
++        self.assertEqual(order, ["load", "layers.1.ple", "layers.1.linear_attn"])
++        self.assertEqual(worker.wait_for_layer_load.call_count, 1)
++        connector.wait_for_layer_load("layers.2.linear_attn")
++        self.assertEqual(worker.wait_for_layer_load.call_count, 2)
++        connector.bind_connector_metadata(AscendConnectorMetadata(set()))
++        connector.wait_for_layer_load("layers.2.linear_attn")
++        self.assertEqual(worker.wait_for_layer_load.call_count, 3)
++
++    def test_layer_index_fallback_is_reused_for_deduplication(self):
++        connector = self._make_shared_layer_connector()
++        worker = connector.connector_worker
++        for name in ("model.layers.0.ple", "attention", "model.layers.0.linear_attn"):
++            connector.wait_for_layer_load(name)
++        self.assertEqual(worker.wait_for_layer_load.call_count, 1)
++        self.assertEqual(connector._mamba_state.do_mamba_copy_for_layer.call_count, 3)
++        self.assertEqual(connector._loaded_layer, 0)
++
++    def test_single_owner_layers_each_wait_once(self):
++        connector = self._make_shared_layer_connector(mamba_state=False)
++        worker = connector.connector_worker
++        for layer in range(3):
++            connector.wait_for_layer_load(f"model.layers.{layer}.self_attn")
++        self.assertEqual(worker.wait_for_layer_load.call_count, 3)
++
+     def test_mamba_state_copy_not_deferred_after_finish(self):
+         from vllm.distributed.kv_transfer.kv_connector.v1.base import KVConnectorRole
+ 
+diff --git a/tests/ut/distributed/ascend_store/test_layerwise_cache_layout.py b/tests/ut/distributed/ascend_store/test_layerwise_cache_layout.py
+index 44148ef45..9a9beb710 100644
+--- a/tests/ut/distributed/ascend_store/test_layerwise_cache_layout.py
++++ b/tests/ut/distributed/ascend_store/test_layerwise_cache_layout.py
+@@ -306,6 +306,7 @@ def test_layout_includes_mtp_layers():
+         ("mtp.layers.0.self_attn", 4),
+         ("model.mtp.layers.1.self_attn", 5),
+         ("model.layers.4.self_attn", 4),
++        ("notlayers.2.model.layers.3.attn", 2),
+     ],
+ )
+ def test_physical_layer_index_supports_mtp_names(
+diff --git a/tests/ut/distributed/ascend_store/test_mooncake_hybrid.py b/tests/ut/distributed/ascend_store/test_mooncake_hybrid.py
+index 5840c241e..f36a6e560 100644
+--- a/tests/ut/distributed/ascend_store/test_mooncake_hybrid.py
++++ b/tests/ut/distributed/ascend_store/test_mooncake_hybrid.py
+@@ -283,7 +283,7 @@ class TestMooncakeHybrid(unittest.TestCase):
+             self.assertEqual(scheduler.get_num_new_matched_tokens(request, 0), (32, False))
+             load = scheduler.load_specs[request.request_id]
+             self.assertEqual(load.kvpool_cached_tokens, 32)
+-            self.assertEqual(load.kvpool_store_skip_tokens, 64)
++            self.assertEqual(load.kvpool_store_skip_tokens, 64 if eagle else 32)
+         # The full hit is a write-skip extent, not the recurrent resume point.
+         worker.use_eagle = False
+         request = ReqMeta(
+diff --git a/tests/ut/distributed/ascend_store/test_qsa_basic_pooling.py b/tests/ut/distributed/ascend_store/test_qsa_basic_pooling.py
+new file mode 100644
+index 000000000..775a4104d
+--- /dev/null
++++ b/tests/ut/distributed/ascend_store/test_qsa_basic_pooling.py
+@@ -0,0 +1,339 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++
++"""Bulk QSA pooling contracts shared by memcache and Mooncake."""
++
++import ctypes
++import unittest
++from types import SimpleNamespace
++from unittest.mock import MagicMock, patch
++
++import numpy as np
++import pytest
++
++import tests.ut.distributed.ascend_store._mock_deps  # noqa: F401
++
++# isort: split
++from vllm.v1.kv_cache_interface import FullAttentionSpec, KVCacheGroupSpec
++
++from tests.ut.distributed.ascend_store import test_pool_scheduler as scheduler_tests
++from tests.ut.distributed.ascend_store.test_pool_worker import make_worker
++from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.backend.memcache_backend import MemcacheBackend
++from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.backend.mooncake_backend import MooncakeBackend
++from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.layerwise.pool_scheduler import LayerwiseKVPoolScheduler
++from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.metadata import (
++    AscendConnectorMetadata,
++    ChunkedTokenDatabase,
++    KeyMetadata,
++    LoadSpec,
++    ReqMeta,
++)
++from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.pool_worker import KVPoolWorker
++
++
++class BufferStore:
++    """Copy bytes into independent objects; never retain source addresses."""
++
++    def __init__(self, buffers):
++        self.objects = {}
++        self.bounds = [(array.ctypes.data, array.ctypes.data + array.nbytes) for array in buffers]
++        self.get_calls = 0
++
++    def _check_range(self, address, size):
++        assert size > 0
++        assert any(start <= address and address + size <= end for start, end in self.bounds)
++
++    def batch_put_from_multi_buffers(self, keys, addresses, sizes, config):
++        for key, pointers, lengths in zip(keys, addresses, sizes, strict=True):
++            for address, size in zip(pointers, lengths, strict=True):
++                self._check_range(address, size)
++            self.objects[key] = b"".join(ctypes.string_at(p, n) for p, n in zip(pointers, lengths, strict=True))
++        return [0] * len(keys)
++
++    def batch_get_into_multi_buffers(self, keys, addresses, sizes):
++        self.get_calls += 1
++        results = []
++        for key, pointers, lengths in zip(keys, addresses, sizes, strict=True):
++            value = self.objects.get(key)
++            if value is None:
++                results.append(-1)
++                continue
++            assert len(value) == sum(lengths)
++            offset = 0
++            for address, size in zip(pointers, lengths, strict=True):
++                self._check_range(address, size)
++                ctypes.memmove(address, value[offset : offset + size], size)
++                offset += size
++            results.append(offset)
++        return results
++
++    def batch_put_from_layers(self, keys, addresses, sizes, direction):
++        return self.batch_put_from_multi_buffers(keys, addresses, sizes, None)
++
++    def batch_get_into_layers(self, keys, addresses, sizes, direction):
++        return [0 if result >= 0 else result for result in self.batch_get_into_multi_buffers(keys, addresses, sizes)]
++
++
++def make_backend(backend_name, store):
++    backend_type = MooncakeBackend if backend_name == "mooncake" else MemcacheBackend
++    backend = backend_type.__new__(backend_type)
++    backend.store = store
++    backend._lazy_init = False
++    backend._store_initialized = True
++    backend.config = SimpleNamespace(preferred_segment=False, prefer_alloc_in_same_node=True)
++    return backend
++
++
++def make_six_region_database(backing, padding):
++    payloads = [32, 48, 64, 16, 80, 96]
++    strides = [payload + padding for payload in payloads]
++    offsets = []
++    cursor = 64
++    for stride in strides:
++        offsets.append(cursor)
++        cursor += stride * 5 + 64
++    assert cursor <= backing.nbytes
++    database = ChunkedTokenDatabase([KeyMetadata("next", 0, 0, 0)], [16], None)
++    database.set_group_buffers(
++        {0: [backing.ctypes.data + offset for offset in offsets]},
++        {0: payloads},
++        {0: strides},
++    )
++    return database, offsets, strides, payloads
++
++
++@pytest.mark.parametrize("backend_name", ["memcache", "mooncake"])
++@pytest.mark.parametrize("padding", [0, 64])
++@pytest.mark.parametrize("tokens", [8, 16])
++def test_six_region_restore_uses_external_bytes_and_preserves_other_owners(backend_name, padding, tokens):
++    source = np.full(8192, 90, dtype=np.uint8)
++    destination = np.full_like(source, 90)
++    database, offsets, strides, payloads = make_six_region_database(source, padding)
++    target, _, _, _ = make_six_region_database(destination, padding)
++    for region, (offset, stride, payload) in enumerate(zip(offsets, strides, payloads, strict=True)):
++        for block in range(5):
++            start = offset + block * stride
++            source[start : start + payload] = (np.arange(payload) + region * 17 + block * 29) % 256
++
++    native = BufferStore([source, destination])
++    backend = make_backend(backend_name, native)
++    keys = ["block-a", "block-b", "block-c"]
++    source_order, target_order = [4, 1, 3], [0, 2, 4]
++    source_rows = [database.prepare_value(0, tokens, [], block_id=block) for block in source_order]
++    target_rows = [target.prepare_value(0, tokens, [], block_id=block) for block in target_order]
++    expected = destination.copy()
++    for source_block, target_block in zip(source_order, target_order, strict=True):
++        for offset, stride, payload in zip(offsets, strides, payloads, strict=True):
++            size = payload * tokens // 16
++            src, dst = offset + source_block * stride, offset + target_block * stride
++            expected[dst : dst + size] = source[src : src + size]
++
++    assert backend.put(keys, [row[0] for row in source_rows], [row[1] for row in source_rows]) == [True] * 3
++    for addresses, sizes, _ in source_rows + target_rows:
++        for address, size in zip(addresses, sizes, strict=True):
++            ctypes.memset(address, 165, size)
++    assert not np.array_equal(destination, expected)
++    assert backend.get(keys, [row[0] for row in target_rows], [row[1] for row in target_rows]) == [0] * 3
++    assert native.get_calls == 1
++    np.testing.assert_array_equal(destination, expected)
++
++
++@pytest.fixture
++def worker_factory():
++    case = unittest.TestCase()
++
++    def create(backend_name, group_count=2):
++        groups = [
++            KVCacheGroupSpec(
++                [f"model.layers.{index}.attn"],
++                FullAttentionSpec(
++                    block_size=16,
++                    num_kv_heads=1,
++                    head_size=1,
++                    dtype="uint8",
++                ),
++            )
++            for index in range(group_count)
++        ]
++        with patch.object(KVPoolWorker, "_build_cache_coordinator", return_value=None):
++            worker = make_worker(
++                case,
++                kv_role="kv_both",
++                extra_config={"backend": backend_name, "load_async": False},
++                kv_cache_config=SimpleNamespace(num_blocks=8, kv_cache_groups=groups),
++            )
++        worker.token_database.set_group_buffers({0: [1000], 1: [2000]}, {0: [16], 1: [16]})
++        return worker
++
++    yield create
++    case.doCleanups()
++
++
++@pytest.mark.parametrize(
++    "backend_name,layerwise",
++    [("memcache", False), ("mooncake", False), ("mooncake", True)],
++)
++@pytest.mark.parametrize(
++    "prompt_tokens,boundary",
++    [(9216, 7680), (9217, 9216), (10087, 9216), (16384, 15360)],
++)
++def test_private_state_lookup_queries_the_restorable_boundary(backend_name, prompt_tokens, boundary, layerwise):
++    module = "vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.pool_scheduler"
++    config = scheduler_tests.TestKVPoolScheduler()._make_config(block_size=1536, extra_config={"backend": backend_name})
++    with patch(module + ".importlib") as imports, patch(module + ".LookupKeyClient") as client:
++        imports.import_module.return_value = MagicMock()
++        scheduler_cls = LayerwiseKVPoolScheduler if layerwise else scheduler_tests.KVPoolScheduler
++        scheduler = scheduler_cls(config, use_layerwise=layerwise)
++        scheduler.cacheable_group_ids = [0]
++        scheduler.original_block_size = [1536, 4]
++        scheduler.kv_cache_group_ids = [0]
++        scheduler.use_eagle = False
++        client.return_value.closed = False
++        client.return_value.lookup.side_effect = lambda token_len, *args, **kwargs: token_len
++        request = SimpleNamespace(
++            request_id="private-tail",
++            prompt_token_ids=[0] * prompt_tokens,
++            num_tokens=prompt_tokens,
++            block_hashes=[b"h"] * (prompt_tokens // 1536),
++        )
++        with patch.object(
++            scheduler,
++            "_get_block_key_layerwise_hit_tokens",
++            side_effect=lambda req, token_len, computed: token_len,
++            create=True,
++        ) as layer_lookup:
++            assert scheduler.get_num_new_matched_tokens(request, 0) == (boundary, False)
++        if layerwise:
++            assert layer_lookup.call_args.args[1] == boundary
++        else:
++            assert client.return_value.lookup.call_args.args[0] == boundary
++        assert scheduler.load_specs[request.request_id].kvpool_cached_tokens == boundary
++
++
++def test_mooncake_dense_read_failure_keeps_existing_block_fallback(worker_factory):
++    worker = worker_factory("mooncake", group_count=1)
++    worker.m_store.get.return_value = [-800]
++    request = ReqMeta(
++        req_id="dense",
++        token_len_chunk=16,
++        block_ids=[7],
++        block_hashes=["h0"],
++        load_spec=LoadSpec(0, 16, can_load=True, token_len=16),
++        can_save=True,
++    )
++    metadata = AscendConnectorMetadata(set())
++    metadata.add_request(request)
++    worker.start_load_kv(metadata)
++    assert worker.get_block_ids_with_load_errors() == {7}
++    assert worker.get_failed_requests() == set()
++
++
++def test_mooncake_preserves_partial_get_errors():
++    native = MagicMock()
++    native.batch_get_into_multi_buffers.return_value = [514, -800]
++    backend = make_backend("mooncake", native)
++    assert backend.get(["ok", "missing"], [[100], [200]], [[514], [514]]) == [0, -800]
++
++
++@pytest.mark.parametrize("backend_name", ["memcache", "mooncake"])
++def test_packed_qsa_gdn_pages_restore_disjoint_live_block_ids(backend_name):
++    """Restore actual shared-page views without touching another live owner."""
++    import torch
++    from vllm.v1.kv_cache_interface import CircularBufferSpec, MambaSpec, MLAAttentionSpec
++
++    from vllm_ascend.models.qwen4_exp.cache_config import build_qwen4_kv_cache_layout, make_slab_view
++
++    main = FullAttentionSpec(block_size=128, num_kv_heads=1, head_size=8, head_size_v=8, dtype=torch.float16)
++    raw = CircularBufferSpec(block_size=8, num_kv_heads=1, head_size=4, head_size_v=0, dtype=torch.float16)
++    compressed = MLAAttentionSpec(block_size=128, num_kv_heads=1, head_size=4, dtype=torch.float16, tokens_per_state=4)
++    gdn = MambaSpec(block_size=128, shapes=((2, 4), (4, 4)), dtypes=(torch.float16, torch.float32))
++    ple = MambaSpec(block_size=128, shapes=((2, 4),), dtypes=(torch.float16,))
++    groups = [
++        KVCacheGroupSpec(["model.layers.0.self_attn.attn"], main),
++        KVCacheGroupSpec(["model.layers.0.self_attn.indexer.raw_key_cache"], raw),
++        KVCacheGroupSpec(["model.layers.0.self_attn.indexer.compressed_key_cache"], compressed),
++        KVCacheGroupSpec(["model.layers.1.linear_attn"], gdn),
++        KVCacheGroupSpec(["model.ple"], ple),
++    ]
++    blocks = 5
++    layout = build_qwen4_kv_cache_layout(groups, blocks)
++    private_offset = layout.slot_backing_size + 64
++    size = private_offset + blocks * 16 + 64
++    source, destination = (np.full(size, 90, dtype=np.uint8) for _ in range(2))
++
++    def views(array):
++        backing = torch.from_numpy(array)
++
++        def view(dtype, shape, offset, stride=None):
++            return make_slab_view(
++                backing,
++                dtype=dtype,
++                num_blocks=blocks,
++                item_shape=shape,
++                storage_offset=offset,
++                block_stride=stride,
++            )
++
++        shared = layout.region("r0")
++        return {
++            0: [
++                view(torch.float16, (128, 1, 8), 0, shared.block_stride),
++                view(torch.float16, (128, 1, 8), 2048, shared.block_stride),
++                view(torch.float16, (32, 1, 4), layout.region("r5").offset),
++            ],
++            1: [view(torch.float16, (8, 1, 4), layout.region("r4").offset)],
++            2: [
++                view(torch.float16, (2, 4), layout.region("r1").offset, shared.block_stride),
++                view(torch.float32, (4, 4), layout.region("r2").offset, shared.block_stride),
++            ],
++            3: [view(torch.float16, (2, 4), private_offset)],
++        }
++
++    source_views, target_views = views(source), views(destination)
++    # QSA and GDN deliberately alias physical pages. Their live block IDs
++    # must be disjoint, as enforced by the shared scheduler block pool.
++    mappings = {0: ([1, 4], [0, 2]), 1: ([1, 4], [0, 2]), 2: ([0, 3], [1, 4]), 3: ([0, 3], [1, 4])}
++    for group_id, (source_ids, _) in mappings.items():
++        for tensor_id, tensor in enumerate(source_views[group_id]):
++            for block_id in source_ids:
++                tensor[block_id].fill_(group_id * 11 + tensor_id + block_id + 1)
++
++    def database(cache_views):
++        result = ChunkedTokenDatabase([KeyMetadata("next", 0, 0, 0)], [128, 8, 128, 128], None)
++        result.set_group_buffers(
++            {group: [tensor.data_ptr() for tensor in tensors] for group, tensors in cache_views.items()},
++            {
++                group: [tensor[0].numel() * tensor.element_size() for tensor in tensors]
++                for group, tensors in cache_views.items()
++            },
++            {
++                group: [tensor.stride(0) * tensor.element_size() for tensor in tensors]
++                for group, tensors in cache_views.items()
++            },
++        )
++        return result
++
++    source_db, target_db = database(source_views), database(target_views)
++    keys, source_rows, target_rows = [], [], []
++    expected = destination.copy()
++    for group_id, (source_ids, target_ids) in mappings.items():
++        for index, (source_id, target_id) in enumerate(zip(source_ids, target_ids, strict=True)):
++            keys.append(f"{group_id}-{index}")
++            tokens = 8 if group_id == 1 else 128
++            src = source_db.prepare_value(group_id, tokens, [], block_id=source_id)
++            dst = target_db.prepare_value(group_id, tokens, [], block_id=target_id)
++            source_rows.append(src)
++            target_rows.append(dst)
++            for src_addr, dst_addr, length in zip(src[0], dst[0], src[1], strict=True):
++                offset = dst_addr - destination.ctypes.data
++                expected[offset : offset + length] = np.frombuffer(ctypes.string_at(src_addr, length), dtype=np.uint8)
++
++    store = BufferStore([source, destination])
++    backend = make_backend(backend_name, store)
++    assert backend.put(keys, [row[0] for row in source_rows], [row[1] for row in source_rows]) == [True] * len(keys)
++    source.fill(165)
++    for row in target_rows:
++        for address, length in zip(row[0], row[1], strict=True):
++            ctypes.memset(address, 136, length)
++    assert backend.get(keys, [row[0] for row in target_rows], [row[1] for row in target_rows]) == [0] * len(keys)
++    np.testing.assert_array_equal(destination, expected)
+diff --git a/tests/ut/models/qwen4_exp/test_ple_internal_format.py b/tests/ut/models/qwen4_exp/test_ple_internal_format.py
+index 79a70206e..808bd116b 100644
+--- a/tests/ut/models/qwen4_exp/test_ple_internal_format.py
++++ b/tests/ut/models/qwen4_exp/test_ple_internal_format.py
+@@ -212,7 +212,9 @@ def test_ple_internal_format_is_scoped(monkeypatch: pytest.MonkeyPatch) -> None:
+     monkeypatch.setattr(ple, "_set_allow_internal_format", updates.append)
+     output = torch.tensor([2.0])
+     original = Mock(return_value=output)
+-    layer = object()
++    layer = SimpleNamespace(prefix="layers.1.ple")
++    wait = Mock()
++    monkeypatch.setattr(ple, "wait_for_kv_layer_from_connector", wait)
+     inputs = torch.tensor([1.0])
+     residual = torch.tensor([2.0])
+     outer_residual = torch.tensor([3.0])
+@@ -222,6 +224,7 @@ def test_ple_internal_format_is_scoped(monkeypatch: pytest.MonkeyPatch) -> None:
+     assert wrapped(layer, inputs, residual, outer_residual) is output
+     original.assert_called_once_with(layer, inputs, residual, outer_residual)
+     assert updates == [False, True]
++    wait.assert_called_once_with(layer.prefix)
+ 
+ 
+ def test_ple_internal_format_is_restored_on_error(
+@@ -232,7 +235,8 @@ def test_ple_internal_format_is_restored_on_error(
+     monkeypatch.setattr(ple, "_set_allow_internal_format", updates.append)
+ 
+     original = Mock(side_effect=RuntimeError("expected short-conv failure"))
+-    layer = object()
++    layer = SimpleNamespace(prefix="layers.1.ple")
++    monkeypatch.setattr(ple, "wait_for_kv_layer_from_connector", Mock())
+     inputs = torch.tensor([1.0])
+     wrapped = ple._wrap_ple_short_conv(original)
+ 
+diff --git a/tests/ut/models/qwen4_exp/test_qsa_layerwise_hooks.py b/tests/ut/models/qwen4_exp/test_qsa_layerwise_hooks.py
+new file mode 100644
+index 000000000..9075140c4
+--- /dev/null
++++ b/tests/ut/models/qwen4_exp/test_qsa_layerwise_hooks.py
+@@ -0,0 +1,57 @@
++# Copyright (c) 2026 Huawei Technologies Co., Ltd. All Rights Reserved.
++# SPDX-License-Identifier: Apache-2.0
++
++from contextlib import contextmanager
++from types import SimpleNamespace
++
++import torch
++
++from vllm_ascend.models.qwen4_exp import qsa
++
++
++def test_qsa_restores_before_updates_and_opens_prefetch_after_updates(monkeypatch):
++    order = []
++    main = SimpleNamespace(num_actual_tokens=2, slot_mapping=torch.arange(2))
++    raw = SimpleNamespace(num_actual_tokens=2, token_to_req=None, logical_positions=None, seq_lens=None)
++    monkeypatch.setattr(qsa, "get_forward_context", lambda: SimpleNamespace(attn_metadata={"main": main, "raw": raw}))
++    monkeypatch.setattr(qsa, "wait_for_kv_layer_from_connector", lambda name: order.append("load"))
++    saved = []
++
++    def save_cache(layer_name, cache):
++        saved.append((layer_name, cache))
++        order.append("save")
++
++    monkeypatch.setattr(qsa, "maybe_save_kv_layer_to_connector", save_cache)
++
++    @contextmanager
++    def window():
++        order.append("gate_open")
++        yield
++        order.append("gate_close")
++
++    monkeypatch.setattr(qsa, "attention_transfer_window", window)
++
++    class Indexer:
++        raw_key_cache = SimpleNamespace(prefix="raw")
++        output_width = 4
++
++        def __call__(self, *args):
++            order.append("indexer_update")
++            return torch.zeros(2, self.output_width, dtype=torch.int32)
++
++    owner = SimpleNamespace(
++        layer_name="main",
++        kv_cache=(torch.zeros(1), torch.zeros(1)),
++        indexer=Indexer(),
++        topk_indices_buffer=torch.zeros(2, 4, dtype=torch.int32),
++        impl=SimpleNamespace(
++            do_kv_cache_update=lambda *args: order.append("main_kv_update"),
++            forward_qsa=lambda *args, **kwargs: order.append("attention"),
++        ),
++    )
++    value = torch.zeros(2, 4)
++    qsa.AscendQwen4ExpQSAAttention._run_qsa(owner, value, torch.arange(2), value, value, value, value)
++    assert order == ["load", "indexer_update", "main_kv_update", "gate_open", "attention", "gate_close", "save"]
++    assert saved[0][0] == "main"
++    assert isinstance(saved[0][1], list)
++    assert all(actual is expected for actual, expected in zip(saved[0][1], owner.kv_cache, strict=True))
+diff --git a/tests/ut/worker/test_mamba_kv_connector.py b/tests/ut/worker/test_mamba_kv_connector.py
+index 8c3f5499f..01ebee59e 100644
+--- a/tests/ut/worker/test_mamba_kv_connector.py
++++ b/tests/ut/worker/test_mamba_kv_connector.py
+@@ -103,6 +103,7 @@ def test_connector_lifecycle_is_forwarded():
+     inner = SimpleNamespace(
+         pre_forward=Mock(),
+         finish_forward=Mock(),
++        finalize_step=Mock(),
+         post_forward=Mock(return_value=output),
+         no_forward=Mock(return_value=output),
+         set_disabled=Mock(),
+@@ -111,12 +112,14 @@ def test_connector_lifecycle_is_forwarded():
+     copy = Mock()
+     wrapped = MambaCopyKVConnector(inner, copy)
+     wrapped.finish_forward()
++    wrapped.finalize_step()
+     assert wrapped.post_forward({"done"}, wait_for_save=False) is output
+     tokenless_step = object()
+     assert wrapped.no_forward(tokenless_step) is output
+     wrapped.set_disabled(True)
+     wrapped.reset_capture_state()
+     inner.finish_forward.assert_called_once_with()
++    inner.finalize_step.assert_called_once_with()
+     inner.post_forward.assert_called_once_with({"done"}, wait_for_save=False)
+     inner.no_forward.assert_called_once_with(tokenless_step)
+     inner.set_disabled.assert_called_once_with(True)
+@@ -124,6 +127,38 @@ def test_connector_lifecycle_is_forwarded():
+     copy.assert_not_called()
+ 
+ 
++def test_mtp_deferred_finalize_saves_after_draft():
++    events = []
++    output = object()
++
++    class Inner:
++        def post_forward(self, finished_req_ids, defer_finalize=False):
++            assert finished_req_ids == {"done"}
++            assert defer_finalize
++            events.append("collect_results")
++            return output
++
++        def finalize_step(self):
++            events.append("save_and_clear_metadata")
++
++    copy = Mock()
++    wrapped = MambaCopyKVConnector(Inner(), copy)
++    assert wrapped.post_forward({"done"}, defer_finalize=True) is output
++    assert events == ["collect_results"]
++    events.append("draft")
++    wrapped.finalize_step()
++    assert events == ["collect_results", "draft", "save_and_clear_metadata"]
++    copy.assert_not_called()
++
++
++def test_finalize_step_propagates_save_failure():
++    inner = SimpleNamespace(finalize_step=Mock(side_effect=RuntimeError("save failed")))
++    wrapped = MambaCopyKVConnector(inner, Mock())
++    with pytest.raises(RuntimeError, match="save failed"):
++        wrapped.finalize_step()
++    inner.finalize_step.assert_called_once_with()
++
++
+ def test_wrappers_keep_runner_state_independent():
+     copy_a, copy_b = Mock(), Mock()
+     inner = SimpleNamespace(pre_forward=Mock())
+diff --git a/tests/ut/worker/test_model_runner_v2_mamba.py b/tests/ut/worker/test_model_runner_v2_mamba.py
+index 1e3f8e9a4..a44eff9c8 100644
+--- a/tests/ut/worker/test_model_runner_v2_mamba.py
++++ b/tests/ut/worker/test_model_runner_v2_mamba.py
+@@ -9,6 +9,7 @@ import pytest
+ import torch
+ import vllm.v1.worker.gpu.cp_utils as _cp_utils
+ from vllm.config.compilation import CUDAGraphMode
++from vllm.v1.attention.backends.registry import MambaAttentionBackendEnum
+ from vllm.v1.kv_cache_interface import (
+     FullAttentionSpec,
+     KVCacheConfig,
+@@ -184,10 +185,44 @@ def _make_defer_state(kv_cache_config):
+     state.num_accepted_tokens_gpu = torch.ones(4, dtype=torch.int32)
+     state._layerwise_mamba_copy = None
+     state._layer_state_ranges = None
++    state._mamba_state_copy_funcs = {
++        group.kv_cache_spec.mamba_type: tuple(MagicMock() for _ in group.kv_cache_spec.shapes)
++        for group in kv_cache_config.kv_cache_groups
++    }
+     state._layer_state_ranges = state._get_layer_state_ranges(kv_cache_config)
+     return state
+ 
+ 
++@pytest.mark.parametrize("ple_first", [False, True])
++def test_layerwise_copy_rows_follow_each_groups_state_types(ple_first):
++    gdn = replace(_mamba_spec(), mamba_type=MambaAttentionBackendEnum.GDN_ATTN)
++    ple = replace(
++        gdn,
++        shapes=((9, 4),),
++        dtypes=(torch.float16,),
++        mamba_type=MambaAttentionBackendEnum.SHORT_CONV,
++    )
++    groups = [
++        KVCacheGroupSpec(
++            layer_names=["layers.0.linear_attn", "layers.1.linear_attn"],
++            kv_cache_spec=gdn,
++        ),
++        KVCacheGroupSpec(layer_names=["layers.1.ple"], kv_cache_spec=ple),
++    ]
++    if ple_first:
++        groups.reverse()
++    config = KVCacheConfig(num_blocks=3, kv_cache_tensors=[], kv_cache_groups=groups)
++    state = _make_defer_state(config)
++    state._mamba_group_ids = [0, 1]
++    state._layer_state_ranges = None
++    ranges = state._get_layer_state_ranges(config)
++    offset = 1 if ple_first else 0
++    assert ranges["layers.0.linear_attn"] == (offset, offset + 2)
++    assert ranges["layers.1.linear_attn"] == (offset + 2, offset + 4)
++    assert ranges["layers.1.ple"] == ((0, 1) if ple_first else (4, 5))
++    assert max(end for _, end in ranges.values()) == 5
++
++
+ @patch("vllm_ascend.worker.v2.model_states.mamba_hybrid.preprocess_mamba_align_fused_kernel")
+ @patch("vllm_ascend.worker.v2.model_states.mamba_hybrid.get_kv_transfer_group")
+ @patch(
+diff --git a/vllm_ascend/distributed/kv_transfer/kv_pool/ascend_store/ascend_store_connector.py b/vllm_ascend/distributed/kv_transfer/kv_pool/ascend_store/ascend_store_connector.py
+index 4ec1f9e4d..872a1fc90 100644
+--- a/vllm_ascend/distributed/kv_transfer/kv_pool/ascend_store/ascend_store_connector.py
++++ b/vllm_ascend/distributed/kv_transfer/kv_pool/ascend_store/ascend_store_connector.py
+@@ -164,6 +164,7 @@ class AscendStoreConnector(KVConnectorBase_V1, SupportsHMA):
+         # Handle to the (V2) mamba hybrid model state while its per-layer
+         # align pre-copy is deferred behind this connector's layerwise loads.
+         self._mamba_state: Any = None
++        self._loaded_layer: int | None = None
+         self.requires_mamba_state_copy_after_layer_load = self.use_layerwise
+         # Opt in only for synchronous bulk loads, not background retrieval.
+         self.requires_mamba_state_copy_after_load = not self.use_layerwise and not extra_config.get("load_async", False)
+@@ -359,6 +360,7 @@ class AscendStoreConnector(KVConnectorBase_V1, SupportsHMA):
+             # Target hooks have advanced current_layer by then, so preparing
+             # the step there would reset the current layer before MTP.
+             self._mamba_copy_bufs = None
++            self._loaded_layer = None
+             cast(LayerwiseKVPoolWorker, self.connector_worker).prepare_layerwise_step(connector_metadata)
+ 
+     def start_load_kv(self, forward_context: "ForwardContext", **kwargs) -> None:
+@@ -393,7 +395,12 @@ class AscendStoreConnector(KVConnectorBase_V1, SupportsHMA):
+         if not self.use_layerwise:
+             return
+         assert self.connector_worker is not None
+-        cast(LayerwiseKVPoolWorker, self.connector_worker).wait_for_layer_load()
++        # PLE and attention can share one physical layer. Load its groups once,
++        # then let each cache owner copy its own recurrent state before use.
++        layer = self.connector_worker._extract_physical_layer_index(layer_name)
++        if self._loaded_layer != layer:
++            cast(LayerwiseKVPoolWorker, self.connector_worker).wait_for_layer_load()
++            self._loaded_layer = layer
+         if self._mamba_copy_bufs is not None:
+             mamba_utils.do_mamba_copy_block_for_layer(
+                 self._mamba_copy_bufs,
+diff --git a/vllm_ascend/distributed/kv_transfer/kv_pool/ascend_store/layerwise/pool_scheduler.py b/vllm_ascend/distributed/kv_transfer/kv_pool/ascend_store/layerwise/pool_scheduler.py
+index ace344bd0..a7c1d5545 100644
+--- a/vllm_ascend/distributed/kv_transfer/kv_pool/ascend_store/layerwise/pool_scheduler.py
++++ b/vllm_ascend/distributed/kv_transfer/kv_pool/ascend_store/layerwise/pool_scheduler.py
+@@ -104,6 +104,8 @@ class LayerwiseKVPoolScheduler(KVPoolScheduler):
+         prompt_token_len = len(request.prompt_token_ids)
+         if self.use_block_key_layerwise:
+             token_len = self._floor_to_cache_transfer_granularity(prompt_token_len)
++            if not self.use_eagle and len(self.cacheable_group_ids) != len(self.original_block_size):
++                token_len = self._floor_to_cache_transfer_granularity(max(prompt_token_len - 1, 0))
+             if token_len < self.cache_transfer_granularity:
+                 return None
+             return self._get_block_key_layerwise_hit_tokens(request, token_len, num_computed_tokens)
+@@ -111,11 +113,14 @@ class LayerwiseKVPoolScheduler(KVPoolScheduler):
+         if self.use_layerwise_transfer:
+             return self._get_layerwise_hit_tokens(request, prompt_token_len, num_computed_tokens)
+ 
+-        token_len = (
+-            self._floor_to_cache_transfer_granularity(prompt_token_len)
+-            if self._discard_partial_chunks
+-            else prompt_token_len
+-        )
++        if len(self.cacheable_group_ids) != len(self.original_block_size):
++            token_len = self._floor_to_cache_transfer_granularity(max(prompt_token_len - 1, 0))
++        else:
++            token_len = (
++                self._floor_to_cache_transfer_granularity(prompt_token_len)
++                if self._discard_partial_chunks
++                else prompt_token_len
++            )
+         if token_len < self.cache_transfer_granularity:
+             return None
+         return self._get_store_lookup_hit_tokens(request, token_len, num_computed_tokens, include_layers=True)
+diff --git a/vllm_ascend/distributed/kv_transfer/kv_pool/ascend_store/pool_scheduler.py b/vllm_ascend/distributed/kv_transfer/kv_pool/ascend_store/pool_scheduler.py
+index f147aa92e..aff070908 100644
+--- a/vllm_ascend/distributed/kv_transfer/kv_pool/ascend_store/pool_scheduler.py
++++ b/vllm_ascend/distributed/kv_transfer/kv_pool/ascend_store/pool_scheduler.py
+@@ -431,11 +431,15 @@ class KVPoolScheduler:
+ 
+     def _lookup_external_hit_tokens(self, request: "Request", num_computed_tokens: int) -> int | None:
+         prompt_token_len = len(request.prompt_token_ids)
+-        token_len = (
+-            self._floor_to_cache_transfer_granularity(prompt_token_len)
+-            if self._discard_partial_chunks
+-            else prompt_token_len
+-        )
++        if len(self.cacheable_group_ids) != len(self.original_block_size):
++            # Private compressor state is rebuilt from a whole token page.
++            token_len = self._floor_to_cache_transfer_granularity(max(prompt_token_len - 1, 0))
++        else:
++            token_len = (
++                self._floor_to_cache_transfer_granularity(prompt_token_len)
++                if self._discard_partial_chunks
++                else prompt_token_len
++            )
+         if token_len < self.cache_transfer_granularity or num_computed_tokens >= token_len:
+             return None
+         if self.client is None or self.client.closed:
+diff --git a/vllm_ascend/models/qwen4_exp/ple.py b/vllm_ascend/models/qwen4_exp/ple.py
+index 87cecfc35..5bb1fffb6 100644
+--- a/vllm_ascend/models/qwen4_exp/ple.py
++++ b/vllm_ascend/models/qwen4_exp/ple.py
+@@ -26,6 +26,8 @@ import torch_npu
+ from vllm.logger import logger
+ from vllm.v1.attention.backends.utils import NULL_BLOCK_ID
+ 
++from vllm_ascend.attention.utils import wait_for_kv_layer_from_connector
++
+ 
+ def _get_allow_internal_format() -> bool:
+     raw_value = torch_npu._C._npu_getOption("ALLOW_INTERNAL_FORMAT")
+@@ -211,6 +213,8 @@ def _wrap_ple_short_conv(original: Callable[..., Any]) -> Callable[..., Any]:
+ 
+     @wraps(original)
+     def wrapped(self: Any, *args: Any, **kwargs: Any) -> Any:
++        # PLE runs before attention in the same decoder layer.
++        wait_for_kv_layer_from_connector(self.prefix)
+         previous = _get_allow_internal_format()
+         _set_allow_internal_format(False)
+         try:
+diff --git a/vllm_ascend/models/qwen4_exp/qsa.py b/vllm_ascend/models/qwen4_exp/qsa.py
+index ea9bd5c50..165c7c86f 100644
+--- a/vllm_ascend/models/qwen4_exp/qsa.py
++++ b/vllm_ascend/models/qwen4_exp/qsa.py
+@@ -39,6 +39,11 @@ from vllm.utils.torch_utils import (
+ from vllm.v1.kv_cache_interface import AttentionSpec
+ from vllm.v1.kv_cache_layout import KVCacheLayout
+ 
++from vllm_ascend.attention.utils import (
++    maybe_save_kv_layer_to_connector,
++    wait_for_kv_layer_from_connector,
++)
++from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.attention_fence import attention_transfer_window
+ from vllm_ascend.ops.triton.linearnorm import qsa_rmsnorm_mrope as _qsa_rmsnorm_mrope  # noqa: F401
+ from vllm_ascend.ops.triton.qwen4_exp.qsa import (
+     qsa_compress_groups_with_ratio as qsa_compress_groups_with_ratio_fused,
+@@ -537,6 +542,8 @@ class AscendQwen4ExpQSAAttention(upstream_qsa.Qwen4ExpQSAAttention):
+         if not _qsa_cache_is_bound(self.kv_cache):
+             raise RuntimeError("QSA main K/V cache is not bound")
+         num_tokens = main_metadata.num_actual_tokens
++        # Restore main KV and indexer groups before either cache is updated.
++        wait_for_kv_layer_from_connector(self.layer_name)
+         side_metadata = metadata[self.indexer.raw_key_cache.prefix]
+         if side_metadata.num_actual_tokens != num_tokens:
+             raise RuntimeError("QSA main and side metadata token counts disagree")
+@@ -571,18 +578,20 @@ class AscendQwen4ExpQSAAttention(upstream_qsa.Qwen4ExpQSAAttention):
+             self.kv_cache,
+             main_metadata.slot_mapping,
+         )
+-        self.impl.forward_qsa(
+-            self,
+-            query,
+-            key,
+-            value,
+-            self.kv_cache,
+-            main_metadata,
+-            output,
+-            token_to_req=side_metadata.token_to_req,
+-            logical_positions=side_metadata.logical_positions,
+-            seq_lens=side_metadata.seq_lens,
+-        )
++        with attention_transfer_window():
++            self.impl.forward_qsa(
++                self,
++                query,
++                key,
++                value,
++                self.kv_cache,
++                main_metadata,
++                output,
++                token_to_req=side_metadata.token_to_req,
++                logical_positions=side_metadata.logical_positions,
++                seq_lens=side_metadata.seq_lens,
++            )
++        maybe_save_kv_layer_to_connector(self.layer_name, list(self.kv_cache))
+ 
+ 
+ __all__ = ["AscendQSAIndexer", "AscendQwen4ExpQSAAttention"]
+diff --git a/vllm_ascend/worker/v2/kv_connector.py b/vllm_ascend/worker/v2/kv_connector.py
+index 5c25fa39e..3f0a00106 100644
+--- a/vllm_ascend/worker/v2/kv_connector.py
++++ b/vllm_ascend/worker/v2/kv_connector.py
+@@ -29,6 +29,9 @@ class MambaCopyKVConnector(KVConnector):
+     def finish_forward(self) -> None:
+         self._connector.finish_forward()
+ 
++    def finalize_step(self) -> None:
++        self._connector.finalize_step()
++
+     def post_forward(self, finished_req_ids: set[str], *args: Any, **kwargs: Any) -> "KVConnectorOutput | None":
+         return self._connector.post_forward(finished_req_ids, *args, **kwargs)
+ 
+diff --git a/vllm_ascend/worker/v2/model_states/mamba_hybrid.py b/vllm_ascend/worker/v2/model_states/mamba_hybrid.py
+index 039f7524d..3582f7754 100644
+--- a/vllm_ascend/worker/v2/model_states/mamba_hybrid.py
++++ b/vllm_ascend/worker/v2/model_states/mamba_hybrid.py
+@@ -102,12 +102,14 @@ class AscendMambaHybridModelState(MambaHybridModelState, AscendModelState):
+         ``initialize_from_forward_context``)."""
+         if self._layer_state_ranges is None:
+             assert self._mamba_spec is not None
+-            num_state_types = len(self.model.get_mamba_state_copy_func())
+             ranges: dict[str, tuple[int, int]] = {}
+             idx = 0
+             for mamba_group_id in self._mamba_group_ids:
+-                layer_names = kv_cache_config.kv_cache_groups[mamba_group_id].layer_names
+-                for layer_name in layer_names:
++                group = kv_cache_config.kv_cache_groups[mamba_group_id]
++                for layer_name in group.layer_names:
++                    # Match the per-type rows populated by the existing copy context.
++                    spec = mamba_utils._get_mamba_spec_for_layer(group, layer_name)
++                    num_state_types = len(self._mamba_state_copy_funcs[spec.mamba_type])
+                     ranges[layer_name] = (idx, idx + num_state_types)
+                     idx += num_state_types
+             self._layer_state_ranges = ranges

@@ -1,0 +1,298 @@
+commit 2f285ddccee3282da5b07a91c97160e1934203f9
+Author:     NTS <sxh139726845@163.com>
+AuthorDate: Fri Oct 30 21:02:04 2026 +0800
+Commit:     GitHub <noreply@github.com>
+CommitDate: Fri Oct 30 21:02:04 2026 +0800
+
+    [BugFix] Preserve GLM shared slots with layerwise KV transfer (#19880)
+    
+    ### What this PR does / why we need it?
+    
+    Fix GLM-5.3-Flash Model Runner V2 initialization with Memcache
+    `use_layerwise: true`. GLM's planner already overlays MLA/KDA and
+    indexer/tail caches across scheduler groups, but the generic V2
+    allocation loop mistakes their zero-stride descriptors for cross-layer
+    scratch aliases and raises `Layerwise V2 KV aliases require identical
+    cache specs.`
+    
+    Allocate GLM-Next descriptors in a dedicated path before generic
+    hybrid/scratch dispatch. Validate descriptor geometry and layer
+    coverage, allocate one aligned backing per physical slot, map its
+    members to that backing, and return. This follows the review suggestion
+    and removes the two GLM exemptions from the generic path. Existing
+    reshape code builds the per-spec views; other models retain scratch-spec
+    validation, and actual Mamba cross-layer scratch reuse remains
+    unsupported. The change affects initialization only.
+    
+    Duplicate-work check: searched open PRs for GLM/layerwise, the exception
+    text, MRV2, and alias keywords, and inspected the related diffs. #16858
+    and #16946 address Memcache transfer lifecycle, #18172 addresses GLM
+    PP/MTP allocation, and #19494 addresses the shared-pool capacity budget;
+    none contains this scratch-alias classification fix.
+    
+    ### Does this PR introduce _any_ user-facing change?
+    
+    N/A.
+    
+    ### How was this patch tested?
+    
+    Enable kvpool with layerwise, startup succeed:
+    
+    vllm serve /mnt/weight/GLM-5.3-Flash-W8A8-1010-V1 \
+      --served-model-name glm \
+      --host 0.0.0.0 \
+      --port 18100 \
+      --distributed-executor-backend mp \
+      --data-parallel-size 2 \
+      --data-parallel-size-local 2 \
+      --data-parallel-backend mp \
+      --tensor-parallel-size 8 \
+      --enable-expert-parallel \
+      --seed 1024 \
+      --safetensors-load-strategy prefetch \
+      --max-model-len 1048576 \
+      --max-num-seqs 64 \
+      --max-num-batched-tokens 4096 \
+      --trust-remote-code \
+      --quantization ascend \
+      --kv-cache-dtype int8 \
+      --limit-mm-per-prompt '{"image":7,"video":0}' \
+      --gpu-memory-utilization 0.92 \
+      --enforce-eager \
+      --enable-prefix-caching \
+      --enable-chunked-prefill \
+      --tool-call-parser glm47 \
+      --reasoning-parser glm45 \
+      --enable-auto-tool-choice \
+      --speculative-config '{
+        "num_speculative_tokens": 3,
+        "method": "deepseek_mtp",
+        "enforce_eager": true
+      }' \
+      --additional-config '{
+        "enable_flashcomm1": true,
+        "enable_prefill_mc2": true,
+        "enable_fused_mc2": 0,
+        "enable_shared_expert_dp": true,
+        "multistream_overlap_shared_expert": true
+      }' \
+      --kv-transfer-config '{
+        "kv_connector": "AscendStoreConnector",
+        "kv_role": "kv_both",
+        "kv_connector_extra_config": {
+          "backend": "memcache",
+          "lookup_rpc_port": "18700",
+          "use_layerwise": true
+        }
+      }'
+    
+    and passed the inference accuracy test.
+    
+    <img width="1122" height="94" alt="image"
+    src="https://github.com/user-attachments/assets/df60b9fd-9d9c-4df2-8a40-29ca8cef4aa2"
+    />
+    
+    
+    - vLLM main:
+    https://github.com/vllm-project/vllm/commit/544f182d9f0c9bfe8bd7645525951d5e3692a542
+    
+    ---------
+    
+    Signed-off-by: shenxionghao <sxh139726845@163.com>
+    Co-authored-by: sadlavaarsc <sadlavaarsc@users.noreply.github.com>
+    Co-authored-by: Codex <noreply@openai.com>
+
+diff --git a/tests/ut/worker/test_glm5next_pooled_cache.py b/tests/ut/worker/test_glm5next_pooled_cache.py
+index b40ef3028..ca57f447f 100644
+--- a/tests/ut/worker/test_glm5next_pooled_cache.py
++++ b/tests/ut/worker/test_glm5next_pooled_cache.py
+@@ -12,13 +12,16 @@ import torch
+ from vllm.v1.core.single_type_kv_cache_manager import (
+     register_all_kvcache_specs,
+ )
+-from vllm.v1.kv_cache_interface import KVCacheGroupSpec, MambaSpec
++from vllm.v1.kv_cache_interface import KVCacheGroupSpec, MambaSpec, UniformTypeKVCacheSpecs
+ 
+ from vllm_ascend.core.kv_cache_interface import (
+     AscendIndexerKPoolTailSpec,
+     AscendMLAAttentionSpec,
+     requires_padded_page_layout,
+ )
++from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.layerwise.layerwise_cache_layout import (
++    apply_layerwise_kv_cache_plan,
++)
+ from vllm_ascend.models.glm5next.cache_config import (
+     get_glm5_next_kv_cache_config,
+     get_glm5_next_kv_cache_groups,
+@@ -246,6 +249,93 @@ def test_glm5_next_runner_allocates_contiguous_slot_backings():
+     assert mamba_payload_size < descriptors[MAMBA].size
+ 
+ 
++@pytest.fixture(params=[True, False], ids=["glm-marker", "layout-capability"])
++def v2_glm_cache_plan(request, monkeypatch):
++    config, _, plan = _make_plan()
++    if not request.param:
++        for group in plan.kv_cache_groups:
++            spec = group.kv_cache_spec
++            if isinstance(spec, UniformTypeKVCacheSpecs):
++                group.kv_cache_spec = replace(
++                    spec,
++                    kv_cache_specs={
++                        name: replace(layer_spec, model_version=None)
++                        for name, layer_spec in spec.kv_cache_specs.items()
++                    },
++                )
++    config.model_config.get_num_layers = lambda _: 2
++    monkeypatch.setattr(attn_utils, "get_current_vllm_config", lambda: config)
++    monkeypatch.setattr(attn_utils.KVPPConfig, "from_vllm_config", lambda _: SimpleNamespace(size=1))
++    monkeypatch.setattr(attn_utils, "_is_dsv4_model", lambda _: False)
++    monkeypatch.setattr(attn_utils, "enable_sfa", lambda _: False)
++    return config, plan
++
++
++@pytest.mark.parametrize(
++    ("use_layerwise", "independent_layers"),
++    [(None, None), (False, None), (True, None), (True, "all")],
++    ids=["no-transfer", "non-layerwise", "layerwise", "independent"],
++)
++def test_v2_glm_shared_slots_preserve_backings(monkeypatch, v2_glm_cache_plan, use_layerwise, independent_layers):
++    config, plan = v2_glm_cache_plan
++    if use_layerwise is not None:
++        extra_config = {"backend": "memcache", "use_layerwise": use_layerwise}
++        if independent_layers is not None:
++            extra_config["layerwise_independent_layers"] = independent_layers
++        config.kv_transfer_config = SimpleNamespace(
++            kv_connector="AscendStoreConnector", kv_connector_extra_config=extra_config
++        )
++    apply_layerwise_kv_cache_plan(plan, config)
++    allocated_sizes = []
++    allocate = attn_utils._allocate_int8_cache_tensor
++
++    def allocate_slot(size, alignment, device):
++        allocated_sizes.append(size)
++        return allocate(size, alignment, device)
++
++    monkeypatch.setattr(attn_utils, "_allocate_int8_cache_tensor", allocate_slot)
++
++    raw_caches = attn_utils._allocate_kv_cache(plan, {}, torch.device("cpu"))
++
++    assert set(raw_caches) == {MAIN, INDEXER, STATE, MAMBA}
++    assert raw_caches[MAIN] is raw_caches[MAMBA]
++    assert raw_caches[INDEXER] is raw_caches[STATE]
++    assert raw_caches[MAIN] is not raw_caches[INDEXER]
++    assert allocated_sizes == [descriptor.size for descriptor in plan.kv_cache_tensors]
++    for descriptor in plan.kv_cache_tensors:
++        backing = raw_caches[descriptor.layers[0]]
++        assert backing.numel() == descriptor.size
++        if use_layerwise is not None:
++            assert backing.data_ptr() % (2 * 1024 * 1024) == 0
++
++
++@pytest.mark.parametrize(
++    "descriptor_changes",
++    [
++        {"offset": 1},
++        {"layer_stride": 1},
++        {"block_stride": 0},
++        {"size": 1},
++        {"layers": []},
++        {"block_stride": 1, "size": 3},
++    ],
++)
++def test_v2_glm_shared_slots_reject_invalid_geometry(v2_glm_cache_plan, descriptor_changes):
++    _, plan = v2_glm_cache_plan
++    plan.kv_cache_tensors[0] = replace(plan.kv_cache_tensors[0], **descriptor_changes)
++
++    with pytest.raises(ValueError, match="Invalid padded shared-slot KV cache descriptor geometry"):
++        attn_utils._allocate_kv_cache(plan, {}, torch.device("cpu"))
++
++
++def test_v2_glm_shared_slots_reject_missing_layers(v2_glm_cache_plan):
++    _, plan = v2_glm_cache_plan
++    plan.kv_cache_tensors.pop()
++
++    with pytest.raises(ValueError, match="Padded shared-slot KV cache descriptors must cover every cache spec"):
++        attn_utils._allocate_kv_cache(plan, {}, torch.device("cpu"))
++
++
+ def test_glm5_next_runner_splits_main_mla_components_within_each_page():
+     config, _, plan = _make_plan(main_head_size=6)
+     runner = _make_runner(config, main_cache_dims=(4, 2))
+@@ -337,9 +427,8 @@ def test_padded_page_layout_detected_for_shared_state_pages():
+     assert requires_padded_page_layout(layer_specs.values())
+ 
+ 
+-def test_padded_page_layout_rejected_without_tail_caches():
+-    # A standalone MTP runner has the same attention specs but no recurrent
+-    # state caches, so no state view needs the padded page stride.
++def test_padded_page_layout_rejected_without_mamba_states():
++    # Attention-only plans have no recurrent state pages to pad.
+     specs = {name: spec for name, spec in _make_specs().items() if not isinstance(spec, MambaSpec)}
+     assert not requires_padded_page_layout(specs.values())
+ 
+diff --git a/vllm_ascend/worker/v2/attn_utils.py b/vllm_ascend/worker/v2/attn_utils.py
+index 86128b54f..c148ad5da 100644
+--- a/vllm_ascend/worker/v2/attn_utils.py
++++ b/vllm_ascend/worker/v2/attn_utils.py
+@@ -85,6 +85,7 @@ from vllm_ascend.core.kv_cache_interface import (
+     AscendSlidingWindowMLASpec,
+     get_kv_cache_compression_ratio,
+     get_storage_block_size,
++    requires_padded_page_layout,
+     supports_component_major_mla_pd,
+ )
+ from vllm_ascend.device.hardware_profile import HardwareCapability, get_current_hardware_profile
+@@ -1167,6 +1168,36 @@ def _allocate_kv_cache(
+             for name in get_kv_cache_tensor_layers(allocation):
+                 kv_cache_raw_tensors[name] = backing
+         return kv_cache_raw_tensors
++    uses_padded_page_layout = requires_padded_page_layout(layer_kv_cache_spec.values())
++    has_shared_slot_descriptors = any(descriptor.layer_stride == 0 for descriptor in kv_cache_config.kv_cache_tensors)
++    # GLM-Next emits one descriptor for each physical cache slot. Layers
++    # listed by a descriptor deliberately alias that slot even when they
++    # belong to different scheduler groups (for example MLA and Mamba, or
++    # the compressed indexer and its state cache). This differs from the
++    # generic main layout, which treats descriptor layers as independent
++    # regions within one common backing.
++    if uses_padded_page_layout and has_shared_slot_descriptors:
++        slot_layers: set[str] = set()
++        for descriptor in kv_cache_config.kv_cache_tensors:
++            names = get_kv_cache_tensor_layers(descriptor)
++            if (
++                not names
++                or descriptor.offset != 0
++                or descriptor.layer_stride != 0
++                or descriptor.block_stride <= 0
++                or descriptor.size != kv_cache_config.num_blocks * descriptor.block_stride
++                or any(layer_kv_cache_spec[name].page_size_bytes != descriptor.block_stride for name in names)
++            ):
++                raise ValueError("Invalid padded shared-slot KV cache descriptor geometry.")
++            slot_layers.update(names)
++        if layer_kv_cache_spec.keys() != (slot_layers | shared_layers.keys()):
++            raise ValueError("Padded shared-slot KV cache descriptors must cover every cache spec.")
++
++        for descriptor in kv_cache_config.kv_cache_tensors:
++            backing = _allocate_int8_cache_tensor(descriptor.size, alignment, device)
++            for name in get_kv_cache_tensor_layers(descriptor):
++                kv_cache_raw_tensors[name] = backing
++        return kv_cache_raw_tensors
+     has_mamba = any(isinstance(spec, MambaSpec) for spec in layer_kv_cache_spec.values())
+     has_attention = any(isinstance(spec, AttentionSpec) for spec in layer_kv_cache_spec.values())
+     use_hybrid_layout = has_mamba and has_attention
+@@ -1175,7 +1206,6 @@ def _allocate_kv_cache(
+     # below rather than being fixed here.
+     text_config = getattr(getattr(vllm_config, "model_config", None), "hf_text_config", None)
+     is_step_model = getattr(text_config, "model_type", None) in ("step3p5", "step3p7")
+-    is_glm5_next = any(getattr(spec, "model_version", None) == "glm5_next" for spec in layer_kv_cache_spec.values())
+ 
+     # Qwen4 QSA hybrids (Qwen3.8 Flash Next): use the model-owned planner and
+     # build the layout from the cache groups themselves. Allocate
+@@ -1256,7 +1286,7 @@ def _allocate_kv_cache(
+     # full cache pool and can OOM before the second tensor is initialized.
+     hybrid_backing: torch.Tensor | None = None
+     step_backing: torch.Tensor | None = None
+-    if use_hybrid_layout and not is_dsv4_model and not is_glm5_next:
++    if use_hybrid_layout and not is_dsv4_model:
+         tensor_sizes = {tensor.size for tensor in kv_cache_config.kv_cache_tensors}
+         if len(tensor_sizes) != 1:
+             raise ValueError("Hybrid KV cache tensors must share one backing allocation.")

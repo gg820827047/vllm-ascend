@@ -1,0 +1,528 @@
+commit 3c6d01695de5c70c012cde449ec60bf138738af0
+Author:     Linfeng Yu <yulinfeng2@huawei.com>
+AuthorDate: Tue Oct 27 09:23:01 2026 +0800
+Commit:     GitHub <noreply@github.com>
+CommitDate: Tue Oct 27 09:23:01 2026 +0800
+
+    [Feature][MRV2][Spec Decode] Support MultiModuleMTPSpeculator for Ascend  (#19296)
+    
+    ### What this PR does / why we need it?
+    
+    Add MultiModuleMTPSpeculator support in Ascend for multi kv cache groups
+    mtp, such as step3.7 and step5. followed
+    https://github.com/vllm-project/vllm/pull/48892 adapted by me
+    
+    ### Does this PR introduce _any_ user-facing change?
+    
+    No.
+    
+    ### How was this patch tested?
+    
+    step3.7 in v1:
+    input_len=65536, output_len=4096, bs=64: avg ITL=104.8ms, avg
+    TPOT=28.1ms
+    aime26: 93.33%
+    
+    step3.7 in v2:
+    input_len=65536, output_len=4096, bs=64: avg ITL=101.7ms, avg
+    TPOT=27.2ms
+    aime26: 96.67%
+    
+    ---
+    
+    ### Checklist
+    
+    #### Testing
+    
+    - [x] **Boundary / edge-case coverage**: I reviewed whether this change
+    involves
+    boundary conditions (e.g. empty input, single/zero element, min/max
+    values,
+    off-by-one, sequence-length limits, integer overflow). Where applicable,
+    I
+    added unit tests covering these edge cases in `tests/ut/` or
+    `tests/e2e/`.
+    - [x] **Regression test**: If this PR fixes a bug, I added a regression
+    test
+      that would fail without the fix.
+    - [x] **Error / failure path coverage**: I covered abnormal paths
+    (exceptions,
+    timeouts, out-of-range, division by zero) in addition to the happy path.
+    - [x] **Meaningful & reliable tests**: New tests assert real behavior
+    and are
+      not written merely to satisfy CI.
+    - [x] **Performance impact**: If this PR touches a performance-sensitive
+    path,
+      I attached benchmark results and added performance regression tests.
+    
+    
+    - vLLM main:
+    https://github.com/vllm-project/vllm/commit/c0b6f74bee518aeaf5d72b200a0216e72fbb5e7c
+    
+    ---------
+    
+    Signed-off-by: earthmanylf <yulinfeng2@huawei.com>
+
+diff --git a/tests/ut/spec_decode/test_multi_module_mtp_speculator.py b/tests/ut/spec_decode/test_multi_module_mtp_speculator.py
+new file mode 100644
+index 000000000..946bf853d
+--- /dev/null
++++ b/tests/ut/spec_decode/test_multi_module_mtp_speculator.py
+@@ -0,0 +1,132 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM Ascend project
++
++from contextlib import nullcontext
++from types import SimpleNamespace
++from unittest.mock import MagicMock, patch
++
++import numpy as np
++import pytest
++import torch
++from vllm.config.compilation import CUDAGraphMode
++from vllm.v1.worker.gpu.cudagraph_utils import BatchExecutionDescriptor
++from vllm.v1.worker.gpu.spec_decode.multi_module_mtp.speculator import (
++    MultiModuleMTPSpeculator,
++)
++
++from vllm_ascend.attention.attention_v1 import AscendAttentionState
++from vllm_ascend.worker.v2.input_batch import AscendInputBatch
++from vllm_ascend.worker.v2.spec_decode.multi_module_mtp import speculator as speculator_module
++from vllm_ascend.worker.v2.spec_decode.multi_module_mtp.speculator import (
++    AscendMultiModuleMTPSpeculator,
++)
++
++
++def _make_speculator(**attrs):
++    """Build a speculator without running the heavy upstream __init__."""
++    speculator = AscendMultiModuleMTPSpeculator.__new__(AscendMultiModuleMTPSpeculator)
++    for name, value in attrs.items():
++        setattr(speculator, name, value)
++    return speculator
++
++
++def test_build_draft_attn_metadatas_rebuilds_from_current_batch():
++    """The replay hook rebuilds the draft metadata from the cached batch
++    (DFlash/DSpark pattern) instead of reusing a cached one."""
++    query_start_loc_np = np.array([0, 4, 8, 12, 16], dtype=np.int32)
++    seq_lens_cpu_upper_bound = torch.arange(8, dtype=torch.int32)
++    input_batch = SimpleNamespace(
++        num_reqs=3,
++        query_start_loc_np=query_start_loc_np,
++        seq_lens_cpu_upper_bound=seq_lens_cpu_upper_bound,
++    )
++    speculator = _make_speculator(
++        input_batch=input_batch,
++        draft_attn_layer_names={"model.layers.45", "model.layers.46"},
++    )
++    built_metadata = {
++        "model.layers.45": "m45",
++        "model.layers.46": "m46",
++        "model.layers.0": "target-only",
++    }
++
++    with (
++        patch.object(
++            AscendMultiModuleMTPSpeculator,
++            "_build_attn_metadata",
++            return_value=built_metadata,
++        ) as mock_build,
++        patch.object(speculator_module, "build_attn_metadata_wrapper", return_value=nullcontext()) as mock_wrapper,
++    ):
++        result = speculator.build_draft_attn_metadatas(
++            num_reqs_padded=4, num_tokens_padded=16, is_draft_model_prefill=False
++        )
++
++    assert result == [{"model.layers.45": "m45", "model.layers.46": "m46"}]
++    kwargs = mock_build.call_args.kwargs
++    assert kwargs["num_reqs"] == 3
++    assert kwargs["step"] == 0
++    assert kwargs["query_start_loc_np"] is query_start_loc_np
++    assert kwargs["seq_lens_cpu_upper_bound"] is seq_lens_cpu_upper_bound
++    batch_desc = kwargs["batch_desc"]
++    assert isinstance(batch_desc, BatchExecutionDescriptor)
++    assert batch_desc.cg_mode == CUDAGraphMode.FULL
++    assert batch_desc.num_tokens == 16
++    assert batch_desc.num_reqs == 4
++    mock_wrapper.assert_called_once()
++    # The propose-built metadata is no longer cached on the instance.
++    assert not hasattr(speculator, "_draft_attn_metadata")
++
++
++def test_build_draft_attn_metadatas_requires_input_batch():
++    """Replay without a cached batch fails loudly instead of building garbage."""
++    speculator = _make_speculator(input_batch=None, draft_attn_layer_names=set())
++
++    with pytest.raises(AssertionError):
++        speculator.build_draft_attn_metadatas(num_reqs_padded=4, num_tokens_padded=16, is_draft_model_prefill=False)
++
++
++@pytest.mark.parametrize(
++    "any_prefilling,expected_state",
++    [
++        (True, AscendAttentionState.ChunkedPrefill),
++        (False, AscendAttentionState.DecodeOnly),
++    ],
++)
++def test_build_attn_metadata_selects_state_by_prefill(any_prefilling, expected_state):
++    """Prefill-shaped windows build as ChunkedPrefill, decode as DecodeOnly."""
++    is_prefilling_np = np.zeros(4, dtype=bool)
++    is_prefilling_np[0] = any_prefilling
++    input_batch = MagicMock(spec=AscendInputBatch)
++    input_batch.is_prefilling_np = is_prefilling_np
++    positions = torch.zeros(4)
++    speculator = _make_speculator(
++        input_batch=input_batch,
++        input_buffers=SimpleNamespace(positions=positions),
++        vllm_config=SimpleNamespace(parallel_config=object()),
++    )
++    batch_desc = SimpleNamespace(num_tokens=16)
++    query_start_loc_np = np.array([0, 4, 8], dtype=np.int32)
++    seq_lens_cpu_upper_bound = torch.arange(8, dtype=torch.int32)
++
++    with (
++        patch.object(speculator_module, "build_attn_metadata_factory", return_value=nullcontext()) as mock_factory,
++        patch.object(
++            MultiModuleMTPSpeculator, "_build_attn_metadata", return_value={"layer": "metadata"}
++        ) as mock_parent,
++    ):
++        result = speculator._build_attn_metadata(2, batch_desc, query_start_loc_np, seq_lens_cpu_upper_bound, 0)
++
++    assert result is mock_parent.return_value
++    # The Ascend factory receives the prefill flags, the exact per-request
++    # CPU lengths and the selected attention state.
++    factory_args, factory_kwargs = mock_factory.call_args
++    assert factory_args[0] is positions
++    assert factory_args[1] == 16
++    torch.testing.assert_close(factory_args[2], torch.from_numpy(is_prefilling_np))
++    torch.testing.assert_close(factory_kwargs["seq_lens_cpu"], seq_lens_cpu_upper_bound[:2])
++    assert factory_kwargs["attn_state"] == expected_state
++    # All builder arguments pass through to the upstream implementation.
++    mock_parent.assert_called_once_with(
++        2, batch_desc, query_start_loc_np, seq_lens_cpu_upper_bound, 0, True, None, None
++    )
+diff --git a/tests/ut/worker/v2/test_spec_decode.py b/tests/ut/worker/v2/test_spec_decode.py
+index 04b42165d..7ad51dca9 100644
+--- a/tests/ut/worker/v2/test_spec_decode.py
++++ b/tests/ut/worker/v2/test_spec_decode.py
+@@ -52,6 +52,7 @@ def _make_config(
+         uses_draft_model=MagicMock(return_value=False),
+         use_gemma4_mtp=MagicMock(return_value=use_gemma4_mtp),
+         use_step3p5_mtp=MagicMock(return_value=use_step3p5_mtp),
++        use_multi_module_mtp=MagicMock(return_value=False),
+         draft_model_config=SimpleNamespace(architectures=architectures or []),
+     )
+     return SimpleNamespace(speculative_config=speculative_config)
+diff --git a/vllm_ascend/worker/v2/spec_decode/__init__.py b/vllm_ascend/worker/v2/spec_decode/__init__.py
+index d59024c7f..854bd3764 100644
+--- a/vllm_ascend/worker/v2/spec_decode/__init__.py
++++ b/vllm_ascend/worker/v2/spec_decode/__init__.py
+@@ -73,6 +73,10 @@ def init_speculator(
+         )
+ 
+         return AscendMTPSpeculator(vllm_config, device)
++    if speculative_config.use_multi_module_mtp():
++        from vllm_ascend.worker.v2.spec_decode.multi_module_mtp.speculator import AscendMultiModuleMTPSpeculator
++
++        return AscendMultiModuleMTPSpeculator(vllm_config, device)
+     if speculative_config.use_eagle():
+         from vllm_ascend.worker.v2.spec_decode.eagle.speculator import AscendEagleSpeculator
+ 
+diff --git a/vllm_ascend/worker/v2/spec_decode/multi_module_mtp/__init__.py b/vllm_ascend/worker/v2/spec_decode/multi_module_mtp/__init__.py
+new file mode 100644
+index 000000000..e12f4db9c
+--- /dev/null
++++ b/vllm_ascend/worker/v2/spec_decode/multi_module_mtp/__init__.py
+@@ -0,0 +1,16 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Ascend project
++#
++# Licensed under the Apache License, Version 2.0 (the "License");
++# you may not use this file except in compliance with the License.
++# You may obtain a copy of the License at
++#
++#     http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS,
++# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++# See the License for the specific language governing permissions and
++# limitations under the License.
++# This file is a part of the vllm-ascend project.
++#
+diff --git a/vllm_ascend/worker/v2/spec_decode/multi_module_mtp/speculator.py b/vllm_ascend/worker/v2/spec_decode/multi_module_mtp/speculator.py
+new file mode 100644
+index 000000000..ef7bdd617
+--- /dev/null
++++ b/vllm_ascend/worker/v2/spec_decode/multi_module_mtp/speculator.py
+@@ -0,0 +1,270 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Ascend project
++#
++# Licensed under the Apache License, Version 2.0 (the "License");
++# you may not use this file except in compliance with the License.
++# You may obtain a copy of the License at
++#
++#     http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS,
++# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++# See the License for the specific language governing permissions and
++# limitations under the License.
++# This file is a part of the vllm-ascend project.
++#
++import torch
++from vllm.config import VllmConfig, replace
++from vllm.config.compilation import CUDAGraphMode
++from vllm.model_executor.models.utils import get_draft_quant_config
++from vllm.v1.worker.gpu.cudagraph_utils import BatchExecutionDescriptor
++from vllm.v1.worker.gpu.input_batch import InputBatch
++from vllm.v1.worker.gpu.spec_decode.eagle.utils import load_eagle_model
++from vllm.v1.worker.gpu.spec_decode.multi_module_mtp.speculator import (
++    MultiModuleMTPSpeculator,
++)
++
++from vllm_ascend.attention.attention_v1 import AscendAttentionState
++from vllm_ascend.utils import vllm_version_is
++from vllm_ascend.worker.v2.aclgraph_utils import _get_graph_update_backend
++from vllm_ascend.worker.v2.attn_utils import (
++    build_attn_metadata_factory,
++    build_attn_metadata_wrapper,
++)
++from vllm_ascend.worker.v2.input_batch import AscendInputBatch, AscendInputBuffers
++from vllm_ascend.worker.v2.spec_decode.autoregressive.aclgraph import (
++    AutoRegressiveAclGraphManager,
++)
++from vllm_ascend.worker.v2.spec_decode.autoregressive.speculator import (
++    torch_gather_wrapper,
++)
++
++
++class AscendMultiModuleMTPSpeculator(MultiModuleMTPSpeculator):
++    """Ascend multi-module MTP speculator.
++
++    The whole draft loop (input rolling, per-module forward, sampling) is
++    inherited from the upstream GPU implementation, including its Triton
++    kernels (executed by triton-ascend). Ascend replaces the attention
++    metadata construction and the CUDA-graph manager (ACL FULL graphs with
++    UpdatableGraph attention-parameter updates on replay).
++    """
++
++    def __init__(self, vllm_config: VllmConfig, device: torch.device):
++        super().__init__(vllm_config, device)
++
++        self.input_batch: InputBatch | None = None
++        del self.input_buffers
++        self.input_buffers: AscendInputBuffers = AscendInputBuffers(
++            max_num_reqs=self.max_num_reqs,
++            max_num_tokens=self.max_num_tokens,
++            device=device,
++        )
++        self.update_stream = None
++
++    def _fixup_draft_model_config(self) -> None:
++        # Transformers validates Step3.5 layer_types against num_hidden_layers
++        # and may leave only the base-layer entries. The MTP draft model builds
++        # layers at num_hidden_layers + k, so make the draft config cover those
++        # layer indices before the model is constructed. This can be removed when
++        # v0.33.0 is supported.
++        hf_config = self.draft_model_config.hf_config
++        layer_types = getattr(hf_config, "layer_types", None)
++        num_hidden_layers = getattr(hf_config, "num_hidden_layers", None)
++        num_mtp_layers = getattr(hf_config, "num_nextn_predict_layers", 0)
++        if layer_types is not None and num_hidden_layers is not None and num_mtp_layers:
++            needed = num_hidden_layers + num_mtp_layers
++            if len(layer_types) < needed:
++                extension = ["sliding_attention"] * (needed - len(layer_types))
++                hf_config.layer_types = list(layer_types) + extension
++                target_hf_config = self.vllm_config.model_config.hf_config
++                target_layer_types = getattr(target_hf_config, "layer_types", None)
++                if target_layer_types is not None and len(target_layer_types) < needed:
++                    target_hf_config.layer_types = list(target_layer_types) + extension
++
++    def load_model(self, target_model: torch.nn.Module) -> None:
++        self._fixup_draft_model_config()
++        super().load_model(target_model)
++
++    def _create_draft_vllm_config(self) -> VllmConfig:
++        parallel_config = replace(
++            self.vllm_config.parallel_config,
++            pipeline_parallel_size=1,
++        )
++        draft_vllm_config = replace(
++            self.vllm_config,
++            parallel_config=parallel_config,
++            model_config=self.draft_model_config,
++            quant_config=get_draft_quant_config(self.vllm_config),
++        )
++        return draft_vllm_config
++
++    def load_draft_model(
++        self,
++        target_model: torch.nn.Module,
++        target_attn_layer_names: set[str],
++    ) -> torch.nn.Module:
++        # Step3p5MTP set has_own_lm_head to True in v0.32.0, so here we
++        # add keep_own_heads to make sure that each layer's share_head stays independent.
++        # When v0.32.0 is supported, this can be removed.
++        self.draft_vllm_config = self._create_draft_vllm_config()
++        keep_own_heads = getattr(self.draft_model_config.hf_config, "model_type", "") == "step3p5_mtp"
++        if keep_own_heads and vllm_version_is("0.31.0"):
++            import vllm.v1.worker.gpu.spec_decode.eagle.utils as _eagle_utils
++
++            _orig_should_share = _eagle_utils._should_share
++
++            def _keep_checkpoint_mtp_heads(eagle, flag, draft, target):
++                if flag == "has_own_lm_head":
++                    return False
++                return _orig_should_share(eagle, flag, draft, target)
++
++            _eagle_utils._should_share = _keep_checkpoint_mtp_heads
++        return load_eagle_model(target_model, self.draft_vllm_config)
++
++    def init_cudagraph_manager(self, cudagraph_mode: CUDAGraphMode) -> None:
++        # Mirror the upstream mode selection: piecewise is unsupported for
++        # the multi-module loop.
++        if self.speculative_config.enforce_eager:
++            cudagraph_mode = CUDAGraphMode.NONE
++        if cudagraph_mode.has_piecewise_cudagraphs():
++            cudagraph_mode = (
++                CUDAGraphMode.FULL_DECODE_ONLY if cudagraph_mode.has_full_cudagraphs() else CUDAGraphMode.NONE
++            )
++        self.cudagraph_manager = AutoRegressiveAclGraphManager(
++            self.vllm_config,
++            self.device,
++            cudagraph_mode,
++            self.num_speculative_steps + 1,
++        )
++        # The Ascend manager needs this speculator to rebuild draft metadata
++        # and FIA graph-update params on replay (mirrors
++        # AscendAutoRegressiveSpeculator.init_cudagraph_manager).
++        self.cudagraph_manager.speculator = self
++        self.cudagraph_manager.update_stream = self.update_stream
++        # Backend class used to select the replay parameter-update path.
++        self.attn_backend = _get_graph_update_backend(self.attn_groups)
++
++    def capture(self) -> None:
++        assert self.cudagraph_manager is not None
++        if not self.cudagraph_manager.needs_capture():
++            return
++        # Reset indices to zeros to prevent stale values from prior dummy
++        # runs from causing out-of-bounds indexing during capture.
++        self.last_token_indices.zero_()
++        if self.cudagraph_manager.use_breakable_cg:
++            self.cudagraph_manager.init_breakable_cg_runner(self.model)
++        self.cudagraph_manager.capture(
++            self._generate_drafts,
++            self.model_state,
++            self.input_buffers,
++            self.block_tables,
++            self.attn_groups,
++            self.kv_cache_config,
++            progress_bar_desc="Capturing multi-module MTP ACL graphs",
++        )
++
++    def propose(self, input_batch: InputBatch, *args, **kwargs):
++        self.input_batch = input_batch
++        with (
++            build_attn_metadata_wrapper(),
++            torch_gather_wrapper(),
++        ):
++            return super().propose(input_batch, *args, **kwargs)
++
++    def build_draft_attn_metadatas(
++        self,
++        num_reqs_padded: int,
++        num_tokens_padded: int,
++        is_draft_model_prefill: bool,
++    ) -> list[dict]:
++        """Replay hook for AutoRegressiveAclGraphManager.run_fullgraph.
++
++        The multi-module draft loop shares a single attention metadata
++        across all module forwards (upstream contract: one metadata built at
++        step 0), so the metadata propose() just built for the dispatched
++        padded batch covers the whole graph -- no per-step copies needed.
++        """
++        assert self.input_batch is not None
++        batch_desc = BatchExecutionDescriptor(
++            cg_mode=CUDAGraphMode.FULL,
++            num_tokens=num_tokens_padded,
++            num_reqs=num_reqs_padded,
++        )
++        with build_attn_metadata_wrapper():
++            attn_metadata = self._build_attn_metadata(
++                num_reqs=self.input_batch.num_reqs,
++                batch_desc=batch_desc,
++                query_start_loc_np=self.input_batch.query_start_loc_np,
++                seq_lens_cpu_upper_bound=self.input_batch.seq_lens_cpu_upper_bound,
++                step=0,
++            )
++        assert attn_metadata is not None
++        return [{name: metadata for name, metadata in attn_metadata.items() if name in self.draft_attn_layer_names}]
++
++    def build_fia_params(
++        self,
++        num_reqs_padded: int,
++        draft_attn_metadata: dict,
++        is_draft_model_prefill: bool,
++    ) -> list[dict]:
++        """Per-layer FIA parameters for the UpdatableGraph task update.
++
++        Every attention task registered at capture time matches its update
++        parameters by layer name and requires exactly one entry (see
++        UpdatableGraph.resolve_tasks), so emit one entry per draft attention
++        layer. All layers share the same batch-level values because the
++        three module forwards reuse one metadata.
++        """
++        fia_params = []
++        for layer_name, metadata in draft_attn_metadata.items():
++            fia_params.append(
++                {
++                    "layer_name": layer_name,
++                    "actual_seq_lengths": metadata.actual_seq_lengths_q,
++                    "actual_seq_lengths_kv": metadata.seq_lens_list,
++                    "block_table": metadata.block_tables,
++                }
++            )
++        return fia_params
++
++    def _build_attn_metadata(
++        self,
++        num_reqs: int,
++        batch_desc,
++        query_start_loc_np,
++        seq_lens_cpu_upper_bound: torch.Tensor,
++        step: int,
++        causal=True,
++        dcp_local_seq_lens=None,
++        slot_mappings=None,
++    ):
++        assert self.input_batch is not None
++        assert isinstance(self.input_batch, AscendInputBatch)
++        is_prefilling = torch.from_numpy(self.input_batch.is_prefilling_np)
++        if bool(is_prefilling[:num_reqs].any()):
++            attn_state = AscendAttentionState.ChunkedPrefill
++        else:
++            attn_state = AscendAttentionState.DecodeOnly
++
++        seq_lens_cpu = seq_lens_cpu_upper_bound[:num_reqs]
++        with build_attn_metadata_factory(
++            self.input_buffers.positions,
++            batch_desc.num_tokens,
++            is_prefilling,
++            seq_lens_cpu=seq_lens_cpu,
++            attn_state=attn_state,
++            parallel_config=self.vllm_config.parallel_config,
++        ):
++            attn_metadata = super()._build_attn_metadata(
++                num_reqs,
++                batch_desc,
++                query_start_loc_np,
++                seq_lens_cpu_upper_bound,
++                step,
++                causal,
++                dcp_local_seq_lens,
++                slot_mappings,
++            )
++        return attn_metadata

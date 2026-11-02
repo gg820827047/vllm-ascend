@@ -1,0 +1,325 @@
+commit d04ca23915093c662b4061c77d0c08a07791d7dc
+Author:     dailiang16 <dailiang0110@yeah.net>
+AuthorDate: Fri Oct 23 09:42:50 2026 +0800
+Commit:     GitHub <noreply@github.com>
+CommitDate: Fri Oct 23 09:42:50 2026 +0800
+
+    [Feature][Ops] Gather RoPE cos/sin rows from the contiguous flat base (#19247)
+    
+    ## Why
+    
+    Every MTP draft step calls `get_cos_and_sin_mla(positions)` to gather
+    RoPE cos/sin rows. On NPU, indexing the **strided per-half views**
+    (`_cos_cache[positions]`, `_sin_cache[positions]`) makes `aclnnIndex`
+    materialize the **entire cache table** on every lookup, while the
+    effective payload is only `bs * rotary_dim * 2` bytes:
+    
+    - 1M-row BF16 cache => ~134 MB written / ~250 MB read per lookup, ~420
+    us each;
+    - with MTP K=5 that is **12 full-cache materializations per decode
+    step** (2 lookups x 6 forwards), ~4.2 ms/step (~5.7% of the step period)
+    on GLM-5.2 DP16 x TP2.
+    
+    (GPU keeps lazy views; the NPU aclnn path does not, so the row gather
+    degenerates into a full-table copy.)
+    
+    ## What
+    
+    Register a contiguous **flat view of the interleaved base table** at
+    registration time (`_cos_sin_flat`, where `_cos_cache[i] == flat[2i]`
+    and `_sin_cache[i] == flat[2i+1]`) and gather rows from it
+    (`flat[positions*2]` / `flat[positions*2+1]`). The flat base is
+    contiguous, so the same row gather is a plain copy (~10 us):
+    
+    - the fast path is **unconditional** — no config switch. The fix is
+    zero-risk (bitwise identical) and benefits every model on the
+    interleaved-registration path (DeepSeek-V3.2 family, GLM, Kimi, ...);
+    - the legacy strided gather remains as the fallback for registrations
+    that do not provide the flat view (the non-interleaved
+    `_record_cos_and_sin_cache` path resets it to `None`);
+    - the flat view shares storage with the registered derived buffers, so
+    the sleep-mode wake restore that rebuilds them in place covers it as
+    well.
+    
+    ## Correctness
+    
+    **Bitwise identical** to the legacy path: same physical storage, same
+    rows, integer-only index arithmetic (`positions * 2` / `+ 1` on int
+    indices), pure byte copy, identical out-of-bounds domain (`2p < 2N ⟺ p <
+    N`). Proven by unit tests (`tests/ut/ops/test_rotary_flat_gather.py`):
+    flat-vs-fallback bitwise equality (duplicates / empty / boundary
+    positions / `use_cache` path), plus registration semantics (storage
+    sharing with the derived buffers, first-wins, non-interleaved override
+    resets the flat view).
+    
+    ## Performance
+    
+    Measured on GLM-5.2 (2x Atlas A3, 32 dies, DP16 x TP2, EP32, MTP K=5):
+    removes **12 full-cache materializations per decode step (~4.2
+    ms/step)**; each lookup becomes ~10 us regardless of cache size,
+    reversing the size sensitivity of the legacy path (whose cost was
+    proportional to the full 1M-row table, independent of batch/context).
+    
+    ## Testing
+    
+    - [x] `py_compile` + structural assertions for touched files
+    - [x] New UT: `tests/ut/ops/test_rotary_flat_gather.py`
+    - [x] NPU server validation (trace assertion:
+    `aclnnIndex_SliceAiCore_Slice` on the rope lookup path 12/step -> 0;
+    draft token sequence bit-identical vs legacy path)
+    
+    Measured on GLM-5.2 (2 x A3, 32 dies, PD disaggregation, DP2 x TP16,
+    EP32, MTP K=5):
+    
+    **The ITL is optimized by ~3.5ms**
+    
+    **NOTE:** This is the first of two PRs splitting #18219 (the two
+    features are file-orthogonal and independently revertable). The sibling
+    PR (multistream MTP metadata overlap) will be submitted separately;
+    #18219 can be closed once both land.
+    
+    - vLLM main:
+    https://github.com/vllm-project/vllm/commit/a98247ab4db686ee03c66d5feb3c761e52a2f8ab
+    
+    ---------
+    
+    Signed-off-by: dailiang16 <dailiang0110@yeah.net>
+    Co-authored-by: liuwj-research <liuwj.2008@tsinghua.org.cn>
+    Co-authored-by: 2luckydog <2981945956@qq.com>
+
+diff --git a/tests/ut/ops/test_rotary_flat_gather.py b/tests/ut/ops/test_rotary_flat_gather.py
+new file mode 100644
+index 000000000..a24ea828d
+--- /dev/null
++++ b/tests/ut/ops/test_rotary_flat_gather.py
+@@ -0,0 +1,136 @@
++#
++# Copyright (c) 2026 Huawei Technologies Co., Ltd. All Rights Reserved.
++# Copyright 2023 The vLLM team.
++#
++# Licensed under the Apache License, Version 2.0 (the "License");
++# you may not use this file except in compliance with the License.
++# You may obtain a copy of the License at
++#
++#     http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS,
++# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++# See the License for the specific language governing permissions and
++# limitations under the License.
++# This file is a part of the vllm-ascend project.
++#
++
++from __future__ import annotations
++
++import torch
++import torch.nn as nn
++
++import vllm_ascend.ops.rotary_embedding as rope
++
++NUM_POSITIONS = 64
++ROTARY_DIM = 64
++
++
++def _make_cache(num_positions=NUM_POSITIONS, rotary_dim=ROTARY_DIM, seed=0):
++    generator = torch.Generator().manual_seed(seed)
++    return torch.randn(num_positions, rotary_dim, generator=generator, dtype=torch.float32).to(torch.bfloat16)
++
++
++def _make_owner(cos_sin_cache):
++    owner = nn.Module()
++    owner.register_buffer("cos_sin_cache", cos_sin_cache, persistent=False)
++    return owner
++
++
++def _register_interleaved(monkeypatch, cos_sin_cache):
++    monkeypatch.setattr(rope, "_cos_cache", None)
++    monkeypatch.setattr(rope, "_sin_cache", None)
++    monkeypatch.setattr(rope, "_cos_sin_flat", None)
++    rope._record_cos_and_sin_cache_interleaved(_make_owner(cos_sin_cache), cos_sin_cache)
++
++
++class TestFlatRegistration:
++    def test_flat_view_row_identity(self, monkeypatch):
++        _register_interleaved(monkeypatch, _make_cache())
++        assert rope._cos_sin_flat is not None
++        assert torch.equal(rope._cos_cache, rope._cos_sin_flat[0::2])
++        assert torch.equal(rope._sin_cache, rope._cos_sin_flat[1::2])
++
++    def test_flat_shares_storage_with_half_tables(self, monkeypatch):
++        _register_interleaved(monkeypatch, _make_cache())
++        assert rope._cos_sin_flat.untyped_storage().data_ptr() == rope._cos_cache.untyped_storage().data_ptr()
++
++
++class TestFlatGatherEquivalence:
++    """The flat fast path must be bitwise identical to the legacy strided-view
++    gather, which is exercised through the flat-is-None fallback branch."""
++
++    def _gather(self, positions):
++        return rope.get_cos_and_sin_mla(positions)
++
++    def test_bitwise_equal_with_duplicates(self, monkeypatch):
++        _register_interleaved(monkeypatch, _make_cache())
++        positions = torch.tensor([0, 5, 5, 63, 7, 0], dtype=torch.int64)
++        cos_fast, sin_fast = self._gather(positions)
++        monkeypatch.setattr(rope, "_cos_sin_flat", None)
++        cos_base, sin_base = self._gather(positions)
++        assert torch.equal(cos_fast, cos_base)
++        assert torch.equal(sin_fast, sin_base)
++        assert cos_fast.shape == (6, 1, 1, ROTARY_DIM)
++        assert cos_fast.dtype == torch.bfloat16
++
++    def test_bitwise_equal_all_positions(self, monkeypatch):
++        _register_interleaved(monkeypatch, _make_cache())
++        positions = torch.arange(NUM_POSITIONS, dtype=torch.int64)
++        cos_fast, sin_fast = self._gather(positions)
++        monkeypatch.setattr(rope, "_cos_sin_flat", None)
++        cos_base, sin_base = self._gather(positions)
++        assert torch.equal(cos_fast, cos_base)
++        assert torch.equal(sin_fast, sin_base)
++
++    def test_bitwise_equal_empty_positions(self, monkeypatch):
++        _register_interleaved(monkeypatch, _make_cache())
++        positions = torch.empty(0, dtype=torch.int64)
++        cos_fast, sin_fast = self._gather(positions)
++        monkeypatch.setattr(rope, "_cos_sin_flat", None)
++        cos_base, sin_base = self._gather(positions)
++        assert cos_fast.shape == (0, 1, 1, ROTARY_DIM)
++        assert torch.equal(cos_fast, cos_base)
++        assert torch.equal(sin_fast, sin_base)
++
++    def test_bitwise_equal_boundary_position(self, monkeypatch):
++        _register_interleaved(monkeypatch, _make_cache())
++        positions = torch.tensor([NUM_POSITIONS - 1], dtype=torch.int64)
++        cos_fast, sin_fast = self._gather(positions)
++        monkeypatch.setattr(rope, "_cos_sin_flat", None)
++        cos_base, sin_base = self._gather(positions)
++        assert torch.equal(cos_fast, cos_base)
++        assert torch.equal(sin_fast, sin_base)
++
++    def test_use_cache_path_bitwise_equal(self, monkeypatch):
++        _register_interleaved(monkeypatch, _make_cache())
++        monkeypatch.setattr(rope, "_cos_mla", torch.zeros(NUM_POSITIONS, 1, 1, ROTARY_DIM, dtype=torch.bfloat16))
++        monkeypatch.setattr(rope, "_sin_mla", torch.zeros(NUM_POSITIONS, 1, 1, ROTARY_DIM, dtype=torch.bfloat16))
++        positions = torch.tensor([1, 2, 3], dtype=torch.int64)
++        cos_fast = rope.get_cos_and_sin_mla(positions, use_cache=True)[0].clone()
++        sin_fast = rope.get_cos_and_sin_mla(positions, use_cache=True)[1].clone()
++        monkeypatch.setattr(rope, "_cos_sin_flat", None)
++        cos_base = rope.get_cos_and_sin_mla(positions, use_cache=True)[0].clone()
++        sin_base = rope.get_cos_and_sin_mla(positions, use_cache=True)[1].clone()
++        assert torch.equal(cos_fast, cos_base)
++        assert torch.equal(sin_fast, sin_base)
++
++
++class TestRegistrationOverride:
++    def test_non_interleaved_overwrite_disables_fast_path(self, monkeypatch):
++        _register_interleaved(monkeypatch, _make_cache())
++        assert rope._cos_sin_flat is not None
++        new_cos = torch.randn(NUM_POSITIONS, ROTARY_DIM).to(torch.bfloat16)
++        new_sin = torch.randn(NUM_POSITIONS, ROTARY_DIM).to(torch.bfloat16)
++        rope._record_cos_and_sin_cache(new_cos, new_sin)
++        assert rope._cos_sin_flat is None
++        assert rope._cos_cache is new_cos
++        assert rope._sin_cache is new_sin
++
++    def test_interleaved_registration_is_first_wins(self, monkeypatch):
++        _register_interleaved(monkeypatch, _make_cache(seed=1))
++        first_cache = rope._cos_cache
++        second = _make_cache(seed=2)
++        rope._record_cos_and_sin_cache_interleaved(_make_owner(second), second)
++        assert rope._cos_cache is first_cache
+diff --git a/vllm_ascend/ops/rotary_embedding.py b/vllm_ascend/ops/rotary_embedding.py
+index 5b7b4a936..59acf411f 100644
+--- a/vllm_ascend/ops/rotary_embedding.py
++++ b/vllm_ascend/ops/rotary_embedding.py
+@@ -57,6 +57,7 @@ _cos_mla: torch.Tensor = None
+ _sin_mla: torch.Tensor = None
+ _cos_cache: torch.Tensor = None
+ _sin_cache: torch.Tensor = None
++_cos_sin_flat: torch.Tensor | None = None
+ _cos_sin_cache: torch.Tensor = None
+ _cos: torch.Tensor = None
+ _sin: torch.Tensor = None
+@@ -96,13 +97,36 @@ def get_cos_and_sin_mla(positions, use_cache=False):
+     global _sin_cache
+     global _cos_mla
+     global _sin_mla
++    global _cos_sin_flat
+     num_tokens = positions.size(0)
+     # MLA-NoPE skip rope cache (e.g. GLM-5.3-Flash qk_rope_head_dim=0).
+     # Do not copy indexer RoPE (last dim 32) into a 0-width MLA buffer.
+     if _cos_mla is not None and _cos_mla.shape[-1] == 0:
+         return _cos_mla[:num_tokens], _sin_mla[:num_tokens]
+-    cos = _cos_cache[positions].unsqueeze(1).unsqueeze(2)
+-    sin = _sin_cache[positions].unsqueeze(1).unsqueeze(2)
++    # Layout dispatch, not a fast/slow fallback: the two registration paths
++    # produce mutually exclusive cache layouts. The flat base only exists for
++    # interleaved registration (row 2i / 2i+1 addressing); contiguous
++    # registration has no interleaved base, and its per-half tables are
++    # already contiguous. Each branch is the optimal gather for its own
++    # layout, so neither can be dropped.
++    if _cos_sin_flat is not None:
++        # Interleaved registration (AscendRotaryEmbedding, MLA/SFA models):
++        # gather from the contiguous flat view of the interleaved base, where
++        # row 2i holds _cos_cache[i] and row 2i + 1 holds _sin_cache[i]. A row
++        # gather from the strided per-half views would make aclnnIndex
++        # materialize the whole cache table on every lookup; the flat base is
++        # contiguous, so this is a plain row copy.
++        even_positions = positions * 2
++        cos = _cos_sin_flat[even_positions]
++        sin = _cos_sin_flat[even_positions + 1]
++    else:
++        # Contiguous registration (AscendDeepseekScalingRotaryEmbedding):
++        # the per-half tables are already contiguous, so indexing them
++        # directly is a plain row gather with no materialization.
++        cos = _cos_cache[positions]
++        sin = _sin_cache[positions]
++    cos = cos.unsqueeze(1).unsqueeze(2)
++    sin = sin.unsqueeze(1).unsqueeze(2)
+     if not use_cache:
+         return cos, sin
+     if _cos_mla is None or _cos_mla.shape[-1] != cos.shape[-1]:
+@@ -134,8 +158,14 @@ def _record_cos_sin_cache(cos_sin_cache):
+ def _record_cos_and_sin_cache(cos_cache, sin_cache):
+     global _cos_cache
+     global _sin_cache
++    global _cos_sin_flat
+     _cos_cache = cos_cache
+     _sin_cache = sin_cache
++    # Contiguous registration: these per-half tables are already contiguous, so
++    # get_cos_and_sin_mla gathers from them directly. Drop the interleaved flat
++    # view so the fast path cannot read a stale buffer from the previous
++    # registration.
++    _cos_sin_flat = None
+ 
+ 
+ def _record_cos_and_sin_cache_interleaved(owner: "torch.nn.Module", cos_sin_cache) -> None:
+@@ -161,14 +191,26 @@ def _record_cos_and_sin_cache_interleaved(owner: "torch.nn.Module", cos_sin_cach
+     """
+     global _cos_cache
+     global _sin_cache
++    global _cos_sin_flat
+     if _cos_cache is not None or _sin_cache is not None:
+         return
+     hidden_dim = cos_sin_cache.shape[-1] // 2
+-    cos_cache, sin_cache = cos_sin_cache.view(-1, 2, hidden_dim).repeat(1, 1, 2).chunk(2, dim=1)
++    repeated = cos_sin_cache.view(-1, 2, hidden_dim).repeat(1, 1, 2)
++    cos_cache, sin_cache = repeated.chunk(2, dim=1)
+     _cos_cache = cos_cache.squeeze(1)
+     _sin_cache = sin_cache.squeeze(1)
+     owner.register_buffer("_rope_derived_cos_cache", _cos_cache, persistent=False)
+     owner.register_buffer("_rope_derived_sin_cache", _sin_cache, persistent=False)
++    # Contiguous flat view of the interleaved buffer: row 2i == _cos_cache[i]
++    # and row 2i + 1 == _sin_cache[i]. get_cos_and_sin_mla gathers rows from
++    # this view because a row gather from the strided per-half views makes
++    # aclnnIndex materialize the whole cache per lookup; from the contiguous
++    # flat base it is a plain row copy. The strided pair above must stay: it is
++    # the registered derived-buffer pair (see docstring) and remains the gather
++    # source for registrations that do not provide this view. The flat view
++    # shares the same storage, so the sleep-mode wake backup that restores
++    # those buffers in place covers it as well.
++    _cos_sin_flat = repeated.view(-1, repeated.shape[-1])
+ 
+ 
+ def update_cos_sin(positions):

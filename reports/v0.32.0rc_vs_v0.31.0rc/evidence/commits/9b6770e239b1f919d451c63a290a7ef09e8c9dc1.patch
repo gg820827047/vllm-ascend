@@ -1,0 +1,354 @@
+commit 9b6770e239b1f919d451c63a290a7ef09e8c9dc1
+Author:     zzzzzz198 <yhzhao96@qq.com>
+AuthorDate: Mon Nov 2 15:43:49 2026 +0800
+Commit:     GitHub <noreply@github.com>
+CommitDate: Mon Nov 2 15:43:49 2026 +0800
+
+    [releases/v0.32.0rc][BugFix][Performance] Zero QSFA TND output tail in-kernel and drop redundant SFA masked_fill (#20578)
+    
+    ### What this PR does / why we need it?
+    
+    cherry pick of https://github.com/vllm-project/vllm-ascend/pull/20404
+    
+    **Problem**: On the GLM-5.3-Flash SFA c8 (int8 KV, NoPE, TND layout)
+    path, the fork QSFA kernel (`npu_kv_quant_sparse_flash_attention_vllm`)
+    only writes valid rows of its output buffer. The output is allocated via
+    `at::empty` and the `needInit`-based output initialization excluded TND
+    layouts (plus used a BSND size formula), so
+    padding rows `[actual, T)` kept stale/NaN residue when graph bucket
+    capacity shrank between calls. The Python side carried a per-layer
+    `masked_fill` workaround (arange + lt + masked_fill × 11 SFA layers per
+    decode step).
+    
+    **Fix** (ports cann/ops-transformer#14799 to the fork kernel):
+    - arch32 (A2/A3, 910_93): enable `needInit` for TND and zero only
+    `[actual, T)` read from the device-side cumulative query lengths, with
+    32B-aligned per-core ranges; full batches skip entirely. The fork's
+    extra softmax-LSE init section is preserved (flag-guarded early skip
+    instead of `return`).
+    - arch35 (A5): add `InitOutputTail()` hooked into `CleanOutput()` when
+    the full needInit path does not run; no new cross-core barrier (disjoint
+    tail writes, local MTE3_V event guard only).
+    - Remove the now-redundant Python `masked_fill` in `sfa_v1.py` (NoPE c8
+    branch).
+    
+    **Tests**:
+    - E2E `test_tnd_output_tail_zeroed`: capacity-shrink (128→64) must
+    produce finite valid rows and an exactly-zero tail (fails on the unfixed
+    kernel with NaN tail).
+    - UT: NoPE c8 path returns the operator buffer unmasked (documents the
+    new contract).
+    
+    ### Does this PR introduce _any_ user-facing change?
+    
+    NO. Numerics of valid rows are unchanged; only previously-undefined
+    padding rows become defined (zero).
+    
+    ### How was this patch tested?
+    
+    A3 precision:
+     GSM8K 96.89%  AIME26 90.00%
+    
+    A3 performance:
+    | Case | BEFORE | AFTER | Δ |
+    |---|---|---|---|
+    | 2k/512，bs 32 | 257.7 tok/s | 260.2 tok/s | +1.0% |
+    | 128k/512，bs 8| 12.26 tok/s | 12.44 tok/s | +1.5% |
+    
+    A5 precision:
+    GSM8K 97.42%  AIME26 90.00%
+    
+    A5 performance:
+    | Case | BEFORE | AFTER | Δ |
+    |---|---|---|---|
+    | prefill 4k | 10.7074 QPS | 10.7624 QPS | +0.5% |
+    | prefill 128k| 1.494 QPS | 1.5085 QPS | +0.9% |
+    | decode 4k/2k| 87.3 ITL | 87.0 ITL | +0.3% |
+    | decode 128k/1k| 121.9 ITL | 113.8 ITL | +6% |
+    
+    - vLLM main:
+    https://github.com/vllm-project/vllm/commit/544f182d9f0c9bfe8bd7645525951d5e3692a542
+    
+    ---------
+    
+    Signed-off-by: zzzzzz198 <zhaoyuhui14@h-partners.com>
+    Co-authored-by: zzzzzz198 <zhaoyuhui14@h-partners.com>
+
+diff --git a/csrc/attention/kv_quant_sparse_flash_attention_vllm/op_kernel/arch35/kv_quant_sparse_flash_attention_vllm_kernel_mla.h b/csrc/attention/kv_quant_sparse_flash_attention_vllm/op_kernel/arch35/kv_quant_sparse_flash_attention_vllm_kernel_mla.h
+index 0e89600f7..4160f33ea 100644
+--- a/csrc/attention/kv_quant_sparse_flash_attention_vllm/op_kernel/arch35/kv_quant_sparse_flash_attention_vllm_kernel_mla.h
++++ b/csrc/attention/kv_quant_sparse_flash_attention_vllm/op_kernel/arch35/kv_quant_sparse_flash_attention_vllm_kernel_mla.h
+@@ -161,6 +161,7 @@ __aicore__ inline void KvQuantSparseFlashAttentionVllmMla<CubeBlockType, VecBloc
+         constInfo.gSize = this->sharedParams.gSize;
+         constInfo.s1Size = this->sharedParams.s1Size;
+         constInfo.needInit = this->sharedParams.needInit;
++        constInfo.n2Size = this->sharedParams.n2Size;
+         constInfo.dSizeV = 512;
+     }
+     vecBlock.CleanOutput(attentionOut, softmaxMax, softmaxSum, constInfo);
+diff --git a/csrc/attention/kv_quant_sparse_flash_attention_vllm/op_kernel/arch35/kv_quant_sparse_flash_attention_vllm_service_vector_mla.h b/csrc/attention/kv_quant_sparse_flash_attention_vllm/op_kernel/arch35/kv_quant_sparse_flash_attention_vllm_service_vector_mla.h
+index 2ce3b1fc7..15a8c4e5c 100644
+--- a/csrc/attention/kv_quant_sparse_flash_attention_vllm/op_kernel/arch35/kv_quant_sparse_flash_attention_vllm_service_vector_mla.h
++++ b/csrc/attention/kv_quant_sparse_flash_attention_vllm/op_kernel/arch35/kv_quant_sparse_flash_attention_vllm_service_vector_mla.h
+@@ -85,6 +85,7 @@ public:
+     __aicore__ inline void InitGlobalBuffer(__gm__ uint8_t *key, __gm__ uint8_t *value, __gm__ uint8_t *sparseIndices,
+         __gm__ uint8_t *blockTable);
+     __aicore__ inline void InitOutputSingleCore(ConstInfo &constInfo);
++    __aicore__ inline void InitOutputTail(ConstInfo &constInfo);
+     __aicore__ inline void ClearEmptyQueryOutput(const RunParamStr &runParam, const ConstInfo &constInfo);
+     __aicore__ inline void ProcessVec0(Buffer<BufferType::L1, SyncType::CROSS_CORE_SYNC_FORWARD> &outputL1,
+         Buffer<BufferType::GM, SyncType::CROSS_CORE_SYNC_BACKWARD> &v0ResGm,
+@@ -830,6 +831,43 @@ __aicore__ inline void QSFAVectorService<TEMPLATE_ARGS>::CopyOutAttentionOut(
+     this->Bmm2DataCopyOut(runInfo, constInfo, vec2ResUb, vec2S1Idx, qsfaVec2CalcSize);
+ }
+ 
++TEMPLATES_DEF_NO_DEFAULT
++__aicore__ inline void QSFAVectorService<TEMPLATE_ARGS>::InitOutputTail(ConstInfo &constInfo)
++{
++    // Zero only the TND capacity tail [actual, T) on every call, including graph
++    // replay (reads the device-side cumulative query lengths each time).
++    if constexpr (LAYOUT_T == QSFA_LAYOUT::TND) {
++        if (constInfo.bSize == 0 || GetBlockNum() == 0) {
++            return;
++        }
++        uint32_t actualRows = cuSeqlensQGm.GetValue(constInfo.bSize - 1);
++        if (actualRows >= constInfo.s1Size) {
++            return;
++        }
++        uint64_t rowSize = static_cast<uint64_t>(constInfo.n2Size) * constInfo.gSize * constInfo.dSizeV;
++        uint64_t tailSize = (constInfo.s1Size - actualRows) * rowSize;
++        constexpr uint64_t alignElements = BUFFER_SIZE_BYTE_32B / sizeof(OUTPUT_T);
++        uint64_t coreCount = CV_RATIO * GetBlockNum();
++        uint64_t singleCoreSize = (tailSize + coreCount - 1) / coreCount;
++        singleCoreSize = (singleCoreSize + alignElements - 1) / alignElements * alignElements;
++        uint64_t coreOffset = constInfo.aivIdx * singleCoreSize;
++        if (coreOffset >= tailSize) {
++            return;
++        }
++        uint64_t initSize = Min(singleCoreSize, tailSize - coreOffset);
++        GlobalTensor<OUTPUT_T> tailGm =
++            attentionOutGm[static_cast<uint64_t>(actualRows) * rowSize + coreOffset];
++        AscendC::Fill<OUTPUT_T>(tailGm, initSize, static_cast<OUTPUT_T>(0));
++        // Fill borrows UB before the compute buffers are initialized. Finish its
++        // local MTE3 reads before reusing UB; disjoint tail writes need no
++        // cross-core barrier.
++        auto eventId = GetTPipePtr()->AllocEventID<HardEvent::MTE3_V>();
++        SetFlag<HardEvent::MTE3_V>(eventId);
++        WaitFlag<HardEvent::MTE3_V>(eventId);
++        GetTPipePtr()->ReleaseEventID<HardEvent::MTE3_V>(eventId);
++    }
++}
++
+ TEMPLATES_DEF_NO_DEFAULT
+ __aicore__ inline void QSFAVectorService<TEMPLATE_ARGS>::InitOutputSingleCore(ConstInfo &constInfo)
+ {
+@@ -889,6 +927,8 @@ __aicore__ inline void QSFAVectorService<TEMPLATE_ARGS>::CleanOutput(__gm__ uint
+         }
+         if (constInfo.needInit == 1 && !returnSoftmaxLse) {
+             InitOutputSingleCore(constInfo);
++        } else {
++            InitOutputTail(constInfo);
+         }
+     }
+ }
+diff --git a/csrc/attention/kv_quant_sparse_flash_attention_vllm/op_kernel/kv_quant_sparse_flash_attention_vllm_kernel_mla.h b/csrc/attention/kv_quant_sparse_flash_attention_vllm/op_kernel/kv_quant_sparse_flash_attention_vllm_kernel_mla.h
+index 63bcc7304..c3b8b8c81 100644
+--- a/csrc/attention/kv_quant_sparse_flash_attention_vllm/op_kernel/kv_quant_sparse_flash_attention_vllm_kernel_mla.h
++++ b/csrc/attention/kv_quant_sparse_flash_attention_vllm/op_kernel/kv_quant_sparse_flash_attention_vllm_kernel_mla.h
+@@ -302,14 +302,48 @@ __aicore__ inline void KvQuantSparseFlashAttentionVllmMla<QSFAT>::InitOutputSing
+ {
+     uint32_t qsfaCoreNum = GetBlockNum();
+     if (qsfaCoreNum != 0) {
+-        uint64_t qsfaTotalOutputSize = constInfo.batchSize * constInfo.qHeadNum * constInfo.qSeqSize *
+-            constInfo.headDim;
+-        // 2 means c:v = 1:2
+-        uint64_t qsfaSingleCoreSize = (qsfaTotalOutputSize + (2 * qsfaCoreNum) - 1) / (2 * qsfaCoreNum);
+-        uint64_t qsfaTailSize = qsfaTotalOutputSize - tmpBlockIdx * qsfaSingleCoreSize;
+-        uint64_t qsfaSingleInitOutputSize = qsfaTailSize < qsfaSingleCoreSize ? qsfaTailSize : qsfaSingleCoreSize;
+-        if (tmpBlockIdx * qsfaSingleCoreSize < qsfaTotalOutputSize && qsfaSingleInitOutputSize > 0) {
+-            matmul::InitOutput<OUT_T>(attentionOutGm[tmpBlockIdx * qsfaSingleCoreSize], qsfaSingleInitOutputSize, 0);
++        uint64_t qsfaTotalOutputSize;
++        uint64_t qsfaOutputStart = 0;
++        bool qsfaNeedOutputInit = true;
++        if constexpr (LAYOUT_T == QSFA_LAYOUT::TND) {
++            // TND lengths are cumulative: the last entry is the number of valid
++            // rows. Only initialize [actual, T); valid rows are written by the
++            // compute path. The early-skip is kept as a flag (instead of return)
++            // so the softmax-LSE init below still runs.
++            if (constInfo.batchSize == 0 || constInfo.actualLenDimsQ == 0) {
++                qsfaNeedOutputInit = false;
++            } else {
++                uint32_t qsfaActualRows = actualSeqLengthsQGm.GetValue(constInfo.batchSize - 1);
++                if (qsfaActualRows >= constInfo.qSeqSize) {
++                    qsfaNeedOutputInit = false;
++                } else {
++                    uint64_t qsfaOutputRowSize =
++                        static_cast<uint64_t>(constInfo.kvHeadNum) * constInfo.gSize * constInfo.headDim;
++                    qsfaOutputStart = static_cast<uint64_t>(qsfaActualRows) * qsfaOutputRowSize;
++                    qsfaTotalOutputSize = (constInfo.qSeqSize - qsfaActualRows) * qsfaOutputRowSize;
++                }
++            }
++        } else {
++            qsfaTotalOutputSize = constInfo.batchSize * constInfo.qHeadNum * constInfo.qSeqSize *
++                constInfo.headDim;
++        }
++        if (qsfaNeedOutputInit) {
++            // 2 means c:v = 1:2
++            uint64_t qsfaSingleCoreSize = (qsfaTotalOutputSize + (2 * qsfaCoreNum) - 1) / (2 * qsfaCoreNum);
++            if constexpr (LAYOUT_T == QSFA_LAYOUT::TND) {
++                // Keep adjacent AIV partitions on separate 32-byte GM blocks.
++                constexpr uint64_t qsfaAlignElements = 32 / sizeof(OUT_T);
++                qsfaSingleCoreSize =
++                    (qsfaSingleCoreSize + qsfaAlignElements - 1) / qsfaAlignElements * qsfaAlignElements;
++            }
++            uint64_t qsfaCoreOffset = tmpBlockIdx * qsfaSingleCoreSize;
++            if (qsfaCoreOffset < qsfaTotalOutputSize) {
++                uint64_t qsfaTailSize = qsfaTotalOutputSize - qsfaCoreOffset;
++                uint64_t qsfaSingleInitOutputSize =
++                    qsfaTailSize < qsfaSingleCoreSize ? qsfaTailSize : qsfaSingleCoreSize;
++                matmul::InitOutput<OUT_T>(attentionOutGm[qsfaOutputStart + qsfaCoreOffset],
++                                          qsfaSingleInitOutputSize, 0);
++            }
+         }
+         if (constInfo.returnSoftmaxLse) {
+             uint64_t totalReturnSoftmaxSize = constInfo.batchSize * constInfo.kvHeadNum * constInfo.qSeqSize * constInfo.gSize;
+@@ -494,7 +528,7 @@ __aicore__ inline void KvQuantSparseFlashAttentionVllmMla<QSFAT>::Init(__gm__ ui
+     softmaxSumGm.SetGlobalBuffer((__gm__ T *)softmaxSum);
+ 
+     if ASCEND_IS_AIV {
+-        if (constInfo.needInit && LAYOUT_T != QSFA_LAYOUT::TND) {
++        if (constInfo.needInit) {
+             InitOutputSingleCore();
+         }
+     }
+diff --git a/release_notes/fragments/20404.yaml b/release_notes/fragments/20404.yaml
+new file mode 100644
+index 000000000..a9eb8ff21
+--- /dev/null
++++ b/release_notes/fragments/20404.yaml
+@@ -0,0 +1,8 @@
++pr: 20404
++entries:
++  - category: bugfix
++    text: Fixed the fork QSFA kernel leaving TND output padding rows uninitialized (stale or NaN residue after capacity-shrink) by zeroing the tail in-kernel on both arch32 and arch35.
++    hardware: [A2, A3, A5]
++  - category: performance
++    text: Removed the redundant per-layer masked_fill on the GLM-5.3-Flash SFA c8 decode path, saving three small ops per layer per decode step.
++    hardware: [A2, A3, A5]
+diff --git a/tests/e2e/nightly/single_node/ops/singlecard_ops/test_kv_quant_sparse_flash_attention_vllm.py b/tests/e2e/nightly/single_node/ops/singlecard_ops/test_kv_quant_sparse_flash_attention_vllm.py
+index 76f6b5c78..f1888244f 100644
+--- a/tests/e2e/nightly/single_node/ops/singlecard_ops/test_kv_quant_sparse_flash_attention_vllm.py
++++ b/tests/e2e/nightly/single_node/ops/singlecard_ops/test_kv_quant_sparse_flash_attention_vllm.py
+@@ -762,3 +762,69 @@ def test_rope0_python_quant_cache_attention_pipeline(dtype):
+     assert torch.count_nonzero(actual[valid_query_tokens:]) == 0
+     atol, rtol = (BF16_ATOL, BF16_RTOL) if dtype == torch.bfloat16 else (FP16_ATOL, FP16_RTOL)
+     torch.testing.assert_close(actual.float(), expected.float(), atol=atol, rtol=rtol)
++
++
++def _make_tnd_tail_inputs(capacity, actual=36, nseq=6, per_seq=6, seed=1006):
++    """TND NoPE (rope_dim=0) inputs: `capacity` query rows, only `actual` valid."""
++    generator = torch.Generator().manual_seed(seed)
++    heads, dim, tile, topk = 64, 512, 128, 1024
++    block_size, block_num = 128, 32
++    q = torch.randn((capacity, heads, dim), generator=generator, dtype=torch.float32).to(torch.bfloat16)
++    q[actual:] = 0
++    q = q.npu()
++    vals = torch.randint(-5, 10, (block_num, block_size, 1, dim), generator=generator, dtype=torch.int8)
++    scales = torch.rand((block_num, block_size, 1, dim // tile), generator=generator, dtype=torch.float32).uniform_(
++        0.1, 1.0
++    )
++    kv = torch.cat((vals, scales.contiguous().view(torch.int8)), dim=-1).contiguous().npu()
++    idx = torch.randint(0, block_num * block_size, (capacity, 1, topk), generator=generator, dtype=torch.int32)
++    idx[actual:] = 0
++    idx = idx.npu()
++    bt = torch.arange(block_num, dtype=torch.int32).reshape(1, block_num).expand(nseq, -1).contiguous().npu()
++    aq = torch.tensor([per_seq * (i + 1) for i in range(nseq)], dtype=torch.int32).npu()
++    akv = torch.full((nseq,), block_num * block_size, dtype=torch.int32).npu()
++    return q, kv, idx, bt, aq, akv
++
++
++@torch.inference_mode()
++def test_tnd_output_tail_zeroed():
++    """TND capacity tail [actual, T) must be zeroed by the kernel, not stale memory.
++
++    Regression: a prior larger-capacity call leaves workspace residue that the
++    unfixed kernel exposed as NaN in the padding rows.
++    """
++    if get_ascend_device_type() == AscendDeviceType.A5:
++        bootstrap_custom_op_env()
++        import_module("vllm_ascend.vllm_ascend_C")
++    dim, actual = 512, 36
++
++    def call(capacity):
++        q, kv, idx, bt, aq, akv = _make_tnd_tail_inputs(capacity)
++        out = torch.ops._C_ascend.npu_kv_quant_sparse_flash_attention_vllm(
++            query=q,
++            key=kv,
++            value=kv,
++            sparse_indices=idx,
++            scale_value=dim**-0.5,
++            sparse_block_size=1,
++            block_table=bt,
++            actual_seq_lengths_query=aq,
++            actual_seq_lengths_kv=akv,
++            layout_query="TND",
++            layout_kv="PA_BSND",
++            sparse_mode=3,
++            attention_mode=2,
++            quant_scale_repo_mode=1,
++            tile_size=128,
++            key_quant_mode=2,
++            value_quant_mode=2,
++            rope_head_dim=0,
++            return_softmax_lse=False,
++        )
++        return out[0] if isinstance(out, tuple) else out
++
++    call(128)  # leave residue from a larger-capacity call
++    out = call(64)
++    valid, tail = out[:actual].cpu().float(), out[actual:].cpu().float()
++    assert torch.isfinite(valid).all(), "valid rows must stay finite"
++    assert (tail == 0).all(), "capacity tail rows must be zeroed by the kernel"
+diff --git a/tests/ut/attention/test_sfa_nope_metadata.py b/tests/ut/attention/test_sfa_nope_metadata.py
+index 2ec1b67ee..ab012d8c3 100644
+--- a/tests/ut/attention/test_sfa_nope_metadata.py
++++ b/tests/ut/attention/test_sfa_nope_metadata.py
+@@ -293,6 +293,22 @@ def test_rope_sfa_preserves_cache_composition_and_device_dispatch(sfa_c8, li_c8)
+     dispatch.assert_called_once_with(impl, q, rope, composed, indices, metadata, query_lens, seq_lens, block_table=None)
+ 
+ 
++def test_nope_c8_output_returns_kernel_buffer_without_python_mask(monkeypatch):
++    """NoPE c8 returns the operator output unmodified: the fork kernel defines its
++    own padding rows (TND tail zero-init), so no Python masked_fill remains."""
++    impl = object.__new__(sfa.AscendSFAImpl)
++    impl.qk_rope_head_dim = 0
++    impl.enable_sparse_sfa_c8 = True
++    impl.enable_sparse_sfa_turboquant = False
++    cache = torch.empty(8, 2, 1, 12, dtype=torch.int8)
++    metadata = SimpleNamespace(block_size=2)
++    with patch.object(sfa.DeviceOperator, "execute_sparse_flash_attention_process") as dispatch:
++        result = impl._execute_sparse_flash_attention_process(
++            torch.empty(4, 2, 8), None, (cache,), None, metadata, None, None
++        )
++    assert result is dispatch.return_value
++
++
+ @pytest.mark.parametrize("a5", [False, True])
+ def test_nope_operator_returns_kernel_output_with_unwritten_graph_rows(monkeypatch, a5):
+     query = torch.ones(3, 2, 128)
+diff --git a/vllm_ascend/attention/sfa_v1.py b/vllm_ascend/attention/sfa_v1.py
+index 5664675c0..a21b8c507 100644
+--- a/vllm_ascend/attention/sfa_v1.py
++++ b/vllm_ascend/attention/sfa_v1.py
+@@ -1644,11 +1644,6 @@ class AscendSFAImpl(MLAAttentionImpl):
+             actual_seq_lengths_key,
+             block_table=block_table,
+         )
+-        if self.qk_rope_head_dim == 0:
+-            # As in floating NoPE, graph-capacity rows may be unwritten by the kernel.
+-            assert isinstance(output, torch.Tensor)
+-            valid = torch.arange(ql_nope.shape[0], device=ql_nope.device) < actual_seq_lengths_query[-1]
+-            output = output.masked_fill(~valid[:, None, None], 0)
+         return output
+ 
+     def _record_query_gather_context(

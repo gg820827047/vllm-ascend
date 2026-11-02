@@ -1,0 +1,777 @@
+commit 7079ab78346e2e348177e7ff15d646d87e903d52
+Author:     Q1uqh <129839262+Q1uqh@users.noreply.github.com>
+AuthorDate: Mon Oct 26 19:27:56 2026 +0800
+Commit:     GitHub <noreply@github.com>
+CommitDate: Mon Oct 26 19:27:56 2026 +0800
+
+    [BugFix][KVPP] Complete Mooncake layerwise load synchronization (#19484)
+    
+    ### What this PR does / why we need it?
+    
+    Complete KVPP + Mooncake block-key layerwise pooling on current main
+    (rebased onto `3b845c4fe`). Refs #18448 and #18647.
+    
+    Main already has #18647's model-layer prefetch window and compact
+    owner-relative Mooncake indices. Those fixes do not order external loads
+    against KVPP broadcasts: the prefetch executor can broadcast a layer
+    before its owner reloads it, while attention clears the completion event
+    before the executor can observe it.
+    
+    Adapt the synchronization and object-isolation work from #18448:
+    - Defer the first layerwise broadcast until attention prepares the
+    connector load, and wait for owner-layer load completion before
+    broadcasting. Keep the direct attention load/broadcast calls and the
+    background non-consuming load-ready observer.
+    - Retain load completion until the next metadata bind, and propagate
+    receive-thread failures/aborts.
+    - Finish Mooncake request loading even when the final physical layer has
+    no owner-local tasks. Keep main's transfer-group/index routing
+    unchanged.
+    - Separate Mooncake KVPP objects from replicated-layout objects,
+    including PP and multiple cache groups.
+    - Adjust the PROLOG_V3 load ordering and avoid duplicate connector
+    load-entry calls for mixed batches.
+    - Detect AscendStore children in MultiConnector and forward the
+    completion observer without advancing child attention cursors.
+    
+    ### Does this PR introduce _any_ user-facing change?
+    
+    No. This fixes synchronization bugs in the existing Mooncake layerwise +
+    KVPP functionality; no new user-facing features, APIs, or configuration
+    options are introduced.
+    
+    ### How was this patch tested?
+    
+    - **181 tests + 156 subtests passed** in a local CPU
+    dependency-isolation harness, covering load/broadcast ordering,
+    completion-event reset, failure propagation, request finalization,
+    namespace isolation, and connector detection. This is not a native
+    vLLM/NPU test run.
+    - Source-method isolation checks covered MultiConnector forwarding and
+    PROLOG_V3 load/broadcast ordering. Ruff, Markdownlint, Python
+    compilation, and `git diff --check` passed. The full formatting command
+    was blocked by local npm dependency installation.
+    - Automated NPU E2E coverage was added in
+    `tests/e2e/cases/features/kv_pool/test_kvpp_mooncake_layerwise.py`;
+    execution of that suite remains pending.
+    
+    Performance measurements:
+    
+    | Devices | Model | Input | Output | Prefix hit rate | Deployment |
+    Concurrency | Requests | TTFT (ms) | KVPP | Layerwise |
+    | ------- | ----- | ----- | ------ | --------------- | ---------- |
+    ----------- | -------- | --------- | ---- | --------- |
+    | 8 | GLM-5.2-W4A8C8 | 128K | 1 | 90% | P/D mixed, TP8 | 32 | 128 |
+    123.6 | Yes | No |
+    | 8 | GLM-5.2-W4A8C8 | 128K | 1 | 90% | P/D mixed, TP8 | 32 | 128 |
+    119.9 | No | Yes |
+    | 8 | GLM-5.2-W4A8C8 | 128K | 1 | 90% | P/D mixed, TP8 | 32 | 128 |
+    126.2 | Yes | Yes |
+    
+    - vLLM main:
+    https://github.com/vllm-project/vllm/commit/c0b6f74bee518aeaf5d72b200a0216e72fbb5e7c
+    
+    ---------
+    
+    Signed-off-by: Q1uqh <129839262+Q1uqh@users.noreply.github.com>
+
+diff --git a/docs/source/user_guide/feature_guide/kvpp.md b/docs/source/user_guide/feature_guide/kvpp.md
+index 3a14c323b..2c3c375f3 100644
+--- a/docs/source/user_guide/feature_guide/kvpp.md
++++ b/docs/source/user_guide/feature_guide/kvpp.md
+@@ -139,6 +139,10 @@ Configure Mooncake as described in the [Mooncake layerwise guide](mooncake_layer
+ 
+ Mooncake layerwise pooling requires `load_async=false` (loads are submitted layer by layer) and does not enable cross-layer reuse of persistent owner caches. It was validated on a single node with TP8, Model Runner V2, and eager execution; PP, PCP, and DCP were not part of that validation.
+ 
++Each owner waits for the layer's pool load to complete before starting its KVPP broadcast. Attention and the broadcast worker share the completion signal until the next step binds metadata. This ordering also applies when the store is a child of `MultiConnector`.
++
++KVPP Mooncake objects use a separate topology namespace: ordinary replicated cache objects have different layer ranges and cannot be reused by KVPP. Enabling KVPP therefore starts a separate pool cache. Existing Mooncake restrictions on PCP, DCP, and producer/consumer topology mismatch still apply.
++
+ ### Combining Connectors
+ 
+ Use `MultiConnector` to combine `MooncakeConnectorV2` with `AscendStoreConnector`.
+diff --git a/tests/e2e/cases/features/kv_pool/test_kvpp_mooncake_layerwise.py b/tests/e2e/cases/features/kv_pool/test_kvpp_mooncake_layerwise.py
+new file mode 100644
+index 000000000..eb0cd08b3
+--- /dev/null
++++ b/tests/e2e/cases/features/kv_pool/test_kvpp_mooncake_layerwise.py
+@@ -0,0 +1,92 @@
++# SPDX-License-Identifier: Apache-2.0
++"""GLM-5.2 owner-sharded Mooncake write/reload with layerwise transfers."""
++
++import json
++
++import pytest
++import requests
++from vllm.transformers_utils.utils import maybe_model_redirect
++from vllm.utils.network_utils import get_open_port
++
++from tests.e2e.common.kv_pool.config import MooncakeKVPoolConfig
++from tests.e2e.common.kvpp import PROMPTS, complete, output_texts, server_args
++from tests.e2e.common.single_node.kv_pool_runtime import SingleNodeMooncakeManager
++from tests.e2e.conftest import RemoteOpenAIServer, wait_until_npu_memory_free
++
++MODEL = "Eco-Tech/GLM-5.2-w4a8"
++TP_SIZE = 8
++
++pytestmark = pytest.mark.e2e_model(MODEL)
++
++
++def external_cache_hits(server):
++    response = requests.get(server.url_for("metrics"), timeout=30)
++    response.raise_for_status()
++    return sum(
++        float(line.split()[-1])
++        for line in response.text.splitlines()
++        if line.startswith("vllm:external_prefix_cache_hits_total{")
++    )
++
++
++@pytest.mark.e2e_coverage(
++    arch="moe",
++    feature="kvpp,chunked_prefill,prefix_caching",
++    parallel="TP,EP",
++    deploy="pd_mix",
++    hardware="A3",
++    quantization="W4A8",
++    graph_mode="eager",
++)
++@pytest.mark.parametrize("use_mtp", [False, True])
++@wait_until_npu_memory_free()
++def test_kvpp_mooncake_layerwise_reload(tmp_path, use_mtp):
++    pytest.importorskip("mooncake.store")
++    pool_config = MooncakeKVPoolConfig(
++        master_port=get_open_port(),
++        metrics_port=get_open_port(),
++        config={
++            "metadata_server": "P2PHANDSHAKE",
++            "protocol": "ascend",
++            "global_segment_size": 1 << 30,
++            "local_buffer_size": 1 << 30,
++        },
++    )
++    with SingleNodeMooncakeManager(pool_config, tmp_path.name) as pool:
++        port = get_open_port()
++        args = server_args(tp_size=TP_SIZE, gpu_memory_utilization=0.9) + [
++            "--port",
++            str(port),
++            "--additional-config",
++            '{"enable_kvpp":true}',
++            "--kv-transfer-config",
++            json.dumps(
++                {
++                    "kv_connector": "AscendStoreConnector",
++                    "kv_role": "kv_both",
++                    "kv_connector_extra_config": {
++                        "lookup_rpc_port": "0",
++                        "backend": "mooncake",
++                        "use_layerwise": True,
++                        "load_async": False,
++                    },
++                }
++            ),
++        ]
++        if use_mtp:
++            args += ["--speculative-config", '{"method":"mtp","num_speculative_tokens":1}']
++        with RemoteOpenAIServer(
++            maybe_model_redirect(MODEL),
++            args,
++            server_port=port,
++            auto_port=False,
++            env_dict={**pool.server_envs, "VLLM_USE_V2_MODEL_RUNNER": "1", "VLLM_SERVER_DEV_MODE": "1"},
++        ) as server:
++            # 128-token chunks span multiple cache blocks and exercise later
++            # forwards with history, including shared-index SFA layers.
++            prompt = PROMPTS[1]
++            expected = output_texts(complete(server.url_root, prompt))
++            hits_before = external_cache_hits(server)
++            requests.post(server.url_for("reset_prefix_cache"), timeout=30).raise_for_status()
++            assert output_texts(complete(server.url_root, [prompt, prompt])) == expected * 2
++            assert external_cache_hits(server) > hits_before
+diff --git a/tests/ut/attention/test_mla_prolog_v3_route.py b/tests/ut/attention/test_mla_prolog_v3_route.py
+index 70c47624e..37f0cb463 100644
+--- a/tests/ut/attention/test_mla_prolog_v3_route.py
++++ b/tests/ut/attention/test_mla_prolog_v3_route.py
+@@ -803,10 +803,17 @@ def test_dcp_prolog_buffers_survive_reloads_and_use_disjoint_workspaces():
+     assert impl._dcp_prefill_current_kv_buffers is first_prefill_buffers
+ 
+ 
+-@pytest.mark.parametrize("num_decode", [0, 2])
+-@pytest.mark.parametrize("padding", [0, 3])
+-def test_mla_preprocess_prolog_v3_replaces_rmsnorm_rope_cache_writer(num_decode, padding):
++@pytest.mark.parametrize(
++    "num_decode,padding,layerwise",
++    [(0, 0, False), (0, 3, False), (2, 0, False), (2, 3, False), (2, 0, True)],
++)
++def test_mla_preprocess_prolog_v3_replaces_rmsnorm_rope_cache_writer(num_decode, padding, layerwise):
+     impl = _make_impl()
++    order = []
++    if layerwise:
++        impl.layerwise_kv_cache_hook = SimpleNamespace(
++            layerwise=True, wait_for_layer=lambda name: order.append(("broadcast", name))
++        )
+     num_prefill = 3
+     total_tokens = num_decode + num_prefill + padding
+     qkv_lora = torch.zeros(total_tokens, impl.q_lora_rank + FUSED_DIM)
+@@ -836,6 +843,8 @@ def test_mla_preprocess_prolog_v3_replaces_rmsnorm_rope_cache_writer(num_decode,
+     )
+ 
+     def fake_prolog(**kwargs):
++        if layerwise:
++            order.append(("prolog", impl.layer_name))
+         tokens = kwargs["token_x"].shape[0]
+         return (
+             torch.zeros(tokens, impl.num_heads * NOPE_DIM),
+@@ -853,9 +862,17 @@ def test_mla_preprocess_prolog_v3_replaces_rmsnorm_rope_cache_writer(num_decode,
+         patch("torch_npu.npu_mla_prolog_v3", side_effect=fake_prolog) as mock_prolog,
+         patch("torch_npu.npu_kv_rmsnorm_rope_cache") as mock_legacy,
+         patch.object(mla_v1, "load_mla_cache_rows_by_slots", side_effect=_load_cache_rows_on_cpu),
++        patch.object(
++            mla_v1, "wait_for_kv_layer_from_connector", side_effect=lambda name: order.append(("load", name))
++        ) as wait_load,
+     ):
+         decode, prefill = impl.mla_preprocess_prolog_v3(hidden, (nope, rope), metadata)
+ 
++    wait_load.assert_called_once_with(impl.layer_name)
++    if layerwise:
++        assert order == [("load", impl.layer_name), ("broadcast", impl.layer_name)] + [("prolog", impl.layer_name)] * (
++            1 + bool(num_decode)
++        )
+     assert mock_prolog.call_count == 1 + bool(num_decode)
+     mock_legacy.assert_not_called()
+     assert (decode is not None) == bool(num_decode)
+diff --git a/tests/ut/distributed/ascend_store/test_layerwise_keys.py b/tests/ut/distributed/ascend_store/test_layerwise_keys.py
+index 80dc134ba..7ccda31e5 100644
+--- a/tests/ut/distributed/ascend_store/test_layerwise_keys.py
++++ b/tests/ut/distributed/ascend_store/test_layerwise_keys.py
+@@ -17,6 +17,34 @@ from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.backend import mem
+ 
+ 
+ class TestBoundLayerwiseKeys(unittest.TestCase):
++    def test_kvpp_lookup_covers_every_owner_and_uses_separate_layout_keys(self):
++        for pp_size in (1, 2):
++            for num_groups in (1, 2):
++                with self.subTest(pp_size=pp_size, num_groups=num_groups):
++                    config = self.make_config(pp_size)
++                    config.additional_config = {"enable_kvpp": True}
++                    config.parallel_config.prefill_context_parallel_size = 1
++                    cache = self.make_cache_config(num_groups)
++                    args = dict(
++                        vllm_config=config,
++                        kv_cache_config=cache,
++                        model_name="model",
++                        use_hybrid=num_groups > 1,
++                        grouped_block_size=[16 * (group + 1) for group in range(num_groups)],
++                    )
++                    kvpp_keys = mooncake_layerwise.bind_layerwise_keys(**args)
++                    config.additional_config = {"enable_kvpp": False}
++                    replicated_keys = mooncake_layerwise.bind_layerwise_keys(**args)
++                    for group in range(num_groups):
++                        owners = [
++                            kvpp_keys.make_full_key(group, "hash", owner, stage)
++                            for stage in range(pp_size)
++                            for owner in range(2)
++                        ]
++                        self.assertEqual(kvpp_keys.make_hit_check_keys(group, "hash", 2), owners)
++                        ordinary = replicated_keys.make_hit_check_keys(group, "hash", 1)
++                        self.assertTrue(set(owners).isdisjoint(ordinary))
++
+     @staticmethod
+     def make_config(pp_size=1):
+         return SimpleNamespace(
+diff --git a/tests/ut/distributed/ascend_store/test_pool_scheduler.py b/tests/ut/distributed/ascend_store/test_pool_scheduler.py
+index 93c530b5d..f26222646 100644
+--- a/tests/ut/distributed/ascend_store/test_pool_scheduler.py
++++ b/tests/ut/distributed/ascend_store/test_pool_scheduler.py
+@@ -189,6 +189,7 @@ def test_joint_prefix_group_ownership_survives_scheduler_conversion_and_empty_pp
+ 
+ def make_config(kv_role="kv_producer", extra_config=None, block_size=16):
+     config = MagicMock()
++    config.additional_config = {}
+     config.kv_events_config = None
+     config.kv_transfer_config.kv_role = kv_role
+     config.kv_transfer_config.kv_connector_extra_config = extra_config or {}
+diff --git a/tests/ut/distributed/ascend_store/test_pool_worker.py b/tests/ut/distributed/ascend_store/test_pool_worker.py
+index 98f2dd682..e32e64370 100644
+--- a/tests/ut/distributed/ascend_store/test_pool_worker.py
++++ b/tests/ut/distributed/ascend_store/test_pool_worker.py
+@@ -417,6 +417,80 @@ class TestLayerwiseAttentionSave(unittest.TestCase):
+ 
+ 
+ class TestKVPPPoolWorker(unittest.TestCase):
++    def test_load_completion_is_shared_and_reset_at_step_binding(self):
++        worker = make_worker(self, tp_size=2, use_mla=True, use_kvpp=True, use_layerwise=True)
++        worker._global_to_local_layer = {9: 0, 10: 1}
++        worker.layer_load_tasks[0] = [MagicMock()]
++        worker.layer_load_finished_events = [threading.Event(), threading.Event()]
++        worker.layer_load_finished_events[0].set()
++        worker.current_layer = 0
++        worker.kv_recv_thread = MagicMock()
++        worker.external_slot_release_waiter = None
++        worker._submit_ready_layer_loads = MagicMock()
++        worker._finish_current_layerwise_load_sessions = MagicMock()
++        worker.wait_for_layer_load()
++        # Both observers can see the same completion, in either order.
++        worker.wait_for_layer_load_ready("model.layers.9.self_attn.attn")
++        worker.wait_for_layer_load_ready("model.layers.9.self_attn.attn")
++        self.assertTrue(worker.layer_load_finished_events[0].is_set())
++        self.assertEqual(worker.current_layer, 0)
++        # Non-owners have no tasks or signal to wait on.
++        worker.wait_for_layer_load_ready("model.layers.10.self_attn.attn")
++        worker.current_layer = 1
++        worker._current_layerwise_last_chunk_req_ids = {"loaded-request"}
++        worker.wait_for_layer_load()
++        worker.kv_recv_thread.set_finished_request.assert_called_once_with("loaded-request")
++        worker.process_layer_data = MagicMock()
++        worker.prepare_layerwise_step(AscendConnectorMetadata(preempted_req_ids=set()))
++        self.assertFalse(worker.layer_load_finished_events[0].is_set())
++        self.assertEqual(worker.next_layer_to_submit, 0)
++
++    def test_load_observer_surfaces_receive_failure(self):
++        worker = make_worker(self, tp_size=2, use_mla=True, use_kvpp=True, use_layerwise=True)
++        worker.layer_load_tasks[0] = [MagicMock()]
++        worker.layer_load_finished_events = [threading.Event(), threading.Event()]
++        worker.kv_recv_thread = MagicMock()
++        worker.kv_recv_thread.raise_if_failed.side_effect = RuntimeError("receive failed")
++        with self.assertRaisesRegex(RuntimeError, "receive failed"):
++            worker.wait_for_layer_load_ready("model.layers.0.self_attn.attn")
++
++    def test_load_observer_resolves_local_layer(self):
++        cases: tuple[tuple[dict[int, int], int, bool], ...] = (
++            ({9: 0, 10: 1}, 0, False),
++            ({9: 0, 10: 1}, 11, False),
++            ({}, 2, False),
++            ({9: 2}, 9, False),
++            ({9: -1}, 9, False),
++            ({}, 1, True),
++        )
++        for mapping, physical_layer, local in cases:
++            with self.subTest(mapping=mapping, physical_layer=physical_layer):
++                worker = make_worker(self, tp_size=2, use_mla=True, use_kvpp=True, use_layerwise=True)
++                worker._global_to_local_layer = mapping
++                worker.layer_load_tasks = [[MagicMock()], [MagicMock()]]
++                worker.layer_load_finished_events = [threading.Event(), threading.Event()]
++                worker.layer_load_finished_events[1].set()
++                worker.kv_recv_thread = MagicMock()
++                if not local:
++                    worker.kv_recv_thread.raise_if_failed.side_effect = RuntimeError("unexpected receive check")
++                worker.wait_for_layer_load_ready(f"model.layers.{physical_layer}.self_attn.attn")
++                if local:
++                    worker.kv_recv_thread.raise_if_failed.assert_called()
++                    self.assertTrue(worker.layer_load_finished_events[1].is_set())
++                else:
++                    worker.kv_recv_thread.raise_if_failed.assert_not_called()
++
++    def test_load_observer_requires_initialized_dependencies(self):
++        for missing in ("kv_recv_thread", "layer_load_finished_events"):
++            with self.subTest(missing=missing):
++                worker = make_worker(self, tp_size=2, use_mla=True, use_kvpp=True, use_layerwise=True)
++                worker._global_to_local_layer = {9: 0}
++                worker.layer_load_tasks[0] = [MagicMock()]
++                worker.kv_recv_thread = MagicMock()
++                setattr(worker, missing, None)
++                with self.assertRaisesRegex(RuntimeError, f"{missing} is not initialized"):
++                    worker.wait_for_layer_load_ready("model.layers.9.self_attn.attn")
++
+     def test_pcp_registers_persistent_owner_layers_and_mtp(self):
+         import torch
+ 
+@@ -652,6 +726,7 @@ class TestKVPoolWorkerHelpers(unittest.TestCase):
+     def test_wait_for_layer_load_fallback_waits_for_reuse(self):
+         cls = self._make_worker_class()
+         worker = cls.__new__(cls)
++        worker.use_kvpp = False
+         worker.current_layer = 0
+         worker.num_layers = 1
+         worker.layer_load_tasks = [[]]
+diff --git a/tests/ut/distributed/ascend_store/test_reuse_publication_fence.py b/tests/ut/distributed/ascend_store/test_reuse_publication_fence.py
+index 569a5987a..da15f4dfe 100644
+--- a/tests/ut/distributed/ascend_store/test_reuse_publication_fence.py
++++ b/tests/ut/distributed/ascend_store/test_reuse_publication_fence.py
+@@ -21,6 +21,7 @@ class TestReusePublicationFence(unittest.TestCase):
+                 with self.subTest(transfer=transfer, reuse=reuse, tp_size=tp_size, empty=not requests):
+                     worker = module.KVPoolWorker.__new__(module.KVPoolWorker)
+                     worker.use_layerwise = True
++                    worker.use_kvpp = False
+                     worker.use_layerwise_transfer = transfer
+                     worker.layerwise_offload = reuse
+                     worker.tp_size = tp_size
+diff --git a/tests/ut/kv_offload/test_ascend_multi_connector.py b/tests/ut/kv_offload/test_ascend_multi_connector.py
+index 465dd2254..78f438b09 100644
+--- a/tests/ut/kv_offload/test_ascend_multi_connector.py
++++ b/tests/ut/kv_offload/test_ascend_multi_connector.py
+@@ -14,6 +14,18 @@ from vllm_ascend.distributed.kv_transfer.ascend_multi_connector import (  # noqa
+ )
+ 
+ 
++def test_load_ready_observer_does_not_advance_child_attention_hooks():
++    observer = MagicMock()
++    child = SimpleNamespace(wait_for_layer_load_ready=observer, wait_for_layer_load=MagicMock())
++    other = SimpleNamespace(wait_for_layer_load=MagicMock())
++    connector = AscendMultiConnector.__new__(AscendMultiConnector)
++    connector._connectors = [child, other]
++    connector.wait_for_layer_load_ready("model.layers.9.self_attn.attn")
++    observer.assert_called_once_with("model.layers.9.self_attn.attn")
++    child.wait_for_layer_load.assert_not_called()
++    other.wait_for_layer_load.assert_not_called()
++
++
+ @pytest.mark.parametrize(
+     "producer,consumer,method,full_prompt",
+     [
+diff --git a/tests/ut/worker/test_kvpp.py b/tests/ut/worker/test_kvpp.py
+index 02d49425c..af457f55e 100644
+--- a/tests/ut/worker/test_kvpp.py
++++ b/tests/ut/worker/test_kvpp.py
+@@ -1,4 +1,6 @@
+ # SPDX-License-Identifier: Apache-2.0
++import threading
++from concurrent.futures import ThreadPoolExecutor
+ from types import SimpleNamespace
+ from unittest.mock import Mock
+ 
+@@ -87,6 +89,38 @@ def test_runtime_binds_complete_layer_storage(monkeypatch, scheduler_device, exp
+     assert torch.count_nonzero(caches[mtp][0]) == 0
+ 
+ 
++@pytest.mark.parametrize(
++    "transfer",
++    [
++        SimpleNamespace(kv_connector="AscendStoreConnector"),
++        SimpleNamespace(
++            kv_connector="MultiConnector",
++            kv_connector_extra_config={
++                "connectors": [{"kv_connector": "AscendStoreConnector", "kv_connector_extra_config": None}]
++            },
++        ),
++        None,
++    ],
++)
++def test_layerwise_store_detection_accepts_missing_config(transfer):
++    assert kvpp._uses_layerwise_store(transfer) is False
++
++
++@pytest.mark.parametrize("composite", [False, True])
++@pytest.mark.parametrize("enabled", [False, True])
++def test_detects_layerwise_store_configuration(composite, enabled):
++    connector = {
++        "kv_connector": "AscendStoreConnector",
++        "kv_connector_extra_config": {"use_layerwise": enabled},
++    }
++    transfer = (
++        SimpleNamespace(kv_connector="MultiConnector", kv_connector_extra_config={"connectors": [connector]})
++        if composite
++        else SimpleNamespace(**connector)
++    )
++    assert kvpp._uses_layerwise_store(transfer) is enabled
++
++
+ def test_prefetch_sequence_across_forwards(scheduler_device):
+     events, compute, transfer = scheduler_device
+     transport = Mock()
+@@ -153,3 +187,61 @@ def test_hook_propagates_failed_future_without_scheduling_next(scheduler_device)
+         scheduler.wait_for_layer(layer_name(0))
+     assert raised.value is error
+     assert len(scheduler._prefetch_executor.submitted) == 1
++
++
++def test_layerwise_prefetch_waits_for_load_before_every_broadcast(monkeypatch, scheduler_device):
++    events, _, _ = scheduler_device
++    load_entered, load_ready = threading.Event(), threading.Event()
++    connector = Mock()
++
++    def wait_for_load(name):
++        load_entered.set()
++        assert load_ready.wait(timeout=5)
++        events.append(("load_ready", name))
++
++    connector.wait_for_layer_load_ready.side_effect = wait_for_load
++    monkeypatch.setattr(kvpp, "get_kv_transfer_group", lambda: connector)
++    monkeypatch.setattr(kvpp, "ThreadPoolExecutor", ThreadPoolExecutor)
++    transport = Mock()
++    transport.prefetch.side_effect = lambda name, *_args: events.append(("broadcast", name))
++    names = tuple(layer_name(i) for i in range(3))
++    scheduler = kvpp.KVPPScheduler(transport, names, layerwise=True)
++    executor = scheduler._prefetch_executor
++    try:
++        with ThreadPoolExecutor(max_workers=1) as attention:
++            for has_history in (True, False, True):
++                load_entered.clear()
++                load_ready.clear()
++                scheduler.schedule_forward(has_history)
++                assert scheduler._prefetch_future is None
++                first_wait = attention.submit(scheduler.wait_for_layer, names[0])
++                if has_history:
++                    assert load_entered.wait(timeout=5)
++                    assert not first_wait.done()
++                    assert not any(event[0] == "broadcast" for event in events)
++                    load_ready.set()
++                first_wait.result(timeout=5)
++                for name in names[1:]:
++                    scheduler.wait_for_layer(name)
++                if has_history:
++                    for name in names:
++                        assert events.index(("load_ready", name)) < events.index(("broadcast", name))
++                scheduler.complete_forward()
++                assert scheduler._prefetch_future is None
++                events.clear()
++    finally:
++        load_ready.set()
++        executor.shutdown(wait=True)
++    assert transport.prefetch.call_count == 6
++
++
++def test_layerwise_load_failure_prevents_broadcast(monkeypatch, scheduler_device):
++    connector = Mock()
++    connector.wait_for_layer_load_ready.side_effect = RuntimeError("external load failed")
++    monkeypatch.setattr(kvpp, "get_kv_transfer_group", lambda: connector)
++    transport = Mock()
++    scheduler = kvpp.KVPPScheduler(transport, (layer_name(0),), layerwise=True)
++    scheduler.schedule_forward(True)
++    with pytest.raises(RuntimeError, match="external load failed"):
++        scheduler.run_layer_prefetch(layer_name(0), Mock())
++    transport.prefetch.assert_not_called()
+diff --git a/vllm_ascend/attention/mla_v1.py b/vllm_ascend/attention/mla_v1.py
+index 5bb368de9..ea4042685 100644
+--- a/vllm_ascend/attention/mla_v1.py
++++ b/vllm_ascend/attention/mla_v1.py
+@@ -2420,6 +2420,8 @@ class AscendMLAImpl(MLAAttentionImpl):
+         assert self.layer_name is not None
+ 
+         if self.layerwise_kv_cache_hook is not None:
++            if getattr(self.layerwise_kv_cache_hook, "layerwise", False):
++                wait_for_kv_layer_from_connector(self.layer_name)
+             self.layerwise_kv_cache_hook.wait_for_layer(self.layer_name)
+ 
+         if num_decode_tokens > 0:
+@@ -2475,7 +2477,8 @@ class AscendMLAImpl(MLAAttentionImpl):
+         if num_actual_tokens > num_decode_tokens:
+             if attn_metadata.prefill is None or attn_metadata.prefill.cos is None or attn_metadata.prefill.sin is None:
+                 raise RuntimeError("PROLOG_V3 prefill requires prefill cos/sin tables.")
+-            wait_for_kv_layer_from_connector(self.layer_name)
++            if self.layerwise_kv_cache_hook is None or not getattr(self.layerwise_kv_cache_hook, "layerwise", False):
++                wait_for_kv_layer_from_connector(self.layer_name)
+             prefill_slots = attn_metadata.slot_mapping[num_decode_tokens:num_actual_tokens]
+             num_prefill_tokens = num_actual_tokens - num_decode_tokens
+             # Metadata can include graph padding beyond the actual prefill rows.
+diff --git a/vllm_ascend/distributed/kv_transfer/ascend_multi_connector.py b/vllm_ascend/distributed/kv_transfer/ascend_multi_connector.py
+index fe5f1f9b2..bf7f6a1b8 100644
+--- a/vllm_ascend/distributed/kv_transfer/ascend_multi_connector.py
++++ b/vllm_ascend/distributed/kv_transfer/ascend_multi_connector.py
+@@ -103,6 +103,13 @@ class AscendMultiConnector(MultiConnector, SupportsHMA):
+         self._connectors[:] = [*self._layerwise_slot_release_providers, *self._non_slot_release_connectors]
+         super().shutdown()
+ 
++    def wait_for_layer_load_ready(self, layer_name: str) -> None:
++        """Observe child completion without advancing their layer cursors."""
++        for connector in self._connectors:
++            wait_ready = getattr(connector, "wait_for_layer_load_ready", None)
++            if wait_ready is not None:
++                wait_ready(layer_name)
++
+     def wait_for_layer_load(self, layer_name: str) -> None:
+         if getattr(self, "_external_slot_release_sink_configured", False):
+             # AscendStore owns the layer-entry reuse wait after accepting the
+diff --git a/vllm_ascend/distributed/kv_transfer/kv_pool/ascend_store/ascend_store_connector.py b/vllm_ascend/distributed/kv_transfer/kv_pool/ascend_store/ascend_store_connector.py
+index 9c454dc81..c41bc33d0 100644
+--- a/vllm_ascend/distributed/kv_transfer/kv_pool/ascend_store/ascend_store_connector.py
++++ b/vllm_ascend/distributed/kv_transfer/kv_pool/ascend_store/ascend_store_connector.py
+@@ -365,6 +365,13 @@ class AscendStoreConnector(KVConnectorBase_V1, SupportsHMA):
+         )
+         self.connector_worker.start_load_kv(metadata)
+ 
++    def wait_for_layer_load_ready(self, layer_name: str) -> None:
++        """Let KVPP observe a layer's loads without advancing attention hooks."""
++        if not self.use_layerwise:
++            return
++        assert self.connector_worker is not None
++        self.connector_worker.wait_for_layer_load_ready(layer_name)
++
+     def wait_for_layer_load(self, layer_name: str) -> None:
+         if not self.use_layerwise:
+             return
+diff --git a/vllm_ascend/distributed/kv_transfer/kv_pool/ascend_store/backend/mooncake_layerwise.py b/vllm_ascend/distributed/kv_transfer/kv_pool/ascend_store/backend/mooncake_layerwise.py
+index 0c907ce45..212504cb2 100644
+--- a/vllm_ascend/distributed/kv_transfer/kv_pool/ascend_store/backend/mooncake_layerwise.py
++++ b/vllm_ascend/distributed/kv_transfer/kv_pool/ascend_store/backend/mooncake_layerwise.py
+@@ -13,6 +13,7 @@ from typing import TYPE_CHECKING, Any
+ from vllm.logger import logger
+ from vllm.v1.kv_cache_interface import UniformTypeKVCacheSpecs
+ 
++from vllm_ascend.ascend_config import KVPPConfig
+ from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.backend.layerwise_keys import LayerwiseKeyBuilder
+ from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.metadata import (
+     ReqMeta,
+@@ -117,8 +118,14 @@ def layerwise_topology_namespace(vllm_config: Any, kv_cache_config: Any = None)
+     hash: the scheduler and every stage must derive the same namespace.
+     """
+     parallel = vllm_config.parallel_config
++    kvpp_size = KVPPConfig.from_vllm_config(vllm_config).size if getattr(vllm_config, "additional_config", None) else 1
++    kvpp_namespace = (
++        f"kvpp-tp{parallel.tensor_parallel_size}-pcp{parallel.prefill_context_parallel_size}" if kvpp_size > 1 else ""
++    )
+     if parallel.pipeline_parallel_size == 1:
+-        return ""
++        # Owner-only objects have different sizes and layer offsets from the
++        # ordinary replicated layout, even with the same model and TP size.
++        return kvpp_namespace
+     model = vllm_config.model_config
+     partitions = []
+     previous_end = 0
+@@ -144,7 +151,7 @@ def layerwise_topology_namespace(vllm_config: Any, kv_cache_config: Any = None)
+             size for group in kv_cache_config.kv_cache_groups for size in group_block_size_signature(group)
+         )
+     speculative = vllm_config.speculative_config
+-    identity = (
++    identity: tuple[Any, ...] = (
+         parallel.tensor_parallel_size,
+         partitions,
+         model.compute_hash(),
+@@ -153,6 +160,8 @@ def layerwise_topology_namespace(vllm_config: Any, kv_cache_config: Any = None)
+         cache.block_size,
+         speculative.compute_hash() if speculative is not None else None,
+     )
++    if kvpp_namespace:
++        identity += (kvpp_namespace,)
+     digest = hashlib.sha256(json.dumps(identity, sort_keys=True).encode()).hexdigest()
+     return f"mooncake_pp_v3:{digest}"
+ 
+diff --git a/vllm_ascend/distributed/kv_transfer/kv_pool/ascend_store/pool_worker.py b/vllm_ascend/distributed/kv_transfer/kv_pool/ascend_store/pool_worker.py
+index 1851e114e..7a3122bc1 100644
+--- a/vllm_ascend/distributed/kv_transfer/kv_pool/ascend_store/pool_worker.py
++++ b/vllm_ascend/distributed/kv_transfer/kv_pool/ascend_store/pool_worker.py
+@@ -1365,6 +1365,10 @@ class KVPoolWorker:
+         self.layerwise_retrievers: list[Any] = []
+         self.next_layer_to_submit = 0
+         reset_attention_compute_start_gate()
++        if self.use_kvpp:
++            assert self.layer_load_finished_events is not None
++            for event in self.layer_load_finished_events:
++                event.clear()
+         self._attention_saved_layers = set()
+         self._save_disabled.clear()
+         if self.kv_recv_thread is not None:
+@@ -3127,6 +3131,28 @@ class KVPoolWorker:
+             self.next_layer_to_submit += 1
+             submit_layer_load(layer_id)
+ 
++    def wait_for_layer_load_ready(self, layer_name: str) -> None:
++        physical_layer = self._extract_physical_layer_index(layer_name)
++        layer_id = self._global_to_local_layer.get(physical_layer)
++        if layer_id is None:
++            if self._global_to_local_layer:
++                return
++            layer_id = physical_layer
++        if not 0 <= layer_id < len(self.layer_load_tasks):
++            return
++        if self.kv_recv_thread is None:
++            raise RuntimeError("kv_recv_thread is not initialized")
++        self.kv_recv_thread.raise_if_failed()
++        if not self.layer_load_tasks[layer_id] and layer_id not in self.prefetch_layer_map:
++            return
++        if self.layer_load_finished_events is None:
++            raise RuntimeError("layer_load_finished_events is not initialized")
++        while not self.layer_load_finished_events[layer_id].wait(timeout=1):
++            self.kv_recv_thread.raise_if_failed()
++            if self._layer_load_aborted.is_set():
++                raise RuntimeError("Layerwise load aborted before KVPP broadcast")
++        self.kv_recv_thread.raise_if_failed()
++
+     def wait_for_layer_load(self) -> None:
+         if self.current_layer >= self.num_layers:
+             return
+@@ -3171,8 +3197,12 @@ class KVPoolWorker:
+             if getattr(self, "use_block_key_layerwise", False):
+                 self._finish_current_layerwise_load_sessions()
+             raise
+-        self.layer_load_finished_events[self.current_layer].clear()
+-        if getattr(self, "block_key_hybrid", False) and self.current_layer == self.num_layers - 1:
++        # KVPP can observe completion after attention; reset at the next bind.
++        if not self.use_kvpp:
++            self.layer_load_finished_events[self.current_layer].clear()
++        if (
++            getattr(self, "block_key_hybrid", False) or (self.use_kvpp and self.use_block_key_layerwise)
++        ) and self.current_layer == self.num_layers - 1:
+             # The final model layer can have no reachable load rows. Completion
+             # belongs to the whole request, not whichever group happens to end here.
+             for req_id in self._current_layerwise_last_chunk_req_ids:
+diff --git a/vllm_ascend/worker/v2/kvpp.py b/vllm_ascend/worker/v2/kvpp.py
+index 3c6261107..a902de407 100644
+--- a/vllm_ascend/worker/v2/kvpp.py
++++ b/vllm_ascend/worker/v2/kvpp.py
+@@ -5,6 +5,7 @@ from concurrent.futures import Future, ThreadPoolExecutor
+ from typing import Any
+ 
+ import torch
++from vllm.distributed.kv_transfer import get_kv_transfer_group
+ 
+ from vllm_ascend.ascend_config import KVPPConfig
+ from vllm_ascend.core.kv_cache_placement import build_kvpp_layer_layout, create_kvpp_cache_allocation_plan
+@@ -13,6 +14,22 @@ from vllm_ascend.distributed.parallel_state import get_kvpp_group
+ from vllm_ascend.worker.kvpp_cache import get_kvpp_cache_specs
+ 
+ 
++def _uses_layerwise_store(transfer: Any) -> bool:
++    if transfer is None:
++        return False
++    extra_config = getattr(transfer, "kv_connector_extra_config", None) or {}
++    connectors = (
++        extra_config.get("connectors", [])
++        if transfer.kv_connector == "MultiConnector"
++        else [{"kv_connector": transfer.kv_connector, "kv_connector_extra_config": extra_config}]
++    )
++    return any(
++        connector.get("kv_connector") == "AscendStoreConnector"
++        and (connector.get("kv_connector_extra_config") or {}).get("use_layerwise", False)
++        for connector in connectors
++    )
++
++
+ class KVPPRuntime:
+     """Bind contiguous cache storage to the shared layer prefetch scheduler."""
+ 
+@@ -57,6 +74,7 @@ class KVPPRuntime:
+         scheduler = KVPPScheduler(
+             transport=BroadcastKVPPTransport(group, plan.layer_owner_ranks, layer_buffers),
+             attention_layer_names=tuple(layer_buffers),
++            layerwise=_uses_layerwise_store(vllm_config.kv_transfer_config),
+         )
+         for name in layer_buffers:
+             static_forward_context[name].impl.layerwise_kv_cache_hook = scheduler
+@@ -74,7 +92,10 @@ class KVPPRuntime:
+ class KVPPScheduler:
+     """Prefetch one layer ahead; Target execution ordinal selects scratch."""
+ 
+-    def __init__(self, transport: BroadcastKVPPTransport, attention_layer_names: tuple[str, ...]) -> None:
++    def __init__(
++        self, transport: BroadcastKVPPTransport, attention_layer_names: tuple[str, ...], *, layerwise: bool = False
++    ) -> None:
++        self.layerwise = layerwise
+         self.transport = transport
+         self.attention_layer_names = attention_layer_names
+         self._has_history = False
+@@ -87,7 +108,7 @@ class KVPPScheduler:
+     def schedule_forward(self, has_history: bool) -> None:
+         self._has_history = has_history
+         self._next_attention_layer_index = 0
+-        if has_history:
++        if has_history and not self.layerwise:
+             self.start_layer_prefetch(self.attention_layer_names[0])
+ 
+     def start_layer_prefetch(self, layer_name: str) -> None:
+@@ -97,11 +118,15 @@ class KVPPScheduler:
+ 
+     def run_layer_prefetch(self, layer_name: str, cache_ready: Any) -> None:
+         torch.npu.set_device(self._npu_device_id)
++        if self.layerwise:
++            get_kv_transfer_group().wait_for_layer_load_ready(layer_name)
+         self.transport.prefetch(layer_name, cache_ready, self._kv_transfer_stream)
+ 
+     def wait_for_layer(self, layer_name: str) -> None:
+         if not self._has_history:
+             return
++        if self.layerwise and self._prefetch_future is None:
++            self.start_layer_prefetch(layer_name)
+         assert self._prefetch_future is not None
+         self._prefetch_future.result()
+         self._prefetch_future = None

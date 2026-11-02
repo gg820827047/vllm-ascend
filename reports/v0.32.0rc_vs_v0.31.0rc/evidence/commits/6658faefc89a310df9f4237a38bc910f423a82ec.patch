@@ -1,0 +1,443 @@
+commit 6658faefc89a310df9f4237a38bc910f423a82ec
+Author:     Zhu Yi Lin <116337067+GDzhu01@users.noreply.github.com>
+AuthorDate: Fri Oct 30 10:23:25 2026 +0800
+Commit:     GitHub <noreply@github.com>
+CommitDate: Fri Oct 30 10:23:25 2026 +0800
+
+    [Feature][Proxy] Add opt-in prefill session affinity (#19708)
+    
+    ### What this PR does / why we need it?
+    
+    Multi-turn agent requests can land on different prefill DP ranks even
+    when their prompt prefix is unchanged, reducing opportunities to reuse
+    rank-local prefix cache. Add optional conversation affinity to the
+    load-balance proxy using SHA256 rendezvous hashing over individual
+    prefill endpoints.
+    
+    Conversation identity comes from `X-Session-Id`, the request body's
+    `user`, or the first user message and preceding system/developer
+    instructions, together with the model name. Later turns and tool results
+    do not change the fallback key. Initial prefill and recomputation use
+    the same policy. Endpoints marked for removal are excluded, and removing
+    an endpoint remaps only the conversations assigned to it. Existing
+    request/KV accounting and decode load balancing are preserved.
+    
+    ### Does this PR introduce _any_ user-facing change?
+    
+    Yes: `--enable-prefill-affinity` enables the new policy; the default
+    remains load based. When enabled, a nonempty `X-Session-Id` overrides
+    the forwarded `user` field. The new example README documents identity
+    precedence, agent session IDs, rank endpoint registration, and
+    limitations: busy endpoints remain sticky and cache hits are not
+    guaranteed after eviction, restart, or prefix changes.
+    
+    ### How was this patch tested?
+    
+    - `PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 PYTHONPATH=. python3 -m pytest -q
+    --noconftest -c /dev/null tests/ut/proxy`: **35 passed** in an isolated
+    remote Linux directory, covering the new affinity tests and existing
+    scheduler/HTTP regression tests.
+    - New tests cover growing histories, explicit sessions and compaction,
+    model/prefix separation, structured Unicode content, CLI defaults,
+    accounting, unchanged decode balancing, endpoint removal/tainting, hash
+    stability across subprocesses and endpoint order, header precedence, and
+    initial/recompute routing.
+    - Ran the exact candidate proxy with **two workers** against an existing
+    **P DP32 / D DP32 Mooncake** deployment on a separate loopback port.
+    Three consecutive chat turns returned HTTP 200 and `pong`; all three
+    selected the same specific P endpoint. The test proxy was stopped
+    afterward; model services were not restarted.
+    - Ruff check/format, codespell, markdownlint, and `git diff --check`
+    passed for the changed files.
+    - Full `bash format.sh ci` was attempted locally but its actionlint Go
+    environment installation stalled; it was stopped and the relevant
+    changed-file hooks were run successfully instead.
+    
+    No controlled throughput or cache-hit improvement benchmark is claimed.
+    
+    - vLLM main:
+    https://github.com/vllm-project/vllm/commit/c0b6f74bee518aeaf5d72b200a0216e72fbb5e7c
+    
+    ---------
+    
+    Signed-off-by: GDzhu01 <116337067+GDzhu01@users.noreply.github.com>
+
+diff --git a/examples/disaggregated_prefill_v1/README.md b/examples/disaggregated_prefill_v1/README.md
+new file mode 100644
+index 000000000..4254b776f
+--- /dev/null
++++ b/examples/disaggregated_prefill_v1/README.md
+@@ -0,0 +1,64 @@
++# Load balance proxy session affinity
++
++The `load_balance_proxy_server_example.py` proxy can keep a multi-turn
++conversation on the same prefill endpoint to reuse its prefix cache. Enable
++this optional policy with `--enable-prefill-affinity`:
++
++```bash
++python load_balance_proxy_server_example.py \
++  --host 0.0.0.0 --port 9000 --workers 2 \
++  --prefiller-hosts 127.0.0.1 127.0.0.1 \
++  --prefiller-ports 8100 8101 \
++  --decoder-hosts 127.0.0.1 127.0.0.1 \
++  --decoder-ports 8200 8201 \
++  --enable-prefill-affinity
++```
++
++Without the flag, the existing load-based scheduling policy remains unchanged.
++Decode scheduling remains load based with either policy.
++
++## Conversation identity
++
++When affinity is enabled, the proxy identifies the conversation in this order:
++
++1. The `X-Session-Id` HTTP header, if nonempty. It overrides the forwarded
++   request body's `user` field.
++2. A nonempty string in the OpenAI-compatible `user` field.
++3. The first `user` message and any preceding `system` or `developer` messages.
++
++The model name is included in every identity. The fallback uses canonical JSON,
++including structured message content; later messages and sampling parameters
++do not affect it. Requests without an identity use load-based scheduling.
++For `/v1/completions`, provide an explicit session ID to enable affinity.
++
++Agent clients should send a stable ID for each task, agent branch and sample:
++
++```bash
++curl http://localhost:9000/v1/chat/completions \
++  -H 'Content-Type: application/json' \
++  -H 'X-Session-Id: run-123:task-456:agent-0:sample-0' \
++  -d '{"model":"your-model","messages":[{"role":"user","content":"Fix this bug"}]}'
++```
++
++Keep the ID unchanged across tool calls, subsequent turns and request retries.
++Use a different ID for independent tasks, branches or samples. Prefer explicit
++IDs if the agent compacts history or rewrites its initial instructions. Do not
++use one shared `user` value for every conversation: it would pin them all to
++one endpoint. Without explicit IDs, identical initial messages and instructions
++share an affinity key.
++
++## Routing behavior and limits
++
++The proxy uses SHA256 rendezvous hashing over the conversation key and each
++registered prefill `host:port`, selecting the highest score. Register individual
++DP rank endpoints to obtain rank-level affinity; a load balancer hiding multiple
++ranks behind one endpoint cannot provide this guarantee. Selection is stable
++across proxy workers and restarts while the endpoint set is unchanged. Removing
++an endpoint remaps only its conversations; adding one may attract conversations
++from existing endpoints. Endpoints marked for removal are excluded immediately.
++If no eligible prefill endpoints remain, assignment fails.
++
++Affinity does not move a conversation away from a busy prefill endpoint, so it
++can trade load balance for cache reuse. It does not reserve cache space or
++guarantee hits after eviction, service restart or prompt-prefix changes. Decode
++requests still use the existing KV-transfer flow and load-based scheduler.
+diff --git a/examples/disaggregated_prefill_v1/load_balance_proxy_server_example.py b/examples/disaggregated_prefill_v1/load_balance_proxy_server_example.py
+index 2cfc14f20..f524fc75d 100644
+--- a/examples/disaggregated_prefill_v1/load_balance_proxy_server_example.py
++++ b/examples/disaggregated_prefill_v1/load_balance_proxy_server_example.py
+@@ -116,6 +116,7 @@ import argparse
+ import asyncio
+ import base64
+ import functools
++import hashlib
+ import heapq
+ import ipaddress
+ import json
+@@ -227,6 +228,22 @@ def setup_logging(log_level: str) -> None:
+     logger.setLevel(getattr(logging, log_level.upper()))
+ 
+ 
++def conversation_affinity_key(req_data: dict) -> str | None:
++    """Identify a conversation without hashing its growing message history."""
++    user = req_data.get("user")
++    if isinstance(user, str) and user:
++        identity = [req_data.get("model"), "session", user]
++    else:
++        messages = req_data.get("messages") or []
++        first_user_index = next((i for i, message in enumerate(messages) if message.get("role") == "user"), None)
++        if first_user_index is None:
++            return None
++        instructions = [m for m in messages[:first_user_index] if m.get("role") in ("system", "developer")]
++        identity = [req_data.get("model"), instructions, messages[first_user_index]]
++    encoded = json.dumps(identity, sort_keys=True, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
++    return hashlib.sha256(encoded).hexdigest()
++
++
+ def next_req_id() -> str:
+     return str(uuid.uuid4())
+ 
+@@ -385,8 +402,22 @@ class SharedProxyScheduler:
+         *,
+         active_tokens: bool = False,
+         kv_cache: bool = False,
++        affinity_key: str | None = None,
+     ) -> dict[str, Any]:
+-        key = self._pop_valid(role)
++        if affinity_key and role is ServerRole.PREFILL:
++            pool = self._pool(role)
++            candidates = pool.servers.keys() - pool.tainted
++            if not candidates:
++                raise RuntimeError("No available prefill servers for session affinity")
++            # Rendezvous hashing is stable across workers/restarts and only
++            # remaps conversations whose chosen endpoint is removed.
++            key = max(
++                candidates,
++                key=lambda k: (hashlib.sha256((affinity_key + "\0" + k).encode("utf-8")).digest(), k),
++            )
++            logger.debug("Prefill affinity key=%s backend=%s", affinity_key[:16], key)
++        else:
++            key = self._pop_valid(role)
+         entry = self._pool(role).servers[key]
+         if active_tokens:
+             entry.active_tokens += load
+@@ -413,17 +444,17 @@ class SharedProxyScheduler:
+             entry.active_kv_cache = max(0.0, entry.active_kv_cache - load)
+         self._push_heap(role, key)
+ 
+-    def begin_request(self, load: float) -> dict[str, Any]:
++    def begin_request(self, load: float, affinity_key: str | None = None) -> dict[str, Any]:
+         """Pick a prefiller, reserve KV pressure, and count this as an active request."""
+         with self._lock:
+-            picked = self._pick_server(ServerRole.PREFILL, load, kv_cache=True)
++            picked = self._pick_server(ServerRole.PREFILL, load, kv_cache=True, affinity_key=affinity_key)
+             self.request_num += 1
+             return picked
+ 
+-    def reserve_prefill_kv(self, load: float) -> dict[str, Any]:
++    def reserve_prefill_kv(self, load: float, affinity_key: str | None = None) -> dict[str, Any]:
+         """Pick a prefiller for recompute without bumping the active request count."""
+         with self._lock:
+-            return self._pick_server(ServerRole.PREFILL, load, kv_cache=True)
++            return self._pick_server(ServerRole.PREFILL, load, kv_cache=True, affinity_key=affinity_key)
+ 
+     def pick_decoder(self, load: float) -> dict[str, Any]:
+         with self._lock:
+@@ -676,6 +707,11 @@ def parse_args() -> argparse.Namespace:
+     parser.add_argument("--prefiller-ports", type=int, nargs="+", default=[8001])
+     parser.add_argument("--decoder-hosts", type=str, nargs="+", default=["localhost"])
+     parser.add_argument("--decoder-ports", type=int, nargs="+", default=[8002])
++    parser.add_argument(
++        "--enable-prefill-affinity",
++        action="store_true",
++        help="Route conversations to stable prefill endpoints to reuse prefix cache; decode remains load balanced.",
++    )
+     parser.add_argument("--max-retries", type=int, default=3, help="Maximum number of retries for HTTP requests")
+     parser.add_argument(
+         "--retry-delay", type=float, default=0.001, help="Base delay (seconds) for exponential backoff retries"
+@@ -956,7 +992,10 @@ async def assign_instances(
+     decoder_score = calculate_decode_score(request_length)
+     request_id = req_data.get("request_id") or next_req_id()
+     pick_prefill = "begin_request" if is_initial_request else "reserve_prefill_kv"
+-    prefiller = await runtime.schedule(pick_prefill, prefiller_score)
++    if args.enable_prefill_affinity:
++        prefiller = await runtime.schedule(pick_prefill, prefiller_score, conversation_affinity_key(req_data))
++    else:
++        prefiller = await runtime.schedule(pick_prefill, prefiller_score)
+     prefiller_key = prefiller["key"]
+ 
+     try:
+@@ -1038,6 +1077,8 @@ async def handle_completions_impl(api: str, request: Request):
+     request_released = False
+     try:
+         req_data = await request.json()
++        if args.enable_prefill_affinity and (session_id := request.headers.get("X-Session-Id")):
++            req_data["user"] = session_id
+         if request_id := request.headers.get("X-Request-Id"):
+             req_data["request_id"] = request_id
+         req_body = await request.body()
+diff --git a/release_notes/fragments/19708.yaml b/release_notes/fragments/19708.yaml
+new file mode 100644
+index 000000000..8e9ce3163
+--- /dev/null
++++ b/release_notes/fragments/19708.yaml
+@@ -0,0 +1,7 @@
++pr: 19708
++entries:
++  - category: feature
++    text: >-
++      Added optional prefill session affinity to the load-balance proxy with
++      --enable-prefill-affinity, keeping multi-turn agent requests on a stable
++      prefill endpoint while preserving load-based decode scheduling.
+diff --git a/tests/ut/proxy/test_prefill_session_affinity.py b/tests/ut/proxy/test_prefill_session_affinity.py
+new file mode 100644
+index 000000000..a7ff738ea
+--- /dev/null
++++ b/tests/ut/proxy/test_prefill_session_affinity.py
+@@ -0,0 +1,176 @@
++# SPDX-License-Identifier: Apache-2.0
++"""Conversation routing and accounting without model or accelerator imports."""
++
++import asyncio
++import copy
++import json
++import os
++import subprocess
++import sys
++from types import SimpleNamespace
++from unittest.mock import AsyncMock
++
++import pytest
++from starlette.requests import Request
++
++from examples.disaggregated_prefill_v1 import load_balance_proxy_server_example as proxy
++
++
++def make_scheduler(endpoints=None):
++    return proxy.SharedProxyScheduler(
++        endpoints or [("10.0.0.1", port) for port in range(8000, 8004)],
++        [("10.0.0.2", 9000), ("10.0.0.2", 9001)],
++    )
++
++
++def chat():
++    return {
++        "model": "test-model",
++        "messages": [{"role": "system", "content": "Be helpful"}, {"role": "user", "content": "Fix this bug"}],
++    }
++
++
++def test_growing_history_and_sampling_do_not_change_key():
++    request = chat()
++    key = proxy.conversation_affinity_key(request)
++    request["messages"] += [
++        {"role": "assistant", "content": "Inspect the file"},
++        {"role": "tool", "content": "file contents"},
++        {"role": "user", "content": "Continue"},
++    ]
++    request.update(temperature=0.5, max_tokens=1024, request_id="another-request")
++    assert proxy.conversation_affinity_key(request) == key
++
++
++@pytest.mark.parametrize("field", ["model", "instructions", "first_user"])
++def test_fallback_distinguishes_model_and_prefix(field):
++    request = chat()
++    changed = copy.deepcopy(request)
++    if field == "model":
++        changed["model"] = "other-model"
++    else:
++        changed["messages"][0 if field == "instructions" else 1]["content"] = "different"
++    assert proxy.conversation_affinity_key(request) != proxy.conversation_affinity_key(changed)
++
++
++def test_explicit_session_survives_history_compaction():
++    original = {**chat(), "user": "task-1:agent-0"}
++    compacted = {"model": "test-model", "user": "task-1:agent-0", "messages": []}
++    assert proxy.conversation_affinity_key(original) == proxy.conversation_affinity_key(compacted)
++    compacted["user"] = "task-2:agent-0"
++    assert proxy.conversation_affinity_key(original) != proxy.conversation_affinity_key(compacted)
++
++
++def test_structured_unicode_content_and_dictionary_order():
++    request = {"model": "model", "messages": [{"role": "user", "content": [{"type": "text", "text": "你好"}]}]}
++    reordered = {"messages": [{"content": [{"text": "你好", "type": "text"}], "role": "user"}], "model": "model"}
++    assert proxy.conversation_affinity_key(request) == proxy.conversation_affinity_key(reordered)
++
++
++@pytest.mark.parametrize("req_data", [{"prompt": "hello"}, {"messages": []}, {"messages": [{"role": "system"}]}])
++def test_missing_session_and_user_message_has_no_affinity(req_data):
++    assert proxy.conversation_affinity_key(req_data) is None
++
++
++def test_cli_affinity_is_opt_in(monkeypatch):
++    monkeypatch.setattr(sys, "argv", ["proxy"])
++    assert not proxy.parse_args().enable_prefill_affinity
++    monkeypatch.setattr(sys, "argv", ["proxy", "--enable-prefill-affinity"])
++    assert proxy.parse_args().enable_prefill_affinity
++
++
++def test_affinity_ignores_load_but_preserves_accounting_and_decode_balancing():
++    scheduler = make_scheduler()
++    first = scheduler.begin_request(10, "session")
++    second = scheduler.begin_request(20, "session")
++    recompute = scheduler.reserve_prefill_kv(5, "session")
++    assert first["key"] == second["key"] == recompute["key"]
++    assert scheduler.request_num == 2
++    assert scheduler.prefillers[first["key"]].active_kv_cache == 35
++    scheduler.release_prefill_kv(first["key"], 35)
++    assert scheduler.prefillers[first["key"]].active_kv_cache == 0
++    assert scheduler.pick_decoder(10)["key"] != scheduler.pick_decoder(10)["key"]
++
++
++def test_default_scheduler_still_balances_load():
++    scheduler = make_scheduler()
++    assert scheduler.begin_request(10)["key"] != scheduler.begin_request(10)["key"]
++
++
++def test_removal_only_remaps_affected_sessions():
++    scheduler = make_scheduler()
++    before = {str(i): scheduler.reserve_prefill_kv(0, str(i))["key"] for i in range(100)}
++    assert len(set(before.values())) == 4
++    removed = before["0"]
++    host, port = removed.rsplit(":", 1)
++    scheduler.remove_instances(proxy.ServerRole.PREFILL, [(host, int(port))])
++    for session, previous in before.items():
++        current = scheduler.reserve_prefill_kv(0, session)["key"]
++        assert current != removed
++        if previous != removed:
++            assert current == previous
++
++
++def test_tainted_endpoint_is_excluded_and_all_tainted_fails_without_leaking_load():
++    scheduler = make_scheduler()
++    first = scheduler.begin_request(10, "session")
++    host, port = first["key"].rsplit(":", 1)
++    scheduler.remove_instances(proxy.ServerRole.PREFILL, [(host, int(port))])
++    assert scheduler.reserve_prefill_kv(5, "session")["key"] != first["key"]
++    scheduler.remove_instances(proxy.ServerRole.PREFILL, [("10.0.0.1", p) for p in range(8000, 8004)])
++    count = scheduler.request_num
++    with pytest.raises(RuntimeError, match="No available prefill"):
++        scheduler.begin_request(10, "session")
++    assert scheduler.request_num == count
++
++
++def test_endpoint_order_and_python_hash_seed_do_not_affect_routes():
++    code = (
++        "import json; from examples.disaggregated_prefill_v1 import load_balance_proxy_server_example as p; "
++        "s=p.SharedProxyScheduler([('10.0.0.1',n) for n in PORTS], [('10.0.0.2',9000)]); "
++        "print(json.dumps([s.reserve_prefill_kv(0,str(i))['key'] for i in range(20)]))"
++    )
++    routes = []
++    for seed, ports in [("1", [8000, 8001, 8002, 8003]), ("2", [8003, 8002, 8001, 8000])]:
++        output = subprocess.check_output(
++            [sys.executable, "-c", code.replace("PORTS", repr(ports))],
++            env={**os.environ, "PYTHONHASHSEED": seed},
++            text=True,
++        )
++        routes.append(json.loads(output))
++    assert routes[0] == routes[1]
++
++
++@pytest.mark.parametrize("enabled", [False, True])
++def test_session_header_precedence_only_when_enabled(monkeypatch, enabled):
++    received = []
++
++    async def receive():
++        return {"type": "http.request", "body": json.dumps({**chat(), "user": "body-session"}).encode()}
++
++    async def capture_assignment(api, req_data, request_length, *, is_initial_request):
++        received.append(req_data)
++        raise RuntimeError("stop after inspecting routing input")
++
++    monkeypatch.setattr(proxy, "get_runtime", lambda: None)
++    monkeypatch.setattr(proxy, "get_global_args", lambda: SimpleNamespace(enable_prefill_affinity=enabled))
++    monkeypatch.setattr(proxy, "assign_instances", capture_assignment)
++    request = Request({"type": "http", "headers": [(b"x-session-id", b"header-session")]}, receive)
++    with pytest.raises(RuntimeError, match="stop after inspecting"):
++        asyncio.run(proxy.handle_completions_impl("/v1/chat/completions", request))
++    assert received[0]["user"] == ("header-session" if enabled else "body-session")
++
++
++@pytest.mark.parametrize("initial", [False, True])
++def test_assignment_propagates_affinity_on_initial_and_recompute(monkeypatch, initial):
++    runtime = SimpleNamespace(schedule=AsyncMock(side_effect=RuntimeError("captured")))
++    monkeypatch.setattr(proxy, "get_runtime", lambda: runtime)
++    monkeypatch.setattr(proxy, "get_global_args", lambda: SimpleNamespace(enable_prefill_affinity=True))
++    request = chat()
++    with pytest.raises(RuntimeError, match="captured"):
++        asyncio.run(proxy.assign_instances("/v1/chat/completions", request, 100, is_initial_request=initial))
++    runtime.schedule.assert_awaited_once_with(
++        "begin_request" if initial else "reserve_prefill_kv",
++        proxy.calculate_prefill_score(100),
++        proxy.conversation_affinity_key(request),
++    )

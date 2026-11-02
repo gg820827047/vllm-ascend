@@ -1,0 +1,439 @@
+commit c60929c0cda0ee2857bab58ff2637e10a5efbe7a
+Author:     freyfwt <110148731+freyfwt@users.noreply.github.com>
+AuthorDate: Thu Oct 29 17:30:01 2026 +0800
+Commit:     GitHub <noreply@github.com>
+CommitDate: Thu Oct 29 17:30:01 2026 +0800
+
+    [Performance][EPLB] Wait for consumed event before HIXL buffer reuse (#19342)
+    
+    ### What this PR does / why we need it?
+    
+    HIXL READs currently synchronize the entire EPLB stream before reusing
+    the shared expert buffer. For subsequent changed layers, the required
+    dependency is the previous foreground consumption of that buffer.
+    
+    Pass the recorded consumption event from the existing Ascend async
+    worker to its HIXL communicator, then synchronize that event on the host
+    before submitting private-stream READs. Capture it after
+    `CpuGpuEvent.wait()` observes the foreground acknowledgement, since
+    `record()` replaces the underlying device event. Scope the dependency to
+    one model and rearrangement cycle, clear it after each layer even on
+    failure, and retain the stream fallback for the first changed layer and
+    other callers. Publication synchronization, transfer completion and
+    cross-rank failure confirmation are preserved.
+    
+    ### Does this PR introduce _any_ user-facing change?
+    
+    No API or configuration changes. This narrows an internal
+    synchronization boundary. No end-to-end throughput or latency
+    improvement is claimed.
+    
+    ### How was this patch tested?
+    
+    Latest rebase validation at `eda265bbb`, using the pinned vLLM commit
+    `544f182d9f0c9bfe8bd7645525951d5e3692a542`:
+    
+    - `bash format.sh ci`: passed.
+    - Full `tools/mypy.sh 1` for Python 3.10, 3.11 and 3.12: passed across
+    `vllm_ascend`, `examples` and `tests` in a Linux lint environment.
+    - CPU/mock regression tests: **68 passed** across
+    `tests/ut/distributed/eplb/test_hixl_communicator.py` and
+    `tests/ut/patch/platform/test_patch_eplb.py`. Covers event replacement,
+    model/cycle isolation, repeated layer execution, empty READ batches,
+    fallback synchronization and failure cleanup.
+    - Real Ascend A5 two-device HIXL regression: **4 passed, 0 skipped**,
+    with both the ctypes backend and official Python binding. Tests the
+    stream fallback and consumed-event dependency using real device events,
+    delayed foreground consumption, HIXL READs and independent checks of
+    both buffer payloads. The event case also rejects full-stream
+    synchronization. The standard shared E2E conftest was used successfully.
+    
+    ```bash
+    VLLM_VERSION=0.32.1.dev0 VLLM_USE_V2_MODEL_RUNNER=1 \
+      python -m pytest -sv -rs \
+      tests/e2e/pull_request/two_card/test_hixl_eplb_registration.py::test_async_read_waits_for_previous_layer_buffer_consumption
+    ```
+    
+    The documented `VLLM_VERSION` override selects main compatibility paths
+    for the pinned source checkout. The real NPU run used CANN 9.2.0,
+    PyTorch 2.10.0 and torch_npu 2.10.0.post7.dev20261020. This validates
+    the dependency and buffer lifetime.
+    
+    An additional exploratory full-model A5 comparison used exact parent
+    `c4090d8ef9854cd788cbcbdb1e95b961f3adc7ad` versus `eda265bbb` in the
+    same runtime: BF16 Qwen3-30B-A3B, TP2/DP2/EP4, zero redundant experts,
+    asynchronous STAIR/HIXL, FULL_AND_PIECEWISE graphs, prefix caching
+    disabled, and eight prompts generating 512 tokens each. After observing
+    a committed real migration, three timed samples each generated 4096
+    output tokens.
+    
+    | Source | Sample throughput (output tokens/s) | Aggregate throughput |
+    | --- | --- | --- |
+    | Parent | 906.38, 910.34, 911.25 | 909.32 |
+    | PR head | 898.25, 908.12, 897.19 | 901.16 |
+    
+    This single sequential pair measured about -0.90% aggregate throughput
+    and does not establish a statistically meaningful improvement or
+    regression. Later migration cycles differed in transfer work, so their
+    phase timings are not direct performance comparisons. The parent model
+    diagnostic passed. The head diagnostic completed all timed samples but
+    failed its final existing answer-prefix assertion: the last completion
+    began `called January` rather than `January`. That response answers the
+    question correctly, but the assertion remains failed; it was not
+    weakened or removed. The complete head model run is not reported as
+    passing. Repeated performance sampling and assessment of this
+    model/oracle boundary remain pending.
+    
+    ---
+    
+    ### Checklist
+    
+    #### Testing
+    
+    - [x] **Boundary / edge-case coverage**
+    - [x] **Regression test**
+    - [x] **Error / failure path coverage**
+    - [x] **Meaningful & reliable tests**
+    - [ ] **Performance impact**: narrower synchronization is asserted; a
+    matched model pilot is recorded above, with repeatability and
+    model/oracle acceptance still pending.
+    
+    - vLLM main:
+    https://github.com/vllm-project/vllm/commit/544f182d9f0c9bfe8bd7645525951d5e3692a542
+    
+    Signed-off-by: freyfwt <freytian1996@gmail.com>
+
+diff --git a/tests/e2e/pull_request/two_card/test_hixl_eplb_registration.py b/tests/e2e/pull_request/two_card/test_hixl_eplb_registration.py
+index 15fdd7772..cde4b9275 100644
+--- a/tests/e2e/pull_request/two_card/test_hixl_eplb_registration.py
++++ b/tests/e2e/pull_request/two_card/test_hixl_eplb_registration.py
+@@ -17,6 +17,7 @@ import torch.distributed as dist
+ import torch.multiprocessing as mp
+ import torch_npu  # noqa: F401
+ from torch.multiprocessing.spawn import ProcessExitedException
++from vllm.distributed.eplb.eplb_utils import CpuGpuEvent
+ from vllm.utils.network_utils import get_open_port
+ from vllm.v1.executor.multiproc_executor import WorkerProc
+ 
+@@ -33,7 +34,7 @@ def _migrate(communicator, buffers, rank: int) -> None:
+     communicator.execute()
+ 
+ 
+-def _async_buffer_reuse_worker(rank: int, port: int, binding: str) -> None:
++def _async_buffer_reuse_worker(rank: int, port: int, binding: str, use_consumed_event: bool) -> None:
+     torch.npu.set_device(rank)
+     if binding == "ctypes":
+         eplb_communicator._resolve_hixl_module = lambda: hixl_compat
+@@ -71,14 +72,31 @@ def _async_buffer_reuse_worker(rank: int, port: int, binding: str) -> None:
+     torch.npu.synchronize()
+     assert torch.all(buffers[0][0].cpu() == 2 - rank)
+     consumed = torch.empty_like(buffers[0][0])
+-    consumed_event = torch.npu.Event()
++    consumed_event = CpuGpuEvent()
+     with torch.npu.stream(consumer):
+         delay.replay()
+         consumed.copy_(buffers[0][0], non_blocking=True)
+         consumed_event.record(consumer)
+-    consumed_event.wait(background)
+-    with torch.npu.stream(background):
+-        read_layer(1)
++    consumed_event.wait(stream=background)
++    if use_consumed_event:
++        communicator.set_consumed_event(consumed_event._event)
++
++        def reject_stream_sync():
++            raise AssertionError("event-based buffer reuse must not synchronize the background stream")
++
++        communicator.set_stream(SimpleNamespace(synchronize=reject_stream_sync))
++        start_transfers = session._start_transfers
++
++        def check_read_dependency(reads):
++            assert consumed_event._event.query()
++            start_transfers(reads)
++
++        session._start_transfers = check_read_dependency
++    try:
++        with torch.npu.stream(background):
++            read_layer(1)
++    finally:
++        communicator.set_consumed_event(None)
+     torch.npu.synchronize()
+     assert torch.all(consumed.cpu() == 2 - rank)
+     assert torch.all(buffers[0][0].cpu() == 12 - rank)
+@@ -87,13 +105,14 @@ def _async_buffer_reuse_worker(rank: int, port: int, binding: str) -> None:
+ 
+ 
+ @pytest.mark.parametrize("binding", ["ctypes", "official"])
+-def test_async_read_waits_for_previous_layer_buffer_consumption(monkeypatch, binding):
++@pytest.mark.parametrize("use_consumed_event", [False, True])
++def test_async_read_waits_for_previous_layer_buffer_consumption(monkeypatch, binding, use_consumed_event):
+     if torch.npu.device_count() < 2:
+         pytest.skip("requires two NPU devices")
+     if binding == "official" and importlib.util.find_spec("hixl") is None:
+         pytest.skip("CANN does not provide the official Python binding")
+     monkeypatch.setenv("PYTORCH_NPU_ALLOC_CONF", "expandable_segments:True")
+-    mp.spawn(_async_buffer_reuse_worker, args=(get_open_port(), binding), nprocs=2, join=True)
++    mp.spawn(_async_buffer_reuse_worker, args=(get_open_port(), binding, use_consumed_event), nprocs=2, join=True)
+ 
+ 
+ def _registration_worker(rank: int, port: int, binding: str) -> None:
+diff --git a/tests/ut/distributed/eplb/test_hixl_communicator.py b/tests/ut/distributed/eplb/test_hixl_communicator.py
+index 307e2f024..10cc3f77f 100644
+--- a/tests/ut/distributed/eplb/test_hixl_communicator.py
++++ b/tests/ut/distributed/eplb/test_hixl_communicator.py
+@@ -307,6 +307,62 @@ def test_hixl_waits_for_buffer_consumption_before_private_stream_read(monkeypatc
+     session.close()
+ 
+ 
++@pytest.mark.parametrize("has_reads", [False, True])
++def test_hixl_waits_only_for_consumed_event_across_layer_batches(monkeypatch, has_reads):
++    session, models, engine = _shared_models(monkeypatch)
++    session.initialize(models)
++    communicator = models["main"]
++    stream = MagicMock()
++    stream.synchronize.side_effect = AssertionError("must not wait for later EPLB stream work")
++    communicator.set_stream(stream)
++    event = MagicMock()
++    communicator.set_consumed_event(event)
++    session._confirm_all_ranks = MagicMock(wraps=session._confirm_all_ranks)
++    original_transfer = engine.transfer_async
++
++    def transfer(*args):
++        assert event.synchronize.call_count > len(engine.transfers)
++        return original_transfer(*args)
++
++    engine.transfer_async = transfer
++    for _ in range(2):
++        communicator.set_transfer_context(np.arange(4), layer_idx=1)
++        if has_reads:
++            communicator.add_recv([_Tensor(2000, session._device, (4,), 16)], 1, 3)
++        communicator.execute()
++
++    assert event.synchronize.call_count == 2
++    assert len(engine.transfers) == 2 * int(has_reads)
++    assert session._confirm_all_ranks.call_count == 2
++    stream.synchronize.assert_not_called()
++    communicator.set_consumed_event(None)
++    session.close()
++
++
++def test_hixl_consumed_event_failure_prevents_reads_and_retains_storage(monkeypatch):
++    session, models, engine = _shared_models(monkeypatch)
++    session.initialize(models)
++    communicator = models["main"]
++    storage_refs = list(session._storage_refs)
++    handles = list(session._registered_handles)
++    failure = RuntimeError("buffer consumption failed")
++    communicator.set_consumed_event(MagicMock(synchronize=MagicMock(side_effect=failure)))
++    communicator.set_transfer_context(np.arange(4), layer_idx=1)
++    communicator.add_recv([_Tensor(2000, session._device, (4,), 16)], 1, 3)
++    session._confirm_all_ranks = MagicMock(wraps=session._confirm_all_ranks)
++
++    with pytest.raises(RuntimeError, match="buffer consumption failed") as error:
++        communicator.execute()
++
++    assert error.value is failure
++    assert engine.transfers == []
++    session._confirm_all_ranks.assert_called_once_with(failure, "transfer")
++    assert session._error is failure and not session._usable
++    assert session._storage_refs == storage_refs
++    assert session._registered_handles == handles
++    assert not engine.deregistered and not engine.finalized
++
++
+ @pytest.mark.parametrize(
+     "ranges, expected",
+     [
+diff --git a/tests/ut/patch/platform/test_patch_eplb.py b/tests/ut/patch/platform/test_patch_eplb.py
+index 6a9b58fac..8356079a6 100644
+--- a/tests/ut/patch/platform/test_patch_eplb.py
++++ b/tests/ut/patch/platform/test_patch_eplb.py
+@@ -11,6 +11,7 @@ import pytest
+ import torch
+ from vllm.config import EPLBConfig, ParallelConfig, VllmConfig
+ from vllm.config import parallel as parallel_module
++from vllm.distributed.eplb.eplb_utils import CpuGpuEvent
+ from vllm.platforms import current_platform
+ from vllm.v1.executor.multiproc_executor import WorkerProc
+ 
+@@ -539,6 +540,96 @@ def test_async_worker_only_publishes_changed_layers(monkeypatch, changed_layer):
+     assert patch_eplb._async_worker.transfer_layer.call_count == int(changed_layer is not None)
+ 
+ 
++@pytest.mark.parametrize("fail_transfer", [False, True])
++def test_hixl_worker_consumption_events_are_scoped_to_model_cycle_and_layer(monkeypatch, fail_transfer):
++    session, communicators, _engine = _shared_models(monkeypatch)
++    session.initialize(communicators)
++    old_mapping = torch.tensor([[0, 1, 2, 3], [0, 1, 2, 3]])
++    new_mapping = old_mapping.flip(1)
++    model_states = {
++        name: SimpleNamespace(
++            communicator=communicator,
++            physical_to_logical_map=old_mapping,
++            logical_to_physical_map=torch.empty((2, 4, 1), dtype=torch.int32),
++            model=SimpleNamespace(expert_weights=[[object()], [object()]]),
++            expert_buffer=[object()],
++            rebalanced=True,
++            pending_result=None,
++        )
++        for name, communicator in communicators.items()
++    }
++    cycles = iter(range(2))
++    previous_events = {}
++    transfers = []
++    active_model = ""
++    failure = RuntimeError("layer transfer failed")
++    monkeypatch.setattr(torch, "Event", MagicMock(side_effect=lambda: MagicMock()))
++
++    class ConsumedEvent(CpuGpuEvent):
++        def wait(self, stream=None):
++            # Emulate the foreground acknowledgement after publication, including
++            # the real CpuGpuEvent.record() replacement of the device event.
++            model_state = model_states[active_model]
++            assert model_state.pending_result.consumed_event is self
++            self.record()
++            super().wait(stream=stream)
++            previous_events[active_model] = self._event
++            model_state.pending_result = None
++
++    def wait_for_rearrangement(_stream):
++        if next(cycles, None) is None:
++            return False
++        previous_events.clear()
++        return True
++
++    def transfer_layer(**kwargs):
++        nonlocal active_model
++        communicator = kwargs["communicator"]
++        active_model = next(name for name, candidate in communicators.items() if candidate is communicator)
++        layer = kwargs["layer_idx"]
++        dependency = communicator._consumed_event
++        assert dependency is (previous_events[active_model] if layer else None)
++        transfers.append((active_model, layer))
++        if fail_transfer and layer == 1:
++            raise failure
++        communicator.set_transfer_context(kwargs["old_layer_indices"].numpy(), layer)
++        communicator.execute()
++        if dependency is not None:
++            dependency.synchronize.assert_called_once_with()
++        return object()
++
++    monkeypatch.setattr(patch_eplb._async_worker, "CpuGpuEvent", ConsumedEvent)
++    monkeypatch.setattr(patch_eplb._async_worker, "run_rebalance_experts", lambda *_args: new_mapping)
++    monkeypatch.setattr(patch_eplb._async_worker, "transfer_layer", transfer_layer)
++    monkeypatch.setattr(
++        patch_eplb._async_worker,
++        "get_eplb_group",
++        lambda: SimpleNamespace(device_group=MagicMock(), cpu_group=MagicMock(size=lambda: 1)),
++    )
++    monkeypatch.setattr(patch_eplb.torch.distributed, "all_reduce", MagicMock())
++    state = AscendEplbState.__new__(AscendEplbState)
++    state.model_states = model_states
++    state._hixl_session = session
++    state.wait_for_rearrangement = wait_for_rearrangement
++
++    def original_worker(state, stream, is_profile=False):
++        raise AssertionError("Ascend state must use the patched worker")
++
++    worker = patch_eplb._wrap_async_worker(original_worker)
++    if fail_transfer:
++        with pytest.raises(RuntimeError, match="layer transfer failed") as error:
++            worker(state, MagicMock())
++        assert session._error is error.value is failure
++        assert not session._usable
++        assert transfers == [("draft", 0), ("draft", 1)]
++    else:
++        worker(state, MagicMock())
++        assert transfers == [(name, layer) for _ in range(2) for name in communicators for layer in range(2)]
++        session.close()
++    assert all(communicator._consumed_event is None for communicator in communicators.values())
++    assert all(model_state.pending_result is None for model_state in model_states.values())
++
++
+ @pytest.mark.parametrize("failure_stage", ["context", "synchronize"])
+ def test_hixl_async_failure_outside_execute_exits_rpc_and_retains_shared_storage(monkeypatch, failure_stage):
+     session, communicators, engine = _shared_models(monkeypatch)
+diff --git a/vllm_ascend/distributed/eplb/eplb_communicator.py b/vllm_ascend/distributed/eplb/eplb_communicator.py
+index e102e844e..4c6f2f1c3 100644
+--- a/vllm_ascend/distributed/eplb/eplb_communicator.py
++++ b/vllm_ascend/distributed/eplb/eplb_communicator.py
+@@ -482,6 +482,7 @@ class AscendHixlEplbCommunicator(EplbCommunicator):
+         self._all_expert_weights = all_expert_weights
+         self._expert_buffer = expert_buffer
+         self._stream: torch.Stream | None = None
++        self._consumed_event: torch.Event | None = None
+         self._session: _HixlSession | None = None
+         self._remote_send_meta: dict[int, _ExpertMetadata] = {}
+         self._expert_to_src_row: list[dict[int, int]] | None = None
+@@ -569,6 +570,10 @@ class AscendHixlEplbCommunicator(EplbCommunicator):
+         self._require_session()._set_hixl_context()
+         self._stream = stream
+ 
++    def set_consumed_event(self, event: torch.Event | None) -> None:
++        """Set the recorded buffer-consumption dependency for one layer."""
++        self._consumed_event = event
++
+     def set_transfer_context(self, old_indices: np.ndarray, layer_idx: int) -> None:
+         self._require_session()
+         if self._pending_reads:
+@@ -617,12 +622,16 @@ class AscendHixlEplbCommunicator(EplbCommunicator):
+         phase_started_at = time.perf_counter()
+         local_error: Exception | None = None
+         try:
+-            # HIXL's private streams cannot honor the consumed-event wait on
+-            # the EPLB stream. Finish that wait before a READ overwrites the
+-            # shared buffer with the next layer's weights.
++            # HIXL's private streams bypass the EPLB stream's consumed-event
++            # wait. Finish consumption before a READ reuses the buffer, without
++            # waiting for unrelated work subsequently queued on the EPLB stream.
+             with gpu_sync_allowed():
+-                stream = self._stream if self._stream is not None else torch.accelerator.current_stream()
+-                stream.synchronize()
++                if self._consumed_event is not None:
++                    self._consumed_event.synchronize()
++                else:
++                    # First layer and callers without a consumption event.
++                    stream = self._stream if self._stream is not None else torch.accelerator.current_stream()
++                    stream.synchronize()
+             session._start_transfers(self._pending_reads)
+         except Exception as error:
+             local_error = error
+diff --git a/vllm_ascend/patch/platform/patch_eplb.py b/vllm_ascend/patch/platform/patch_eplb.py
+index 00980bdef..3a20244b6 100644
+--- a/vllm_ascend/patch/platform/patch_eplb.py
++++ b/vllm_ascend/patch/platform/patch_eplb.py
+@@ -580,6 +580,7 @@ def _wrap_async_worker(original_worker):
+             eplb_cpu_group = _async_worker.get_eplb_group().cpu_group
+             for model_state in state.model_states.values():
+                 model_state.communicator.set_stream(stream)
++                previous_consumed_event = None
+                 with stream if stream is not None else nullcontext():
+                     old_mapping = model_state.physical_to_logical_map.cpu()
+                 new_mapping = _async_worker.run_rebalance_experts(model_state, state, old_mapping, stream)
+@@ -628,7 +629,14 @@ def _wrap_async_worker(original_worker):
+                         "layer_idx": layer_idx,
+                         transfer_stream_parameter: stream,
+                     }
+-                    metadata = _async_worker.transfer_layer(**transfer_kwargs)
++                    communicator = model_state.communicator
++                    if isinstance(communicator, AscendHixlEplbCommunicator):
++                        communicator.set_consumed_event(previous_consumed_event)
++                    try:
++                        metadata = _async_worker.transfer_layer(**transfer_kwargs)
++                    finally:
++                        if isinstance(communicator, AscendHixlEplbCommunicator):
++                            communicator.set_consumed_event(None)
+                     with gpu_sync_allowed():
+                         stream.synchronize()
+                     consumed_event = _async_worker.CpuGpuEvent()
+@@ -643,6 +651,10 @@ def _wrap_async_worker(original_worker):
+                     )
+                     consumed_event.wait(stream=stream)
+                     assert model_state.pending_result is None
++                    if isinstance(communicator, AscendHixlEplbCommunicator):
++                        # record() replaces the underlying event. Capture it only
++                        # after wait() has observed the foreground acknowledgement.
++                        previous_consumed_event = consumed_event._event
+                     if index == len(changed_layers) - 1:
+                         # On both supported lanes, the last workspace move may
+                         # use upstream's helper instead of the wrapped commit

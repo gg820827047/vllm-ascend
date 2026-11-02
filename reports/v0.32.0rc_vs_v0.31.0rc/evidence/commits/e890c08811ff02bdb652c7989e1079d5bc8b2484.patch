@@ -1,0 +1,1926 @@
+commit e890c08811ff02bdb652c7989e1079d5bc8b2484
+Author:     Lethobenthos20 <167174511+Lethobenthos20@users.noreply.github.com>
+AuthorDate: Sun Nov 1 15:09:30 2026 +0800
+Commit:     GitHub <noreply@github.com>
+CommitDate: Sun Nov 1 15:09:30 2026 +0800
+
+    [Performance][Qwen3.8Next][Attention] Dispatch prefill between FIA+mask and GBSA at 24K logical KV [v0.32.0rc] (#20467)
+    
+    ## What this PR does
+    
+    This PR ports the Qwen4Exp FIA + selected-token-mask dispatch and the
+    24K logical-visible-KV dispatch policy from #20304 onto
+    `vllm-project/vllm-ascend:releases/v0.32.0rc`. The original commit
+    ordering and author attribution are preserved while resolving the
+    release-branch integration against its latest head.
+    
+    ### Dispatch policy
+    
+    - Pure decode always uses GBSA.
+    - For each prefill request in pure-prefill or mixed batches:
+    - if the cached logical KV prefix at the start of the current chunk is
+    below 24K, the whole chunk uses FIA + selected-token mask;
+    - if the cached logical KV prefix is at least 24K, the whole chunk uses
+    GBSA.
+    - A normal 4K chunk that crosses 24K is kept intact on FIA + mask. The
+    following chunk switches to GBSA.
+    - Mixed batches are classified per request, and consecutive GBSA rows
+    are coalesced without changing request IDs or output positions.
+    
+    The threshold is based on request/query-row logical visible KV length,
+    not physical cache allocation or the fixed 4K scheduler capacity.
+    
+    ## Why
+    
+    This retains FIA behavior for short and medium prefill while routing
+    later long-context chunks to GBSA. Decode remains on GBSA.
+    
+    ## Performance results
+    
+    ### 32K input / 1-token output
+    
+    This single-request result compares the dispatch strategy before and
+    after the stacked optimization. Input length is 32K, output length is 1
+    token, and concurrency is 1.
+    
+    | Metric | Unit | Before (dispatch strategy) | After | Change | Change
+    rate |
+    |---|---:|---:|---:|---:|---:|
+    | E2EL | ms | 13476.0 | 10325.2 | -3150.8 | -23.38% |
+    | TTFT | ms | 13475.8 | 10325.0 | -3150.8 | -23.38% |
+    | ITL | ms | 0.1 | 0.1 | 0.0 | 0.00% |
+    | Input Tokens | token | 32820 | 32820 | 0 | 0.00% |
+    | Output Tokens | token | 1 | 1 | 0 | 0.00% |
+    | Output Token Throughput | token/s | 0.0742 | 0.0969 | +0.0227 |
+    +30.59% |
+    | Prefill Token Throughput | token/s | 2435.4699 | 3178.6852 | +743.2153
+    | +30.52% |
+    | Input Token Throughput | token/s | 2435.4403 | 3178.6461 | +743.2058 |
+    +30.52% |
+    | Total Token Throughput | token/s | 2435.5145 | 3178.7429 | +743.2284 |
+    +30.52% |
+    | Request Throughput | req/s | 0.0742 | 0.0969 | +0.0227 | +30.59% |
+    | Benchmark Duration | ms | 13476.0029 | 10325.1508 | -3150.8521 |
+    -23.38% |
+    | Total Requests | count | 1 | 1 | 0 | - |
+    | Concurrency | - | 1.0 | 1.0 | 0 | - |
+    | Failed Requests | count | 0 | 0 | 0 | - |
+    
+    The stacked optimization reduces TTFT and E2EL by **23.38%**, while
+    improving prefill, input, and total token throughput by approximately
+    **30.52%**. No requests failed.
+    ## Validation
+    
+    - Focused dispatch unit tests: **76 passed**.
+    - Pure Prefill, pure Decode, mixed-batch, and both sides of the 24K
+    boundary are covered.
+    - On the `releases/v0.32.0rc` base, 553 focused dispatch/GBSA/QSA tests,
+    `py_compile`, and `git diff --check` passed.
+    - Single-curl semantic checks completed for 4K, 24K, 24K+1, 28K, 32K,
+    and 64K prompts.
+    - Candidate functional and performance runs completed at 4K, 8K, 16K,
+    32K, 33K, 64K, 126K, and 128K.
+    
+    ## Attribution
+    
+    The initial FIA + mask dispatch commit is authored by Dean11879 and
+    co-authored by Lethobenthos20. The 24K logical-KV dispatch commit is
+    authored and committed by Lethobenthos20.
+    
+    - vLLM main:
+    https://github.com/vllm-project/vllm/commit/544f182d9f0c9bfe8bd7645525951d5e3692a542
+    
+    ---------
+    
+    Signed-off-by: Dean11879 <81577875+Dean11879@users.noreply.github.com>
+    Signed-off-by: Lethobenthos20 <Lethobenthos20@users.noreply.github.com>
+    Signed-off-by: Lethobenthos20 <167174511+Lethobenthos20@users.noreply.github.com>
+    Signed-off-by: shaopeng-666 <shaopeng-666@users.noreply.github.com>
+    Co-authored-by: Dean11879 <81577875+Dean11879@users.noreply.github.com>
+    Co-authored-by: Lethobenthos20 <Lethobenthos20@users.noreply.github.com>
+    Co-authored-by: shaopeng-666 <shaopeng-666@users.noreply.github.com>
+
+diff --git a/tests/e2e/nightly/single_node/ops/singlecard_ops/triton/test_qwen4_exp_qsa.py b/tests/e2e/nightly/single_node/ops/singlecard_ops/triton/test_qwen4_exp_qsa.py
+new file mode 100644
+index 000000000..c76542a37
+--- /dev/null
++++ b/tests/e2e/nightly/single_node/ops/singlecard_ops/triton/test_qwen4_exp_qsa.py
+@@ -0,0 +1,85 @@
++import pytest
++import torch
++from vllm.triton_utils import HAS_TRITON
++
++from vllm_ascend.device.device_config import get_ascend_device_type
++from vllm_ascend.device.hardware import AscendDeviceType
++from vllm_ascend.ops.triton.qwen4_exp.fia import QSAFIAMaskWorkspace, build_qsa_fia_mask
++from vllm_ascend.ops.triton.qwen4_exp.gbsa import prepare_qsa_gbsa_inputs
++from vllm_ascend.ops.triton.qwen4_exp.qsa import pack_qsa_group_indices_npu
++
++pytestmark = [
++    pytest.mark.skipif(get_ascend_device_type() != AscendDeviceType.A3, reason="Requires Ascend A3"),
++    pytest.mark.skipif(not HAS_TRITON, reason="Triton is not available"),
++]
++
++
++@torch.inference_mode()
++def test_qsa_pack_supports_non_power_of_two_output_width() -> None:
++    groups, ratio = 512, 4
++    block_indices = torch.arange(groups, dtype=torch.int32).repeat(2, 1).npu()
++    query_positions = torch.tensor([2048, 4094], dtype=torch.int64).npu()
++    sequence_lengths = torch.tensor([4096, 4096], dtype=torch.int32).npu()
++    token_to_req = torch.tensor([0, 1], dtype=torch.int32).npu()
++
++    actual = pack_qsa_group_indices_npu(
++        block_indices,
++        query_positions,
++        sequence_lengths,
++        token_to_req,
++        token_topk=2048,
++        compress_ratio=ratio,
++    )
++
++    expected = torch.full((2, groups + ratio - 1), -1, dtype=torch.int32)
++    expected[0, :512] = torch.arange(512, dtype=torch.int32)
++    expected[0, 512] = 2048
++    expected[1, :512] = torch.arange(512, dtype=torch.int32)
++    expected[1, 512:515] = torch.arange(4092, 4095, dtype=torch.int32)
++    torch.testing.assert_close(actual.cpu(), expected, rtol=0, atol=0)
++
++
++@torch.inference_mode()
++def test_qsa_fia_workspace_wide_to_narrow_reuse() -> None:
++    workspace = QSAFIAMaskWorkspace(torch.device("npu:0"), max_rows=2, max_bytes=4096, max_update_width=520)
++    compact = torch.full((2, 131), -1, dtype=torch.int32, device="npu")
++    compact[0, :2] = torch.tensor([1, 5], dtype=torch.int32, device="npu")
++    compact[1, :2] = torch.tensor([2, 9], dtype=torch.int32, device="npu")
++    visible = torch.tensor([256, 256], dtype=torch.int32, device="npu")
++
++    actual, selected = build_qsa_fia_mask(compact, visible, kv_length=256, mask_width=256, workspace=workspace)
++
++    expected = torch.ones((2, 256), dtype=torch.bool)
++    expected[0, 4:8] = False
++    expected[0, 20:24] = False
++    expected[1, 8:12] = False
++    expected[1, 36:40] = False
++    torch.testing.assert_close(actual.cpu(), expected, rtol=0, atol=0)
++    torch.testing.assert_close(selected.cpu(), torch.ones(2, dtype=torch.bool), rtol=0, atol=0)
++
++
++@torch.inference_mode()
++def test_qsa_gbsa_preparation_ragged_noncontiguous_table() -> None:
++    compact = torch.tensor(
++        [[0, 2, -1, 4, -1, -1, -1, -1, 99, 99, 99], [0, 1, 2, 3, 4, 5, 6, 7, 99, 99, 99]],
++        dtype=torch.int32,
++        device="npu",
++    )
++    positions = torch.tensor([18, 31], dtype=torch.int64, device="npu")
++    lengths = torch.tensor([19, 32], dtype=torch.int32, device="npu")
++    token_to_req = torch.tensor([0, 1], dtype=torch.int32, device="npu")
++    table_storage = torch.arange(24, dtype=torch.int32, device="npu").reshape(2, 12)
++    block_table = table_storage[:, ::2]
++
++    sparse, counts, visible, cu_query, row_table = prepare_qsa_gbsa_inputs(
++        compact, positions, lengths, token_to_req, block_table, num_kv_heads=2
++    )
++
++    sparse_cpu = sparse.cpu()
++    for head in range(2):
++        torch.testing.assert_close(sparse_cpu[head, 0, :3], torch.tensor([0, 2, 4], dtype=torch.int32), rtol=0, atol=0)
++        torch.testing.assert_close(sparse_cpu[head, 1, :8], torch.arange(8, dtype=torch.int32), rtol=0, atol=0)
++    torch.testing.assert_close(counts.cpu(), torch.tensor([[3, 8], [3, 8]], dtype=torch.int32), rtol=0, atol=0)
++    torch.testing.assert_close(visible.cpu(), torch.tensor([19, 32], dtype=torch.int32), rtol=0, atol=0)
++    torch.testing.assert_close(cu_query.cpu(), torch.tensor([0, 1, 2], dtype=torch.int64), rtol=0, atol=0)
++    torch.testing.assert_close(row_table.cpu(), block_table.cpu(), rtol=0, atol=0)
+diff --git a/tests/ut/models/qwen4_exp/gbsa_reference.py b/tests/ut/models/qwen4_exp/gbsa_reference.py
+new file mode 100644
+index 000000000..0cc355305
+--- /dev/null
++++ b/tests/ut/models/qwen4_exp/gbsa_reference.py
+@@ -0,0 +1,67 @@
++# SPDX-License-Identifier: Apache-2.0
++"""Reference GBSA metadata preparation used by Qwen4Exp unit tests."""
++
++import torch
++
++GBSA_RESIDUAL_TOKENS = 3
++GBSA_COMPRESS_RATIO = 4
++GBSA_MAX_SPARSE_BLOCKS = 512
++
++
++def reference_prepare(
++    compact_indices: torch.Tensor,
++    logical_positions: torch.Tensor,
++    seq_lens: torch.Tensor,
++    token_to_req: torch.Tensor,
++    block_table: torch.Tensor,
++    num_kv_heads: int,
++) -> tuple[torch.Tensor, ...]:
++    sparse_width = compact_indices.shape[1] - GBSA_RESIDUAL_TOKENS
++    row_requests = token_to_req.long()
++    row_request_lens = seq_lens[row_requests].to(torch.int32)
++    row_visible_lens = torch.minimum(
++        logical_positions.to(torch.int32).add(1).clamp_min(0),
++        row_request_lens,
++    )
++    sparse_idx = compact_indices[:, :sparse_width].to(torch.int32)
++    full_blocks = torch.div(
++        row_visible_lens,
++        GBSA_COMPRESS_RATIO,
++        rounding_mode="floor",
++    )
++    has_residual_block = row_visible_lens.remainder(GBSA_COMPRESS_RATIO).ne(0)
++    valid = (sparse_idx >= 0) & (sparse_idx < full_blocks.unsqueeze(1))
++    order = torch.argsort((~valid).to(torch.int32), dim=1, stable=True)
++    sparse_idx = sparse_idx.gather(1, order)
++    full_sparse_count = valid.sum(dim=1).to(torch.int32)
++
++    # A3 GBSA does not accept residual_block_mode=1 in its metadata
++    # scheduler. Represent the incomplete visible tail as an explicit sparse
++    # block instead. The LI-v2 groups are restricted to full blocks above, so
++    # the tail block cannot duplicate an existing valid selection.
++    # A3 GBSA accepts at most 512 sparse entries. Normally append one slot so
++    # every LI-v2 full-block selection is preserved. If LI-v2 already fills
++    # the operator limit, reuse the final slot by dropping the last
++    # (lowest-priority) full-block selection.
++    if sparse_idx.shape[1] < GBSA_MAX_SPARSE_BLOCKS:
++        sparse_idx = torch.cat(
++            (sparse_idx, torch.full_like(sparse_idx[:, :1], -1)),
++            dim=1,
++        )
++    sparse_capacity = torch.full_like(full_sparse_count, sparse_idx.shape[1])
++    sparse_capacity = sparse_capacity - has_residual_block.to(torch.int32)
++    sparse_count = torch.minimum(full_sparse_count, sparse_capacity)
++    columns = torch.arange(sparse_idx.shape[1], device=sparse_idx.device)
++    tail_slot = columns.unsqueeze(0).eq(sparse_count.long().unsqueeze(1))
++    sparse_idx = torch.where(
++        tail_slot & has_residual_block.unsqueeze(1),
++        full_blocks.unsqueeze(1),
++        sparse_idx,
++    )
++    sparse_count = sparse_count + has_residual_block.to(torch.int32)
++    sparse_idx = sparse_idx.unsqueeze(0).expand(num_kv_heads, -1, -1).contiguous()
++    sparse_count = sparse_count.unsqueeze(0).expand(num_kv_heads, -1).contiguous()
++
++    cu_q = torch.arange(compact_indices.shape[0] + 1, dtype=torch.int64, device=compact_indices.device)
++    row_block_table = block_table[row_requests].contiguous()
++    return sparse_idx, sparse_count, row_visible_lens, cu_q, row_block_table
+diff --git a/tests/ut/models/qwen4_exp/test_fia_dispatch.py b/tests/ut/models/qwen4_exp/test_fia_dispatch.py
+new file mode 100644
+index 000000000..e15a65f97
+--- /dev/null
++++ b/tests/ut/models/qwen4_exp/test_fia_dispatch.py
+@@ -0,0 +1,376 @@
++# SPDX-License-Identifier: Apache-2.0
++"""Mask semantics and scheduler-shape coverage without requiring a native NPU."""
++
++import ast
++from dataclasses import dataclass
++from pathlib import Path
++from types import SimpleNamespace
++from typing import Any
++
++import pytest
++import torch
++
++MODEL_DIR = Path(__file__).resolve().parents[4] / "vllm_ascend/models/qwen4_exp"
++
++
++def _load_source(filename, namespace):
++    source = MODEL_DIR / filename
++    module = ast.parse(source.read_text())
++    module.body = [node for node in module.body if not isinstance(node, (ast.Import, ast.ImportFrom))]
++    exec(compile(module, str(source), "exec"), namespace)
++
++
++@pytest.fixture
++def implementation():
++    namespace = {"torch": torch, "dataclass": dataclass, "__name__": __name__}
++    _load_source("gbsa.py", namespace)
++    _load_source("fia.py", namespace)
++    _load_source("attention_dispatch.py", namespace)
++    return namespace
++
++
++def test_mask_discards_invalid_and_duplicate_indices(implementation):
++    indices = torch.tensor([[[0, 2, 5, -1], [1, 3, 7, -1], [0, 4, -1, -1], [2, 2, 5, -1]]])
++    mask = implementation["build_selected_token_mask"](indices, 6, 8)
++    expected = torch.tensor(
++        [[1, 0, 1, 0, 0, 1, 0, 0], [0, 1, 0, 1, 0, 0, 0, 0], [1, 0, 0, 0, 1, 0, 0, 0], [0, 0, 1, 0, 0, 1, 0, 0]],
++        dtype=torch.bool,
++    )
++    torch.testing.assert_close(mask[0, 0], expected)
++
++
++def test_mask_broadcasts_one_effective_length_per_batch(implementation):
++    indices = torch.tensor(
++        [
++            [[0, 2, 4], [1, 3, 5]],
++            [[0, 2, 4], [1, 3, 5]],
++        ]
++    )
++    mask = implementation["build_selected_token_mask"](indices, torch.tensor([3, 5]), 6)
++    expected = torch.tensor(
++        [
++            [[1, 0, 1, 0, 0, 0], [0, 1, 0, 0, 0, 0]],
++            [[1, 0, 1, 0, 1, 0], [0, 1, 0, 1, 0, 0]],
++        ],
++        dtype=torch.bool,
++    )
++    torch.testing.assert_close(mask[:, 0], expected)
++
++
++@pytest.mark.parametrize("visible", range(12))
++def test_compact_groups_and_implicit_tail_respect_each_query_position(implementation, visible):
++    # Deliberately poison explicit tail slots: GBSA derives its tail from visibility.
++    compact = torch.tensor([[0, 1, 8, -1, 999, 999, 999]], dtype=torch.int32)
++    selected = implementation["expand_qsa_selected_tokens"](compact, torch.tensor([visible]))
++    allowed = implementation["build_selected_token_mask"](selected[None], torch.tensor([[visible]]), 16)
++    expected = torch.zeros(16, dtype=torch.bool)
++    expected[: min(visible // 4 * 4, 8)] = True
++    expected[visible // 4 * 4 : visible] = True
++    torch.testing.assert_close(allowed[0, 0, 0], expected)
++
++
++def test_fia_passes_gqa_heads_causal_mask_and_zeroes_empty_rows(implementation):
++    calls = []
++
++    def fia(**kwargs):
++        calls.append(kwargs)
++        return torch.ones_like(kwargs["query"]), None
++
++    implementation["torch_npu"] = SimpleNamespace(npu_fused_infer_attention_score_v2=fia)
++    query = torch.zeros(4, 4, 8, dtype=torch.bfloat16)
++    key = torch.zeros(4, 1, 8, dtype=torch.bfloat16)
++    compact = torch.tensor([[0, -1, -1, -1]] * 4)
++    result = implementation["qsa_fia_attention"](
++        query,
++        key,
++        key,
++        compact,
++        torch.tensor([0, 2, 3, 4]),
++        4,
++        torch.empty_like(query),
++    )
++    assert calls[0]["num_query_heads"] == 4
++    assert calls[0]["num_key_value_heads"] == 1
++    assert calls[0]["block_table"] is None
++    assert calls[0]["atten_mask"][0, 0, 1].tolist() == [False, False, True, True]
++    assert torch.all(result[0] == 0)
++    assert torch.all(result[1:] == 1)
++
++
++@pytest.mark.parametrize("groups", [31, 128, 511, 512])
++@pytest.mark.parametrize("tail", range(4))
++@pytest.mark.parametrize("holes", [False, True])
++def test_fia_mask_matches_latest_gbsa_explicit_tail_policy(implementation, groups, tail, holes):
++    from tests.ut.models.qwen4_exp.gbsa_reference import reference_prepare
++
++    visible = 4096 + tail
++    indices = torch.full((1, groups + 3), -1, dtype=torch.int32)
++    indices[0, :groups] = torch.arange(groups - 1, -1, -1)
++    if holes:
++        indices[0, 2:groups:7] = -1
++    lengths = torch.tensor([visible], dtype=torch.int32)
++    packed, counts, *_ = reference_prepare(
++        indices,
++        torch.tensor([visible - 1]),
++        lengths,
++        torch.tensor([0]),
++        torch.arange(33, dtype=torch.int32)[None],
++        1,
++    )
++    expected = torch.zeros(visible, dtype=torch.bool)
++    for group in packed[0, 0, : counts[0, 0]].tolist():
++        expected[group * 4 : min(group * 4 + 4, visible)] = True
++    selected = implementation["expand_qsa_selected_tokens"](indices, lengths)
++    actual = implementation["build_selected_token_mask"](selected[None], lengths[None], visible)
++    torch.testing.assert_close(actual[0, 0, 0], expected)
++
++
++def test_fia_descriptor_page_mapping_is_zero_copy(implementation):
++    storage = torch.arange(8 * 128 * 2 * 4).reshape(8, 128, 2, 4)
++    cache = storage.as_strided((3, 128, 2, 4), (2 * 128 * 8, 8, 4, 1))
++    key, value, table, width = implementation["prepare_qsa_fia_paged_kv"](
++        cache,
++        cache,
++        torch.tensor([[2, 0, -1]], dtype=torch.int32),
++        257,
++    )
++    assert key.data_ptr() == cache.data_ptr()
++    assert value.data_ptr() == cache.data_ptr()
++    assert table.tolist() == [[4, 0, 0]]
++    assert width == 384
++    torch.testing.assert_close(key[4], cache[2].flatten(1))
++
++
++@pytest.mark.parametrize(
++    "query_length,kv_length,prefill",
++    [
++        (1, 1, True),
++        (1, 32768, True),
++        (4096, 4096, True),
++        (4096, 32768, True),
++        (1, 128, False),
++        (4, 16383, False),
++        (8, 32768, False),
++    ],
++)
++def test_route_uses_explicit_phase_not_query_or_kv_length(implementation, query_length, kv_length, prefill):
++    plan = implementation["build_qsa_request_plan"](
++        torch.tensor([0, query_length]), torch.tensor([kv_length]), query_length, torch.tensor([prefill])
++    )
++    assert plan[0].is_prefill is prefill
++    assert plan[0].use_paged_kv is (query_length != kv_length)
++    if not prefill:
++        assert not plan[0].use_fia
++
++
++@pytest.mark.parametrize(
++    "query_length,kv_length,expected_fia",
++    [
++        (1, 24575, True),
++        (1, 24576, True),
++        (1, 24577, False),
++        (4, 24578, True),
++        (4096, 24576, True),
++        (4096, 28671, True),
++        (4096, 28672, False),
++        (4096, 32768, False),
++        (131072, 131072, True),
++    ],
++)
++def test_chunk_start_policy_including_large_initial_prefill(implementation, query_length, kv_length, expected_fia):
++    plan = implementation["build_qsa_request_plan"](
++        torch.tensor([0, query_length]), torch.tensor([kv_length]), query_length, torch.tensor([True])
++    )
++    request = plan[0]
++    assert request.use_fia is expected_fia
++    assert request.fia_query_end == (query_length if expected_fia else 0)
++    assert request.gbsa_query_start == (query_length if expected_fia else 0)
++
++
++def run_stub_batch(implementation, phases, query_lengths, kv_lengths):
++    starts = [0]
++    for length in query_lengths:
++        starts.append(starts[-1] + length)
++    total = starts[-1]
++    q = torch.arange(total, dtype=torch.float32).reshape(total, 1, 1)
++    out = torch.zeros_like(q)
++    calls = []
++
++    def prepare(k, v, table, kv):
++        return k, v, table, kv
++
++    def fia(q, k, v, idx, visible, kv, out, **kwargs):
++        calls.append(("fia", q.flatten().tolist()))
++        out.fill_(3)
++
++    def gbsa(q, k, v, idx, table, requests, positions, lengths, out):
++        calls.append(("gbsa", q.flatten().tolist()))
++        out.fill_(7)
++        return out
++
++    implementation.update(prepare_qsa_fia_paged_kv=prepare, qsa_fia_attention=fia, qsa_gbsa_attention=gbsa)
++    plan = implementation["build_qsa_request_plan"](
++        torch.tensor(starts), torch.tensor(kv_lengths), total, torch.tensor(phases)
++    )
++    requests = torch.repeat_interleave(torch.arange(len(phases)), torch.tensor(query_lengths))
++    implementation["dispatch_qsa_attention"](
++        q,
++        q,
++        q,
++        q,
++        q,
++        torch.zeros(total, 7),
++        torch.zeros(len(phases), 256),
++        requests,
++        torch.arange(total),
++        torch.tensor(kv_lengths),
++        out,
++        plan,
++    )
++    expected = []
++    for phase, query_length, kv_length in zip(phases, query_lengths, kv_lengths):
++        fia_rows = 0
++        if phase:
++            kv_before_query = kv_length - query_length
++            fia_rows = query_length if kv_before_query < 24576 else 0
++        expected.extend([3] * fia_rows)
++        expected.extend([7] * (query_length - fia_rows))
++    torch.testing.assert_close(out.flatten(), torch.tensor(expected, dtype=torch.float32))
++    return calls
++
++
++def test_pure_prefill_routes_by_logical_kv_length(implementation):
++    calls = run_stub_batch(implementation, [True, True, True], [2, 4, 1], [4096, 24578, 24577])
++    assert calls == [("fia", [0, 1]), ("fia", [2, 3, 4, 5]), ("gbsa", [6])]
++
++
++def test_pure_decode_is_one_gbsa_call_including_mtp(implementation):
++    calls = run_stub_batch(implementation, [False, False, False], [1, 4, 8], [1, 8192, 32768])
++    assert calls == [("gbsa", list(range(13)))]
++
++
++def test_mixed_batch_runs_prefill_first_then_contiguous_decode_spans(implementation):
++    calls = run_stub_batch(
++        implementation,
++        [False, True, True, False, False, True, False],
++        [1, 2, 1, 1, 4, 1, 1],
++        [4096, 24576, 24577, 16384, 12, 1, 8192],
++    )
++    assert calls == [
++        ("fia", [1, 2]),
++        ("fia", [9]),
++        ("gbsa", [0]),
++        ("gbsa", [3, 4, 5, 6, 7, 8]),
++        ("gbsa", [10]),
++    ]
++
++
++def test_decode_sentinel_bypasses_request_planner(implementation):
++    calls = []
++
++    def gbsa(*args):
++        calls.append(args)
++        return args[-1]
++
++    implementation["qsa_gbsa_attention"] = gbsa
++    q = torch.zeros(4, 3, 8)
++    implementation["dispatch_qsa_attention"](
++        q, q, q, q, q, torch.zeros(4, 7), torch.zeros(1, 1), torch.zeros(4), torch.arange(4), torch.tensor([4]), q, None
++    )
++    assert len(calls) == 1 and calls[0][0] is q
++
++
++def test_padding_requests_are_ignored(implementation):
++    plan = implementation["build_qsa_request_plan"](
++        torch.tensor([0, 1, 3, 8]), torch.tensor([4096, 32768, 0]), 3, torch.tensor([False, True, False])
++    )
++    assert [(r.query_start, r.query_end, r.is_prefill) for r in plan] == [(0, 1, False), (1, 3, True)]
++
++
++def test_phase_metadata_required_to_cover_requests(implementation):
++    with pytest.raises(ValueError, match="every request"):
++        implementation["build_qsa_request_plan"](
++            torch.tensor([0, 1, 2]), torch.tensor([10, 20]), 2, torch.tensor([False])
++        )
++
++
++def load_builder():
++    source = MODEL_DIR / "qsa.py"
++    builder = next(
++        n
++        for n in ast.parse(source.read_text(encoding="utf-8")).body
++        if isinstance(n, ast.ClassDef) and n.name == "AscendQSAMetadataBuilder"
++    )
++
++    class Base:
++        def build(self, *args, **kwargs):
++            return SimpleNamespace(block_table="kept")
++
++    plans = []
++
++    def plan(*args):
++        plans.append(args)
++        return ("prefill-plan",)
++
++    namespace: dict[str, Any] = dict(
++        upstream_qsa=SimpleNamespace(Qwen4ExpQSAMetadataBuilder=Base),
++        AttentionCGSupport=SimpleNamespace(UNIFORM_BATCH="uniform"),
++        CommonAttentionMetadata=object,
++        build_qsa_request_plan=plan,
++    )
++    exec(compile(ast.Module(body=[builder], type_ignores=[]), str(source), "exec"), namespace)
++    return namespace["AscendQSAMetadataBuilder"](), plans
++
++
++def test_metadata_builder_keeps_decode_capture_on_gbsa():
++    builder, plans = load_builder()
++    assert builder._cudagraph_support == "uniform"
++    common = SimpleNamespace(is_prefilling=torch.tensor([False]), seq_lens_cpu_upper_bound=None)
++    assert builder.build(0, common).qsa_request_plan is None
++    # Capture dummy inputs can look like prefills; the decode capture contract
++    # must not freeze FIA or host KV lengths into the graph.
++    common.is_prefilling = torch.tensor([True])
++    assert builder.build_for_cudagraph_capture(common).qsa_request_plan is None
++    assert plans == []
++
++
++def test_metadata_builder_uses_phase_flags_and_host_lengths_for_prefill():
++    builder, plans = load_builder()
++    common = SimpleNamespace(
++        is_prefilling=torch.tensor([True]),
++        seq_lens_cpu_upper_bound=torch.tensor([32768]),
++        query_start_loc_cpu=torch.tensor([0, 4096]),
++        num_actual_tokens=4096,
++    )
++    meta = builder.build(0, common)
++    assert meta.block_table == "kept" and meta.qsa_request_plan == ("prefill-plan",)
++    assert plans[0][-1] is common.is_prefilling
++
++
++def test_metadata_builder_rejects_unknown_phase_instead_of_guessing():
++    builder, _ = load_builder()
++    with pytest.raises(ValueError, match="is_prefilling"):
++        builder.build(0, SimpleNamespace(is_prefilling=None))
++
++
++def test_fia_helper_tiles_mask_memory_for_eligible_prefill(implementation):
++    calls = []
++    implementation["QSA_FIA_MASK_BUDGET_BYTES"] = 64
++
++    def fia(**kwargs):
++        calls.append(kwargs)
++        return torch.ones_like(kwargs["query"]), None
++
++    implementation["torch_npu"] = SimpleNamespace(npu_fused_infer_attention_score_v2=fia)
++    query = torch.zeros(5, 2, 4, dtype=torch.bfloat16)
++    key = torch.zeros(32, 1, 4, dtype=query.dtype)
++    implementation["qsa_fia_attention"](
++        query,
++        key,
++        key,
++        torch.tensor([[0, -1, -1, -1]] * 5),
++        torch.tensor([28, 29, 30, 31, 32]),
++        32,
++        torch.empty_like(query),
++    )
++    assert [c["query"].shape[1] for c in calls] == [2, 2, 1]
+diff --git a/tests/ut/models/qwen4_exp/test_gbsa_adapter.py b/tests/ut/models/qwen4_exp/test_gbsa_adapter.py
+index 53a7a8868..71121dd59 100644
+--- a/tests/ut/models/qwen4_exp/test_gbsa_adapter.py
++++ b/tests/ut/models/qwen4_exp/test_gbsa_adapter.py
+@@ -6,6 +6,8 @@ from pathlib import Path
+ import pytest
+ import torch
+ 
++from tests.ut.models.qwen4_exp.test_gbsa_preparation import load_cpu_preparation
++
+ 
+ def _load_cache_views():
+     import math
+@@ -16,6 +18,7 @@ def _load_cache_views():
+     module.body = [node for node in module.body if isinstance(node, ast.FunctionDef) and node.name in names]
+     namespace = {
+         "torch": torch,
++        "prepare_qsa_gbsa_inputs": load_cpu_preparation(),
+         "math": math,
+         "get_dtype_size": lambda dtype: torch.empty((), dtype=dtype).element_size(),
+     }
+@@ -61,6 +64,7 @@ def test_qsa_gbsa_uses_kernel_paged_cache(dtype, tail_tokens, storage_page_size,
+ 
+     namespace = {
+         "torch": torch,
++        "prepare_qsa_gbsa_inputs": load_cpu_preparation(),
+         "generic_block_sparse_attention_metadata": metadata,
+         "generic_block_sparse_attention": attention,
+     }
+@@ -148,6 +152,7 @@ def test_qsa_gbsa_uses_per_row_mtp_visible_lengths():
+ 
+     namespace = {
+         "torch": torch,
++        "prepare_qsa_gbsa_inputs": load_cpu_preparation(),
+         "generic_block_sparse_attention_metadata": metadata,
+         "generic_block_sparse_attention": attention,
+     }
+@@ -206,6 +211,7 @@ def test_qsa_gbsa_reserves_tail_within_512_entry_limit():
+ 
+     namespace = {
+         "torch": torch,
++        "prepare_qsa_gbsa_inputs": load_cpu_preparation(),
+         "generic_block_sparse_attention_metadata": metadata,
+         "generic_block_sparse_attention": attention,
+     }
+diff --git a/tests/ut/models/qwen4_exp/test_gbsa_preparation.py b/tests/ut/models/qwen4_exp/test_gbsa_preparation.py
+new file mode 100644
+index 000000000..bf054673a
+--- /dev/null
++++ b/tests/ut/models/qwen4_exp/test_gbsa_preparation.py
+@@ -0,0 +1,206 @@
++# SPDX-License-Identifier: Apache-2.0
++"""CPU execution of the preparation kernel body; NPU compilation is tested separately."""
++
++import ast
++from pathlib import Path
++from types import SimpleNamespace
++
++import numpy as np
++import pytest
++import torch
++
++from tests.ut.models.qwen4_exp.gbsa_reference import reference_prepare
++
++
++class _Value(np.ndarray):
++    def to(self, dtype, bitcast=False):
++        return (self.view(dtype) if bitcast else self.astype(dtype)).view(_Value)
++
++
++def _value(value):
++    return np.asarray(value).view(_Value)
++
++
++class _Pointer:
++    def __init__(self, storage, offset=0):
++        self.storage, self.offset = storage, offset
++
++    def __add__(self, offset):
++        return _Pointer(self.storage, self.offset + offset)
++
++
++class _Language:
++    int32, int64, float32 = np.int32, np.int64, np.float32
++    constexpr = object
++    static_range = staticmethod(range)
++    row = 0
++
++    def program_id(self, axis):
++        return _value(self.row)
++
++    @staticmethod
++    def arange(start, end):
++        return _value(np.arange(start, end, dtype=np.int32))
++
++    @staticmethod
++    def load(pointer, mask=True, other=0):
++        offsets, mask = np.broadcast_arrays(pointer.offset, mask)
++        result = np.full(offsets.shape, other, dtype=pointer.storage.dtype)
++        result[mask] = pointer.storage[offsets[mask]]
++        return _value(result)
++
++    @staticmethod
++    def store(pointer, value, mask=True):
++        offsets, values, mask = np.broadcast_arrays(pointer.offset, value, mask)
++        pointer.storage[offsets[mask]] = values[mask]
++
++    @staticmethod
++    def sum(value, axis):
++        return _value(np.sum(value, axis=axis, dtype=value.dtype))
++
++    @staticmethod
++    def cumsum(value, axis):
++        return _value(np.cumsum(value, axis=axis, dtype=value.dtype))
++
++    @staticmethod
++    def minimum(a, b):
++        return _value(np.minimum(a, b))
++
++    @staticmethod
++    def maximum(a, b):
++        return _value(np.maximum(a, b))
++
++    @staticmethod
++    def where(condition, a, b):
++        return _value(np.where(condition, a, b))
++
++
++class _Kernel:
++    def __init__(self, function, language):
++        self.function, self.language = function, language
++
++    def __getitem__(self, grid):
++        def launch(*args, **kwargs):
++            kwargs.pop("num_warps")
++            pointers = []
++            for argument in args:
++                if isinstance(argument, torch.Tensor):
++                    storage = argument.as_strided(
++                        (argument.untyped_storage().nbytes() // argument.element_size(),), (1,), storage_offset=0
++                    ).numpy()
++                    argument = _Pointer(storage, argument.storage_offset())
++                pointers.append(argument)
++            for row in range(grid[0]):
++                self.language.row = row
++                self.function(*pointers, **kwargs)
++
++        return launch
++
++
++def load_cpu_preparation():
++    source = Path(__file__).resolve().parents[4] / "vllm_ascend/ops/triton/qwen4_exp/gbsa.py"
++    module = ast.parse(source.read_text())
++    module.body = [node for node in module.body if not isinstance(node, (ast.Import, ast.ImportFrom))]
++    language = _Language()
++    for node in module.body:
++        if isinstance(node, ast.FunctionDef):
++            node.decorator_list = []
++    namespace = {
++        "torch": torch,
++        "tl": language,
++        "triton": SimpleNamespace(next_power_of_2=lambda n: 1 << (n - 1).bit_length()),
++    }
++    exec(compile(module, str(source), "exec"), namespace)
++    namespace["_prepare_qsa_gbsa_rows_kernel"] = _Kernel(namespace["_prepare_qsa_gbsa_rows_kernel"], language)
++    return namespace["prepare_qsa_gbsa_inputs"]
++
++
++def make_inputs(groups, tail, pattern, dtype, rows=7):
++    generator = torch.Generator().manual_seed(803)
++    compact = torch.full((rows, 2 * (groups + 3)), -1, dtype=dtype)[:, ::2]
++    selections = torch.randperm(groups, generator=generator).to(dtype)
++    compact[:, :groups] = selections
++    if pattern == "holes":
++        compact[:, 1:groups:3] = -1
++        compact[:, 2:groups:5] = groups + 1
++    elif pattern == "prefix":
++        compact[:, groups // 2 : groups] = -1
++    elif pattern == "invalid":
++        compact[:, :groups] = -1
++    lengths = torch.tensor([groups * 4 + tail, 0, 3, 17], dtype=dtype).repeat_interleave(2)[::2]
++    requests = torch.tensor([0, 1, 2, 3, -1, 0, 0], dtype=dtype)[:rows].repeat_interleave(2)[::2]
++    positions = (lengths[requests.long()] - 1).repeat_interleave(2)[::2]
++    table = torch.randint(0, 100, (4, 86), dtype=dtype, generator=generator)[:, ::2]
++    return compact, positions, lengths, requests, table
++
++
++@pytest.mark.parametrize("groups", [1, 2, 31, 128, 511, 512])
++@pytest.mark.parametrize("tail", range(4))
++@pytest.mark.parametrize("pattern", ["full", "prefix", "holes", "invalid"])
++@pytest.mark.parametrize("dtype", [torch.int32, torch.int64])
++@pytest.mark.parametrize("heads", [1, 2])
++def test_kernel_integer_semantics(groups, tail, pattern, dtype, heads):
++    compact, positions, lengths, requests, table = make_inputs(groups, tail, pattern, dtype)
++    expected = reference_prepare(compact, positions, lengths, requests, table, heads)
++    actual = load_cpu_preparation()(compact, positions, lengths, requests, table, heads)
++    for result, reference in zip(actual, expected, strict=True):
++        torch.testing.assert_close(result, reference, rtol=0, atol=0)
++
++
++def test_empty_preparation():
++    compact, positions, lengths, requests, table = make_inputs(512, 1, "holes", torch.int32, rows=0)
++    actual = load_cpu_preparation()(compact, positions, lengths, requests, table, 2)
++    expected = reference_prepare(compact, positions, lengths, requests, table, 2)
++    for result, reference in zip(actual, expected, strict=True):
++        torch.testing.assert_close(result, reference, rtol=0, atol=0)
++
++
++@pytest.mark.parametrize("dtype", [torch.int32, torch.int64])
++def test_pack_wide_positions_and_strided_buffers(dtype):
++    source = Path(__file__).resolve().parents[4] / "vllm_ascend/ops/triton/qwen4_exp/qsa.py"
++    module = ast.parse(source.read_text())
++    kernel_node = next(
++        node
++        for node in module.body
++        if isinstance(node, ast.FunctionDef) and node.name == "_pack_qsa_group_indices_kernel"
++    )
++    kernel_node.decorator_list = []
++    module.body = [kernel_node]
++    language = _Language()
++    namespace = {"tl": language}
++    exec(compile(module, str(source), "exec"), namespace)
++    kernel = _Kernel(namespace["_pack_qsa_group_indices_kernel"], language)
++    positions = torch.tensor([-2, -1, 0, 1, 2, 3, 4, 7, 2047, 4095, 16383, 2147483646], dtype=dtype)
++    rows = positions.numel()
++    indices = torch.arange(rows * 1024, dtype=torch.int32).reshape(rows, 1024)[:, ::2]
++    lengths = torch.tensor([0, 4096, 32768], dtype=dtype)
++    for request_id in [-1, 0, 1, 2, 3]:
++        requests = torch.full((rows,), request_id, dtype=torch.int32)
++        storage = torch.full((rows, 2051), -777, dtype=torch.int32)
++        output = storage[:, :515]
++        kernel[(rows,)](
++            indices,
++            positions,
++            lengths,
++            requests,
++            output,
++            *indices.stride(),
++            *output.stride(),
++            rows,
++            3,
++            BLOCK_TOPK=512,
++            COMPRESS_RATIO=4,
++            OUTPUT_WIDTH=515,
++            num_warps=1,
++        )
++        expected = torch.full_like(storage, -777)
++        for row, position in enumerate(positions.tolist()):
++            length = int(lengths[request_id]) if 0 <= request_id < 3 else 0
++            complete = max(0, min((position + 1) // 4, length // 4, 512))
++            expected[row, :515] = -1
++            expected[row, :complete] = indices[row, :complete]
++            start = ((position + 1) // 4) * 4
++            for offset in range(3):
++                if offset < (position + 1) - start and start + offset < length:
++                    expected[row, 512 + offset] = start + offset
++        torch.testing.assert_close(storage, expected, rtol=0, atol=0)
+diff --git a/tests/ut/models/test_qwen4_exp_source_regression.py b/tests/ut/models/test_qwen4_exp_source_regression.py
+index 861efe9a0..3d9da656a 100644
+--- a/tests/ut/models/test_qwen4_exp_source_regression.py
++++ b/tests/ut/models/test_qwen4_exp_source_regression.py
+@@ -83,7 +83,7 @@ def test_qsa_metadata_ignores_full_graph_dummy_request_boundaries() -> None:
+ def test_qsa_uses_fused_sparse_backends_and_upstream_qkv_projection() -> None:
+     qsa = _source("vllm_ascend/models/qwen4_exp/qsa.py")
+     assert "return qsa_select_paged_tokens_lightning(" in qsa
+-    assert "return qsa_gbsa_attention(" in qsa
++    assert "return dispatch_qsa_attention(" in qsa
+     assert "torch.ops.vllm.triton_qsa_rmsnorm_mrope(" in qsa
+     assert "torch.ops.vllm.triton_split_qkv_rmsnorm_mrope(" not in qsa
+     assert "def _project_qkv_gate(" not in qsa
+diff --git a/vllm_ascend/models/qwen4_exp/attention_dispatch.py b/vllm_ascend/models/qwen4_exp/attention_dispatch.py
+new file mode 100644
+index 000000000..79c70fbc6
+--- /dev/null
++++ b/vllm_ascend/models/qwen4_exp/attention_dispatch.py
+@@ -0,0 +1,181 @@
++# SPDX-License-Identifier: Apache-2.0
++"""Request dispatch for Qwen4Exp: bounded FIA prefill and GBSA fallback."""
++
++from dataclasses import dataclass
++
++import torch
++
++from .fia import prepare_qsa_fia_paged_kv, qsa_fia_attention
++from .gbsa import qsa_gbsa_attention
++
++QSA_FIA_MAX_LOGICAL_KV_LENGTH = 24 * 1024
++
++
++@dataclass(frozen=True)
++class QSARequest:
++    request_index: int
++    query_start: int
++    query_end: int
++    kv_length: int
++    is_prefill: bool
++
++    @property
++    def use_paged_kv(self) -> bool:
++        return self.kv_length != self.query_end - self.query_start
++
++    @property
++    def use_fia(self) -> bool:
++        """Whether this Prefill chunk starts below the FIA KV limit."""
++        return self.fia_query_end > self.query_start
++
++    @property
++    def fia_query_end(self) -> int:
++        """Keep a chunk crossing 24K on FIA; switch subsequent chunks."""
++        if not self.is_prefill:
++            return self.query_start
++        query_length = self.query_end - self.query_start
++        # Scheduler seq_lens already includes the current query chunk.
++        total_logical_kv_length = self.kv_length
++        fits_fia_limit = total_logical_kv_length <= QSA_FIA_MAX_LOGICAL_KV_LENGTH
++        crosses_fia_limit = (
++            total_logical_kv_length > QSA_FIA_MAX_LOGICAL_KV_LENGTH
++            and total_logical_kv_length - query_length < QSA_FIA_MAX_LOGICAL_KV_LENGTH
++        )
++        if fits_fia_limit or crosses_fia_limit:
++            return self.query_end
++        return self.query_start
++
++    @property
++    def gbsa_query_start(self) -> int:
++        """First row routed to GBSA; Decode starts at the request boundary."""
++        return self.fia_query_end
++
++
++@dataclass(frozen=True)
++class QSARequestPlan:
++    """Precomputed operator routing shared by every QSA layer in one step."""
++
++    requests: tuple[QSARequest, ...]
++    fia_requests: tuple[QSARequest, ...]
++    gbsa_spans: tuple[tuple[int, int], ...]
++
++    def __getitem__(self, index: int) -> QSARequest:
++        return self.requests[index]
++
++    def __iter__(self):
++        return iter(self.requests)
++
++    def __len__(self) -> int:
++        return len(self.requests)
++
++
++def build_qsa_request_plan(
++    query_start_loc_cpu: torch.Tensor,
++    seq_lens_cpu: torch.Tensor,
++    num_actual_tokens: int,
++    is_prefilling_cpu: torch.Tensor,
++) -> QSARequestPlan:
++    """Classify mixed-batch rows once for reuse by every QSA layer."""
++    if any(t.device.type != "cpu" for t in (query_start_loc_cpu, seq_lens_cpu, is_prefilling_cpu)):
++        raise ValueError("QSA dispatch requires scheduler CPU metadata")
++    starts = query_start_loc_cpu.tolist()
++    lengths = seq_lens_cpu.tolist()
++    phases = is_prefilling_cpu.tolist()
++    if len(lengths) < len(starts) - 1 or len(phases) < len(starts) - 1:
++        raise ValueError("QSA phase and KV metadata must cover every request")
++    requests: list[QSARequest] = []
++    for request_index, (start, end) in enumerate(zip(starts, starts[1:])):
++        start = min(max(start, 0), num_actual_tokens)
++        end = min(max(end, start), num_actual_tokens)
++        if end > start:
++            requests.append(
++                QSARequest(request_index, start, end, int(lengths[request_index]), bool(phases[request_index]))
++            )
++    requests_tuple = tuple(requests)
++    fia_requests = tuple(request for request in requests_tuple if request.use_fia)
++    gbsa_spans: list[tuple[int, int]] = []
++    for request in requests_tuple:
++        start = request.gbsa_query_start
++        if start >= request.query_end:
++            continue
++        if gbsa_spans and gbsa_spans[-1][1] == start:
++            gbsa_spans[-1] = (gbsa_spans[-1][0], request.query_end)
++        else:
++            gbsa_spans.append((start, request.query_end))
++    return QSARequestPlan(requests_tuple, fia_requests, tuple(gbsa_spans))
++
++
++def dispatch_qsa_attention(
++    query: torch.Tensor,
++    key: torch.Tensor,
++    value: torch.Tensor,
++    key_cache: torch.Tensor,
++    value_cache: torch.Tensor,
++    compact_indices: torch.Tensor,
++    block_table: torch.Tensor,
++    token_to_req: torch.Tensor,
++    logical_positions: torch.Tensor,
++    seq_lens: torch.Tensor,
++    output: torch.Tensor,
++    request_plan: QSARequestPlan | None,
++) -> torch.Tensor:
++    # None is the decode-only metadata sentinel, including graph capture.
++    # This branch contains no host length decisions or FIA launches; device KV
++    # lengths, positions and page tables may change between graph replays.
++    if request_plan is None:
++        return qsa_gbsa_attention(
++            query,
++            key_cache,
++            value_cache,
++            compact_indices,
++            block_table,
++            token_to_req,
++            logical_positions,
++            seq_lens,
++            output,
++        )
++
++    for request in request_plan.fia_requests:
++        rows = slice(request.query_start, request.fia_query_end)
++        fia_kv_length = request.kv_length
++        visible_lens = torch.minimum(
++            logical_positions[rows].add(1).clamp_min(0),
++            seq_lens[request.request_index].clamp_max(fia_kv_length),
++        )
++        if request.use_paged_kv:
++            keys, values, table, _ = prepare_qsa_fia_paged_kv(
++                key_cache,
++                value_cache,
++                block_table[request.request_index : request.request_index + 1],
++                fia_kv_length,
++            )
++        else:
++            keys, values, table = key[rows], value[rows], None
++        qsa_fia_attention(
++            query[rows],
++            keys,
++            values,
++            compact_indices[rows],
++            visible_lens,
++            fia_kv_length,
++            output[rows],
++            block_table=table,
++        )
++
++    # Every Decode row and each Prefill chunk starting at/above the logical-KV
++    # limit uses GBSA. Coalesce consecutive rows without gathering/copying K/V or
++    # changing the original request IDs used to address block tables and lengths.
++    for start, end in request_plan.gbsa_spans:
++        rows = slice(start, end)
++        qsa_gbsa_attention(
++            query[rows],
++            key_cache,
++            value_cache,
++            compact_indices[rows],
++            block_table,
++            token_to_req[rows],
++            logical_positions[rows],
++            seq_lens,
++            output[rows],
++        )
++    return output
+diff --git a/vllm_ascend/models/qwen4_exp/fia.py b/vllm_ascend/models/qwen4_exp/fia.py
+new file mode 100644
+index 000000000..dae28bb81
+--- /dev/null
++++ b/vllm_ascend/models/qwen4_exp/fia.py
+@@ -0,0 +1,186 @@
++# SPDX-License-Identifier: Apache-2.0
++"""Selected-token FIA for Qwen3.8-Flash-Next prefill."""
++
++import torch
++import torch_npu
++
++from .gbsa import GBSA_COMPRESS_RATIO, GBSA_PAGE_SIZE, GBSA_RESIDUAL_TOKENS
++
++# Bound temporary mask memory even for long-context prefills.
++QSA_FIA_QUERY_TILE = 4096
++QSA_FIA_MASK_BUDGET_BYTES = 64 * 1024 * 1024
++
++
++def build_selected_token_mask(
++    selected_token_indices: torch.Tensor,
++    effective_kv_length: int | torch.Tensor,
++    kv_length: int,
++) -> torch.Tensor:
++    """Return [B, 1, Tq, KV] allowed positions, discarding invalid indices."""
++    if selected_token_indices.ndim != 3 or kv_length <= 0:
++        raise ValueError("Selected indices must be [B, Tq, K] and KV length must be positive")
++    if isinstance(effective_kv_length, int) and not 0 <= effective_kv_length <= kv_length:
++        raise ValueError("effective_kv_length must be between zero and kv_length")
++    lengths = torch.as_tensor(effective_kv_length, device=selected_token_indices.device)
++    lengths = lengths.reshape(lengths.shape + (1,) * (selected_token_indices.ndim - lengths.ndim))
++    valid = (selected_token_indices >= 0) & (selected_token_indices < lengths)
++    valid &= selected_token_indices < kv_length
++    scatter_indices = torch.where(valid, selected_token_indices, kv_length).long()
++    mask = torch.zeros(
++        (*selected_token_indices.shape[:-1], kv_length + 1),
++        dtype=torch.bool,
++        device=selected_token_indices.device,
++    )
++    mask.scatter_(-1, scatter_indices, True)
++    return mask[..., :kv_length].unsqueeze(1)
++
++
++def expand_qsa_selected_tokens(compact_indices: torch.Tensor, visible_lens: torch.Tensor) -> torch.Tensor:
++    """Expand complete groups and reconstruct the implicit GBSA residual group."""
++    if compact_indices.ndim != 2 or compact_indices.shape[1] <= GBSA_RESIDUAL_TOKENS:
++        raise ValueError("Expected compact QSA group indices followed by three residual slots")
++    groups = compact_indices[:, :-GBSA_RESIDUAL_TOKENS]
++    full_groups = visible_lens.floor_divide(GBSA_COMPRESS_RATIO)
++    valid = (groups >= 0) & (groups < full_groups.unsqueeze(-1))
++    if groups.shape[1] >= 512:
++        capacity = groups.shape[1] - visible_lens.remainder(GBSA_COMPRESS_RATIO).ne(0).to(torch.int32)
++        valid &= valid.to(torch.int32).cumsum(-1) <= capacity.unsqueeze(-1)
++    offsets = torch.arange(GBSA_COMPRESS_RATIO, device=groups.device, dtype=groups.dtype)
++    tokens = groups.unsqueeze(-1) * GBSA_COMPRESS_RATIO + offsets
++    tokens = torch.where(valid.unsqueeze(-1), tokens, -1).flatten(1)
++    tail_offsets = torch.arange(GBSA_RESIDUAL_TOKENS, device=groups.device, dtype=groups.dtype)
++    tail = full_groups.unsqueeze(-1) * GBSA_COMPRESS_RATIO + tail_offsets
++    tail = torch.where(tail < visible_lens.unsqueeze(-1), tail, -1)
++    return torch.cat((tokens, tail), dim=-1)
++
++
++def prepare_qsa_fia_paged_kv(
++    key_cache: torch.Tensor,
++    value_cache: torch.Tensor,
++    block_table: torch.Tensor,
++    kv_length: int,
++) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, int]:
++    """Expose descriptor-backed KV as zero-copy FIA pages and remap the table."""
++    if key_cache.shape != value_cache.shape or key_cache.ndim != 4:
++        raise ValueError("QSA FIA requires matching 4-D K/V cache shapes")
++    if key_cache.stride() != value_cache.stride():
++        raise ValueError("QSA FIA requires matching K/V cache page strides")
++    blocks, page_size, heads, dim = key_cache.shape
++    if min(key_cache.shape) == 0 or page_size != GBSA_PAGE_SIZE:
++        raise ValueError("QSA FIA requires nonempty 128-token paged KV cache")
++    row_elements = heads * dim
++    page_elements = page_size * row_elements
++    for cache in (key_cache, value_cache):
++        if (
++            cache.stride(3) != 1
++            or (heads > 1 and cache.stride(2) != dim)
++            or cache.stride(1) != row_elements
++            or cache.stride(0) < page_elements
++            or cache.stride(0) % page_elements
++        ):
++            raise ValueError("QSA FIA requires dense, non-overlapping pages with whole-page gaps")
++    block_stride = key_cache.stride(0) // page_elements
++    physical_pages = (blocks - 1) * block_stride + 1
++    # Include descriptor padding as unreferenced pages; no KV data copy is needed.
++    keys = key_cache.as_strided((physical_pages, page_size, row_elements), (page_elements, row_elements, 1))
++    values = value_cache.as_strided((physical_pages, page_size, row_elements), (page_elements, row_elements, 1))
++    page_count = (kv_length + GBSA_PAGE_SIZE - 1) // GBSA_PAGE_SIZE
++    if kv_length <= 0 or block_table.ndim != 2 or block_table.shape[1] < page_count:
++        raise ValueError("QSA FIA block table must cover the positive KV length")
++    table = block_table[:, :page_count].clamp_min(0).to(torch.int32)
++    if block_stride != 1:
++        table = table * block_stride
++    return keys, values, table.contiguous(), page_count * GBSA_PAGE_SIZE
++
++
++def qsa_fia_attention(
++    query: torch.Tensor,
++    key: torch.Tensor,
++    value: torch.Tensor,
++    compact_indices: torch.Tensor,
++    visible_lens: torch.Tensor,
++    kv_length: int,
++    output: torch.Tensor,
++    *,
++    block_table: torch.Tensor | None = None,
++    kv_lengths: list[int] | None = None,
++) -> torch.Tensor:
++    """Attend a prefill request or a batch of single-token paged Decode requests."""
++    num_heads, head_dim = query.shape[1:]
++    batch_size = len(kv_lengths) if kv_lengths is not None else 1
++    if batch_size != 1 and (block_table is None or query.shape[0] != batch_size):
++        raise ValueError("Batched QSA FIA requires one paged query per request")
++    if query.dtype not in (torch.float16, torch.bfloat16) or key.dtype != query.dtype or value.dtype != query.dtype:
++        raise ValueError("QSA FIA requires matching FP16/BF16 Q/K/V")
++    if block_table is None:
++        num_kv_heads = key.shape[1]
++        key = key.reshape(1, kv_length, num_kv_heads * head_dim).contiguous()
++        value = value.reshape(1, kv_length, num_kv_heads * head_dim).contiguous()
++        mask_kv_length = kv_length
++    else:
++        num_kv_heads = key.shape[-1] // head_dim
++        mask_kv_length = block_table.shape[1] * GBSA_PAGE_SIZE
++    if query.device.type == "npu":
++        mask_kv_length = (mask_kv_length + 31) // 32 * 32
++    if num_heads % num_kv_heads:
++        raise ValueError("QSA FIA requires query heads divisible by KV heads")
++
++    query_tile = (
++        query.shape[0]
++        if batch_size != 1
++        else min(QSA_FIA_QUERY_TILE, max(1, QSA_FIA_MASK_BUDGET_BYTES // mask_kv_length))
++    )
++    mask_workspace = None
++    if query.device.type == "npu":
++        # One process-local allocation is shared by all QSA layers and reused
++        # across every query tile and scheduler step.
++        from vllm_ascend.ops.triton.qwen4_exp.fia import get_qsa_fia_mask_workspace
++
++        mask_workspace = get_qsa_fia_mask_workspace(
++            query.device,
++            QSA_FIA_QUERY_TILE,
++            QSA_FIA_MASK_BUDGET_BYTES,
++            (compact_indices.shape[1] - 2 + 7) // 8 * 8,
++        )
++    for start in range(0, query.shape[0], query_tile):
++        end = min(start + query_tile, query.shape[0])
++        visible = visible_lens[start:end]
++        if query.device.type == "npu":
++            # Lazy import keeps model discovery and CPU semantic tests NPU-free.
++            from vllm_ascend.ops.triton.qwen4_exp.fia import build_qsa_fia_mask, copy_qsa_fia_output
++
++            assert mask_workspace is not None
++            atten_mask, has_selection = build_qsa_fia_mask(
++                compact_indices[start:end], visible, kv_length, mask_kv_length, mask_workspace
++            )
++        else:
++            selected = expand_qsa_selected_tokens(compact_indices[start:end], visible.clamp(0, kv_length))
++            allowed = build_selected_token_mask(selected.unsqueeze(0), visible.unsqueeze(0), mask_kv_length)
++            has_selection = allowed.any(dim=-1).flatten()
++            atten_mask = (~allowed).contiguous()
++            atten_mask[..., 0] &= has_selection.view_as(atten_mask[..., 0])
++        query_length = (end - start) // batch_size
++        atten_mask = atten_mask.reshape(batch_size, 1, query_length, mask_kv_length)
++        result, _ = torch_npu.npu_fused_infer_attention_score_v2(
++            query=query[start:end].reshape(batch_size, query_length, num_heads * head_dim).contiguous(),
++            key=key,
++            value=value,
++            atten_mask=atten_mask,
++            actual_seq_qlen=[query_length] * batch_size,
++            actual_seq_kvlen=kv_lengths if kv_lengths is not None else [kv_length],
++            num_query_heads=num_heads,
++            num_key_value_heads=num_kv_heads,
++            softmax_scale=head_dim**-0.5,
++            input_layout="BSH",
++            sparse_mode=0,
++            inner_precise=0,
++            block_table=block_table,
++            block_size=GBSA_PAGE_SIZE if block_table is not None else 0,
++            return_softmax_lse=False,
++        )
++        result = result.reshape(end - start, num_heads, head_dim)
++        if query.device.type == "npu":
++            copy_qsa_fia_output(result, has_selection, output[start:end])
++        else:
++            output[start:end].copy_(torch.where(has_selection.reshape(-1, 1, 1), result, 0))
++    return output
+diff --git a/vllm_ascend/models/qwen4_exp/gbsa.py b/vllm_ascend/models/qwen4_exp/gbsa.py
+index 7d26c372a..777b0c6d9 100644
+--- a/vllm_ascend/models/qwen4_exp/gbsa.py
++++ b/vllm_ascend/models/qwen4_exp/gbsa.py
+@@ -7,11 +7,11 @@ from vllm_ascend.ops.gbsa import (
+     generic_block_sparse_attention,
+     generic_block_sparse_attention_metadata,
+ )
++from vllm_ascend.ops.triton.qwen4_exp.gbsa import prepare_qsa_gbsa_inputs
+ 
+ GBSA_COMPRESS_RATIO = 4
+ GBSA_RESIDUAL_TOKENS = GBSA_COMPRESS_RATIO - 1
+ GBSA_PAGE_SIZE = 128
+-GBSA_MAX_SPARSE_BLOCKS = 512
+ 
+ 
+ def qsa_gbsa_attention(
+@@ -54,54 +54,9 @@ def qsa_gbsa_attention(
+     if logical_positions.shape != (query.shape[0],):
+         raise ValueError("QSA GBSA logical positions must match query rows")
+ 
+-    sparse_width = compact_indices.shape[1] - GBSA_RESIDUAL_TOKENS
+-    row_requests = token_to_req.long()
+-    row_request_lens = seq_lens[row_requests].to(torch.int32)
+-    row_visible_lens = torch.minimum(
+-        logical_positions.to(torch.int32).add(1).clamp_min(0),
+-        row_request_lens,
++    sparse_idx, sparse_count, row_visible_lens, cu_q, row_block_table = prepare_qsa_gbsa_inputs(
++        compact_indices, logical_positions, seq_lens, token_to_req, block_table, num_kv_heads
+     )
+-    sparse_idx = compact_indices[:, :sparse_width].to(torch.int32)
+-    full_blocks = torch.div(
+-        row_visible_lens,
+-        GBSA_COMPRESS_RATIO,
+-        rounding_mode="floor",
+-    )
+-    has_residual_block = row_visible_lens.remainder(GBSA_COMPRESS_RATIO).ne(0)
+-    valid = (sparse_idx >= 0) & (sparse_idx < full_blocks.unsqueeze(1))
+-    order = torch.argsort((~valid).to(torch.int32), dim=1, stable=True)
+-    sparse_idx = sparse_idx.gather(1, order)
+-    full_sparse_count = valid.sum(dim=1).to(torch.int32)
+-
+-    # A3 GBSA does not accept residual_block_mode=1 in its metadata
+-    # scheduler. Represent the incomplete visible tail as an explicit sparse
+-    # block instead. The LI-v2 groups are restricted to full blocks above, so
+-    # the tail block cannot duplicate an existing valid selection.
+-    # A3 GBSA accepts at most 512 sparse entries. Normally append one slot so
+-    # every LI-v2 full-block selection is preserved. If LI-v2 already fills
+-    # the operator limit, reuse the final slot by dropping the last
+-    # (lowest-priority) full-block selection.
+-    if sparse_idx.shape[1] < GBSA_MAX_SPARSE_BLOCKS:
+-        sparse_idx = torch.cat(
+-            (sparse_idx, torch.full_like(sparse_idx[:, :1], -1)),
+-            dim=1,
+-        )
+-    sparse_capacity = torch.full_like(full_sparse_count, sparse_idx.shape[1])
+-    sparse_capacity = sparse_capacity - has_residual_block.to(torch.int32)
+-    sparse_count = torch.minimum(full_sparse_count, sparse_capacity)
+-    columns = torch.arange(sparse_idx.shape[1], device=sparse_idx.device)
+-    tail_slot = columns.unsqueeze(0).eq(sparse_count.long().unsqueeze(1))
+-    sparse_idx = torch.where(
+-        tail_slot & has_residual_block.unsqueeze(1),
+-        full_blocks.unsqueeze(1),
+-        sparse_idx,
+-    )
+-    sparse_count = sparse_count + has_residual_block.to(torch.int32)
+-    sparse_idx = sparse_idx.unsqueeze(0).expand(num_kv_heads, -1, -1).contiguous()
+-    sparse_count = sparse_count.unsqueeze(0).expand(num_kv_heads, -1).contiguous()
+-
+-    cu_q = torch.arange(query.shape[0] + 1, dtype=torch.int64, device=query.device)
+-    row_block_table = block_table[row_requests].contiguous()
+     common = dict(
+         cu_seqlens_q=cu_q,
+         seqused_kv=row_visible_lens,
+diff --git a/vllm_ascend/models/qwen4_exp/qsa.py b/vllm_ascend/models/qwen4_exp/qsa.py
+index 165c7c86f..b40be7677 100644
+--- a/vllm_ascend/models/qwen4_exp/qsa.py
++++ b/vllm_ascend/models/qwen4_exp/qsa.py
+@@ -36,6 +36,7 @@ from vllm.utils.torch_utils import (
+     canonicalize_singleton_dim_strides,
+     get_dtype_size,
+ )
++from vllm.v1.attention.backend import AttentionCGSupport, CommonAttentionMetadata
+ from vllm.v1.kv_cache_interface import AttentionSpec
+ from vllm.v1.kv_cache_layout import KVCacheLayout
+ 
+@@ -52,6 +53,7 @@ from vllm_ascend.ops.triton.qwen4_exp.qsa import (
+     qsa_store_cache_rows as qsa_store_cache_rows_fused,
+ )
+ 
++from .attention_dispatch import build_qsa_request_plan, dispatch_qsa_attention
+ from .gbsa import GBSA_PAGE_SIZE, qsa_gbsa_attention
+ from .lightning_indexer import qsa_select_paged_tokens_lightning
+ 
+@@ -417,7 +419,6 @@ class AscendQSAImpl:
+         output_scale: torch.Tensor | None = None,
+         output_block_scale: torch.Tensor | None = None,
+     ) -> torch.Tensor:
+-        del key, value
+         if output_scale is not None or output_block_scale is not None:
+             raise NotImplementedError("QSA output quantization is not supported on Ascend")
+         num_tokens = attn_metadata.num_actual_tokens
+@@ -430,9 +431,23 @@ class AscendQSAImpl:
+         value_cache = canonicalize_singleton_dim_strides(value_cache)
+         packed_width = layer.indexer.token_topk // layer.indexer.compress_ratio + layer.indexer.compress_ratio - 1
+         compact_indices = selected_indices[:, :packed_width]
+-        logger.info_once("QSA attention is using the CANN GBSA backend.")
+-        return qsa_gbsa_attention(
++        request_plan = getattr(attn_metadata, "qsa_request_plan", None)
++        if request_plan is None:
++            return qsa_gbsa_attention(
++                query[:num_tokens],
++                key_cache,
++                value_cache,
++                compact_indices,
++                attn_metadata.block_table,
++                token_to_req[:num_tokens],
++                logical_positions[:num_tokens],
++                seq_lens,
++                output[:num_tokens],
++            )
++        return dispatch_qsa_attention(
+             query[:num_tokens],
++            key[:num_tokens],
++            value[:num_tokens],
+             key_cache,
+             value_cache,
+             compact_indices,
+@@ -441,6 +456,7 @@ class AscendQSAImpl:
+             logical_positions[:num_tokens],
+             seq_lens,
+             output[:num_tokens],
++            request_plan,
+         )
+ 
+     @staticmethod
+@@ -455,6 +471,37 @@ class AscendQSAImpl:
+         """QSA replay parameters live in persistent buffers; nothing to rebind."""
+ 
+ 
++class AscendQSAMetadataBuilder(upstream_qsa.Qwen4ExpQSAMetadataBuilder):
++    # FULL_DECODE_ONLY captures a fixed GBSA path. Unlike sequence thresholds,
++    # decode phase cannot cross into FIA when a request grows during replay.
++    _cudagraph_support = AttentionCGSupport.UNIFORM_BATCH
++
++    def build(self, common_prefix_len: int, common_attn_metadata: CommonAttentionMetadata, fast_build: bool = False):
++        metadata = super().build(common_prefix_len, common_attn_metadata, fast_build)
++        phases = common_attn_metadata.is_prefilling
++        if phases is None or phases.device.type != "cpu":
++            raise ValueError("QSA phase dispatch requires scheduler CPU is_prefilling metadata")
++        metadata.qsa_request_plan = None
++        if any(phases.tolist()):
++            lengths = common_attn_metadata.seq_lens_cpu_upper_bound
++            if lengths is None:
++                raise ValueError("QSA prefill dispatch requires scheduler CPU KV lengths")
++            metadata.qsa_request_plan = build_qsa_request_plan(
++                common_attn_metadata.query_start_loc_cpu,
++                lengths,
++                common_attn_metadata.num_actual_tokens,
++                phases,
++            )
++        return metadata
++
++    def build_for_cudagraph_capture(self, common_attn_metadata: CommonAttentionMetadata):
++        # Capture dummy metadata need not carry live phase flags. Explicitly
++        # bypass the prefill planner for the decode-only graph contract.
++        metadata = super().build(0, common_attn_metadata, fast_build=True)
++        metadata.qsa_request_plan = None
++        return metadata
++
++
+ class AscendQSABackend(upstream_qsa.Qwen4ExpQSAFlashAttentionBackend):
+     # QSA pages are represented by descriptor-backed views. Consecutive
+     # logical blocks may be separated by other cache owners in the common
+@@ -474,6 +521,10 @@ class AscendQSABackend(upstream_qsa.Qwen4ExpQSAFlashAttentionBackend):
+     def get_impl_cls() -> type[AscendQSAImpl]:
+         return AscendQSAImpl
+ 
++    @staticmethod
++    def get_builder_cls() -> type[AscendQSAMetadataBuilder]:
++        return AscendQSAMetadataBuilder
++
+     @classmethod
+     def customize_spec(cls, spec: AttentionSpec) -> AttentionSpec:
+         """Store main K/V in two page-major slots of one descriptor page."""
+diff --git a/vllm_ascend/ops/triton/docs/qwen4_exp_qsa_dispatch.md b/vllm_ascend/ops/triton/docs/qwen4_exp_qsa_dispatch.md
+new file mode 100644
+index 000000000..8f33688b0
+--- /dev/null
++++ b/vllm_ascend/ops/triton/docs/qwen4_exp_qsa_dispatch.md
+@@ -0,0 +1,52 @@
++# Qwen4Exp QSA dispatch support kernels
++
++## Description
++
++- **Function**: prepares Qwen4Exp LightningIndexer output for the selected-token FIA-mask and GBSA paths. Prefill requests whose cached logical prefix starts below 24K use FIA for that whole scheduler chunk; later chunks use GBSA. Decode always uses GBSA.
++- **Packing**: the indexer selects 2048 tokens in groups of four. A compact row therefore contains 512 complete-group IDs followed by three residual-token slots. `pack_qsa_group_indices_npu` writes the complete groups and reconstructs up to three visible residual tokens. `-1` denotes an invalid lane.
++- **FIA mask**: `_prepare_qsa_mask_words_kernel` expands group IDs into four-token bit patterns. Its process-local workspace is allocated once before graph replay and reused with its real row stride; the resulting boolean mask uses `False` for visible positions and `True` for masked positions.
++- **GBSA preparation**: `_prepare_qsa_gbsa_rows_kernel` removes invalid groups, preserves selection order, appends/replaces the residual group at the 512-entry capacity boundary, replicates sparse indices per KV head, and gathers the request block-table row.
++
++## Tensor ABI
++
++| Tensor | Direction | Shape | Dtype/layout |
++| --- | --- | --- | --- |
++| compact group indices | input | `[query_rows, groups + 3]` | int32, strided 2-D |
++| query positions | input | `[query_rows]` | int64 |
++| sequence lengths | input | `[requests]` | int32 |
++| token-to-request map | input | `[query_rows]` | int32 |
++| block table | input | `[requests, pages]` | int32, arbitrary positive row/column stride |
++| FIA mask | output | `[query_rows, mask_kv_length]` | bool; `True` masks a KV position |
++| GBSA sparse indices | output | `[kv_heads, query_rows, output_groups]` | int32, `-1` padding |
++
++The Qwen3.8 LightningIndexer ABI fixes `token_topk=2048`, `compress_ratio=4`, and therefore `groups=512`. Shorter synthetic group widths are supported by the reusable FIA workspace and are covered by the wide-to-narrow stride regression.
++
++## Tiling, specialization, and graph constraints
++
++- `GROUPS`, `OUTPUT_GROUPS`, `GROUP_BLOCK`, `KV_HEADS`, `TABLE_BLOCK`, and QSA packing widths affect vector/tile shape and remain `tl.constexpr`. Their serving variant sets are model-static or bounded powers of two.
++- KV length, visible length, row count, tensor strides, and request IDs are runtime values and do not create per-request JIT variants.
++- `WORD_BLOCK` is a bounded power-of-two mask tile (maximum 4096 words); `TABLE_BLOCK` is the bounded power-of-two capacity of the configured block table.
++- The process-local FIA workspace must be sized before graph capture. It is deliberately not reallocated on the serving hot path because replacing captured device pointers would require graph recapture.
++- Triton-Ascend 3.6.0.post2 only requires power-of-two `tl.arange` ranges in SIMT mode. The A3 HACC lowering used here accepts and emits the fixed 515-lane QSA packing range; a real-NPU compile/run test and TTIR are retained with validation evidence.
++
++Normal serving constrains each scheduler chunk with `max_num_batched_tokens` (4096 in the validated deployment). The dispatch decision is based on the cached prefix at the start of the chunk, so a chunk that crosses 24K remains wholly on FIA and the following chunk switches to GBSA. This preserves one operator per request/chunk. Direct callers that bypass scheduler chunking are outside this serving contract; FIA additionally tiles mask construction to a 64 MiB workspace budget.
++
++## Validation
++
++Run CPU semantic coverage with:
++
++```bash
++pytest -q tests/ut/models/qwen4_exp/test_fia_dispatch.py tests/ut/models/qwen4_exp/test_gbsa_preparation.py
++```
++
++Run the A3 native kernels with:
++
++```bash
++pytest -q tests/e2e/nightly/single_node/ops/singlecard_ops/triton/test_qwen4_exp_qsa.py
++```
++
++The native test is discovered by the existing `singlecard-ops-a3` nightly matrix. It compiles and executes QSA packing, FIA wide-to-narrow workspace reuse, and GBSA preparation against independent PyTorch expectations, including residual boundaries, invalid holes, ragged requests, and a non-contiguous block table.
++
++## Origin and differences
++
++These kernels are Ascend-specific adapters for the upstream Qwen4Exp QSA metadata contract. They replace host-side expansion, compaction, and block-table gathering with device-side preparation while keeping the upstream selected-group order and residual-group semantics.
+diff --git a/vllm_ascend/ops/triton/qwen4_exp/fia.py b/vllm_ascend/ops/triton/qwen4_exp/fia.py
+new file mode 100644
+index 000000000..7a32e1ce0
+--- /dev/null
++++ b/vllm_ascend/ops/triton/qwen4_exp/fia.py
+@@ -0,0 +1,209 @@
++# SPDX-License-Identifier: Apache-2.0
++"""Qwen4Exp masks using aligned 32-bit writes for four-token QSA groups."""
++
++import torch
++from vllm.triton_utils import tl, triton
++
++QSA_FIA_MASK_WORD_TILE = 4096
++_QSA_FIA_MASK_WORKSPACES: dict[str, "QSAFIAMaskWorkspace"] = {}
++
++
++class QSAFIAMaskWorkspace:
++    """Process-local FIA mask storage shared by every QSA layer and step."""
++
++    def __init__(self, device: torch.device, max_rows: int, max_bytes: int, max_update_width: int) -> None:
++        self.device = device
++        self.max_rows = max_rows
++        self.max_update_width = max_update_width
++        self.mask_word_capacity = max_bytes // torch.int32.itemsize
++        self.word_capacity = self.mask_word_capacity + max_rows * max_update_width
++        self.storage = torch.empty((self.word_capacity,), dtype=torch.int32, device=device)
++        self.words = torch.empty((self.mask_word_capacity,), dtype=torch.int32, device=device)
++        self.indices = torch.empty((max_rows, max_update_width), dtype=torch.int64, device=device)
++        self.updates = torch.empty((max_rows, max_update_width), dtype=torch.int32, device=device)
++        self.selected = torch.empty((max_rows,), dtype=torch.bool, device=device)
++
++    def views(
++        self, rows: int, mask_words: int, update_width: int
++    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
++        mask_size = rows * mask_words
++        word_stride = mask_words + update_width
++        storage_size = rows * word_stride
++        if (
++            rows > self.max_rows
++            or mask_size > self.mask_word_capacity
++            or storage_size > self.word_capacity
++            or update_width > self.max_update_width
++        ):
++            raise ValueError(
++                f"QSA FIA mask workspace cannot cover rows={rows}, words={mask_words}, updates={update_width}"
++            )
++        storage = self.storage[:storage_size].view(rows, word_stride)
++        words = self.words[:mask_size].view(rows, mask_words)
++        return (
++            storage,
++            words,
++            self.indices[:rows, :update_width],
++            self.updates[:rows, :update_width],
++            self.selected[:rows],
++        )
++
++
++def get_qsa_fia_mask_workspace(
++    device: torch.device, max_rows: int, max_bytes: int, max_update_width: int
++) -> QSAFIAMaskWorkspace:
++    """Allocate the process-local dense mask buffer once, then reuse it."""
++    key = str(device)
++    workspace = _QSA_FIA_MASK_WORKSPACES.get(key)
++    if workspace is None:
++        workspace = QSAFIAMaskWorkspace(device, max_rows, max_bytes, max_update_width)
++        _QSA_FIA_MASK_WORKSPACES[key] = workspace
++    elif (
++        workspace.max_rows < max_rows
++        or workspace.mask_word_capacity * torch.int32.itemsize < max_bytes
++        or workspace.max_update_width < max_update_width
++    ):
++        raise ValueError("QSA FIA mask workspace was initialized with insufficient capacity")
++    return workspace
++
++
++@triton.jit(do_not_specialize=["mask_words"])
++def _initialize_qsa_mask_words_kernel(
++    words,
++    mask_words,
++    word_stride,
++    WORD_BLOCK: tl.constexpr,
++):
++    row = tl.program_id(0)
++    for word_start in range(0, mask_words, WORD_BLOCK):
++        word = word_start + tl.arange(0, WORD_BLOCK)
++        tl.store(words + row * word_stride + word, 0x01010101, word < mask_words)
++
++
++@triton.jit(do_not_specialize=["kv_length", "mask_words"])
++def _prepare_qsa_mask_words_kernel(
++    compact_indices,
++    visible_lens,
++    scatter_indices,
++    updates,
++    has_selection,
++    stride_row,
++    stride_column,
++    scatter_stride_row,
++    updates_stride_row,
++    kv_length,
++    mask_words,
++    update_width,
++    GROUPS: tl.constexpr,
++    BLOCK: tl.constexpr,
++):
++    row = tl.program_id(0)
++    columns = tl.arange(0, BLOCK)
++    visible = tl.minimum(tl.maximum(tl.load(visible_lens + row), 0), kv_length)
++    group = tl.load(compact_indices + row * stride_row + columns * stride_column, columns < GROUPS, other=-1)
++    valid = (columns < GROUPS) & (group >= 0) & (group < visible // 4)
++    residual = visible % 4
++    valid_count = tl.sum(valid.to(tl.int32), 0)
++    if GROUPS >= 512:
++        if residual != 0:
++            # GBSA replaces the final selected full group with its residual
++            # group only when all GROUPS entries are valid. Dropping the
++            # rightmost valid lane is equivalent to the old prefix cumsum,
++            # but avoids a full-width scan for every query row.
++            last_valid_column = tl.max(tl.where(valid, columns, -1), 0)
++            valid = valid & ((valid_count < GROUPS) | (columns != last_valid_column))
++    selected = (valid_count > 0) | (residual != 0)
++    # Each complete four-token group is one aligned int32 mask word. Keep
++    # row-local targets so ScatterElementsV2 can use its efficient dim=1 path.
++    target = tl.where(valid, group, mask_words + columns)
++    tail = (columns == GROUPS) & (residual != 0)
++    tail_value = (0x01010101 << (residual * 8)).to(tl.int32)
++    target = tl.where(tail, visible // 4, target)
++    value = tl.where(tail, tail_value, 0)
++    # An empty row attends token zero and is explicitly zeroed after FIA.
++    dummy = (columns == 0) & (~selected)
++    target = tl.where(dummy, 0, target)
++    value = tl.where(dummy, 0x01010100, value)
++    store_mask = columns < update_width
++    tl.store(scatter_indices + row * scatter_stride_row + columns, target.to(tl.int64), store_mask)
++    tl.store(updates + row * updates_stride_row + columns, value, store_mask)
++    tl.store(has_selection + row, selected)
++
++
++@triton.jit
++def _copy_qsa_fia_output_kernel(
++    result,
++    selected,
++    output,
++    stride_row,
++    stride_head,
++    stride_dim,
++    HEAD_DIM: tl.constexpr,
++    WIDTH: tl.constexpr,
++    BLOCK: tl.constexpr,
++    CONTIGUOUS: tl.constexpr,
++):
++    row = tl.program_id(0)
++    columns = tl.program_id(1) * BLOCK + tl.arange(0, BLOCK)
++    values = tl.load(result + row * WIDTH + columns, columns < WIDTH, other=0)
++    valid = tl.load(selected + row)
++    if CONTIGUOUS:
++        offset = row * WIDTH + columns
++    else:
++        offset = row * stride_row + columns // HEAD_DIM * stride_head + columns % HEAD_DIM * stride_dim
++    tl.store(output + offset, tl.where(valid, values, 0), columns < WIDTH)
++
++
++def build_qsa_fia_mask(
++    compact_indices: torch.Tensor,
++    visible_lens: torch.Tensor,
++    kv_length: int,
++    mask_width: int,
++    workspace: QSAFIAMaskWorkspace,
++) -> tuple[torch.Tensor, torch.Tensor]:
++    """Fill and return a reusable [T, KV] mask plus nonempty-row flags."""
++    rows = compact_indices.shape[0]
++    # Dense DMA stores must not share a 32-byte block with another row.
++    mask_words = triton.cdiv(mask_width, 32) * 8
++    groups = compact_indices.shape[1] - 3
++    update_width = triton.cdiv(groups + 1, 8) * 8
++    storage, words, indices, updates, selected = workspace.views(rows, mask_words, update_width)
++    word_stride = mask_words + update_width
++    word_block = min(QSA_FIA_MASK_WORD_TILE, triton.next_power_of_2(mask_words))
++    _initialize_qsa_mask_words_kernel[(rows,)](storage, mask_words, word_stride, WORD_BLOCK=word_block)
++    _prepare_qsa_mask_words_kernel[(rows,)](
++        compact_indices,
++        visible_lens,
++        indices,
++        updates,
++        selected,
++        compact_indices.stride(0),
++        compact_indices.stride(1),
++        indices.stride(0),
++        updates.stride(0),
++        kv_length=kv_length,
++        mask_words=mask_words,
++        update_width=update_width,
++        GROUPS=groups,
++        BLOCK=triton.next_power_of_2(update_width),
++    )
++    storage.scatter_(1, indices, updates)
++    words.copy_(storage[:, :mask_words])
++    # Ascend's little-endian int32 representation is four bool bytes. This is
++    # a dtype view, not a numerical conversion (which would collapse the bytes).
++    mask = words.view(torch.bool)
++    return mask[:, :mask_width], selected
++
++
++def copy_qsa_fia_output(result: torch.Tensor, selected: torch.Tensor, output: torch.Tensor) -> None:
++    width = output.shape[1] * output.shape[2]
++    _copy_qsa_fia_output_kernel[(output.shape[0], triton.cdiv(width, 1024))](
++        result,
++        selected,
++        output,
++        *output.stride(),
++        HEAD_DIM=output.shape[2],
++        WIDTH=width,
++        BLOCK=1024,
++        CONTIGUOUS=output.is_contiguous(),
++    )
+diff --git a/vllm_ascend/ops/triton/qwen4_exp/gbsa.py b/vllm_ascend/ops/triton/qwen4_exp/gbsa.py
+new file mode 100644
+index 000000000..30d1ab160
+--- /dev/null
++++ b/vllm_ascend/ops/triton/qwen4_exp/gbsa.py
+@@ -0,0 +1,140 @@
++# SPDX-License-Identifier: Apache-2.0
++"""Integer-only preparation for the Qwen4Exp GBSA input contract."""
++
++import torch
++from vllm.triton_utils import tl, triton
++
++
++@triton.jit
++def _prepare_qsa_gbsa_rows_kernel(
++    indices,
++    positions,
++    lengths,
++    requests,
++    table,
++    packed_indices,
++    counts,
++    visible_lengths,
++    cu_query,
++    row_table,
++    indices_row_stride,
++    indices_column_stride,
++    table_row_stride,
++    table_column_stride,
++    position_stride,
++    length_stride,
++    request_stride,
++    requests_count,
++    rows,
++    table_columns,
++    GROUPS: tl.constexpr,
++    OUTPUT_GROUPS: tl.constexpr,
++    GROUP_BLOCK: tl.constexpr,
++    KV_HEADS: tl.constexpr,
++    TABLE_BLOCK: tl.constexpr,
++):
++    row = tl.program_id(0)
++    columns = tl.arange(0, GROUP_BLOCK)
++    request = tl.load(requests + row * request_stride).to(tl.int64)
++    # Match torch indexing for negative request IDs. Callers must provide in-range IDs.
++    request = tl.where(request < 0, request + requests_count, request)
++    position = tl.load(positions + row * position_stride).to(tl.int32)
++    length = tl.load(lengths + request * length_stride).to(tl.int32)
++    visible = tl.minimum(tl.maximum(position + 1, 0), length)
++    group = tl.load(
++        indices + row * indices_row_stride + columns * indices_column_stride, columns < GROUPS, other=-1
++    ).to(tl.int32)
++    valid = (columns < GROUPS) & (group >= 0) & (group < visible // 4)
++    count = tl.sum(valid.to(tl.int32), 0)
++    has_tail = visible % 4 != 0
++    tail_slot = tl.minimum(count, OUTPUT_GROUPS - has_tail.to(tl.int32))
++    if tl.sum(((columns < count) & (~valid)).to(tl.int32), 0) == 0:
++        # LI-v2 packing normally already has a valid prefix. Preserve its
++        # selected-group order directly, without sorting or a prefix scan.
++        packed = tl.where(has_tail & (columns == tail_slot), visible // 4, group)
++        for head in tl.static_range(KV_HEADS):
++            tl.store(packed_indices + (head * rows + row) * OUTPUT_GROUPS + columns, packed, columns < GROUPS)
++    else:
++        # Use the native scan: gather-based scans can miscompile on Triton-Ascend 3.6.
++        prefix = tl.cumsum(valid.to(tl.int32), 0)
++        destination = tl.where(valid, prefix - 1, count + columns - prefix)
++        packed = tl.where(has_tail & (destination == tail_slot), visible // 4, group)
++        for head in tl.static_range(KV_HEADS):
++            tl.store(packed_indices + (head * rows + row) * OUTPUT_GROUPS + destination, packed, columns < GROUPS)
++    for head in tl.static_range(KV_HEADS):
++        # Append the residual slot when capacity allows, otherwise replace the
++        # final selection exactly as the PR adapter does at the 512-entry limit.
++        if OUTPUT_GROUPS > GROUPS:
++            extra = tl.where(has_tail & (tail_slot == GROUPS), visible // 4, -1)
++            tl.store(packed_indices + (head * rows + row) * OUTPUT_GROUPS + GROUPS, extra)
++        tl.store(counts + head * rows + row, tail_slot + has_tail.to(tl.int32))
++    tl.store(visible_lengths + row, visible)
++    tl.store(cu_query + row, row.to(tl.int64))
++    if row == 0:
++        tl.store(cu_query + rows, rows)
++    page_columns = tl.arange(0, TABLE_BLOCK)
++    stored_page = tl.load(
++        table + request * table_row_stride + page_columns * table_column_stride,
++        page_columns < table_columns,
++        other=-1,
++    )
++    tl.store(row_table + row * table_columns + page_columns, stored_page, page_columns < table_columns)
++
++
++def prepare_qsa_gbsa_inputs(
++    compact_indices: torch.Tensor,
++    logical_positions: torch.Tensor,
++    seq_lens: torch.Tensor,
++    token_to_req: torch.Tensor,
++    block_table: torch.Tensor,
++    num_kv_heads: int,
++) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
++    """Produce the same integer tensors as the original GBSA torch pipeline.
++
++    The block table already addresses 128-token kernel pages. Residual blocks
++    remain explicit (residual_block_mode=0), including the 512-entry limit.
++    Every output element is written before use. No device-to-host reads or
++    process-global tensor cache are introduced; inputs can change every call.
++    """
++    rows = compact_indices.shape[0]
++    groups = compact_indices.shape[1] - 3
++    columns = block_table.shape[1]
++    output_groups = groups + (groups < 512)
++    sparse_idx = torch.empty((num_kv_heads, rows, output_groups), dtype=torch.int32, device=compact_indices.device)
++    sparse_count = torch.empty((num_kv_heads, rows), dtype=torch.int32, device=compact_indices.device)
++    visible = torch.empty((rows,), dtype=torch.int32, device=compact_indices.device)
++    cu_query = torch.empty((rows + 1,), dtype=torch.int64, device=compact_indices.device)
++    row_table = torch.empty((rows, columns), dtype=block_table.dtype, device=block_table.device)
++    if rows == 0:
++        cu_query.zero_()
++        return sparse_idx, sparse_count, visible, cu_query, row_table
++    group_block = triton.next_power_of_2(groups)
++    _prepare_qsa_gbsa_rows_kernel[(rows,)](
++        compact_indices,
++        logical_positions,
++        seq_lens,
++        token_to_req,
++        block_table,
++        sparse_idx,
++        sparse_count,
++        visible,
++        cu_query,
++        row_table,
++        compact_indices.stride(0),
++        compact_indices.stride(1),
++        block_table.stride(0),
++        block_table.stride(1),
++        logical_positions.stride(0),
++        seq_lens.stride(0),
++        token_to_req.stride(0),
++        block_table.shape[0],
++        rows,
++        columns,
++        GROUPS=groups,
++        OUTPUT_GROUPS=output_groups,
++        GROUP_BLOCK=group_block,
++        KV_HEADS=num_kv_heads,
++        TABLE_BLOCK=triton.next_power_of_2(columns),
++        num_warps=1,
++    )
++    return sparse_idx, sparse_count, visible, cu_query, row_table
+diff --git a/vllm_ascend/ops/triton/qwen4_exp/qsa.py b/vllm_ascend/ops/triton/qwen4_exp/qsa.py
+index 232ae31bd..7b3450e9f 100644
+--- a/vllm_ascend/ops/triton/qwen4_exp/qsa.py
++++ b/vllm_ascend/ops/triton/qwen4_exp/qsa.py
+@@ -42,6 +42,7 @@ def _pack_qsa_group_indices_kernel(
+         ),
+         BLOCK_TOPK,
+     )
++    complete_groups = tl.maximum(complete_groups, 0).to(tl.int32)
+     is_group = columns < BLOCK_TOPK
+     safe_group_column = tl.minimum(columns, BLOCK_TOPK - 1)
+     group = tl.load(
+@@ -52,8 +53,10 @@ def _pack_qsa_group_indices_kernel(
+     tail_offset = columns - BLOCK_TOPK
+     tail_start = ((query_position + 1) // COMPRESS_RATIO) * COMPRESS_RATIO
+     tail_count = tl.minimum((query_position + 1) - tail_start, COMPRESS_RATIO - 1)
+-    tail = tail_start + tail_offset
+-    valid_tail = (~is_group) & (tail_offset >= 0) & (tail_offset < tail_count) & (tail < sequence_length)
++    # Keep wide scalar position arithmetic, but use bounded int32 vectors.
++    valid_tail_count = tl.maximum(tl.minimum(tail_count, sequence_length - tail_start), 0).to(tl.int32)
++    tail = tail_start.to(tl.int32) + tail_offset
++    valid_tail = (~is_group) & (tail_offset >= 0) & (tail_offset < valid_tail_count)
+     packed = tl.where(is_group, group, tl.where(valid_tail, tail, -1))
+     tl.store(
+         output_ptr + row * stride_output_row + columns * stride_output_column,

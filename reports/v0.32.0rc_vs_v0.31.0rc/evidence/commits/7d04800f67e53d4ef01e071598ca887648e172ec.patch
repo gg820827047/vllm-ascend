@@ -1,0 +1,375 @@
+commit 7d04800f67e53d4ef01e071598ca887648e172ec
+Author:     tianshizhici-2026 <asertuiondamielineberg@gmail.com>
+AuthorDate: Mon Oct 26 11:20:03 2026 +0800
+Commit:     GitHub <noreply@github.com>
+CommitDate: Mon Oct 26 11:20:03 2026 +0800
+
+    [BugFix] Publish Mooncake engine after initialization and prevent unsafe retries (#19086)
+    
+    ### What this PR does / why we need it?
+    
+    `GlobalTE.get_transfer_engine()` publishes the native engine before
+    initialization finishes and keeps it published even when initialization
+    fails. Build and initialize locally, then publish only after success.
+    Concurrent callers wait for that result.
+    
+    A failed native construction or initialization now also prevents further
+    initialization attempts through the singleton. Subsequent callers
+    receive an error asking them to restart the process, instead of
+    receiving a failed engine or creating another one.
+    
+    This failure guard is necessary with the currently used
+    `mooncake-transfer-engine-npu==0.3.11.post1`:
+    `MultiTransport::installTransport()` leaks its transport object when
+    `install()` fails. Repeated attempts can accumulate native resources,
+    including handshake threads and sockets. [Mooncake
+    #2332](https://github.com/kvcache-ai/Mooncake/pull/2332) fixes the
+    cleanup, and the `v0.3.12` source includes it. Reconsider retries only
+    after the minimum supported dependency includes the fix and
+    repeated-failure cleanup is validated on Ascend. The guard prevents
+    accumulation; it does not reclaim resources leaked by the first failure.
+    
+    Fixes #16257.
+    
+    ### Does this PR introduce _any_ user-facing change?
+    
+    After native construction or initialization fails, correct the original
+    error and restart the affected process before retrying. Upgrading the
+    Mooncake package alone does not disable this guard. Successful
+    initialization, singleton reuse, and buffer registration retain their
+    existing behavior. The FAQ and release note describe this requirement.
+    
+    ### How was this patch tested?
+    
+    - Five regression tests cover successful concurrent publication, nonzero
+    initialization returns, initialization exceptions, constructor
+    exceptions, a waiting caller after failure, and registration after
+    success. The same tests fail on both the original production source and
+    the previous retry-enabled PR source, and pass with the guard.
+    - Joint collection with AscendStore tests on the updated base: **938
+    passed, 12 skipped**. This also checks isolation from collection-time
+    mocks.
+    - `bash format.sh ci` passed; scoped mypy checks passed for Python 3.10,
+    3.11, and 3.12. Release note fragment checks passed.
+    - Real Ascend 910B3 with Mooncake **0.3.11.post1**: 30 sequential calls
+    from fresh threads without NPU context trigger real native failure. No
+    native methods are mocked and exceptions/futures are not retained;
+    Python GC runs before resource samples.
+    
+    | Implementation | Native initialization failures | Returned failed
+    engine | Remaining extra threads / file descriptors |
+    | --- | ---: | ---: | ---: |
+    | Original base | 1 | 29 calls | +1 / +1 |
+    | Previous retry-enabled PR | 30 | 0 | +30 / +30 |
+    | Current guard | 1; next 29 calls raise without initializing | 0 | +1 /
+    +1, no growth after the first failure |
+    
+    - Retrying from a thread with a valid device context after the first
+    native failure is also rejected, with the singleton remaining
+    unpublished.
+    - The event-controlled scheduling check around the real native engine
+    still waits for successful initialization, followed by a bit-exact **4
+    MiB NPU transfer** over local Ascend transport.
+    
+    ```bash
+    python -m pytest -q tests/ut/distributed/ascend_store tests/ut/distributed/kv_transfer/test_mooncake_transfer_engine.py
+    bash format.sh ci
+    ```
+    
+    The PR is synchronized with Ascend main
+    `3c088bc78b97e0fb9e5dc380a93a94c23fd77dc0`; local joint tests use its
+    verified vLLM source `c0b6f74bee518aeaf5d72b200a0216e72fbb5e7c`. Native
+    checks use the container-provided dependencies on physical NPU 2. No
+    full prefill/decode serving deployment, HBM leak, or OOM reproduction is
+    claimed. Remote CI results are tracked in the checks below.
+    
+    Prepared with AI assistance.
+    
+    ---
+    
+    ### Checklist
+    
+    #### Testing
+    
+    - [x] Boundary / edge-case coverage: concurrent first use and callers
+    waiting on a failed initialization.
+    - [x] Regression test: unchanged production and the previous
+    retry-enabled implementation fail the new checks.
+    - [x] Error / failure path coverage: nonzero returns, native
+    initialization exceptions, and constructor exceptions.
+    - [x] Meaningful & reliable tests: assertions cover publication and
+    rejection without creating another native engine.
+    - [x] Performance impact: native resource accumulation was compared
+    under repeated failures; no throughput claim.
+    - [x] Release note: `release_notes/fragments/19086.yaml`.
+    
+    - vLLM main:
+    https://github.com/vllm-project/vllm/commit/c0b6f74bee518aeaf5d72b200a0216e72fbb5e7c
+    
+    ---------
+    
+    Signed-off-by: tianshizhici-2026 <265756935+tianshizhici-2026@users.noreply.github.com>
+    Co-authored-by: tianshizhici-2026 <265756935+tianshizhici-2026@users.noreply.github.com>
+
+diff --git a/docs/source/faqs.md b/docs/source/faqs.md
+index 9461e0eab..9be1018ac 100644
+--- a/docs/source/faqs.md
++++ b/docs/source/faqs.md
+@@ -115,6 +115,19 @@ If all above steps are not working, feel free to submit a GitHub issue.
+ 
+ Yes, vllm-ascend supports Prefill-Decode Disaggregation feature with Mooncake backend. See the [official tutorial](https://docs.vllm.ai/projects/ascend/en/latest/tutorials/features/pd_disaggregation_mooncake_multi_node.html) for example.
+ 
++If Mooncake reports `TransferEngine initialization previously failed`, inspect the
++first initialization error, correct its cause, and restart the affected process.
++The shared transfer engine is published only after initialization succeeds. Once
++native construction or initialization fails, further attempts in that process
++are rejected because Mooncake `0.3.11.post1` can leak native transport resources
++on failure. This guard prevents repeated failures from accumulating resources;
++it does not reclaim resources leaked by the first failure.
++
++The upstream cleanup fix, [Mooncake #2332](https://github.com/kvcache-ai/Mooncake/pull/2332),
++is included in the `v0.3.12` source. Retrying remains disabled until the minimum
++supported dependency includes the fix and repeated-failure cleanup is validated
++on Ascend. Installing a newer Mooncake package alone does not disable this guard.
++
+ ### 9. Does vllm-ascend support quantization method?
+ 
+ Currently, w8a8, w4a8, and w4a4 quantization methods are already supported by vllm-ascend.
+diff --git a/release_notes/fragments/19086.yaml b/release_notes/fragments/19086.yaml
+new file mode 100644
+index 000000000..80cff195a
+--- /dev/null
++++ b/release_notes/fragments/19086.yaml
+@@ -0,0 +1,8 @@
++pr: 19086
++entries:
++  - category: bugfix
++    text: >-
++      Mooncake callers now receive the shared transfer engine only after successful
++      initialization. A native construction or initialization failure requires a
++      process restart before retrying, preventing repeated attempts from accumulating
++      leaked transport resources with Mooncake 0.3.11.post1.
+diff --git a/tests/ut/distributed/kv_transfer/test_mooncake_transfer_engine.py b/tests/ut/distributed/kv_transfer/test_mooncake_transfer_engine.py
+new file mode 100644
+index 000000000..a0db7d7a2
+--- /dev/null
++++ b/tests/ut/distributed/kv_transfer/test_mooncake_transfer_engine.py
+@@ -0,0 +1,169 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vllm-ascend project
++import importlib.util
++import threading
++import unittest
++from concurrent.futures import ThreadPoolExecutor
++from pathlib import Path
++from types import ModuleType
++from unittest.mock import MagicMock, patch
++
++_WAIT_SECONDS = 5
++
++
++class TestGlobalTE(unittest.TestCase):
++    def setUp(self):
++        # Mooncake is optional; these unit tests only exercise singleton state.
++        mooncake = ModuleType("mooncake")
++        engine_module = ModuleType("mooncake.engine")
++        engine_module.__dict__["TransferEngine"] = MagicMock()
++        mooncake.__dict__["engine"] = engine_module
++        modules = patch.dict("sys.modules", {"mooncake": mooncake, "mooncake.engine": engine_module})
++        modules.start()
++        self.addCleanup(modules.stop)
++
++        # ascend_store tests replace the canonical module during collection.
++        # Load the real source privately without changing their mocked module.
++        source = Path(__file__).parents[4] / "vllm_ascend/distributed/kv_transfer/utils/mooncake_transfer_engine.py"
++        spec = importlib.util.spec_from_file_location("_test_global_te", source)
++        assert spec is not None and spec.loader is not None
++        module = importlib.util.module_from_spec(spec)
++        spec.loader.exec_module(module)
++        self.global_te_cls = module.GlobalTE
++
++    def test_concurrent_getters_only_receive_initialized_engine(self):
++        started = threading.Event()
++        release = threading.Event()
++        observed = threading.Event()
++        engine = MagicMock()
++        engine.ready = False
++
++        def initialize(*args):
++            started.set()
++            if not release.wait(_WAIT_SECONDS):
++                raise TimeoutError("initialization was not released")
++            engine.ready = True
++            return 0
++
++        engine.initialize.side_effect = initialize
++        global_te = self.global_te_cls()
++        lock = threading.Lock()
++
++        class ObservedLock:
++            def __enter__(self):
++                if started.is_set():
++                    observed.set()
++                lock.acquire()
++
++            def __exit__(self, *args):
++                lock.release()
++
++        def second_getter():
++            result = global_te.get_transfer_engine("localhost", None)
++            was_ready = result.ready
++            observed.set()
++            return result, was_ready
++
++        with (
++            patch.object(global_te, "transfer_engine_lock", ObservedLock()),
++            patch("mooncake.engine.TransferEngine", return_value=engine) as factory,
++        ):
++            with ThreadPoolExecutor(max_workers=2) as pool:
++                first = pool.submit(global_te.get_transfer_engine, "localhost", None)
++                try:
++                    self.assertTrue(started.wait(_WAIT_SECONDS))
++                    second = pool.submit(second_getter)
++                    self.assertTrue(observed.wait(_WAIT_SECONDS))
++                finally:
++                    release.set()
++                self.assertIs(first.result(timeout=_WAIT_SECONDS), engine)
++                returned_engine, was_ready = second.result(timeout=_WAIT_SECONDS)
++            self.assertIs(returned_engine, engine)
++            self.assertTrue(was_ready)
++            factory.assert_called_once_with()
++            engine.initialize.assert_called_once_with("localhost", "P2PHANDSHAKE", "ascend", "")
++
++    def test_failed_initialization_is_not_retried(self):
++        for failure in (-1, RuntimeError("native initialization failed")):
++            with self.subTest(failure=failure):
++                global_te = self.global_te_cls()
++                failed = MagicMock()
++                if isinstance(failure, Exception):
++                    failed.initialize.side_effect = failure
++                else:
++                    failed.initialize.return_value = failure
++                with patch("mooncake.engine.TransferEngine", return_value=failed) as factory:
++                    with self.assertRaises(RuntimeError):
++                        global_te.get_transfer_engine("localhost", "device0")
++                    self.assertIsNone(global_te.transfer_engine)
++                    for _ in range(3):
++                        with self.assertRaisesRegex(RuntimeError, "Restart the process"):
++                            global_te.get_transfer_engine("localhost", "device0")
++                    factory.assert_called_once_with()
++                    failed.initialize.assert_called_once_with("localhost", "P2PHANDSHAKE", "ascend", "device0")
++
++    def test_failed_construction_is_not_retried(self):
++        global_te = self.global_te_cls()
++        with patch("mooncake.engine.TransferEngine", side_effect=RuntimeError("construction failed")) as factory:
++            with self.assertRaisesRegex(RuntimeError, "construction failed"):
++                global_te.get_transfer_engine("localhost", None)
++            with self.assertRaisesRegex(RuntimeError, "Restart the process"):
++                global_te.get_transfer_engine("localhost", None)
++            self.assertIsNone(global_te.transfer_engine)
++            factory.assert_called_once_with()
++
++    def test_waiting_getter_does_not_retry_failed_initialization(self):
++        started, release, waiting = (threading.Event() for _ in range(3))
++        engine = MagicMock()
++
++        def initialize(*args):
++            started.set()
++            if not release.wait(_WAIT_SECONDS):
++                raise TimeoutError("initialization was not released")
++            return -1
++
++        engine.initialize.side_effect = initialize
++        global_te = self.global_te_cls()
++        lock = threading.Lock()
++
++        class ObservedLock:
++            def __enter__(self):
++                if started.is_set():
++                    waiting.set()
++                lock.acquire()
++
++            def __exit__(self, *args):
++                lock.release()
++
++        with (
++            patch.object(global_te, "transfer_engine_lock", ObservedLock()),
++            patch("mooncake.engine.TransferEngine", return_value=engine) as factory,
++        ):
++            with ThreadPoolExecutor(max_workers=2) as pool:
++                first = pool.submit(global_te.get_transfer_engine, "localhost", None)
++                try:
++                    self.assertTrue(started.wait(_WAIT_SECONDS))
++                    second = pool.submit(global_te.get_transfer_engine, "localhost", None)
++                    self.assertTrue(waiting.wait(_WAIT_SECONDS))
++                finally:
++                    release.set()
++                with self.assertRaisesRegex(RuntimeError, "ret_value: -1"):
++                    first.result(timeout=_WAIT_SECONDS)
++                with self.assertRaisesRegex(RuntimeError, "Restart the process"):
++                    second.result(timeout=_WAIT_SECONDS)
++            self.assertIsNone(global_te.transfer_engine)
++            factory.assert_called_once_with()
++            engine.initialize.assert_called_once_with("localhost", "P2PHANDSHAKE", "ascend", "")
++
++    def test_registration_uses_successfully_initialized_engine(self):
++        global_te = self.global_te_cls()
++        with self.assertRaisesRegex(AssertionError, "must be initialized"):
++            global_te.register_buffer([100], [64])
++        engine = MagicMock()
++        engine.initialize.return_value = 0
++        engine.register_memory.return_value = 0
++        with patch("mooncake.engine.TransferEngine", return_value=engine):
++            self.assertIs(global_te.get_transfer_engine("localhost", None), engine)
++            global_te.register_buffer([100], [64])
++            global_te.register_buffer([100], [64])
++        engine.register_memory.assert_called_once_with(100, 64)
+diff --git a/vllm_ascend/distributed/kv_transfer/utils/mooncake_transfer_engine.py b/vllm_ascend/distributed/kv_transfer/utils/mooncake_transfer_engine.py
+index 7cf309b0e..c627c4d40 100644
+--- a/vllm_ascend/distributed/kv_transfer/utils/mooncake_transfer_engine.py
++++ b/vllm_ascend/distributed/kv_transfer/utils/mooncake_transfer_engine.py
+@@ -4,6 +4,7 @@ import threading
+ class GlobalTE:
+     def __init__(self):
+         self.transfer_engine = None
++        self._initialization_attempted = False
+         self.is_register_buffer: bool = False
+         self.transfer_engine_lock = threading.Lock()
+         self.register_buffer_lock = threading.Lock()
+@@ -13,6 +14,11 @@ class GlobalTE:
+             with self.transfer_engine_lock:
+                 # Double-Checked Locking
+                 if self.transfer_engine is None:
++                    if self._initialization_attempted:
++                        raise RuntimeError(
++                            "TransferEngine initialization previously failed. "
++                            "Restart the process before retrying to avoid leaking native resources."
++                        )
+                     try:
+                         from mooncake.engine import TransferEngine  # type: ignore
+                     except ImportError as e:
+@@ -21,11 +27,21 @@ class GlobalTE:
+                             "https://github.com/kvcache-ai/Mooncake/blob/main/doc/en/build.md "  # noqa: E501
+                             "to run vLLM with MooncakeConnector."
+                         ) from e
+-                    self.transfer_engine = TransferEngine()
++                    # Mooncake 0.3.11.post1 leaks transport resources on failed
++                    # initialization (kvcache-ai/Mooncake#2332). Mark the attempt
++                    # before native construction, including exceptions. Revisit
++                    # retries once the minimum supported version includes that
++                    # fix and repeated-failure resource cleanup is verified.
++                    self._initialization_attempted = True
++                    engine = TransferEngine()
+                     device_name = device_name if device_name is not None else ""
+-                    ret_value = self.transfer_engine.initialize(hostname, "P2PHANDSHAKE", "ascend", device_name)
++                    ret_value = engine.initialize(hostname, "P2PHANDSHAKE", "ascend", device_name)
+                     if ret_value != 0:
+-                        raise RuntimeError(f"TransferEngine initialization failed with ret_value: {ret_value}")
++                        raise RuntimeError(
++                            f"TransferEngine initialization failed with ret_value: {ret_value}. "
++                            "Restart the process before retrying."
++                        )
++                    self.transfer_engine = engine
+         return self.transfer_engine
+ 
+     def register_buffer(self, ptrs: list[int], sizes: list[int]):

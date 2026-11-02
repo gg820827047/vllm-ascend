@@ -1,0 +1,210 @@
+commit 93ece982809a117545cfd2672713c673c6e5ced5
+Author:     Xiaoliang <amazingapple@users.noreply.github.com>
+AuthorDate: Tue Oct 27 20:23:17 2026 +0800
+Commit:     GitHub <noreply@github.com>
+CommitDate: Tue Oct 27 20:23:17 2026 +0800
+
+    [BugFix] Forward uses_mrope to NewRequestData.from_request in BalanceScheduler/DyntraLB (#19731)
+    
+    ### What this PR does / why we need it?
+    
+    `NewRequestData.from_request()` strips the payload of multimodal items
+    that are fully covered by a prefix-cache hit. With the upstream default
+    `uses_mrope=False` it drops every payload field, including the
+    `keep_on_cpu` `image_grid_thw` / `video_grid_thw` that M-RoPE models
+    need to compute positions.
+    
+    vLLM core's `Scheduler` already forwards
+    `uses_mrope=self.model_uses_mrope`, and the Ascend `RecomputeScheduler`
+    / `scheduler_profiling_chunk` copies do the same. The balance-scheduling
+    copy (`patch_balance_schedule.py`) and `dyntra_lb_scheduler.py` do not,
+    so with `enable_balance_scheduling` (or DyntraLB) plus prefix caching,
+    an M-RoPE multimodal model crashes the engine when a request reuses a
+    cached video prefix.
+    
+    Reproduced on Qwen3.5-35B-A3B (hybrid Mamba model, block size 1152) with
+    vLLM 0.30.0 + vllm-ascend 0.30.0rc2, `--enable-prefix-caching
+    --additional-config '{"enable_balance_scheduling": true}'`. The second
+    request that hits the cached video prefix emits:
+    
+    ```
+    SchedulerOutput(scheduled_new_reqs=[NewRequestData(..., num_computed_tokens=4608,
+      mm_features=[MultiModalFeatureSpec(data=None, modality='video', mm_position=PlaceholderRange(offset=4, length=3190), ...)])])
+    ```
+    
+    and the worker dies with:
+    
+    ```
+    File "vllm/model_executor/models/qwen3_vl.py", line 2677, in _iter_mm_grid_hw
+        t, h, w = mm_feature.data["video_grid_thw"].data.tolist()
+    TypeError: 'NoneType' object is not subscriptable
+    ```
+    
+    which kills EngineCore (`EngineDeadError`, HTTP 500).
+    
+    After the fix, the same two-request sequence succeeds and the cached
+    second request keeps the CPU-side grid fields.
+    
+    Fixes #19727
+    
+    ### Does this PR introduce _any_ user-facing change?
+    
+    No. This is an internal scheduler fix (forwarding `uses_mrope` to
+    `NewRequestData.from_request`). It does not change public APIs, CLI
+    flags, configuration keys, or output semantics; it only prevents an
+    engine crash and restores the intended behavior for M-RoPE models with
+    prefix caching.
+    
+    ### How was this patch tested?
+    
+    Unit tests (CPU only), in
+    `tests/ut/patch/platform/test_patch_balance_schedule.py`:
+    
+    - `test_mrope_ascend_schedulers_forward_uses_mrope_to_from_request` —
+    source guard over every `NewRequestData.from_request()` call in
+    `patch_balance_schedule.py` and `dyntra_lb_scheduler.py`.
+    - `test_balance_schedule_forwards_uses_mrope_to_new_request_data` —
+    schedules a real `BalanceScheduler` with `model_uses_mrope=True` and
+    asserts `from_request` receives `uses_mrope=True`.
+    
+    Both pass with the fix (`2 passed`) and both fail when the fix is
+    reverted (`2 failed`), so they guard against regression.
+    
+    End-to-end on Ascend 910B (2 NPU, TP2, Qwen3.5-35B-A3B, vLLM 0.30.0 +
+    vllm-ascend 0.30.0rc2, `--enable-prefix-caching`, balance scheduling
+    enabled, OpenCV video backend):
+    
+    1. Send `video + long text` twice; the second request hits the prefix
+    cache (`num_computed_tokens=4608` covering the whole video span).
+    2. Before the fix: request 2 fails with HTTP 500 / `EngineDeadError` and
+    the traceback above.
+    3. After the fix: both requests succeed (`OK`, 4 output tokens) and the
+    log contains no traceback.
+    
+    ### Checklist
+    
+    - [x] The title contains a change-type tag accepted by the CI title
+    check (`[BugFix]`).
+    - [x] Applicable test coverage and validation results are recorded in
+    this PR.
+    - [x] CI checks pass before merge.
+    - [ ] Outstanding NPU hardware or performance validation is completed
+    before merge.
+    
+    - vLLM main:
+    https://github.com/vllm-project/vllm/commit/544f182d9f0c9bfe8bd7645525951d5e3692a542
+    
+    ---------
+    
+    Signed-off-by: sjyyxl1 <sjyyxl@163.com>
+
+diff --git a/tests/ut/patch/platform/test_patch_balance_schedule.py b/tests/ut/patch/platform/test_patch_balance_schedule.py
+index 545f32e61..d51d77f7d 100644
+--- a/tests/ut/patch/platform/test_patch_balance_schedule.py
++++ b/tests/ut/patch/platform/test_patch_balance_schedule.py
+@@ -1129,3 +1129,59 @@ def test_balance_encoder_only_prefill_budget(encoder_only, chunked_prefill, num_
+     assert output.total_num_scheduled_tokens == expected
+     assert (request in scheduler.running) == bool(expected)
+     assert (request in scheduler.waiting) == (not expected)
++
++
++# ---------------------------------------------------------------------------
++# M-RoPE multimodal data must survive prefix-cache stripping
++# ---------------------------------------------------------------------------
++
++
++def test_mrope_ascend_schedulers_forward_uses_mrope_to_from_request():
++    """Every ``NewRequestData.from_request`` call in the Ascend schedulers must
++    forward ``uses_mrope``.
++
++    ``from_request`` drops the payload of multimodal items fully covered by a
++    prefix-cache hit (``num_computed_tokens > 0``). With ``uses_mrope=False``
++    (the upstream default) it drops *all* payload fields, including the
++    CPU-side ``image_grid_thw`` / ``video_grid_thw`` kept via ``keep_on_cpu``.
++    An M-RoPE model (e.g. Qwen3.5) then reads ``mm_feature.data`` as ``None``
++    when building positions and the engine dies. See issue #19727.
++    """
++    repo_root = Path(__file__).resolve().parents[4]
++    sources = [
++        repo_root / "vllm_ascend/patch/platform/patch_balance_schedule.py",
++        repo_root / "vllm_ascend/core/dyntra_lb_scheduler.py",
++    ]
++    if not all(path.is_file() for path in sources):
++        pytest.skip("source checkout layout not available")
++
++    for path in sources:
++        tree = ast.parse(path.read_text(encoding="utf-8"))
++        calls = [
++            node
++            for node in ast.walk(tree)
++            if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) and node.func.attr == "from_request"
++        ]
++        assert calls, f"{path.name}: no NewRequestData.from_request() call found"
++        for call in calls:
++            assert any(keyword.arg == "uses_mrope" for keyword in call.keywords), (
++                f"{path.name}:{call.lineno}: NewRequestData.from_request() must forward "
++                "uses_mrope=self.model_uses_mrope"
++            )
++
++
++def test_balance_schedule_forwards_uses_mrope_to_new_request_data():
++    """The balance copy of ``schedule()`` must pass the model's real M-RoPE flag
++    into ``NewRequestData.from_request``."""
++    from vllm_ascend.patch.platform import patch_balance_schedule as pbs
++
++    scheduler = _make_balance_scheduler()
++    scheduler.model_uses_mrope = True
++    request = _create_requests(1, num_tokens=32, max_tokens=8)[0]
++    scheduler.add_request(request)
++
++    with patch.object(pbs.NewRequestData, "from_request", wraps=pbs.NewRequestData.from_request) as spy:
++        scheduler.schedule()
++
++    spy.assert_called_once()
++    assert spy.call_args.kwargs["uses_mrope"] is True
+diff --git a/vllm_ascend/core/dyntra_lb_scheduler.py b/vllm_ascend/core/dyntra_lb_scheduler.py
+index b212a3e83..053e4ff87 100644
+--- a/vllm_ascend/core/dyntra_lb_scheduler.py
++++ b/vllm_ascend/core/dyntra_lb_scheduler.py
+@@ -1076,12 +1076,17 @@ class DyntraLBScheduler(DyntraLBPolicyMixin, Scheduler):
+                     req,
+                     req_to_new_blocks[req.request_id].get_block_ids(),
+                     req._all_token_ids,
++                    uses_mrope=self.model_uses_mrope,
+                 )
+                 for req in scheduled_new_reqs
+             ]
+         else:
+             new_reqs_data = [
+-                NewRequestData.from_request(req, req_to_new_blocks[req.request_id].get_block_ids())
++                NewRequestData.from_request(
++                    req,
++                    req_to_new_blocks[req.request_id].get_block_ids(),
++                    uses_mrope=self.model_uses_mrope,
++                )
+                 for req in scheduled_new_reqs
+             ]
+ 
+diff --git a/vllm_ascend/patch/platform/patch_balance_schedule.py b/vllm_ascend/patch/platform/patch_balance_schedule.py
+index b53a74f7a..355f12d90 100644
+--- a/vllm_ascend/patch/platform/patch_balance_schedule.py
++++ b/vllm_ascend/patch/platform/patch_balance_schedule.py
+@@ -764,12 +764,17 @@ class BalanceScheduler(Scheduler):
+                     req,
+                     req_to_new_blocks[req.request_id].get_block_ids(),
+                     req._all_token_ids,
++                    uses_mrope=self.model_uses_mrope,
+                 )
+                 for req in scheduled_new_reqs
+             ]
+         else:
+             new_reqs_data = [
+-                NewRequestData.from_request(req, req_to_new_blocks[req.request_id].get_block_ids())
++                NewRequestData.from_request(
++                    req,
++                    req_to_new_blocks[req.request_id].get_block_ids(),
++                    uses_mrope=self.model_uses_mrope,
++                )
+                 for req in scheduled_new_reqs
+             ]
+ 

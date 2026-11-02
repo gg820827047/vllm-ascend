@@ -1,0 +1,205 @@
+commit d5554d8558dc782c350125a3ebd9fb6a54163c47
+Author:     liben <61270660+q664171689@users.noreply.github.com>
+AuthorDate: Thu Oct 29 10:00:36 2026 +0800
+Commit:     GitHub <noreply@github.com>
+CommitDate: Thu Oct 29 10:00:36 2026 +0800
+
+    [BugFix][Attention] Preserve standalone MLA output gates (#20104)
+    
+    ### What this PR does / why we need it?
+    
+    Preserve the standalone MLA output gate when `_mla_preprocess` returns
+    no fused gate.
+    
+    With the standalone `g_proj` layout, `AscendMLAImpl.forward` computes
+    the gate before preprocessing. Since #19694, both the plain and strided
+    preprocessing paths unpack the third return value into the same
+    variable. That return value is `None` for the plain QKV-A layout, so it
+    overwrites the standalone gate and silently skips `attention_output *
+    sigmoid(gate)` before `o_proj`.
+    
+    Keep the preprocessing result in a separate variable and replace the
+    existing gate only when preprocessing produces a tensor. This preserves
+    standalone gating, fused gating, and ungated/prolog behavior. The
+    observed affected model is Kimi-K3 with a standalone gate on vLLM
+    v0.32.0; the fix follows the backend contract without model-specific
+    conditions. Any MLA consumer with the same standalone-gate contract can
+    be affected; a fused gate returned as a tensor, or a model without an
+    output gate, does not hit this overwrite bug.
+    
+    ### Does this PR introduce _any_ user-facing change?
+    
+    Yes. Fixes incorrect Kimi-K3 generation when the MLA output gate is
+    projected by a standalone `g_proj`. No launch or configuration changes
+    are required.
+    
+    ### How was this patch tested?
+    
+    - Added `tests/ut/attention/test_mla_output_gate.py`, exercising the
+    actual `AscendMLAImpl.forward` with CPU tensors and mocked device/kernel
+    boundaries. It covers prefill/decode, plain/strided/prolog
+    preprocessing, and standalone/fused/ungated layouts: **16 passed, 2
+    skipped** (fused+prolog is unsupported). The unpatched forward fails all
+    four standalone plain/strided prefill/decode cases.
+    - The new tests plus the existing `tests/ut/attention/test_mla_v1.py`
+    suite: **229 passed, 3 skipped**. The image's normal custom-op bootstrap
+    and a patched-module loader were used; this is focused unit coverage,
+    not a full repository test run.
+    - Actual Ascend A3 serving: Kimi-K3, DP4/TP16/EP64, DSpark7, sequence
+    parallelism and `FULL_DECODE_ONLY` graphs enabled. The persistent source
+    fix was deployed and the service restarted before evaluation. GPQA
+    Diamond, all **198** questions, maximum output **65,536** tokens, client
+    concurrency **64**, temperature **0**, seed **0**, zero-shot, thinking
+    enabled: **180/198 (90.91%)**, zero request errors. Four responses
+    reached the output cap without a parsed answer and count as incorrect.
+    This is post-fix quality evidence; no matched full-budget unpatched or
+    v0.30 full-model baseline is claimed.
+    - Hardware/unit validation used Ascend base
+    `bd42eea01d8312c4df469fabaed45f77a12df4d3` and vLLM v0.32.0
+    `5df63a7203cdb9328d824a27b682e77c7b9928be`. The branch is based on
+    community main `a1fcee98601b8da223d20afc46b7ba3c6c7da393`; the MLA
+    implementation and existing MLA test file are unchanged between those
+    Ascend bases.
+    - Ruff, formatting, codespell, typos, clang-format, Markdown lint,
+    secret scan, shell checks and repository Python policy checks passed.
+    Full `bash format.sh ci` was attempted, but its actionlint environment
+    provisioning stalled and was stopped. The same command passed with only
+    `actionlint` skipped; a separate Homebrew actionlint 1.7.12 run passed
+    for all 54 tracked workflow files with the same exclusions and
+    ShellCheck options (the pre-commit hook pins 1.7.11).
+    - `git diff --check` passed. No latency/throughput comparison or
+    full-model validation for other models is claimed; upstream CI remains
+    pending.
+    
+    ### Checklist
+    
+    #### Testing
+    
+    - [x] Boundary / edge-case coverage: standalone, fused and absent gate;
+    both prefill/decode and plain/strided/prolog paths.
+    - [x] Regression test: standalone cases fail without the fix.
+    - [ ] Error / failure path coverage: this change does not add an
+    exception or validation path.
+    - [x] Meaningful & reliable tests: assertions compare numerical outputs
+    against an independent sigmoid-gating expression.
+    - [ ] Performance impact: no performance improvement claimed; no matched
+    serving-performance comparison run.
+    
+    - vLLM main:
+    https://github.com/vllm-project/vllm/commit/544f182d9f0c9bfe8bd7645525951d5e3692a542
+    
+    ---------
+    
+    Signed-off-by: q664171689 <664171689@qq.com>
+
+diff --git a/tests/ut/attention/test_mla_output_gate.py b/tests/ut/attention/test_mla_output_gate.py
+new file mode 100644
+index 000000000..37129586a
+--- /dev/null
++++ b/tests/ut/attention/test_mla_output_gate.py
+@@ -0,0 +1,69 @@
++from types import SimpleNamespace
++from unittest.mock import MagicMock, patch
++
++import pytest
++import torch
++
++from vllm_ascend.attention.mla_v1 import AscendMLAImpl
++
++
++@pytest.mark.parametrize("is_prefill", [True, False])
++@pytest.mark.parametrize("preprocess_path", ["plain", "strided", "prolog"])
++@pytest.mark.parametrize("gate_layout", ["standalone", "fused", "none"])
++def test_mla_forward_preserves_output_gate(is_prefill, preprocess_path, gate_layout):
++    if preprocess_path == "prolog" and gate_layout == "fused":
++        pytest.skip("The prolog path does not support a QKV-A-fused gate")
++
++    impl = AscendMLAImpl.__new__(AscendMLAImpl)
++    num_tokens, hidden_size = 3, 4
++    hidden = torch.ones(num_tokens, hidden_size)
++    attention = torch.arange(1, num_tokens * hidden_size + 1, dtype=torch.float32).reshape_as(hidden)
++    gate = torch.linspace(-3, 3, num_tokens * hidden_size).reshape_as(hidden)
++    impl.num_heads = 2
++    impl.v_head_dim = 2
++    impl.kv_lora_rank = 2
++    impl.use_output_gate = gate_layout != "none"
++    impl.qkv_a_gate_fused = gate_layout == "fused"
++    impl.g_proj = MagicMock(return_value=(gate, None)) if gate_layout == "standalone" else None
++    impl.use_pcp = False
++    impl.use_dcp = False
++    impl.is_pcp_decode_sharded = False
++    impl.enable_mlapo = False
++    impl.fa_quant_layer = False
++    impl.use_mla_rope = False
++    impl.enable_kv_nz = False
++    impl._decode_requires_current_kv = lambda _: False
++    impl._prefill_requires_current_kv = lambda _: False
++    impl._cache_requires_prolog_v3_writer = lambda _: preprocess_path == "prolog"
++    impl._uses_strided_kv_adapter = lambda: preprocess_path == "strided"
++
++    metadata = SimpleNamespace(
++        num_actual_tokens=num_tokens,
++        num_decodes=0 if is_prefill else 1,
++        num_prefills=1 if is_prefill else 0,
++        num_decode_tokens=0 if is_prefill else num_tokens,
++        external_flashmla=None,
++    )
++    prefill = SimpleNamespace(q_nope=None, q_pe=None, k_nope=None, k_pe=None, value=None)
++    prepared = (None, prefill) if is_prefill else (object(), None)
++    fused_gate = gate if gate_layout == "fused" else None
++    impl._mla_preprocess = MagicMock(return_value=(*prepared, fused_gate))
++    impl.mla_preprocess_prolog_v3 = MagicMock(return_value=prepared)
++    impl._forward_prefill = MagicMock(return_value=attention)
++    impl._forward_decode = MagicMock(return_value=attention)
++    impl.o_proj = MagicMock(side_effect=lambda x, **_: (x, None))
++    cache = torch.empty(2, 2, 4)
++    if preprocess_path == "strided":
++        cache = cache.transpose(0, 1)
++    output = torch.empty_like(hidden)
++    with (
++        patch("vllm_ascend.attention.mla_v1._EXTRA_CTX", SimpleNamespace(num_tokens=num_tokens)),
++        patch("vllm_ascend.attention.mla_v1.maybe_save_kv_layer_to_connector"),
++    ):
++        result = impl.forward("layer", hidden, (cache, cache), metadata, output)
++
++    expected = attention if gate_layout == "none" else attention * torch.sigmoid(gate)
++    assert result is output
++    torch.testing.assert_close(result, expected)
++    if impl.g_proj is not None:
++        impl.g_proj.assert_called_once()
+diff --git a/vllm_ascend/attention/mla_v1.py b/vllm_ascend/attention/mla_v1.py
+index 5a2386841..5cae2c84f 100644
+--- a/vllm_ascend/attention/mla_v1.py
++++ b/vllm_ascend/attention/mla_v1.py
+@@ -3425,6 +3425,7 @@ class AscendMLAImpl(MLAAttentionImpl):
+             gate = self.g_proj(hidden_states.contiguous())[0]
+ 
+         # MLA Preprocess
++        preprocess_gate = None
+         decode_requires_current_kv = self._decode_requires_current_kv(attn_metadata)
+         prefill_requires_current_kv = self._prefill_requires_current_kv(attn_metadata)
+         dcp_current_kv_buffers = getattr(self, "_dcp_current_kv_buffers", None)
+@@ -3463,7 +3464,7 @@ class AscendMLAImpl(MLAAttentionImpl):
+                 hidden_states, kv_cache, attn_metadata
+             )
+         elif self._uses_strided_kv_adapter() and any(not cache.is_contiguous() for cache in kv_cache):
+-            decode_preprocess_res, prefill_preprocess_res, gate = self._mla_preprocess(
++            decode_preprocess_res, prefill_preprocess_res, preprocess_gate = self._mla_preprocess(
+                 layer_name, hidden_states, kv_cache, attn_metadata
+             )
+         elif (
+@@ -3483,9 +3484,13 @@ class AscendMLAImpl(MLAAttentionImpl):
+                 hidden_states, kv_cache, attn_metadata
+             )
+         else:
+-            decode_preprocess_res, prefill_preprocess_res, gate = self._mla_preprocess(
++            decode_preprocess_res, prefill_preprocess_res, preprocess_gate = self._mla_preprocess(
+                 layer_name, hidden_states, kv_cache, attn_metadata
+             )
++        # The plain QKV-A layout returns no gate. Keep the standalone g_proj
++        # result unless preprocessing produced a fused output gate.
++        if preprocess_gate is not None:
++            gate = preprocess_gate
+         if decode_preprocess_res is not None:
+             # MLA Preprocess for decoding
+             if attn_metadata.external_flashmla is not None:

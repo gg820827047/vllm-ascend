@@ -1,0 +1,1293 @@
+commit 65719143a61c4f5c6da132881b9554a3c09d3902
+Author:     lijiahang226 <216526138+lijiahang226@users.noreply.github.com>
+AuthorDate: Mon Nov 2 14:47:54 2026 +0800
+Commit:     GitHub <noreply@github.com>
+CommitDate: Mon Nov 2 14:47:54 2026 +0800
+
+    [Feature][v0.32.0] Add FP8 LI cache support for CANN KeyPool (#20447)
+    
+    ### What this PR does / why we need it?
+    
+    Backports #18447 to `releases/v0.32.0rc`: adds FP8 LI pooled-key caches
+    with FP32 per-pool scales for GLM-5.3-Flash CANN KeyPool on Ascend 950.
+    BF16 remains the default.
+    
+    Refs #15665
+    
+    ### Does this PR introduce _any_ user-facing change?
+    
+    Enables `attention_config.indexer_kv_dtype=fp8`; SFA precision remains
+    independently configurable. FP8 LI does not support KV offloading.
+    
+    ### How was this patch tested?
+    
+    147 focused CPU cases passed with CANN/NPU calls mocked, covering
+    hardware capability checks, BF16 bypass, empty/padded queries and
+    scale/padded-stride kernel arguments. UTs were extended in
+    `test_glm5next_kpool_model_backend.py` and
+    `test_cann_keypool_adapters.py`.
+    
+    The existing FP8 implementation is unchanged by the UT update. The
+    separate A5 regression run is reported below.
+    
+    **A5 operator regression (2026-11-01):** [singlecard-ops-a5
+    run](https://github.com/vllm-project/vllm-ascend/actions/runs/41269132959/job/124739022759)
+    tested head `1b799808133c8e7d9befd0dcf75a71ae22696c50` with vLLM
+    `v0.32.0` on Ascend 950DT using the main CI image: **CANN 9.2.1 /
+    Triton-Ascend 3.2.2 / torch-npu 2.10.0.post4**. All **16** cases in
+    `tests/e2e/nightly/single_node/ops/singlecard_ops/triton/test_glm5next_cann_keypool.py`
+    passed (**8 FP8 + 8 BF16, 0 skipped**), covering values/scales
+    (including zero vectors), invalid slots, shared/padded pages, tail
+    guards, speculative writes and eager/graph replay.
+    
+    This run does **not** validate the release-required **Triton-Ascend
+    3.6.0.post2 / torch-npu 2.10.0.post7** dependencies; no
+    matching-dependency rerun was performed. Although GitHub reports job
+    success, the raw log records a SparseFlashMLA metadata test failure and
+    lacks the final pytest group summary, so only the observed 16-case
+    result is claimed.
+    
+    ### Checklist
+    
+    - [x] Boundary / edge-case coverage.
+    - [x] Error / failure path coverage.
+    - [x] Meaningful tests for hardware capability checks, cache layout and
+    BF16 compatibility.
+    
+    - vLLM main:
+    https://github.com/vllm-project/vllm/commit/544f182d9f0c9bfe8bd7645525951d5e3692a542
+    
+    ---------
+    
+    Signed-off-by: Li Jiahang <216526138+lijiahang226@users.noreply.github.com>
+
+diff --git a/release_notes/fragments/20447.yaml b/release_notes/fragments/20447.yaml
+new file mode 100644
+index 000000000..a289d115f
+--- /dev/null
++++ b/release_notes/fragments/20447.yaml
+@@ -0,0 +1,6 @@
++pr: 20447
++entries:
++  - category: feature
++    text: Added optional FP8 pooled-key indexer caches with FP32 scales for GLM-5.3-Flash on supported Ascend 950 hardware.
++    model: glm-5.3-flash
++    hardware: [Ascend 950]
+diff --git a/tests/e2e/nightly/single_node/ops/singlecard_ops/triton/test_glm5next_cann_keypool.py b/tests/e2e/nightly/single_node/ops/singlecard_ops/triton/test_glm5next_cann_keypool.py
+new file mode 100644
+index 000000000..a829db1d3
+--- /dev/null
++++ b/tests/e2e/nightly/single_node/ops/singlecard_ops/triton/test_glm5next_cann_keypool.py
+@@ -0,0 +1,186 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++
++from types import SimpleNamespace
++
++import pytest
++import torch
++import torch_npu  # noqa: F401
++
++from vllm_ascend.device import HardwareCapability, get_current_hardware_profile
++from vllm_ascend.device.device_config import get_ascend_device_type
++from vllm_ascend.device.hardware import AscendDeviceType
++from vllm_ascend.ops.triton.glm5_next_cann_keypool import write_keypool_caches
++
++pytestmark = pytest.mark.skipif(
++    get_ascend_device_type() not in (AscendDeviceType.A2, AscendDeviceType.A3, AscendDeviceType.A5),
++    reason="Requires Ascend A2/A3/A5",
++)
++
++HEAD_DIM = 128
++BLOCK_SIZE = 32
++CACHE_BLOCKS = 3
++GUARD_BYTES = 256
++GUARD_VALUE = 0x55
++TAIL_PAGE_ROWS = 80
++TAIL_CAPACITY = 7
++
++
++def _cache_views(storage, dtype, page_bytes):
++    item_bytes = torch.empty((), dtype=dtype).element_size()
++    cache = storage.view(dtype).as_strided(
++        (CACHE_BLOCKS, BLOCK_SIZE, 1, HEAD_DIM),
++        (page_bytes // item_bytes, HEAD_DIM, HEAD_DIM, 1),
++        GUARD_BYTES // item_bytes,
++    )
++    scales = None
++    if dtype == torch.float8_e4m3fn:
++        scales = storage.view(torch.float32).as_strided(
++            (CACHE_BLOCKS, BLOCK_SIZE),
++            (page_bytes // 4, 1),
++            (GUARD_BYTES + BLOCK_SIZE * HEAD_DIM) // 4,
++        )
++    return cache, scales
++
++
++def _assert_cache_writes(storage, dtype, page_bytes, pooled, slots):
++    expected = torch.full_like(storage, GUARD_VALUE, device="cpu")
++    cache, scales = _cache_views(expected, dtype, page_bytes)
++    scale_bytes_written = torch.zeros(expected.shape, dtype=torch.bool)
++    values = pooled.float()
++    if scales is not None:
++        maximum = values.abs().amax(dim=-1)
++        descales = torch.where(maximum > 0, maximum / torch.finfo(dtype).max, 1.0)
++        values = values / descales[:, None]
++    for row, slot in enumerate(slots.tolist()):
++        if not 0 <= slot < CACHE_BLOCKS * BLOCK_SIZE:
++            continue
++        block, offset = divmod(slot, BLOCK_SIZE)
++        cache[block, offset, 0] = values[row].to(dtype)
++        if scales is not None:
++            scales[block, offset] = descales[row]
++            begin = GUARD_BYTES + block * page_bytes + BLOCK_SIZE * HEAD_DIM + offset * 4
++            scale_bytes_written[begin : begin + 4] = True
++    actual = storage.cpu()
++    # Compare FP8 encodings and all untouched bytes, including the shared page padding.
++    torch.testing.assert_close(actual[~scale_bytes_written], expected[~scale_bytes_written], rtol=0, atol=0)
++    if scales is not None:
++        _, actual_scales = _cache_views(actual, dtype, page_bytes)
++        torch.testing.assert_close(actual_scales, scales, rtol=1e-6, atol=0)
++
++
++@pytest.mark.parametrize(
++    "cache_dtype",
++    [
++        torch.bfloat16,
++        pytest.param(
++            torch.float8_e4m3fn,
++            marks=pytest.mark.skipif(
++                not get_current_hardware_profile().supports(HardwareCapability.POOL_KEY_INDEXER_FP8),
++                reason="FP8 LI cache requires Ascend 950",
++            ),
++        ),
++    ],
++)
++@pytest.mark.parametrize("padded", [False, True])
++@pytest.mark.parametrize("speculative", [False, True])
++@pytest.mark.parametrize("use_graph", [False, True])
++@torch.inference_mode()
++def test_cache_write_values_scales_invalid_slots_and_graph(cache_dtype, padded, speculative, use_graph):
++    item_bytes = torch.empty((), dtype=cache_dtype).element_size()
++    page_bytes = BLOCK_SIZE * HEAD_DIM * item_bytes
++    if cache_dtype == torch.float8_e4m3fn:
++        page_bytes += BLOCK_SIZE * 4
++    if padded:
++        page_bytes += GUARD_BYTES
++    storage = torch.full(
++        (GUARD_BYTES + CACHE_BLOCKS * page_bytes + GUARD_BYTES,), GUARD_VALUE, dtype=torch.uint8, device="npu"
++    )
++    cache, scales = _cache_views(storage, cache_dtype, page_bytes)
++    tail_storage = torch.full((2 * TAIL_PAGE_ROWS * 2 * HEAD_DIM + 2 * HEAD_DIM,), 17.0, device="npu")
++    tail = tail_storage.as_strided(
++        (2, TAIL_CAPACITY, 2 * HEAD_DIM), (TAIL_PAGE_ROWS * 2 * HEAD_DIM, 2 * HEAD_DIM, 1), HEAD_DIM
++    )
++    writes_storage = torch.full((2, 6), -1, dtype=torch.int64, device="npu")
++    writes = writes_storage[:, :3]
++    state_rows_cpu = torch.tensor([[1, 0, 2], [3, 4, 5]])
++    state_storage = torch.zeros_like(writes_storage)
++    state_rows = state_storage[:, :3]
++    state_rows.copy_(state_rows_cpu)
++    key = torch.empty((6, HEAD_DIM), device="npu")
++    gate = torch.empty_like(key)
++    state = torch.empty((6, 2 * HEAD_DIM), device="npu")
++    pooled_storage = torch.full((7, HEAD_DIM + 16), 8192, dtype=torch.bfloat16, device="npu")
++    pooled = pooled_storage[:, :HEAD_DIM]
++    slots = torch.empty(7, dtype=torch.int64, device="npu")
++    metadata = SimpleNamespace(pooled_slot_mapping=slots)
++    tail_metadata = SimpleNamespace(
++        cann_inputs=SimpleNamespace(write_indices=writes, state_indices=state_rows, page_rows=TAIL_PAGE_ROWS)
++    )
++
++    def run():
++        write_keypool_caches(
++            tail,
++            cache,
++            key if speculative else None,
++            gate if speculative else None,
++            pooled,
++            metadata,
++            tail_metadata,
++            None if speculative else state,
++            scale_cache=scales,
++        )
++
++    graph = None
++    for step in (0, 1):
++        key_cpu = torch.arange(6 * HEAD_DIM, dtype=torch.float32).view(6, HEAD_DIM) / 16 + step
++        gate_cpu = -key_cpu - 1000
++        state_cpu = torch.cat((key_cpu, gate_cpu), dim=-1)
++        # Keep nonrepresentable inputs away from FP8 rounding ties.
++        pool_cpu = torch.tensor([-223.0, -27.25, -6.9, -2.45, -0.24, 0.0, 0.13, 1.03, 5.1, 11.1, 20.4, 223.0])
++        pool_cpu = pool_cpu.roll(step)[torch.arange(HEAD_DIM).remainder(pool_cpu.numel())]
++        pool_cpu[0] = torch.finfo(torch.float8_e4m3fn).max
++        pool_cpu = (pool_cpu[None] * (2.0 ** torch.arange(-3, 4))[:, None] * (2**step)).bfloat16()
++        pool_cpu[2].zero_()
++        slots_cpu = torch.tensor(
++            [
++                step,
++                BLOCK_SIZE - 1 - step,
++                BLOCK_SIZE + step,
++                2 * BLOCK_SIZE + 3 - step,
++                -1,
++                CACHE_BLOCKS * BLOCK_SIZE,
++                CACHE_BLOCKS * BLOCK_SIZE + 3,
++            ]
++        )
++        writes_cpu = torch.tensor(
++            [[6 - step, TAIL_PAGE_ROWS + 6 - step, 2 * TAIL_PAGE_ROWS], [TAIL_CAPACITY, -1, step]]
++        )
++        key.copy_(key_cpu)
++        gate.copy_(gate_cpu)
++        state.copy_(state_cpu)
++        pooled.copy_(pool_cpu)
++        slots.copy_(slots_cpu)
++        writes.copy_(writes_cpu)
++        if use_graph and graph is None:
++            for _ in range(3):
++                run()
++            torch.npu.synchronize()
++            graph = torch.npu.NPUGraph()
++            with torch.npu.graph(graph):
++                run()
++        storage.fill_(GUARD_VALUE)
++        tail_storage.fill_(17)
++        if graph is None:
++            run()
++        else:
++            graph.replay()
++        _assert_cache_writes(storage, cache_dtype, page_bytes, pool_cpu, slots_cpu)
++        expected_tail = torch.full_like(tail_storage, 17, device="cpu")
++        for row, dest in enumerate(writes_cpu.flatten().tolist()):
++            if dest < 0 or dest // TAIL_PAGE_ROWS >= 2 or dest % TAIL_PAGE_ROWS >= TAIL_CAPACITY:
++                continue
++            source = row if speculative else state_rows_cpu.flatten()[row].item()
++            begin = HEAD_DIM + dest * 2 * HEAD_DIM
++            expected_tail[begin : begin + 2 * HEAD_DIM] = state_cpu[source]
++        torch.testing.assert_close(tail_storage.cpu(), expected_tail, rtol=0, atol=0)
+diff --git a/tests/ut/device/test_hardware_profile.py b/tests/ut/device/test_hardware_profile.py
+index 1902542cd..42e9318a8 100644
+--- a/tests/ut/device/test_hardware_profile.py
++++ b/tests/ut/device/test_hardware_profile.py
+@@ -93,6 +93,7 @@ _EXPECTED_CAPABILITIES = {
+             HardwareCapability.DYNAMIC_MX_QUANT_SCALE_ALG_ONE,
+             HardwareCapability.FLA_GDN_PREFILL,
+             HardwareCapability.FP8_ATTENTION,
++            HardwareCapability.POOL_KEY_INDEXER_FP8,
+             HardwareCapability.FUSED_ROTARY_MUL_INTERLEAVE,
+             HardwareCapability.GRAPH_MM_REDUCE_SCATTER_FUSION,
+             HardwareCapability.GRAPH_MULS_ADD_FUSION,
+diff --git a/tests/ut/models/test_glm5next_cache_config.py b/tests/ut/models/test_glm5next_cache_config.py
+index 991a7612b..43581c27d 100644
+--- a/tests/ut/models/test_glm5next_cache_config.py
++++ b/tests/ut/models/test_glm5next_cache_config.py
+@@ -25,6 +25,7 @@ from vllm_ascend.models.glm5next.cache_config import (
+     get_glm5_next_max_memory_usage,
+     get_glm5_next_pool_bytes_per_block,
+ )
++from vllm_ascend.models.glm5next.cache_views import view_compressed_indexer_cache, view_kpool_tail_cache
+ from vllm_ascend.utils import get_kv_cache_tensor_layers
+ 
+ 
+@@ -193,6 +194,79 @@ def test_standalone_mtp_layout_has_no_mamba_groups():
+     assert layout.mamba_groups == ()
+ 
+ 
++def test_fp8_shared_pages_preserve_tail_rows_and_kernel_scale_alignment():
++    specs = make_specs(pool=4)
++    indexer_name = "model.layers.3.indexer.k_cache"
++    tail_name = "model.layers.3.indexer.tail_cache"
++    specs["model.layers.3.attn"] = replace(specs["model.layers.3.attn"], block_size=640)
++    specs[indexer_name] = AscendMLAAttentionSpec(
++        block_size=640,
++        num_kv_heads=1,
++        head_size=128,
++        dtype=torch.float8_e4m3fn,
++        scale_dim=1,
++        scale_dtype=torch.float32,
++        model_version="glm5_next",
++        tokens_per_state=4,
++    )
++    groups = get_glm5_next_kv_cache_groups(make_config(), specs)
++    plan = get_glm5_next_kv_cache_config(make_config(), groups, 3 * get_glm5_next_pool_bytes_per_block(groups))
++    descriptor = next(tensor for tensor in plan.kv_cache_tensors if indexer_name in get_kv_cache_tensor_layers(tensor))
++    raw = torch.zeros(descriptor.size, dtype=torch.uint8)
++    (tail,) = view_kpool_tail_cache(tail_name, specs[tail_name], raw, plan.num_blocks)
++    page_rows = specs[tail_name].page_size_bytes // (2 * specs[tail_name].head_size * tail.element_size())
++    assert page_rows * tail.shape[-1] == tail.stride(0)
++
++    backend = SimpleNamespace(get_kv_cache_shape=lambda n, b, h, d: (n, b, h, d))
++    keys, scales = view_compressed_indexer_cache(indexer_name, specs[indexer_name], raw, backend, 128)
++    page_bytes = descriptor.size // plan.num_blocks
++    assert keys.shape == (15, 32, 1, 128)
++    assert scales.shape == (15, 32, 1, 1)
++    assert keys.stride(0) == scales.stride(0) * scales.element_size() == page_bytes // 5
++    assert scales.data_ptr() - keys.data_ptr() == 32 * 128
++    assert page_bytes == 25600
++
++
++@pytest.mark.parametrize(
++    "block_size,lookahead,bf16_page_bytes,fp8_page_bytes",
++    [(128, 0, 8192, 5120), (128, 5, 9216, 9216), (512, 5, 32768, 17408), (640, 5, 40960, 25600)],
++)
++def test_fp8_cache_budget_accounts_for_scales_tail_and_padding(block_size, lookahead, bf16_page_bytes, fp8_page_bytes):
++    config = make_config()
++    budget = 64 * 1024 * 1024
++    bytes_per_block, capacities = [], []
++    for dtype, expected_page_bytes in ((torch.bfloat16, bf16_page_bytes), (torch.float8_e4m3fn, fp8_page_bytes)):
++        specs = make_specs(pool=4)
++        specs["model.layers.3.attn"] = replace(specs["model.layers.3.attn"], block_size=block_size)
++        specs["model.layers.3.indexer.k_cache"] = AscendMLAAttentionSpec(
++            block_size=block_size,
++            num_kv_heads=1,
++            head_size=128,
++            dtype=dtype,
++            scale_dim=1 if dtype == torch.float8_e4m3fn else 0,
++            scale_dtype=torch.float32 if dtype == torch.float8_e4m3fn else torch.int8,
++            model_version="glm5_next",
++            tokens_per_state=4,
++        )
++        specs["model.layers.3.indexer.tail_cache"] = replace(
++            specs["model.layers.3.indexer.tail_cache"], block_size=4 + lookahead
++        )
++        groups = get_glm5_next_kv_cache_groups(config, specs)
++        layout = _get_glm5_next_cache_layout(groups)
++        assert layout is not None and layout.small_page_size == expected_page_bytes
++        plan = get_glm5_next_kv_cache_config(config, groups, budget)
++        block_bytes = get_glm5_next_pool_bytes_per_block(groups)
++        assert sum(tensor.size for tensor in plan.kv_cache_tensors) == plan.num_blocks * block_bytes <= budget
++        bytes_per_block.append(block_bytes)
++        capacities.append(plan.num_blocks)
++
++    assert bytes_per_block[0] - bytes_per_block[1] == bf16_page_bytes - fp8_page_bytes
++    if fp8_page_bytes < bf16_page_bytes:
++        assert capacities[1] > capacities[0]
++    else:
++        assert capacities[1] == capacities[0]
++
++
+ def test_pipeline_projection_supports_a_mamba_only_worker():
+     config = make_config()
+     groups = get_glm5_next_kv_cache_groups(config, make_specs())
+diff --git a/tests/ut/models/test_glm5next_kpool_model_backend.py b/tests/ut/models/test_glm5next_kpool_model_backend.py
+index e00e28334..855d744da 100644
+--- a/tests/ut/models/test_glm5next_kpool_model_backend.py
++++ b/tests/ut/models/test_glm5next_kpool_model_backend.py
+@@ -3,12 +3,14 @@
+ 
+ import importlib.util
+ from dataclasses import replace
++from functools import partial
+ from types import SimpleNamespace
+ from unittest.mock import MagicMock, patch
+ 
+ import pytest
+ import torch
+ from torch import nn
++from vllm.config import KVTransferConfig
+ from vllm.config.compilation import CUDAGraphMode
+ 
+ import vllm_ascend.attention.indexer_kpool as backend_module
+@@ -21,6 +23,8 @@ from vllm_ascend.attention.indexer_kpool import (
+ )
+ from vllm_ascend.device.hardware import AscendDeviceType
+ from vllm_ascend.device.hardware_profile import get_hardware_profile
++from vllm_ascend.models.glm5next.attention import Indexer
++from vllm_ascend.ops import cann_keypool
+ 
+ with patch.dict(
+     "sys.modules",
+@@ -33,6 +37,29 @@ with patch.dict(
+     from vllm_ascend.models.glm5next.sparse_attn_indexer_kpool import SparseAttnIndexerKpool, append_causal_tail
+ 
+ 
++def test_glm_indexer_rejects_unsupported_cache_dtype_before_constructing_layers():
++    config = SimpleNamespace(attention_config=SimpleNamespace(indexer_kv_dtype="int8"))
++    with pytest.raises(ValueError, match="indexer_kv_dtype must be auto, bf16 or fp8"):
++        Indexer(config, None, 8, 8, None, None, None)
++
++
++@pytest.mark.parametrize("connector", ["OffloadingConnector", "PreemptOffloadConnector"])
++@pytest.mark.parametrize("multi_connector", [False, True])
++def test_glm_fp8_indexer_rejects_kv_offload_before_constructing_layers(connector, multi_connector):
++    config = SimpleNamespace(
++        attention_config=SimpleNamespace(indexer_kv_dtype="fp8"),
++        kv_transfer_config=KVTransferConfig(
++            kv_connector="MultiConnector" if multi_connector else connector,
++            kv_role="kv_both",
++            kv_connector_extra_config={"connectors": [{"kv_connector": connector, "kv_role": "kv_both"}]}
++            if multi_connector
++            else {},
++        ),
++    )
++    with pytest.raises(NotImplementedError, match="FP8 LI cache does not support KV offloading"):
++        Indexer(config, None, 8, 8, None, None, None)
++
++
+ def test_cache_metadata_import_does_not_require_indexer_operators() -> None:
+     module_name = f"{backend_module.__name__}_import_test"
+     spec = importlib.util.spec_from_file_location(module_name, backend_module.__file__)
+@@ -184,7 +211,7 @@ def test_kpool_weight_postprocessing_keeps_nd_before_fp32_cast(monkeypatch, weig
+         softmax_scale=0.5,
+         index_kpool_compress_ape=nn.Parameter(torch.zeros(4, 4, dtype=dtype)),
+         index_kpool_compress_gate=nn.Parameter(torch.randn(4, 8, dtype=dtype)),
+-        k_cache=SimpleNamespace(prefix="indexer.k_cache"),
++        k_cache=SimpleNamespace(prefix="indexer.k_cache", dtype=torch.bfloat16),
+         tail_cache=SimpleNamespace(prefix="indexer.tail"),
+         topk_indices_buffer=None,
+     )
+@@ -228,6 +255,63 @@ def test_kpool_weight_postprocessing_keeps_nd_before_fp32_cast(monkeypatch, weig
+     torch.testing.assert_close(source.wk_weights_proj.weight, original_weight)
+ 
+ 
++@pytest.mark.parametrize("device", [AscendDeviceType.A2, AscendDeviceType.A3, AscendDeviceType.A5])
++@pytest.mark.parametrize("quantized", [False, True])
++def test_fp8_hardware_support_is_checked_by_execution_backend(monkeypatch, device, quantized):
++    source = SimpleNamespace(
++        vllm_config=SimpleNamespace(
++            parallel_config=SimpleNamespace(prefill_context_parallel_size=1, decode_context_parallel_size=1)
++        ),
++        n_head=1,
++        head_dim=128,
++        topk_tokens=2048,
++        q_lora_rank=128,
++        index_kpool=4,
++        wq_b=nn.Identity(),
++        wk_weights_proj=nn.Identity(),
++        k_norm=nn.Identity(),
++        softmax_scale=1.0,
++        index_kpool_compress_ape=torch.zeros(4, 128),
++        index_kpool_compress_gate=torch.zeros(128, 128),
++        k_cache=SimpleNamespace(dtype=torch.float8_e4m3fn if quantized else torch.bfloat16),
++        tail_cache=SimpleNamespace(),
++        topk_indices_buffer=None,
++    )
++    profile = get_hardware_profile(device)
++    hardware = SimpleNamespace(
++        attention_backend_family=profile.attention_backend_family, supports=MagicMock(wraps=profile.supports)
++    )
++    monkeypatch.setattr(backend_module, "get_current_hardware_profile", lambda: hardware)
++    init = MagicMock()
++    monkeypatch.setattr(Glm5NextKPoolIndexerBackend, "_init_cann_ops", init)
++    if quantized and device != AscendDeviceType.A5:
++        with pytest.raises(NotImplementedError, match="PoolKeyIndexer FP8 support"):
++            Glm5NextKPoolIndexerBackend(source, qk_rope_head_dim=0)
++        init.assert_not_called()
++    else:
++        Glm5NextKPoolIndexerBackend(source, qk_rope_head_dim=0)
++        init.assert_called_once_with()
++    if quantized:
++        hardware.supports.assert_called_once_with(backend_module.HardwareCapability.POOL_KEY_INDEXER_FP8)
++    else:
++        hardware.supports.assert_not_called()
++
++
++def test_bound_cache_resolves_complete_tuple_for_virtual_engine(monkeypatch):
++    key = torch.empty(2, 4, 1, 128, dtype=torch.float8_e4m3fn)
++    scale = torch.ones(2, 4, 1, 1)
++    layer = SimpleNamespace(prefix="indexer.cache", kv_cache=[(), (key, scale)])
++    monkeypatch.setattr(backend_module, "get_forward_context", lambda: SimpleNamespace(virtual_engine=1))
++    caches = Glm5NextKPoolIndexerBackend._bound_caches(layer)
++    assert caches[0] is key and caches[1] is scale
++    layer.kv_cache[1] = (key,)
++    with pytest.raises(TypeError, match="one scale tensor"):
++        Glm5NextKPoolIndexerBackend._bound_caches(layer)
++    layer.kv_cache = []
++    with pytest.raises(IndexError, match="virtual engine"):
++        Glm5NextKPoolIndexerBackend._bound_caches(layer)
++
++
+ @pytest.mark.parametrize("compute_topk", [False, True])
+ def test_backend_zero_token_batch_does_not_launch_operators(monkeypatch, compute_topk):
+     compress = MagicMock()
+@@ -422,6 +506,7 @@ def test_cann_backend_reports_missing_operator_dependencies(monkeypatch, missing
+ 
+ 
+ @pytest.mark.parametrize("compute_topk", [False, True])
++@pytest.mark.parametrize("quantized", [False, True])
+ @pytest.mark.parametrize(
+     "actual_query_tokens,runtime_mode,query_rows",
+     [
+@@ -438,8 +523,9 @@ def test_cann_backend_reports_missing_operator_dependencies(monkeypatch, missing
+ @pytest.mark.parametrize("reuse_output", [False, True])
+ @pytest.mark.parametrize("pcp", [False, True])
+ def test_cann_indexer_writes_caches_before_optional_selection(
+-    monkeypatch, compute_topk, actual_query_tokens, runtime_mode, query_rows, reuse_output, pcp
++    monkeypatch, compute_topk, quantized, actual_query_tokens, runtime_mode, query_rows, reuse_output, pcp
+ ):
++    """Preserve cache writes when a rank skips selection or uses padded graph queries."""
+     monkeypatch.setattr(
+         backend_module, "get_forward_context", lambda: SimpleNamespace(cudagraph_runtime_mode=runtime_mode)
+     )
+@@ -451,6 +537,7 @@ def test_cann_indexer_writes_caches_before_optional_selection(
+     op._norm_weight_f32 = op._norm_bias_f32 = None
+     op.k_norm = SimpleNamespace(eps=1e-6)
+     op.index_kpool_compress_ape = torch.empty(4, 2)
++    op._cann_pool_key_indexer = MagicMock()
+     storage = torch.full((20, 22), 77, dtype=torch.int32)
+     op.topk_indices_buffer = storage[::2, :11] if reuse_output else None
+     pooled = torch.empty(2, 2, dtype=torch.bfloat16)
+@@ -486,18 +573,20 @@ def test_cann_indexer_writes_caches_before_optional_selection(
+     metadata.num_actual_tokens = actual_query_tokens
+     tail_metadata = _tail_metadata()
+     tail_metadata.cann_inputs = SimpleNamespace(retained_indices=None)
+-    cache = torch.empty(2, 2, 1, 2, dtype=torch.bfloat16)
++    cache = torch.empty(2, 2, 1, 2, dtype=torch.float8_e4m3fn if quantized else torch.bfloat16)
++    scale_cache = torch.empty(2, 2, 1, 1) if quantized else None
+     tail = torch.empty(2, 4, 4)
+     with patch.object(torch.Tensor, "item", side_effect=AssertionError("unexpected device synchronization")):
+         result = op._forward_cann(
+             torch.empty(8, 3, dtype=torch.bfloat16),
+-            torch.empty(query_rows, 1, 2, dtype=torch.bfloat16),
++            torch.empty(query_rows, 1, 2, dtype=torch.float16 if quantized else torch.bfloat16),
+             torch.empty(query_rows, 1, dtype=torch.bfloat16),
+             cache,
+             tail,
+             metadata,
+             tail_metadata,
+             compute_topk=compute_topk,
++            indexer_scale_cache=scale_cache,
+         )
+     names = [call[0] for call in calls.mock_calls]
+     assert names[:3] == ["prepare_keypool_state", "key_pool", "write_keypool_caches"]
+@@ -507,6 +596,7 @@ def test_cann_indexer_writes_caches_before_optional_selection(
+     assert op._prepare_keypool_state.call_args.args[1] is cache_metadata.start_pos
+     assert op._write_keypool_caches.call_args.args[:2] == (tail, cache)
+     assert op._write_keypool_caches.call_args.args[4] is pooled
++    assert op._write_keypool_caches.call_args.kwargs["scale_cache"] is scale_cache
+     assert op._write_keypool_caches.call_args.args[5] is cache_metadata
+     skip_empty_query = query_rows == 0 or (actual_query_tokens == 0 and runtime_mode != CUDAGraphMode.FULL)
+     if compute_topk and skip_empty_query:
+@@ -525,12 +615,21 @@ def test_cann_indexer_writes_caches_before_optional_selection(
+     elif compute_topk:
+         assert result is packed
+         assert names[3:] == ["pool_key_indexer", "pack_keypool_indices"]
+-        assert op._pool_key_indexer.call_args.args[1] is cache
++        assert op._pool_key_indexer.call_args.args[2] is cache
+         assert op._pool_key_indexer.call_args.kwargs["block_table"] is metadata.block_table
+         assert op._pool_key_indexer.call_args.kwargs["actual_seq_q"] is metadata.cum_query_lens
+         assert op._pool_key_indexer.call_args.kwargs["actual_seq_k"] is metadata.seq_lens
+-        assert op._pool_key_indexer.call_args.args[3] is metadata.pool_tail
++        assert op._pool_key_indexer.call_args.args[4] is metadata.pool_tail
+         assert op._pack_keypool_indices.call_args.args[1] is metadata
++        assert op._pack_keypool_indices.call_args.args[0].shape[0] == query_rows
++        if quantized:
++            select = op._pool_key_indexer.call_args.args[0]
++            assert select.func == op._pool_key_indexer_fp8
++            assert select.keywords["k_descale"].data_ptr() == scale_cache.data_ptr()
++        else:
++            assert op._pool_key_indexer.call_args.args[0] is op._cann_pool_key_indexer
++        assert op._pool_key_indexer.call_args.args[1].shape == (query_rows, 1, 2)
++        assert op._pool_key_indexer.call_args.args[1].dtype == (torch.float16 if quantized else torch.bfloat16)
+     else:
+         assert result is None
+         op._pool_key_indexer.assert_not_called()
+@@ -620,3 +719,86 @@ def test_backend_restores_pcp_keys_before_kpool_cache_write(
+     else:
+         assert result is None
+         assert recorded_args[1:3] == (None, None)
++
++
++@pytest.mark.parametrize("quantized", [False, True])
++@pytest.mark.parametrize("tokens", [0, 3])
++def test_glm_nonempty_indexer_quantizes_fp8_after_padding(monkeypatch, quantized, tokens):
++    heads, dim = 2, 4
++    query = torch.zeros(tokens, heads, dim, dtype=torch.bfloat16)
++    quantized_query = torch.zeros(tokens + 1, heads, dim, dtype=torch.float8_e4m3fn)
++    weights = torch.ones(tokens, heads, dtype=torch.bfloat16)
++    ends, lengths, tails = torch.tensor([0, min(2, tokens)]), torch.tensor([0, 1]), torch.tensor([0, 2])
++    table = torch.zeros(2, 1, dtype=torch.int32)
++    padded = (
++        torch.zeros(tokens + 1, heads, dim, dtype=query.dtype),
++        torch.zeros(tokens + 1, heads, dtype=weights.dtype),
++        torch.tensor([0, min(2, tokens), tokens + 1]),
++        torch.tensor([1, 1, 1]),
++        torch.tensor([0, 2, 0]),
++        torch.zeros(3, 1, dtype=table.dtype),
++    )
++    prepare = MagicMock(return_value=padded)
++    monkeypatch.setattr(cann_keypool, "prepare_nonempty_keypool_inputs", prepare)
++    native_indices = torch.arange((tokens + 1) * 7, dtype=torch.int32).view(tokens + 1, 7)
++    native = MagicMock(return_value=(native_indices, None))
++    q_descale = torch.arange(1, (tokens + 1) * heads * 2 + 1, dtype=torch.float32).view(tokens + 1, heads * 2)[:, ::2]
++    q_descale[0].zero_()
++    q_descale[-1].zero_()
++    expected_descales = q_descale.clone()
++    expected_descales[0].fill_(1)
++    expected_descales[-1].fill_(1)
++    quantize = MagicMock(return_value=(quantized_query, q_descale))
++    monkeypatch.setattr(backend_module.torch_npu, "npu_dynamic_quant", quantize)
++    k_descale = torch.ones(2, 4, 1)
++    cache = torch.empty(2, 4, 1, dim, dtype=quantized_query.dtype if quantized else query.dtype)
++
++    backend = Glm5NextKPoolIndexerBackend.__new__(Glm5NextKPoolIndexerBackend)
++    nn.Module.__init__(backend)
++    backend.k_cache = SimpleNamespace(dtype=cache.dtype)
++    modules = {
++        "cann_ops_transformer": SimpleNamespace(),
++        "vllm_ascend.ops.cann_keypool": cann_keypool,
++        "vllm_ascend.ops.triton.glm5_next_cann_keypool": MagicMock(),
++    }
++    loader = MagicMock(side_effect=modules.__getitem__)
++    monkeypatch.setattr(backend_module, "import_module", loader)
++    monkeypatch.setattr(
++        torch.ops, "cann_ops_transformer", SimpleNamespace(key_pool=MagicMock(), pool_key_indexer=native)
++    )
++    backend._init_cann_ops()
++    select = partial(backend._pool_key_indexer_fp8, k_descale=k_descale) if quantized else native
++
++    with pytest.MonkeyPatch.context() as sync_guard:
++        sync_guard.setattr(torch.Tensor, "item", MagicMock(side_effect=AssertionError("unexpected synchronization")))
++        indices, _ = backend._pool_key_indexer(
++            select,
++            query,
++            cache,
++            weights,
++            tails,
++            actual_seq_q=ends,
++            actual_seq_k=lengths,
++            block_table=table,
++            topk=4,
++            pool_size=4,
++        )
++
++    prepare.assert_called_once_with(query, weights, ends, lengths, tails, table)
++    assert native.call_count == 1
++    assert native.call_args.args == (quantized_query if quantized else padded[0], cache, padded[1], padded[4])
++    assert native.call_args.kwargs["actual_seq_q"] is padded[2]
++    assert native.call_args.kwargs["actual_seq_k"] is padded[3]
++    assert native.call_args.kwargs["block_table"] is padded[5]
++    torch.testing.assert_close(indices, native_indices[:tokens])
++    assert indices.untyped_storage().data_ptr() == native_indices.untyped_storage().data_ptr()
++    if quantized:
++        quantize.assert_called_once_with(padded[0], dst_type=torch.float8_e4m3fn)
++        scales = native.call_args.kwargs["q_descale"]
++        torch.testing.assert_close(scales, expected_descales)
++        assert scales.shape == (tokens + 1, heads)
++        assert native.call_args.kwargs["k_descale"] is k_descale
++        assert native.call_args.kwargs["quant_mode"] == 0
++    else:
++        quantize.assert_not_called()
++        assert not {"q_descale", "k_descale", "quant_mode"} & native.call_args.kwargs.keys()
+diff --git a/tests/ut/models/test_glm5next_kv_cache.py b/tests/ut/models/test_glm5next_kv_cache.py
+index 0f2bbfd2a..f6508a04e 100644
+--- a/tests/ut/models/test_glm5next_kv_cache.py
++++ b/tests/ut/models/test_glm5next_kv_cache.py
+@@ -262,7 +262,8 @@ def test_indexer_metadata_addresses_complete_storage_pages(storage_block_size):
+     torch.testing.assert_close(draft.block_table, common.block_table_tensor[:1])
+ 
+ 
+-def test_model_cache_layers_publish_source_compatible_specs():
++@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float8_e4m3fn])
++def test_model_cache_layers_publish_source_compatible_specs(dtype):
+     current_config = SimpleNamespace(
+         parallel_config=SimpleNamespace(pipeline_parallel_size=2),
+         compilation_config=SimpleNamespace(static_forward_context={}),
+@@ -274,7 +275,7 @@ def test_model_cache_layers_publish_source_compatible_specs():
+     ):
+         indexer = Glm5NextIndexerCache(
+             head_dim=128,
+-            dtype=torch.bfloat16,
++            dtype=dtype,
+             cache_role="indexer",
+             cache_config=cache_config,
+             prefix="model.layers.0.indexer.k_cache",
+@@ -296,6 +297,11 @@ def test_model_cache_layers_publish_source_compatible_specs():
+     assert get_kv_cache_compression_ratio(indexer_spec) == 16
+     assert indexer_spec.model_version == "glm5_next"
+     assert indexer_spec.indexes_kv_by_block_stride
++    assert indexer_spec.dtype == dtype
++    assert indexer_spec.scale_dim == (1 if dtype == torch.float8_e4m3fn else 0)
++    if dtype == torch.float8_e4m3fn:
++        assert indexer_spec.scale_dtype == torch.float32
++        assert indexer_spec.real_page_size_bytes == 16 * (128 + 4)
+     assert state_spec.block_size == state_spec.sliding_window == 16
+     assert state_spec.head_size == 128
+     assert state_spec.dtype == torch.float32
+@@ -309,6 +315,18 @@ def test_model_cache_layers_publish_source_compatible_specs():
+     }
+ 
+ 
++def test_indexer_cache_rejects_unsupported_dtype():
++    with pytest.raises(ValueError, match="BF16 or FP8"):
++        Glm5NextIndexerCache(
++            head_dim=128,
++            dtype=torch.float16,
++            cache_role="indexer",
++            cache_config=SimpleNamespace(block_size=128),
++            prefix="indexer.k_cache",
++            compress_ratio=4,
++        )
++
++
+ def test_indexer_metadata_preserves_raw_request_boundaries(keypool_kernels):
+     config = SimpleNamespace(
+         cache_config=SimpleNamespace(block_size=256),
+diff --git a/tests/ut/ops/test_cann_keypool_adapters.py b/tests/ut/ops/test_cann_keypool_adapters.py
+index 9e82225e1..762dd3a14 100644
+--- a/tests/ut/ops/test_cann_keypool_adapters.py
++++ b/tests/ut/ops/test_cann_keypool_adapters.py
+@@ -105,13 +105,15 @@ def test_business_shape_index_packing_reuses_output_without_running_kernel(monke
+     assert args[4:11] == (2051, output.stride(0), 2048, 4, 2, output.shape[1], 4096)
+ 
+ 
+-def test_cache_writer_passes_padded_page_and_block_layout_without_running_kernel(monkeypatch):
++@pytest.mark.parametrize("quantized", [False, True])
++def test_cache_writer_passes_padded_page_and_block_layout_without_running_kernel(monkeypatch, quantized):
+     launch = MagicMock()
+     monkeypatch.setattr(adapters, "_write_keypool_caches_kernel", launch)
+     dim = 128
+     tail = torch.empty(3, 80, 2 * dim)[:, :7]
+-    cache = torch.empty(3, 48, 1, dim)[:, :32]
+-    pooled = torch.empty(4, dim + 64)[:, :dim]
++    cache = torch.empty(3, 48, 1, dim, dtype=torch.float8_e4m3fn if quantized else torch.bfloat16)[:, :32]
++    scale_cache = torch.empty(3 * 64 + 7).as_strided((3, 32, 1, 1), (64, 1, 1, 1), 3) if quantized else None
++    pooled = torch.empty(4, dim + 64, dtype=torch.bfloat16)[:, :dim]
+     writes = torch.tensor([[1, 81, 241]], dtype=torch.int64)
+     state_rows = torch.empty_like(writes)
+     slots = torch.tensor([0, 33, 96, -1], dtype=torch.int64)
+@@ -120,11 +122,16 @@ def test_cache_writer_passes_padded_page_and_block_layout_without_running_kernel
+         cann_inputs=SimpleNamespace(write_indices=writes, state_indices=state_rows, page_rows=80)
+     )
+     state = torch.empty(5, 4, 2 * dim)
+-    adapters.write_keypool_caches(tail, cache, None, None, pooled, metadata, tail_metadata, state)
++    adapters.write_keypool_caches(
++        tail, cache, None, None, pooled, metadata, tail_metadata, state, scale_cache=scale_cache
++    )
+     args = launch.__getitem__.return_value.call_args.args
+     assert launch.__getitem__.call_args.args == ((7,),)
+     assert args[0] is tail
+     assert args[1] is cache
++    assert args[2] is scale_cache
++    assert args[18] == (scale_cache.stride(0) if quantized else 0)
++    assert args[23] is quantized
+     tensors = [arg for arg in args if isinstance(arg, torch.Tensor)]
+     assert any(arg is slots for arg in tensors)
+     assert any(arg is writes for arg in tensors)
+diff --git a/tests/ut/worker/test_glm5next_pooled_cache.py b/tests/ut/worker/test_glm5next_pooled_cache.py
+index ca57f447f..3a67ce4bf 100644
+--- a/tests/ut/worker/test_glm5next_pooled_cache.py
++++ b/tests/ut/worker/test_glm5next_pooled_cache.py
+@@ -356,6 +356,50 @@ def test_glm5_next_runner_splits_main_mla_components_within_each_page():
+     assert k_pe_cache.data_ptr() - raw_caches[MAIN].data_ptr() == kv_c_cache[0].numel() * kv_c_cache.element_size()
+ 
+ 
++@pytest.mark.parametrize("kernel_size", [4, 8])
++def test_glm_fp8_indexer_keys_and_scales_share_padded_pages_without_overlapping(monkeypatch, kernel_size):
++    config = _make_config()
++    specs = _make_specs()
++    specs[INDEXER] = replace(
++        specs[INDEXER],
++        head_size=128,
++        dtype=torch.float8_e4m3fn,
++        scale_dim=1,
++        scale_dtype=torch.float32,
++        page_size_padded=640,
++    )
++    register_all_kvcache_specs(None)
++    groups = get_glm5_next_kv_cache_groups(config, specs)
++    plan = get_glm5_next_kv_cache_config(config, groups, 3 * get_glm5_next_pool_bytes_per_block(groups))
++    runner = _make_runner(config)
++    raw = runner._allocate_kv_cache_tensors(plan)
++    caches = runner._reshape_kv_cache_tensors(plan, raw, [kernel_size, 2, 0])
++    key, scale = caches[INDEXER]
++    page_bytes = next(
++        d.size // plan.num_blocks for d in plan.kv_cache_tensors if INDEXER in get_kv_cache_tensor_layers(d)
++    )
++    rows = kernel_size // 2
++    assert key.shape == (3 * 8 // kernel_size, rows, 1, 128)
++    assert scale.shape == (3 * 8 // kernel_size, rows, 1, 1)
++    assert key.dtype == torch.float8_e4m3fn and scale.dtype == torch.float32
++    assert key.stride(0) == scale.stride(0) * scale.element_size() == page_bytes // (8 // kernel_size)
++    assert scale.data_ptr() - key.data_ptr() == rows * 128
++    monkeypatch.setattr(attn_utils, "get_current_vllm_config", lambda: config)
++    monkeypatch.setattr(attn_utils, "enable_sfa", lambda _config: False)
++    group = SimpleNamespace(
++        kv_cache_group_id=0, kv_cache_spec=specs[INDEXER], layer_names=[INDEXER], backend=_AttentionBackend
++    )
++    v2_key, v2_scale = attn_utils._reshape_kv_cache_v2([group], raw, "fp8", [kernel_size], {}, plan)[INDEXER]
++    assert v2_key.shape == key.shape and v2_scale.shape == scale.shape
++    assert v2_key.stride() == key.stride() and v2_scale.stride() == scale.stride()
++    assert v2_key.data_ptr() == key.data_ptr() and v2_scale.data_ptr() == scale.data_ptr()
++    key[1].view(torch.uint8).fill_(23)
++    scale[2].fill_(7)
++    assert torch.count_nonzero(key[2].view(torch.uint8)) == 0
++    assert torch.count_nonzero(scale[:2]) == 0
++    assert torch.all(key[1].view(torch.uint8) == 23)
++
++
+ def test_standalone_mtp_uses_existing_compressed_cache_allocator():
+     config = _make_config()
+     specs = {name: spec for name, spec in _make_specs().items() if not isinstance(spec, MambaSpec)}
+diff --git a/vllm_ascend/attention/indexer_kpool.py b/vllm_ascend/attention/indexer_kpool.py
+index d356ffebf..5a1df0d99 100644
+--- a/vllm_ascend/attention/indexer_kpool.py
++++ b/vllm_ascend/attention/indexer_kpool.py
+@@ -9,6 +9,7 @@ from typing import Any
+ 
+ import torch
+ import torch.nn.functional as F
++import torch_npu
+ from torch import nn
+ from vllm.config import VllmConfig
+ from vllm.config.compilation import CUDAGraphMode
+@@ -30,7 +31,7 @@ from vllm_ascend.core.kv_cache_interface import (
+     get_kv_cache_compression_ratio,
+     get_storage_block_size,
+ )
+-from vllm_ascend.device.hardware_profile import AttentionBackendFamily, get_current_hardware_profile
++from vllm_ascend.device.hardware_profile import AttentionBackendFamily, HardwareCapability, get_current_hardware_profile
+ 
+ GLM5_NEXT_SFA_KERNEL_BLOCK_SIZE = 128
+ 
+@@ -558,6 +559,10 @@ class Glm5NextKPoolIndexerBackend(nn.Module):
+         self.k_cache: Any = vllm_indexer.k_cache
+         self.tail_cache: Any = vllm_indexer.tail_cache
+         self.topk_indices_buffer: torch.Tensor | None = vllm_indexer.topk_indices_buffer
++        if self.enable_sparse_li_c8 and not get_current_hardware_profile().supports(
++            HardwareCapability.POOL_KEY_INDEXER_FP8
++        ):
++            raise NotImplementedError("GLM KPool FP8 LI requires CANN PoolKeyIndexer FP8 support on Ascend 950.")
+         self._init_cann_ops()
+         for name in (
+             "_key_weight",
+@@ -577,9 +582,13 @@ class Glm5NextKPoolIndexerBackend(nn.Module):
+         history = (visible // self.index_kpool * self.index_kpool).clamp(max=self.topk_tokens)
+         return history + visible % self.index_kpool
+ 
++    @property
++    def enable_sparse_li_c8(self) -> bool:
++        return self.k_cache.dtype == torch.float8_e4m3fn
++
+     @property
+     def num_cache_tensors(self) -> int:
+-        return 1
++        return 2 if self.enable_sparse_li_c8 else 1
+ 
+     def process_weights_after_loading(self) -> None:
+         self._key_weight = self.wk_weights_proj.weight[: self.head_dim].detach().contiguous()
+@@ -589,7 +598,7 @@ class Glm5NextKPoolIndexerBackend(nn.Module):
+         self._norm_bias_f32 = self.k_norm.bias.detach().float() if self.k_norm.bias is not None else None
+ 
+     @staticmethod
+-    def _bound_cache(layer: Any) -> torch.Tensor:
++    def _bound_caches(layer: Any) -> tuple[torch.Tensor, ...]:
+         context = get_forward_context()
+         cache = layer.kv_cache
+         if isinstance(cache, list):
+@@ -597,13 +606,13 @@ class Glm5NextKPoolIndexerBackend(nn.Module):
+             if virtual_engine >= len(cache):
+                 raise IndexError(f"Cache virtual engine {virtual_engine} is out of range.")
+             cache = cache[virtual_engine]
+-        if isinstance(cache, (list, tuple)):
+-            if len(cache) != 1:
+-                raise TypeError("GLM KPool cache requires one key tensor.")
+-            cache = cache[0]
+-        if not isinstance(cache, torch.Tensor):
++        if isinstance(cache, torch.Tensor):
++            cache = (cache,)
++        if not isinstance(cache, (list, tuple)) or not cache or any(not isinstance(t, torch.Tensor) for t in cache):
+             raise TypeError(f"GLM KPool cache {layer.prefix!r} is not bound to a tensor.")
+-        return cache
++        if len(cache) != (2 if cache[0].dtype == torch.float8_e4m3fn else 1):
++            raise TypeError("GLM KPool cache requires a key tensor and, for FP8, one scale tensor.")
++        return tuple(cache)
+ 
+     def forward(
+         self,
+@@ -638,8 +647,8 @@ class Glm5NextKPoolIndexerBackend(nn.Module):
+             weights = F.linear(hidden.float(), self._head_weight_f32).to(q_values.dtype)
+             weights = weights * (self.softmax_scale * self.n_head**-0.5)
+ 
+-        indexer_cache = self._bound_cache(self.k_cache)
+-        tail_cache = self._bound_cache(self.tail_cache)
++        indexer_cache, *scale_caches = self._bound_caches(self.k_cache)
++        (tail_cache,) = self._bound_caches(self.tail_cache)
+         restore_indices = indexer_metadata.pcp_hidden_restore_indices
+         if restore_indices is not None:
+             padding = indexer_metadata.pcp_local_token_count - k_hidden.shape[0]
+@@ -658,6 +667,7 @@ class Glm5NextKPoolIndexerBackend(nn.Module):
+             indexer_metadata,
+             tail_metadata,
+             compute_topk=compute_topk,
++            indexer_scale_cache=scale_caches[0] if scale_caches else None,
+         )
+ 
+     def _init_cann_ops(self) -> None:
+@@ -670,16 +680,22 @@ class Glm5NextKPoolIndexerBackend(nn.Module):
+             self._prepare_keypool_state = adapters.prepare_keypool_state
+             self._write_keypool_caches = fused.write_keypool_caches
+             self._key_pool = torch.ops.cann_ops_transformer.key_pool
+-            self._pool_key_indexer = partial(
+-                adapters.pool_key_indexer_nonempty,
+-                torch.ops.cann_ops_transformer.pool_key_indexer,
+-            )
++            self._pool_key_indexer = adapters.pool_key_indexer_nonempty
++            self._cann_pool_key_indexer = torch.ops.cann_ops_transformer.pool_key_indexer
+         except (ImportError, AttributeError) as exc:
+             raise RuntimeError(
+                 "GLM-5.3-Flash KPool requires cann_ops_transformer with key_pool and pool_key_indexer, "
+                 "the matching CANN ops-transformer operator package and Triton cache/index adapters."
+             ) from exc
+ 
++    def _pool_key_indexer_fp8(self, query: torch.Tensor, *args, k_descale: torch.Tensor, **kwargs):
++        query, q_descale = torch_npu.npu_dynamic_quant(query, dst_type=torch.float8_e4m3fn)
++        # Zero rows, including the sentinel, use a unit descale.
++        q_descale.masked_fill_(q_descale == 0, 1.0)
++        return self._cann_pool_key_indexer(
++            query, *args, q_descale=q_descale, k_descale=k_descale, quant_mode=0, **kwargs
++        )
++
+     def _forward_cann(
+         self,
+         hidden_states: torch.Tensor,
+@@ -691,6 +707,7 @@ class Glm5NextKPoolIndexerBackend(nn.Module):
+         tail_metadata: AscendIndexerKPoolTailMetadata,
+         *,
+         compute_topk: bool,
++        indexer_scale_cache: torch.Tensor | None = None,
+     ) -> torch.Tensor | None:
+         cache_metadata = indexer_metadata.write_metadata or indexer_metadata
+         num_tokens = q_values.shape[0] if q_values is not None else indexer_metadata.positions.shape[0]
+@@ -723,8 +740,13 @@ class Glm5NextKPoolIndexerBackend(nn.Module):
+             or tail_metadata.cann_inputs is None
+         ):
+             raise ValueError("GLM KPool metadata requires CANN request boundaries and pooled-key row indices.")
+-        if indexer_cache.dtype != torch.bfloat16:
+-            raise TypeError("GLM KPool compressed cache must be bfloat16.")
++        quantized = indexer_cache.dtype == torch.float8_e4m3fn
++        if indexer_cache.dtype not in (torch.bfloat16, torch.float8_e4m3fn):
++            raise TypeError("GLM KPool compressed cache must be bfloat16 or float8_e4m3fn.")
++        if quantized and (indexer_scale_cache is None or indexer_scale_cache.dtype != torch.float32):
++            raise ValueError("GLM KPool FP8 cache requires FP32 per-pool scales.")
++        if not quantized and indexer_scale_cache is not None:
++            raise ValueError("GLM KPool BF16 cache must not have quantization scales.")
+         if tail_cache.dtype != torch.float32:
+             raise TypeError("GLM KPool compressor tail must be float32.")
+         if tail_cache.ndim != 3 or tail_cache.shape[1] < self.index_kpool or tail_cache.shape[2] != 2 * self.head_dim:
+@@ -777,6 +799,7 @@ class Glm5NextKPoolIndexerBackend(nn.Module):
+             cache_metadata,
+             tail_metadata,
+             state,
++            scale_cache=indexer_scale_cache,
+         )
+         # Sharing top-k still advances the compressed cache and raw tail.
+         if not compute_topk:
+@@ -793,8 +816,15 @@ class Glm5NextKPoolIndexerBackend(nn.Module):
+                 return output[:, :output_width].unsqueeze(1)
+             return torch.full((num_tokens, 1, output_width), -1, dtype=torch.int32, device=hidden_states.device)
+         assert q_values is not None and weights is not None
+-        query = q_values.to(indexer_cache.dtype)
++        if quantized:
++            assert indexer_scale_cache is not None
++            query = q_values
++            indexer_op = partial(self._pool_key_indexer_fp8, k_descale=indexer_scale_cache[..., 0])
++        else:
++            query = q_values.to(indexer_cache.dtype)
++            indexer_op = self._cann_pool_key_indexer
+         indices, _ = self._pool_key_indexer(
++            indexer_op,
+             query,
+             indexer_cache,
+             weights.to(torch.bfloat16),
+diff --git a/vllm_ascend/device/hardware_profile.py b/vllm_ascend/device/hardware_profile.py
+index a4227b3ed..62ba13efc 100644
+--- a/vllm_ascend/device/hardware_profile.py
++++ b/vllm_ascend/device/hardware_profile.py
+@@ -97,6 +97,8 @@ class HardwareCapability(Enum):
+     # Enable the FP8/C8 attention KV-cache ABI and matching attention preprocess paths.
+     # This is not a general statement that every FP8 operation is supported.
+     FP8_ATTENTION = auto()
++    # CANN PoolKeyIndexer quant_mode=0 with E4M3 query/key and FP32 descales.
++    POOL_KEY_INDEXER_FP8 = auto()
+     # Select the compatibility grouped-top-k router used by the fused-MoE path.
+     FUSED_MOE_COMPATIBILITY = auto()
+     # Use npu_rotary_mul with adjacent pairs (rotary_mode="interleave").
+@@ -366,6 +368,7 @@ _HARDWARE_PROFILES: Mapping[AscendDeviceType, HardwareProfile] = MappingProxyTyp
+                     HardwareCapability.DYNAMIC_MX_QUANT_SCALE_ALG_ONE,
+                     HardwareCapability.FLA_GDN_PREFILL,
+                     HardwareCapability.FP8_ATTENTION,
++                    HardwareCapability.POOL_KEY_INDEXER_FP8,
+                     HardwareCapability.FUSED_ROTARY_MUL_INTERLEAVE,
+                     HardwareCapability.GRAPH_MM_REDUCE_SCATTER_FUSION,
+                     HardwareCapability.GRAPH_MULS_ADD_FUSION,
+diff --git a/vllm_ascend/models/glm5next/attention.py b/vllm_ascend/models/glm5next/attention.py
+index 6a54f6aa7..036818093 100644
+--- a/vllm_ascend/models/glm5next/attention.py
++++ b/vllm_ascend/models/glm5next/attention.py
+@@ -49,6 +49,16 @@ class Indexer(nn.Module):
+         prefix: str = "",
+     ):
+         super().__init__()
++        indexer_kv_dtype = vllm_config.attention_config.indexer_kv_dtype
++        if indexer_kv_dtype not in ("auto", "bf16", "fp8"):
++            raise ValueError(f"GLM KPool indexer_kv_dtype must be auto, bf16 or fp8, got {indexer_kv_dtype!r}.")
++        if indexer_kv_dtype == "fp8":
++            kv_transfer_config = vllm_config.kv_transfer_config
++            if kv_transfer_config is not None and any(
++                kv_transfer_config.has_connector(connector)
++                for connector in ("OffloadingConnector", "PreemptOffloadConnector")
++            ):
++                raise NotImplementedError("GLM KPool FP8 LI cache does not support KV offloading.")
+         self.vllm_config = vllm_config
+         self.config = config
+         self.quant_config = quant_config
+@@ -98,10 +108,11 @@ class Indexer(nn.Module):
+         self.scale_fmt = None
+         self.quant_block_size = self.head_dim
+         self.topk_indices_buffer = topk_indices_buffer
+-        # Completed pools store BF16 vectors without quantization scales.
++        # KeyPool projects in BF16; completed pools optionally store FP8 keys
++        # with a per-pool FP32 descale for CANN PoolKeyIndexer.
+         self.k_cache = Glm5NextIndexerCache(
+             head_dim=self.head_dim,
+-            dtype=torch.bfloat16,
++            dtype=(torch.float8_e4m3fn if indexer_kv_dtype == "fp8" else torch.bfloat16),
+             cache_role="indexer",
+             prefix=f"{prefix}.k_cache",
+             cache_config=cache_config,
+diff --git a/vllm_ascend/models/glm5next/cache_config.py b/vllm_ascend/models/glm5next/cache_config.py
+index f30c6bf33..d87a64071 100644
+--- a/vllm_ascend/models/glm5next/cache_config.py
++++ b/vllm_ascend/models/glm5next/cache_config.py
+@@ -9,9 +9,11 @@ classes: main MLA/KDA pages and compressed-indexer/tail pages.
+ """
+ 
+ from dataclasses import dataclass
++from math import lcm
+ 
+ from vllm.config import VllmConfig
+ from vllm.model_executor.models.utils import extract_layer_index
++from vllm.utils.torch_utils import get_dtype_size
+ from vllm.v1.kv_cache_interface import (
+     KVCacheConfig,
+     KVCacheGroupSpec,
+@@ -22,7 +24,12 @@ from vllm.v1.kv_cache_interface import (
+     UniformTypeKVCacheSpecs,
+ )
+ 
+-from vllm_ascend.core.kv_cache_interface import AscendIndexerKPoolTailSpec, get_kv_cache_compression_ratio
++from vllm_ascend.core.kv_cache_interface import (
++    AscendIndexerKPoolTailSpec,
++    AscendMLAAttentionSpec,
++    get_kv_cache_compression_ratio,
++    get_storage_block_size,
++)
+ from vllm_ascend.utils import vllm_version_is
+ 
+ # vLLM #61183 moved these helpers to `kv_cache_planning` on main; the v0.32.0
+@@ -120,6 +127,18 @@ def _align_glm5_next_cache_specs(kv_cache_spec: dict[str, KVCacheSpec]) -> None:
+         max(spec.page_size_bytes for spec in small_candidates),
+         max(_unpadded_page_size(spec) for spec in small_candidates),
+     )
++    scale_alignments = tuple(
++        get_storage_block_size(spec) * get_dtype_size(spec.scale_dtype)
++        for spec in indexer_specs
++        if isinstance(spec, AscendMLAAttentionSpec) and spec.scale_dim
++    )
++    if scale_alignments:
++        # C8 shares pages with the FP32 tail; keep whole tail rows and aligned
++        # scales when a scheduler page is split into indexer kernel blocks.
++        small_page_alignment = lcm(
++            *(_unpadded_page_size(spec) // spec.block_size for spec in tail_specs), *scale_alignments
++        )
++        small_page_size = (small_page_size + small_page_alignment - 1) // small_page_alignment * small_page_alignment
+ 
+     for spec in main_candidates:
+         object.__setattr__(spec, "page_size_padded", main_page_size)
+diff --git a/vllm_ascend/models/glm5next/cache_views.py b/vllm_ascend/models/glm5next/cache_views.py
+index b2716bfca..ee064944f 100644
+--- a/vllm_ascend/models/glm5next/cache_views.py
++++ b/vllm_ascend/models/glm5next/cache_views.py
+@@ -56,7 +56,7 @@ def view_compressed_indexer_cache(
+     raw_cache: torch.Tensor | tuple[torch.Tensor, ...],
+     attn_backend: AttentionBackend,
+     kernel_block_size: int,
+-) -> tuple[torch.Tensor]:
++) -> tuple[torch.Tensor, ...]:
+     if isinstance(raw_cache, tuple):
+         if len(raw_cache) != 1:
+             raise ValueError(f"Compressed indexer cache for {layer_name} must be a single tensor.")
+@@ -77,6 +77,33 @@ def view_compressed_indexer_cache(
+     )
+     strides = _row_major_strides(shape)
+     typed_slot = raw_single.view(kv_cache_spec.dtype)
++    if kv_cache_spec.scale_dim:
++        # Each kernel block holds a contiguous K region followed by scales.
++        # Interleave these regions when one scheduler page contains multiple
++        # kernel blocks, so both tensors have a uniform physical block stride.
++        page_bytes = kv_cache_spec.page_size_bytes // num_blocks_per_kv_block
++        key_bytes = strides[0] * get_dtype_size(kv_cache_spec.dtype)
++        scale_shape = (*shape[:-1], kv_cache_spec.scale_dim)
++        scale_strides = _row_major_strides(scale_shape)
++        scale_bytes = scale_strides[0] * get_dtype_size(kv_cache_spec.scale_dtype)
++        if (
++            kv_cache_spec.page_size_bytes % num_blocks_per_kv_block
++            or page_bytes < key_bytes + scale_bytes
++            or page_bytes % get_dtype_size(kv_cache_spec.scale_dtype)
++        ):
++            raise ValueError(f"Compressed indexer key and scale for {layer_name} do not fit aligned kernel pages.")
++        strides[0] = page_bytes // get_dtype_size(kv_cache_spec.dtype)
++        scale_strides[0] = page_bytes // get_dtype_size(kv_cache_spec.scale_dtype)
++        scale_slot = raw_single.view(kv_cache_spec.scale_dtype)
++        return (
++            torch.as_strided(typed_slot, size=shape, stride=tuple(strides)),
++            torch.as_strided(
++                scale_slot,
++                size=scale_shape,
++                stride=tuple(scale_strides),
++                storage_offset=scale_slot.storage_offset() + key_bytes // get_dtype_size(kv_cache_spec.scale_dtype),
++            ),
++        )
+     if strides[0] * shape[0] != typed_slot.numel():
+         raise ValueError(
+             f"Compressed indexer cache for {layer_name} does not exactly fill the small slot: "
+diff --git a/vllm_ascend/models/glm5next/kv_cache.py b/vllm_ascend/models/glm5next/kv_cache.py
+index a368f4ad5..c1f3e04d7 100644
+--- a/vllm_ascend/models/glm5next/kv_cache.py
++++ b/vllm_ascend/models/glm5next/kv_cache.py
+@@ -90,6 +90,8 @@ class Glm5NextIndexerCache(nn.Module, AttentionLayerBase):
+                 f"and {compress_ratio}."
+             )
+         self.head_dim = head_dim
++        if dtype not in (torch.bfloat16, torch.float8_e4m3fn):
++            raise ValueError(f"GLM KPool cache requires BF16 or FP8, got {dtype}.")
+         self.dtype = dtype
+         self.cache_role = cache_role
+         self.cache_config = cache_config
+@@ -110,6 +112,8 @@ class Glm5NextIndexerCache(nn.Module, AttentionLayerBase):
+             num_kv_heads=1,
+             head_size=self.head_dim,
+             dtype=self.dtype,
++            scale_dim=1 if self.dtype == torch.float8_e4m3fn else 0,
++            scale_dtype=torch.float32 if self.dtype == torch.float8_e4m3fn else torch.int8,
+             cache_dtype_str=None,
+             model_version="glm5_next",
+             indexes_kv_by_block_stride=True,
+diff --git a/vllm_ascend/ops/triton/docs/glm5_next_cann_keypool.md b/vllm_ascend/ops/triton/docs/glm5_next_cann_keypool.md
+index 4c4b38802..a33748e65 100644
+--- a/vllm_ascend/ops/triton/docs/glm5_next_cann_keypool.md
++++ b/vllm_ascend/ops/triton/docs/glm5_next_cann_keypool.md
+@@ -4,10 +4,12 @@
+ 
+ - **Function**: Three Triton kernel types adapt GLM-5.3-Flash metadata, cache writes and token indices to CANN `KeyPool`/`PoolKeyIndexer`. The entry points are in `vllm_ascend/ops/triton/glm5_next_cann_keypool.py`.
+ - **Formula**: With pool size `P`, logical block size `L`, position `p` and raw slot `s`, a completed pool has `(p + 1) % P == 0` and compressed slot `(s // L) * (L // P) + (s % L) // P`. A negative slot remains invalid. The visible tail starts at `a = ((p + 1) // P) * P` and contains `[a, ..., p]`, appended after `min(a, topk)` history columns.
++- **FP8 extension**: When `scale_cache` is supplied, each pool stores FP8 E4M3FN (`float8_e4m3fn`) keys with `scale=max(abs(pooled))/448` (or 1 for a zero vector), and stores one FP32 descale per pool.
+ - **Algorithm flow**:
+     1. `_build_keypool_metadata_kernel` has two modes, exposed by `build_keypool_metadata` and `build_tail_inputs`. They build compressed request boundaries/slots and raw-tail read/write addresses once per metadata build. The resulting buffers are reused across layers. Completed pools retain their compact output row even when their cache slot is evicted.
+-    2. After CANN `KeyPool` has consumed the old tail, `_write_keypool_caches_kernel` writes the raw FP32 tail and completed BF16 pools in one launch. Non-MTP reads updated CANN state; MTP writes retained projected key/gate rows so rejected candidates can be overwritten after logical rollback.
+-    3. `_pack_indices_kernel` preserves the selected history, appends the causal tail and clears padded rows/alignment columns in one launch. It can write directly into the SFA output buffer.
++    2. After CANN `KeyPool` has consumed the old tail, `_write_keypool_caches_kernel` writes the raw FP32 tail and completed pooled keys in one launch. Non-MTP reads updated CANN state; MTP writes retained projected key/gate rows so rejected candidates can be overwritten after logical rollback.
++    3. The shared `pool_key_indexer_nonempty` adapter appends one sentinel request and clamps empty pooled histories before CANN selection. The GLM backend quantizes FP8 queries after padding, including a zero sentinel with unit descale; key descales remain unchanged. The shared adapter discards only the trailing sentinel output.
++    4. `_pack_indices_kernel` preserves the selected history, appends the causal tail and clears padded rows/alignment columns in one launch. It can write directly into the SFA output buffer.
+ - **Supported modes**: Eager execution and fixed-shape NPU graph capture/replay.
+ 
+ ## Parameters
+@@ -51,8 +53,9 @@
+ | Parameter | Input/Output/Attribute | Description | Data type | Data format |
+ | --- | --- | --- | --- | --- |
+ | `tail` | Input/output | Request-owned raw key/gate ring, `[Ntail,C,2D]` | FP32 | ND; padded page stride supported |
+-| `cache` | Input/output | Completed pooled keys, `[Ncache,B,1,D]` | BF16 | ND; padded block stride supported |
++| `cache` | Input/output | Completed pooled keys, `[Ncache,B,1,D]` | BF16 or FP8 E4M3FN | ND; padded block stride supported |
+ | `key`, `gate` | Input | MTP retained projections, each `[R*W,D]`; both `None` for non-MTP | FP32 or `None` | Contiguous ND |
++| `scale_cache` | Optional output | FP8 per-pool descales, `[Ncache,B,1]`; default `None` for BF16 | FP32 or `None` | ND; padded block stride supported |
+ | `pooled` | Input | CANN completed-pool vectors, `[Q,D]` | BF16 | ND; row stride supported |
+ | `metadata` | Input | `pooled_slot_mapping[Q]`, the destination of each compact pooled row | int64 | Contiguous ND |
+ | `tail_metadata` | Input | `cann_inputs` from `build_tail_inputs` | Object | N/A |
+@@ -72,7 +75,8 @@
+ 
+ ## Constraints
+ 
+-- Inference only. `P>1`, `D>0`, `L%P==0`, `0<=A<=source<=T`, and input storage must cover every actual token. This adapter documents the BF16 cache path.
++- Inference only. `P>1`, `D>0`, `L%P==0`, `0<=A<=source<=T`, and input storage must cover every actual token. FP8 cache writes require matching FP32 scale storage and supported Ascend 950 hardware. The FP8 LI path does not support `OffloadingConnector` or `PreemptOffloadConnector`, including through `MultiConnector`.
++- The indexer and FP32 tail share padded pages. FP8 reduces allocated cache memory only when the final shared page becomes smaller; a tail-dominated page can have the same physical size for BF16 and FP8 keys.
+ - Queries are contiguous within each request and packed in request order. Normalize a negative query boundary to `A`, clamp boundaries to `A`, then require nondecreasing boundaries beginning at 0 and ending at `A`. Raw sequence lengths must cover the request's query length; actual positions are nonnegative and consistent with those lengths.
+ - Tail blocks are request-local. Use `C=P` for non-MTP and `C=P+num_speculative_tokens` for speculative decoding; `0<retained_width<=C` when MTP is enabled. `page_rows>=C` and `page_rows*2D==tail.stride(0)` preserve shared page padding.
+ - `tail` rows, `cache` tokens and vector columns must be contiguous. Only tail page, compressed block and pooled-vector row strides may include padding. `cache` has exactly one KV head. Metadata output buffers must not overlap unrelated tensors.
+@@ -86,7 +90,7 @@
+ ## Origin and Differences
+ 
+ - **Origin**: Developed for the CANN GLM-5.3-Flash pooled-indexer integration, with the same logical slot and tail contract as the existing GLM KPool path.
+-- **Differences**: Replaces separate boundary conversions, compact-slot construction, tail/cache scatter and output padding operations with three kernel types. The metadata kernel runs in two modes per metadata build; this is not a claim of only three launches per model step. Key pooling and TopK scoring remain CANN operations. FP32 tail and BF16 completed keys are preserved.
++- **Differences**: Replaces separate boundary conversions, compact-slot construction, tail/cache scatter and output padding operations with fused adapters. The metadata kernel runs in two modes per metadata build. A trailing independent request avoids CANN's unsafe TND no-work cleanup. Key pooling and TopK scoring remain CANN operations. Tail state remains FP32; completed keys can be BF16 or FP8 with FP32 descales.
+ 
+ ## Example
+ 
+diff --git a/vllm_ascend/ops/triton/glm5_next_cann_keypool.py b/vllm_ascend/ops/triton/glm5_next_cann_keypool.py
+index b7ec267df..801db2a74 100644
+--- a/vllm_ascend/ops/triton/glm5_next_cann_keypool.py
++++ b/vllm_ascend/ops/triton/glm5_next_cann_keypool.py
+@@ -1,16 +1,19 @@
+ # SPDX-License-Identifier: Apache-2.0
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+-"""Three fused adapters for CANN pooled indexing: inputs, cache writes and indices."""
++"""Fused adapters for CANN pooled indexing: inputs, cache writes and indices."""
+ 
+ from types import SimpleNamespace
+ 
+ from vllm.triton_utils import tl, triton
+ 
++FP8_E4M3_MAX = tl.constexpr(448.0)
++
+ 
+ @triton.jit(do_not_specialize=["tail_rows", "tail_blocks", "cache_blocks", "INPUT_STRIDE", "INPUT_WIDTH"])
+ def _write_keypool_caches_kernel(
+     tail,
+     cache,
++    scale_cache,
+     key,
+     gate,
+     pooled,
+@@ -26,10 +29,12 @@ def _write_keypool_caches_kernel(
+     cache_blocks,
+     BLOCK_SIZE: tl.constexpr,
+     CACHE_STRIDE: tl.constexpr,
++    SCALE_STRIDE: tl.constexpr,
+     POOLED_STRIDE: tl.constexpr,
+     INPUT_STRIDE,
+     INPUT_WIDTH,
+     SPECULATIVE: tl.constexpr,
++    QUANTIZED: tl.constexpr,
+     BLOCK: tl.constexpr,
+ ):
+     row = tl.program_id(0)
+@@ -53,11 +58,17 @@ def _write_keypool_caches_kernel(
+         slot = tl.load(slots + pool_row).to(tl.int64)
+         valid = (slot >= 0) & (slot < cache_blocks * BLOCK_SIZE)
+         pool_value = tl.load(pooled + pool_row * POOLED_STRIDE + cols, valid & (cols < HEAD_DIM), other=0)
++        if QUANTIZED:
++            pool_value = pool_value.to(tl.float32)
++            maximum = tl.max(tl.abs(pool_value), 0)
++            scale = tl.where(maximum > 0, maximum / FP8_E4M3_MAX, 1.0)
++            pool_value = pool_value / scale
++            tl.store(scale_cache + slot // BLOCK_SIZE * SCALE_STRIDE + slot % BLOCK_SIZE, scale, valid)
+         address = cache + slot // BLOCK_SIZE * CACHE_STRIDE + slot % BLOCK_SIZE * HEAD_DIM + cols
+         tl.store(address, pool_value, valid & (cols < HEAD_DIM))
+ 
+ 
+-def write_keypool_caches(tail, cache, key, gate, pooled, metadata, tail_metadata, state):
++def write_keypool_caches(tail, cache, key, gate, pooled, metadata, tail_metadata, state, scale_cache=None):
+     inputs = tail_metadata.cann_inputs
+     writes = inputs.write_indices
+     tail_rows = writes.numel()
+@@ -66,6 +77,7 @@ def write_keypool_caches(tail, cache, key, gate, pooled, metadata, tail_metadata
+     _write_keypool_caches_kernel[(tail_rows + pooled_rows,)](
+         tail,
+         cache,
++        scale_cache,
+         key,
+         gate,
+         pooled,
+@@ -81,10 +93,12 @@ def write_keypool_caches(tail, cache, key, gate, pooled, metadata, tail_metadata
+         cache.shape[0],
+         cache.shape[1],
+         cache.stride(0),
++        scale_cache.stride(0) if scale_cache is not None else 0,
+         pooled.stride(0),
+         writes.stride(0),
+         writes.shape[1],
+         key is not None,
++        scale_cache is not None,
+         triton.next_power_of_2(2 * cache.shape[-1]),
+     )
+ 

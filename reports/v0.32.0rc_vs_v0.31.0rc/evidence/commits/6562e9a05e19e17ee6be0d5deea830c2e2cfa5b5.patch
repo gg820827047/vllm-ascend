@@ -1,0 +1,404 @@
+commit 6562e9a05e19e17ee6be0d5deea830c2e2cfa5b5
+Author:     vllm-ascend-ci <vllmcibot@gmail.com>
+AuthorDate: Mon Nov 2 16:52:48 2026 +0800
+Commit:     GitHub <noreply@github.com>
+CommitDate: Mon Nov 2 16:52:48 2026 +0800
+
+    [Cherry-pick][releases/v0.32.0rc][Bugfix] Support GLM-5.3-Flash PCP with torch.compile (from #20281) (#20473)
+    
+    Cherry-pick of PR #20281 onto `releases/v0.32.0rc`.
+    
+    Original PR: #20281
+    Original author: @bnbryan
+    
+    ---
+    ### What this PR does / why we need it?
+    
+    Fix GLM-5.3-Flash prefill failures when combining PCP with
+    `torch.compile`.
+    
+    Metadata-free profiling skips KDA's PCP gather/restore branches.
+    Compiled execution then passes rank-local tensors to KDA while the
+    request metadata describes global tokens, causing prefill to fail.
+    
+    Wrap the PCP KDA path in a mutable-output custom op and register it as a
+    piecewise split point. This keeps metadata-dependent operations active
+    on every invocation and writes results into a stable buffer.
+    
+    ### Does this PR introduce _any_ user-facing change?
+    
+    Yes. GLM-5.3-Flash can process PCP prefill requests with compilation
+    enabled.
+    
+    For PCP>1, the KDA attention path executes eagerly inside the custom op,
+    including projections and gather/restore. The surrounding backbone
+    remains compiled. PCP=1 retains its existing compilation boundary.
+    
+    ### How was this patch tested?
+    
+    - 50 focused unit tests passed, covering metadata-free export followed
+    by live prefill/decode metadata,
+    
+    - vLLM main:
+    https://github.com/vllm-project/vllm/commit/544f182d9f0c9bfe8bd7645525951d5e3692a542
+    
+    Co-authored-by: github-actions[bot] <github-actions[bot]@users.noreply.github.com>
+
+diff --git a/tests/ut/models/test_glm5next_kda_dispatch.py b/tests/ut/models/test_glm5next_kda_dispatch.py
+index b3b2fc178..abe228285 100644
+--- a/tests/ut/models/test_glm5next_kda_dispatch.py
++++ b/tests/ut/models/test_glm5next_kda_dispatch.py
+@@ -17,12 +17,19 @@ def test_glm_kda_backend_declares_pcp_support() -> None:
+     assert backend.get_builder_cls() is model_kda.AscendGDNHostMetadataBackend.get_builder_cls()
+ 
+ 
+-@pytest.mark.parametrize("pcp_rank", [0, 1])
++@pytest.mark.parametrize(("pcp_size", "pcp_rank"), [(1, 0), (2, 0), (2, 1)])
+ @pytest.mark.parametrize("has_prefill", [False, True])
+-def test_kda_pcp_restores_prefill_and_skips_decode_gather(monkeypatch, pcp_rank, has_prefill):
++@pytest.mark.parametrize("needs_output_buffer", [False, True])
++def test_kda_pcp_restores_prefill_and_skips_decode_gather(
++    monkeypatch, pcp_size, pcp_rank, has_prefill, needs_output_buffer
++):
+     layer = model_kda.Glm5NextLinearAttention.__new__(model_kda.Glm5NextLinearAttention)
+     torch.nn.Module.__init__(layer)
+     layer.prefix = "layer"
++    # Set by __init__ from the CUDA graph mode, which this fixture skips.
++    # True dispatches to the mutable op writing a graph-owned buffer, False to
++    # the variant returning its own output.
++    layer._needs_output_buffer = needs_output_buffer
+     layer.local_projection_size = 2
+     layer.local_num_heads = 1
+     layer.head_dim = 2
+@@ -35,8 +42,8 @@ def test_kda_pcp_restores_prefill_and_skips_decode_gather(monkeypatch, pcp_rank,
+     layer.in_proj_qkvbfg_a = project
+     layer.f_b_proj = lambda x: (torch.zeros(x.shape[0], 2), None)
+     layer.g_b_proj = lambda x: (torch.zeros(x.shape[0], 2), None)
+-    # The gated norm now runs inside the KDA custom op, which writes into `out`.
+-    layer.o_norm = SimpleNamespace(forward_oot=lambda output, gate, *, out: out)
++    # The gated norm runs directly inside the unified custom op.
++    layer.o_norm = lambda output, gate: output
+     layer.o_proj = lambda x: (x, None)
+     seen = []
+ 
+@@ -45,38 +52,41 @@ def test_kda_pcp_restores_prefill_and_skips_decode_gather(monkeypatch, pcp_rank,
+         core_attn_out[0, :, 0, 0] = qkv_proj_states[:, 0]
+         core_attn_out[0, :, 0, 1].zero_()
+ 
+-    layer._forward = run_kda
++    layer._forward_core = run_kda
+     pcp_context = SimpleNamespace(
+         global_batch=SimpleNamespace(is_prefilling_np=torch.tensor([has_prefill])),
+         hidden_restore_idx=torch.tensor([0, 1, 4, 5, 6, 7, 2]),
+         padded_gather_idx=torch.tensor([0, 1, 6, 0, 2, 3, 4, 5]),
+     )
+-    metadata = SimpleNamespace(pcp_context=pcp_context)
++    uses_pcp_prefill = pcp_size > 1 and has_prefill
++    metadata = SimpleNamespace(pcp_context=pcp_context if pcp_size > 1 else None)
+     monkeypatch.setattr(
+         model_kda,
+         "get_forward_context",
+         lambda: SimpleNamespace(attn_metadata={"layer": metadata}, no_compile_layers={"layer": layer}),
+     )
+-    gathered = torch.tensor([[0.0], [1.0], [6.0], [-1.0], [2.0], [3.0], [4.0], [5.0]])
++    gathered = torch.tensor([[0.0], [1.0], [6.0], [-1.0], [2.0], [3.0], [4.0], [5.0]]).expand(-1, 2).clone()
+     pcp_group = SimpleNamespace(
+-        world_size=2,
++        world_size=pcp_size,
+         rank_in_group=pcp_rank,
+-        all_gather=lambda x, dim: gathered if has_prefill else pytest.fail("decode must not gather PCP tokens"),
++        all_gather=lambda x, dim: gathered if uses_pcp_prefill else pytest.fail("batch must not gather PCP tokens"),
+     )
+     layer.pcp_group = pcp_group
+     layer.pcp_size = pcp_group.world_size
+     layer.pcp_rank = pcp_group.rank_in_group
+ 
+-    # The KDA custom op is registered against the NPU dispatch key, so a CPU
+-    # runner cannot dispatch it. Call its implementation directly instead.
++    # Both KDA custom ops are registered against the NPU dispatch key, so a CPU
++    # runner cannot dispatch them. Call their implementations directly instead.
++    monkeypatch.setattr(torch.ops.vllm, "glm5next_kda_forward_with_output", model_kda.glm5next_kda_forward_with_output)
+     monkeypatch.setattr(torch.ops.vllm, "glm5next_kda_forward", model_kda.glm5next_kda_forward)
+ 
+     local_input = gathered[pcp_rank * 4 : (pcp_rank + 1) * 4]
+     output = layer(local_input, torch.arange(4))
+ 
+-    assert seen == (list(range(7)) if has_prefill else local_input[:, 0].tolist())
+-    expected = ([0.0, 1.0, 6.0, 0.0] if pcp_rank == 0 else [2.0, 3.0, 4.0, 5.0]) if has_prefill else seen
++    assert seen == (list(range(7)) if uses_pcp_prefill else local_input[:, 0].tolist())
++    expected = ([0.0, 1.0, 6.0, 0.0] if pcp_rank == 0 else [2.0, 3.0, 4.0, 5.0]) if uses_pcp_prefill else seen
+     assert output[:, 0].tolist() == expected
++    assert torch.count_nonzero(output[:, 1]) == 0
+ 
+ 
+ @pytest.mark.parametrize("recover", [False, True])
+@@ -317,7 +327,7 @@ def test_decode_and_prefill_use_their_own_metadata_and_merge_outputs(
+     query = query + torch.arange(128, dtype=torch.bfloat16)[None, :] / 128
+     qkv = torch.cat((query, query + 8, query + 16), dim=-1)
+     out = torch.full((1, tokens + 1, 1, 128), float("nan"), dtype=torch.bfloat16)
+-    layer._forward(qkv, torch.zeros(1, tokens, 1, 128), torch.zeros(1, tokens, 1), out)
++    layer._forward_core(qkv, torch.zeros(1, tokens, 1, 128), torch.zeros(1, tokens, 1), out)
+     expected = query * 3
+     recurrent_tokens = 2 if speculative else 1
+     expected[:recurrent_tokens] = query[:recurrent_tokens] * 2
+@@ -374,7 +384,7 @@ def test_profile_does_not_touch_the_connector(monkeypatch, metadata):
+     monkeypatch.setattr(model_kda, "wait_for_kv_layer_from_connector", unexpected)
+     monkeypatch.setattr(model_kda, "maybe_save_kv_layer_to_connector", unexpected)
+     output = torch.ones(1)
+-    layer._forward(None, None, None, output)
++    layer._forward_core(None, None, None, output)
+     assert output.item() == 0
+ 
+ 
+@@ -437,7 +447,7 @@ def test_plain_decode_writes_padded_destination_directly(monkeypatch, empty):
+ 
+     monkeypatch.setattr(model_kda, "recurrent_kda", recurrent)
+     qkv = torch.arange(4 * 384, dtype=torch.float32).reshape(4, 384)
+-    layer._forward(qkv, torch.zeros(1, 4, 1, 128), torch.zeros(1, 4, 1), target)
++    layer._forward_core(qkv, torch.zeros(1, 4, 1, 128), torch.zeros(1, 4, 1), target)
+     assert events == (["load", "compute", "save"] if empty else ["load", "compute", "state_write", "save"])
+     if empty:
+         assert calls == []
+diff --git a/tests/ut/models/test_glm5next_kda_pcp.py b/tests/ut/models/test_glm5next_kda_pcp.py
+index ee37a825e..300997199 100644
+--- a/tests/ut/models/test_glm5next_kda_pcp.py
++++ b/tests/ut/models/test_glm5next_kda_pcp.py
+@@ -6,6 +6,7 @@ from unittest.mock import Mock
+ 
+ import pytest
+ import torch
++from vllm.config import CUDAGraphMode
+ from vllm.model_executor import custom_op, parameter
+ from vllm.model_executor.layers import linear
+ 
+@@ -103,7 +104,19 @@ def test_pcp_output_projection_loads_input_heads_and_reduces_over_pcp(
+ 
+ 
+ @pytest.mark.parametrize(("tp_size", "pcp_size"), [(1, 1), (1, 2), (1, 4), (2, 1), (2, 4), (4, 2)])
+-def test_kda_projection_and_state_sharding_follow_pcp_only_with_tp_one(monkeypatch, parallel_groups, tp_size, pcp_size):
++@pytest.mark.parametrize(
++    ("cudagraph_mode", "needs_output_buffer"),
++    [
++        (CUDAGraphMode.NONE, False),
++        (CUDAGraphMode.PIECEWISE, True),
++        (CUDAGraphMode.FULL, False),
++        (CUDAGraphMode.FULL_DECODE_ONLY, False),
++        (CUDAGraphMode.FULL_AND_PIECEWISE, True),
++    ],
++)
++def test_kda_projection_and_state_sharding_follow_pcp_only_with_tp_one(
++    monkeypatch, parallel_groups, tp_size, pcp_size, cudagraph_mode, needs_output_buffer
++):
+     # Construct the complete KDA layer to catch mismatched projection, gate,
+     # convolution, and cache dimensions, including the TP>1 fallback.
+     monkeypatch.setattr(linear, "get_tensor_model_parallel_world_size", lambda: tp_size)
+@@ -124,7 +137,7 @@ def test_kda_projection_and_state_sharding_follow_pcp_only_with_tp_one(monkeypat
+         cache_config=SimpleNamespace(mamba_cache_dtype="auto", use_replayssm=False),
+         speculative_config=None,
+         quant_config=None,
+-        compilation_config=SimpleNamespace(static_forward_context={}),
++        compilation_config=SimpleNamespace(static_forward_context={}, cudagraph_mode=cudagraph_mode),
+     )
+ 
+     def init_base(self, config, vllm_config, prefix):
+@@ -141,6 +154,7 @@ def test_kda_projection_and_state_sharding_follow_pcp_only_with_tp_one(monkeypat
+         "vllm.third_party.flash_linear_attention.ops.kda.FusedRMSNormGated", lambda *args, **kwargs: torch.nn.Identity()
+     )
+     layer = model_kda.Glm5NextLinearAttention(config, vllm_config, prefix="model.layers.0.linear_attn")
++    assert layer._needs_output_buffer is needs_output_buffer
+     assert layer.pcp_group is parallel_groups
+     assert layer.pcp_size == pcp_size
+     assert layer.pcp_rank == pcp_size - 1
+diff --git a/tests/ut/test_platform.py b/tests/ut/test_platform.py
+index 8fc7f4871..3ec410e91 100644
+--- a/tests/ut/test_platform.py
++++ b/tests/ut/test_platform.py
+@@ -345,8 +345,9 @@ def test_setup_compile_backend_scopes_kda_splitting_to_piecewise(mode):
+ 
+     _setup_compile_backend(config, compile_backend="test_backend")
+ 
++    assert "vllm::glm5next_kda_forward" not in compilation_config.splitting_ops
+     expected_count = int(mode in (CUDAGraphMode.PIECEWISE, CUDAGraphMode.FULL_AND_PIECEWISE))
+-    assert compilation_config.splitting_ops.count("vllm::glm5next_kda_forward") == expected_count
++    assert compilation_config.splitting_ops.count("vllm::glm5next_kda_forward_with_output") == expected_count
+     if mode in (CUDAGraphMode.FULL, CUDAGraphMode.FULL_DECODE_ONLY):
+         assert compilation_config.splitting_ops == []
+ 
+diff --git a/vllm_ascend/models/glm5next/kda.py b/vllm_ascend/models/glm5next/kda.py
+index 1e59975fb..8e1edb1d6 100644
+--- a/vllm_ascend/models/glm5next/kda.py
++++ b/vllm_ascend/models/glm5next/kda.py
+@@ -345,7 +345,7 @@ class Glm5NextLinearAttention(GatedDeltaNetAttention):
+         self.k_conv1d.weight.data = self.k_conv1d.weight.data.unsqueeze(1)
+         self.v_conv1d.weight.data = self.v_conv1d.weight.data.unsqueeze(1)
+         # Lazily-built merged q|k|v conv weight (built on first forward, after
+-        # weights are loaded). See _forward.
++        # weights are loaded). See _forward_core.
+         self._merged_conv_weight: torch.Tensor | None = None
+ 
+         self.A_log = nn.Parameter(torch.empty(1, 1, self.local_num_heads, 1, dtype=torch.float32))
+@@ -386,8 +386,12 @@ class Glm5NextLinearAttention(GatedDeltaNetAttention):
+         self.kda_lower_bound = config.linear_lower_bound
+         self.gate_lower_bound = self.kda_lower_bound
+         # Process-global conv-state layout, resolved once here instead of on
+-        # every _forward call (it reads an env-derived flag each time).
++        # every _forward_core call (it reads an env-derived flag each time).
+         self._conv_state_dim_first = is_conv_state_dim_first()
++        # Piecewise graph capture needs a graph-owned output address for the
++        # eager KDA op between captured segments. Other modes can return the
++        # op's own output and skip a hidden_size-wide copy per layer.
++        self._needs_output_buffer = compilation_config.cudagraph_mode.has_piecewise_cudagraphs()
+ 
+     def _dt_bias_weight_loader(self, param, loaded_weight):
+         shard_size = param.shape[0]
+@@ -408,6 +412,16 @@ class Glm5NextLinearAttention(GatedDeltaNetAttention):
+         hidden_states: torch.Tensor,
+         positions: torch.Tensor,
+     ) -> torch.Tensor:
++        if self._needs_output_buffer:
++            # Allocate in the compiled graph so downstream captures retain the
++            # same output address when this split op executes on each
++            # invocation.
++            output = torch.empty_like(hidden_states)
++            torch.ops.vllm.glm5next_kda_forward_with_output(hidden_states, output, self.prefix)
++            return output
++        return torch.ops.vllm.glm5next_kda_forward(hidden_states, self.prefix)
++
++    def _forward(self, hidden_states: torch.Tensor, output_buffer: torch.Tensor | None) -> torch.Tensor | None:
+         attn_metadata_raw = get_forward_context().attn_metadata
+         attn_metadata = attn_metadata_raw.get(self.prefix) if isinstance(attn_metadata_raw, dict) else None
+         pcp_context = getattr(attn_metadata, "pcp_context", None)
+@@ -435,7 +449,7 @@ class Glm5NextLinearAttention(GatedDeltaNetAttention):
+ 
+         # Beta stays raw (bf16) here: the recurrent kernel sigmoids it in fp32
+         # at load (SIGMOID_BETA), and only the chunked prefill path needs the
+-        # pre-computed fp32 sigmoid — computed lazily in _forward. Pure decode
++        # pre-computed fp32 sigmoid — computed lazily in _forward_core. Pure decode
+         # / spec-verify steps then skip the separate sigmoid and its fp32
+         # intermediate entirely.
+         beta = beta_raw.unsqueeze(0)
+@@ -451,16 +465,14 @@ class Glm5NextLinearAttention(GatedDeltaNetAttention):
+             dtype=hidden_states.dtype,
+             device=hidden_states.device,
+         )
+-        # Metadata and recurrent cache updates must execute on every invocation,
+-        # including when Dynamo traces a profiling run without metadata.
+-        torch.ops.vllm.glm5next_kda_forward(
++        # Keep the layer's dispatch outside piecewise graph compilation.
++        self._forward_core(
+             qkv_proj_states=qkv,
+             g1=g1,
+             beta=beta,
+-            g2=g2,
+             core_attn_out=core_attn_out,
+-            layer_name=self.prefix,
+         )
++        core_attn_out = self.o_norm(core_attn_out, g2)
+         core_attn_out = core_attn_out.reshape(core_attn_out.size(1), -1)
+         output = self.o_proj(core_attn_out)[0]
+         if has_pcp_prefill:
+@@ -469,11 +481,18 @@ class Glm5NextLinearAttention(GatedDeltaNetAttention):
+                 raise RuntimeError("KDA PCP token mapping does not match the rank-local model input.")
+             local_start = self.pcp_rank * local_num_tokens
+             local_indices = pcp_context.padded_gather_idx[local_start : local_start + local_num_tokens]
+-            output = output[local_indices]
+-        return output
++            if output_buffer is None:
++                return torch.index_select(output, 0, local_indices)
++            # Restore directly into the graph-owned output rather than
++            # allocating an indexed tensor and then copying it again.
++            torch.index_select(output, 0, local_indices, out=output_buffer)
++            return None
++        if output_buffer is None:
++            return output
++        output_buffer.copy_(output)
++        return None
+ 
+-    @eager_break_during_capture
+-    def _forward(
++    def _forward_core(
+         self,
+         qkv_proj_states: torch.Tensor,
+         g1: torch.Tensor,
+@@ -719,38 +738,42 @@ class Glm5NextLinearAttention(GatedDeltaNetAttention):
+         maybe_save_kv_layer_to_connector("", [])
+ 
+ 
+-def glm5next_kda_forward(
+-    qkv_proj_states: torch.Tensor,
+-    g1: torch.Tensor,
+-    beta: torch.Tensor,
+-    g2: torch.Tensor,
+-    core_attn_out: torch.Tensor,
+-    layer_name: str,
+-) -> None:
++@eager_break_during_capture
++def glm5next_kda_forward_with_output(hidden_states: torch.Tensor, output: torch.Tensor, layer_name: str) -> None:
+     layer = get_forward_context().no_compile_layers[layer_name]
+-    layer._forward(qkv_proj_states, g1, beta, core_attn_out)
+-    # Triton kernel_side_table indices belong to this process. Keep the gated
+-    # norm inside the custom op so serialized FX/AOT graphs do not retain them.
+-    # Piecewise replay retains the address of this caller-owned buffer. A
+-    # newly allocated norm result would leave the next captured segment
+-    # reading the profile run's output instead of this invocation's values.
+-    layer.o_norm.forward_oot(core_attn_out, g2, out=core_attn_out)
+-
+-
+-def glm5next_kda_forward_fake(
+-    qkv_proj_states: torch.Tensor,
+-    g1: torch.Tensor,
+-    beta: torch.Tensor,
+-    g2: torch.Tensor,
+-    core_attn_out: torch.Tensor,
+-    layer_name: str,
+-) -> None:
++    layer._forward(hidden_states, output)
++
++
++def glm5next_kda_forward_with_output_fake(hidden_states: torch.Tensor, output: torch.Tensor, layer_name: str) -> None:
+     return
+ 
+ 
++direct_register_custom_op(
++    op_name="glm5next_kda_forward_with_output",
++    op_func=glm5next_kda_forward_with_output,
++    mutates_args=["output"],
++    fake_impl=glm5next_kda_forward_with_output_fake,
++)
++
++
++# Returning variant for an unsplit FX graph. No eager_break_during_capture:
++# a freshly returned tensor would change address on each eager replay, which
++# is exactly what the breakable-capture contract forbids. forward() selects
++# this one only when the layer is not a splitting op.
++def glm5next_kda_forward(hidden_states: torch.Tensor, layer_name: str) -> torch.Tensor:
++    layer = get_forward_context().no_compile_layers[layer_name]
++    output = layer._forward(hidden_states, None)
++    assert output is not None
++    return output
++
++
++def glm5next_kda_forward_fake(hidden_states: torch.Tensor, layer_name: str) -> torch.Tensor:
++    return torch.empty_like(hidden_states)
++
++
+ direct_register_custom_op(
+     op_name="glm5next_kda_forward",
+     op_func=glm5next_kda_forward,
+-    mutates_args=["core_attn_out"],
++    mutates_args=[],
+     fake_impl=glm5next_kda_forward_fake,
+ )
+diff --git a/vllm_ascend/platform.py b/vllm_ascend/platform.py
+index ffa73dee7..39c2951ed 100644
+--- a/vllm_ascend/platform.py
++++ b/vllm_ascend/platform.py
+@@ -1449,7 +1449,7 @@ def _setup_compile_backend(
+                 "vllm::mla_forward",
+                 "vllm::dsa_forward",
+                 "vllm::minimax_m3_fused_sparse_forward",
+-                "vllm::glm5next_kda_forward",
++                "vllm::glm5next_kda_forward_with_output",
+             ]
+         )
+         additional_config["ascend_compilation_config"]["enable_npugraph_ex"] = False

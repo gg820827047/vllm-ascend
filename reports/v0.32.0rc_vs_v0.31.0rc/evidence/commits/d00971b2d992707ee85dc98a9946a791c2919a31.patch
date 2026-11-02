@@ -1,0 +1,448 @@
+commit d00971b2d992707ee85dc98a9946a791c2919a31
+Author:     XuChi <xuchicolson@163.com>
+AuthorDate: Fri Oct 30 17:58:56 2026 +0800
+Commit:     GitHub <noreply@github.com>
+CommitDate: Fri Oct 30 17:58:56 2026 +0800
+
+    [BugFix] Unify finegrained TP disable semantics: default 1, enabled only when size > 1 (#20111)
+    
+    ### What this PR does / why we need it?
+    
+    Fixes #19823.
+    
+    The four `additional_config["finegrained_tp_config"]` knobs disagreed on
+    what "disabled" means: `oproj_tensor_parallel_size` used `> 1`
+    (consistent with vLLM `ParallelConfig` size semantics), `lmhead` /
+    `embedding` used `> 0`, and `mlp` mixed **both conventions across its
+    own call sites**. This produced real bugs: `mlp_tensor_parallel_size=1`
+    was rejected at config load for lacking
+    `recompute_scheduler_enable=true` even though `1` shards nothing; with
+    the scheduler on it entered a half-enabled state (weight-sharding paths
+    on, all preconditions skipped); `lmhead=1` / `embedding=1` silently took
+    the sharded path over a size-1 group.
+    
+    This normalizes all four knobs on vLLM's `ParallelConfig` semantics —
+    **a parallel size of `1` means no sharding** (tp/dp/pp are all
+    `Field(default=1, ge=1)` with `> 1` enable checks) — in three layers:
+    
+    1. **Enable checks unified on `> 1`** (`0` and `1` both disable):
+    - `vllm_ascend/utils.py`: `lmhead_tp_enable()` / `embedding_tp_enable()`
+    / `mlp_tp_enable()`
+    - `vllm_ascend/distributed/parallel_state.py`: lmhead / embedding / mlp
+    group creation — no more size-1 groups
+    - `vllm_ascend/ascend_config.py`: recompute-scheduler requirement,
+    batch-sharded-sampling mutex, enabled-config logging, MoE-only check,
+    DP-divisibility check
+    2. **Defaults `0` → `1`**, aligning with vLLM's tp/dp/pp defaults:
+       - all four `FinegrainedTPConfig` fields default to `1`
+    - the capture-bound auto-disable path writes back `1` (the canonical off
+    value) instead of `0`
+    - `0` remains tolerated in code as a disabled alias for older configs
+    (validation still accepts `>= 0`), but leaves the documented range: both
+    docs show `1` as the default and a divisor of `data_parallel_size` as
+    the value range
+    3. **RFork seed-sharding guard**: `model_loader/rfork/identity.py` still
+    treated `size > 0` as enabled, so the new default of `1` would have
+    split the RFork weight-seed pool by DP rank for every deployment (dense
+    and TP-only included). Unified on `> 1` like every other site, rfork
+    fixtures aligned with the real defaults. Also refreshed the
+    `AscendConfig` docstring example and dropped three stale
+    `olora_tensor_parallel_size` mock fields left behind by #15857.
+    
+    Supersedes #20040 (comparison flips only, defaults left at `0`). #19873
+    takes the same direction; per the discussion there the implementation
+    consolidates here, and its complementary regression groups will follow
+    as a separate test-only PR.
+    
+    ### Does this PR introduce _any_ user-facing change?
+    
+    Yes — only for configs that explicitly set a knob to `1`: they now get
+    the plain (unsharded) path instead of a sharded path over a size-1
+    group, and `mlp_tensor_parallel_size=1` no longer requires
+    `recompute_scheduler_enable=true`. Everything `> 1` is unchanged;
+    configs that omit the knobs or set `0` behave as before. Release-note
+    fragment included: `release_notes/fragments/20111.yaml`.
+    
+    ### How was this patch tested?
+    
+    - `tests/ut/test_utils.py`: parametrized `(0, False), (1, False), (2,
+    True), (8, True)` over all four enable functions.
+    - `tests/ut/test_ascend_config.py`: new default-value assertions (`(1,
+    1, 1, 1)`); the recompute-scheduler test now covers `(0,*)/(1,*)`
+    no-raise cases plus `(0,2)/(1,2)` enabled cases; the capture-bound tests
+    assert the new write-back value.
+    - `tests/ut/model_loader/rfork/test_identity_validation.py`: fixtures
+    use the real defaults and assert the default config keeps the sharded-DP
+    selector `None`.
+    - CI-equivalent environment (nightly-main-a3 image,
+    `TORCH_DEVICE_BACKEND_AUTOLOAD=0`, CPU mock path): the five
+    knob-touching UT files plus the full rfork suite — **606 passed**; the
+    one `test_dsa_v1.py` failure in a combined run is a pre-existing
+    ordering artifact that reproduces on unmodified `main` and passes
+    standalone.
+    - Upstream CI is fully green on the final head, including both `cpu-ut`
+    variants and all selected e2e shards.
+    
+    - vLLM main:
+    https://github.com/vllm-project/vllm/commit/544f182d9f0c9bfe8bd7645525951d5e3692a542
+    
+    ---------
+    
+    Signed-off-by: xuchi <xuchicolson@163.com>
+
+diff --git a/docs/source/user_guide/configuration/additional_config.md b/docs/source/user_guide/configuration/additional_config.md
+index 1c0bfc85c..3144355b9 100644
+--- a/docs/source/user_guide/configuration/additional_config.md
++++ b/docs/source/user_guide/configuration/additional_config.md
+@@ -130,10 +130,10 @@ Design / ops (analysis branch): `docs/source/developer_guide/Design_Documents/ru
+ 
+ | Name | Type | Default | Description |
+ | ---- | ---- | ------- | ----------- |
+-| `oproj_tensor_parallel_size`     | int  | `0` | The custom tensor parallel size of `o_proj`. Values `0` and `1` disable O-projection TP; values greater than `1` enable sharding.     |
+-| `mlp_tensor_parallel_size`       | int  | `0` | The custom tensor parallel size of `mlp`.       |
+-| `lmhead_tensor_parallel_size`    | int  | `0` | The custom tensor parallel size of `lm_head`.    |
+-| `embedding_tensor_parallel_size` | int  | `0` | The custom tensor parallel size of `embedding`. |
++| `oproj_tensor_parallel_size`     | int  | `1` | The custom tensor parallel size of `o_proj`.     |
++| `mlp_tensor_parallel_size`       | int  | `1` | The custom tensor parallel size of `mlp`.       |
++| `lmhead_tensor_parallel_size`    | int  | `1` | The custom tensor parallel size of `lm_head`.    |
++| `embedding_tensor_parallel_size` | int  | `1` | The custom tensor parallel size of `embedding`. |
+ 
+ **ascend_compilation_config**
+ 
+diff --git a/docs/source/user_guide/feature_guide/Fine_grained_TP.md b/docs/source/user_guide/feature_guide/Fine_grained_TP.md
+index aea8d7062..12f019ef9 100644
+--- a/docs/source/user_guide/feature_guide/Fine_grained_TP.md
++++ b/docs/source/user_guide/feature_guide/Fine_grained_TP.md
+@@ -213,14 +213,14 @@ After the instance starts, check which knobs passed startup validation:
+ 
+ ## Configuration Parameters
+ 
+-All knobs live under `finegrained_tp_config` inside `--additional-config`. The default `0` disables a knob.
++All knobs live under `finegrained_tp_config` inside `--additional-config`. The default `1` disables a knob.
+ 
+ | Parameter | Type | Default | Required | Value Range | Description |
+ |-----------|------|---------|----------|-------------|-------------|
+-| `oproj_tensor_parallel_size` | int | 0 | No | 0, or a divisor of `data_parallel_size` | TP size of the attention output projection (`o_proj`, or the two-stage `wo_a`/`wo_b` in DSA-style models). Values > 1 require the [o_proj / MLP preconditions](#preconditions-for-o_proj--mlp-tp). |
+-| `mlp_tensor_parallel_size` | int | 0 | No | 0, or a divisor of `data_parallel_size` | TP size of the MLP (feed-forward) blocks. Values > 1 require the [o_proj / MLP preconditions](#preconditions-for-o_proj--mlp-tp). |
+-| `lmhead_tensor_parallel_size` | int | 0 | No | 0, or a divisor of `data_parallel_size` | TP size of the LM head (shards the vocabulary dimension). |
+-| `embedding_tensor_parallel_size` | int | 0 | No | 0, or a divisor of `data_parallel_size` | TP size of the token embedding table. |
++| `oproj_tensor_parallel_size` | int | 1 | No | a divisor of `data_parallel_size` | TP size of the attention output projection (`o_proj`, or the two-stage `wo_a`/`wo_b` in DSA-style models). Values > 1 require the [o_proj / MLP preconditions](#preconditions-for-o_proj--mlp-tp). |
++| `mlp_tensor_parallel_size` | int | 1 | No | a divisor of `data_parallel_size` | TP size of the MLP (feed-forward) blocks. Values > 1 require the [o_proj / MLP preconditions](#preconditions-for-o_proj--mlp-tp). |
++| `lmhead_tensor_parallel_size` | int | 1 | No | a divisor of `data_parallel_size` | TP size of the LM head. |
++| `embedding_tensor_parallel_size` | int | 1 | No | a divisor of `data_parallel_size` | TP size of the token embedding table. |
+ 
+ ## Experimental Results
+ 
+diff --git a/release_notes/fragments/20111.yaml b/release_notes/fragments/20111.yaml
+new file mode 100644
+index 000000000..2af24ce23
+--- /dev/null
++++ b/release_notes/fragments/20111.yaml
+@@ -0,0 +1,12 @@
++pr: 20111
++entries:
++  - category: bugfix
++    text: >-
++      Unified the disable semantics of the four finegrained_tp_config knobs
++      (oproj/lmhead/embedding/mlp tensor_parallel_size) on vLLM parallel-size
++      conventions: the default is now 1 and a knob is enabled only when its
++      size is greater than 1. Explicitly setting a knob to 1 now takes the
++      plain unsharded path (previously lmhead/embedding/mlp built a size-1
++      sharded group), and mlp_tensor_parallel_size=1 no longer requires
++      recompute_scheduler_enable=true. Configs using 0 keep working as
++      disabled, but 0 is no longer part of the documented range.
+diff --git a/tests/ut/model_loader/rfork/test_identity_validation.py b/tests/ut/model_loader/rfork/test_identity_validation.py
+index cca50357f..44de9a121 100644
+--- a/tests/ut/model_loader/rfork/test_identity_validation.py
++++ b/tests/ut/model_loader/rfork/test_identity_validation.py
+@@ -253,11 +253,10 @@ def _ascend_config(**overrides):
+         "num_head_replica": 1,
+         "draft_window_size": None,
+         "finegrained_tp_config": SimpleNamespace(
+-            oproj_tensor_parallel_size=0,
+-            lmhead_tensor_parallel_size=0,
+-            embedding_tensor_parallel_size=0,
+-            mlp_tensor_parallel_size=0,
+-            olora_tensor_parallel_size=0,
++            oproj_tensor_parallel_size=1,
++            lmhead_tensor_parallel_size=1,
++            embedding_tensor_parallel_size=1,
++            mlp_tensor_parallel_size=1,
+         ),
+         "dynamic_spec_config": SimpleNamespace(method=None, method_params={}),
+     }
+@@ -549,7 +548,6 @@ def test_data_parallel_rank_stays_out_of_the_fingerprint(identity_module, monkey
+         lmhead_tensor_parallel_size=0,
+         embedding_tensor_parallel_size=0,
+         mlp_tensor_parallel_size=0,
+-        olora_tensor_parallel_size=0,
+     )
+     monkeypatch.setattr(identity_module, "get_ascend_config", lambda: _ascend_config(finegrained_tp_config=finegrained))
+     first_rank = _build_fingerprint(identity_module, model_config, data_parallel_rank=0)
+@@ -606,10 +604,13 @@ def test_sharded_dp_rank_selector_conditions(identity_module, monkeypatch):
+         lmhead_tensor_parallel_size=0,
+         embedding_tensor_parallel_size=0,
+         mlp_tensor_parallel_size=0,
+-        olora_tensor_parallel_size=0,
+     )
+     monkeypatch.setattr(identity_module, "get_ascend_config", lambda: _ascend_config(finegrained_tp_config=finegrained))
+     assert resolve() == 3
++    # The FinegrainedTPConfig defaults (all 1) mean no sharding: with them the
++    # selector must stay None, or every DP deployment would split its seed pool.
++    monkeypatch.setattr(identity_module, "get_ascend_config", lambda: _ascend_config())
++    assert resolve() is None
+ 
+ 
+ def test_speculative_layout_does_not_partition_weight_seeds(identity_module):
+diff --git a/tests/ut/test_ascend_config.py b/tests/ut/test_ascend_config.py
+index a365df824..bc5c25c91 100644
+--- a/tests/ut/test_ascend_config.py
++++ b/tests/ut/test_ascend_config.py
+@@ -161,7 +161,7 @@ class TestAscendConfig(TestBase):
+     @_clean_up_ascend_config
+     @patch("vllm_ascend.platform.NPUPlatform.check_and_update_config")
+     def test_oproj_recompute_scheduler_required_only_for_sharding(self, mock_fix_incompatible_config):
+-        for otp_size, mlp_size in ((0, 0), (1, 0), (2, 0), (8, 0), (1, 1)):
++        for otp_size, mlp_size in ((0, 0), (1, 0), (2, 0), (8, 0), (0, 1), (1, 1), (0, 2), (1, 2)):
+             with self.subTest(otp_size=otp_size, mlp_size=mlp_size):
+                 clear_ascend_config()
+                 config = VllmConfig()
+@@ -173,7 +173,7 @@ class TestAscendConfig(TestBase):
+                     },
+                     "scheduler_config": {"recompute_scheduler_enable": False},
+                 }
+-                if otp_size > 1 or mlp_size > 0:
++                if otp_size > 1 or mlp_size > 1:
+                     with self.assertRaisesRegex((AssertionError, ValueError), "recompute_scheduler_enable=true"):
+                         init_ascend_config(config)
+                 else:
+@@ -214,7 +214,7 @@ class TestAscendConfig(TestBase):
+ 
+         self.assertEqual(config.kvpp_config.size, 1)
+         self.assertFalse(config.xlite_graph_config.enabled)
+-        self.assertEqual(config.finegrained_tp_config.oproj_tensor_parallel_size, 0)
++        self.assertEqual(config.finegrained_tp_config.oproj_tensor_parallel_size, 1)
+         self.assertFalse(config.scheduler_config.short_request_first_config.enabled)
+         self.assertFalse(config.rl_config.enabled)
+ 
+@@ -1313,6 +1313,19 @@ class TestSubconfigPydanticTypeValidation(TestBase):
+         with self.assertRaisesRegex(ValueError, "lmhead_tensor_parallel_size must be non-negative"):
+             FinegrainedTPConfig(lmhead_tensor_parallel_size=-1)
+ 
++    def test_finegrained_tp_config_defaults_to_one(self):
++        # 1 is vLLM's "size 1 = no sharding" default; every knob starts disabled.
++        config = FinegrainedTPConfig()
++        self.assertEqual(
++            (
++                config.oproj_tensor_parallel_size,
++                config.lmhead_tensor_parallel_size,
++                config.embedding_tensor_parallel_size,
++                config.mlp_tensor_parallel_size,
++            ),
++            (1, 1, 1, 1),
++        )
++
+     def _oproj_tp_vllm_config(
+         self,
+         max_num_batched_tokens=8192,
+@@ -1369,7 +1382,7 @@ class TestSubconfigPydanticTypeValidation(TestBase):
+         self.assertEqual(config.oproj_tensor_parallel_size, 2)
+         # 300 reqs x decode_query_len 2 (spec window) = 600 > 512: disabled with a warning.
+         config._validate_preconditions(self._oproj_tp_vllm_config(max_num_seqs=300, num_speculative_tokens=1))
+-        self.assertEqual(config.oproj_tensor_parallel_size, 0)
++        self.assertEqual(config.oproj_tensor_parallel_size, 1)
+         # An explicit capture size that covers the step keeps the knob on.
+         config = FinegrainedTPConfig(oproj_tensor_parallel_size=2)
+         config._validate_preconditions(
+@@ -1390,8 +1403,8 @@ class TestSubconfigPydanticTypeValidation(TestBase):
+         # The step bound is knob-independent, so an oversized step disables both knobs together.
+         config = FinegrainedTPConfig(oproj_tensor_parallel_size=2, mlp_tensor_parallel_size=4)
+         config._validate_preconditions(self._oproj_tp_vllm_config(max_num_seqs=300, num_speculative_tokens=1))
+-        self.assertEqual(config.oproj_tensor_parallel_size, 0)
+-        self.assertEqual(config.mlp_tensor_parallel_size, 0)
++        self.assertEqual(config.oproj_tensor_parallel_size, 1)
++        self.assertEqual(config.mlp_tensor_parallel_size, 1)
+ 
+     def test_eplb_config_int_field_lax(self):
+         cfg = EplbConfig(eplb_policy_type="2")
+diff --git a/tests/ut/test_utils.py b/tests/ut/test_utils.py
+index 6ece8a4c1..04be41e22 100644
+--- a/tests/ut/test_utils.py
++++ b/tests/ut/test_utils.py
+@@ -986,3 +986,19 @@ def test_oproj_tp_enable_requires_weight_sharding(size, enabled):
+     config = SimpleNamespace(finegrained_tp_config=SimpleNamespace(oproj_tensor_parallel_size=size))
+     with mock.patch("vllm_ascend.utils.get_ascend_config", return_value=config):
+         assert utils.oproj_tp_enable() is enabled
++
++
++@pytest.mark.parametrize("size,enabled", [(0, False), (1, False), (2, True), (8, True)])
++@pytest.mark.parametrize(
++    "knob,enable_fn",
++    [
++        ("lmhead_tensor_parallel_size", "lmhead_tp_enable"),
++        ("embedding_tensor_parallel_size", "embedding_tp_enable"),
++        ("mlp_tensor_parallel_size", "mlp_tp_enable"),
++    ],
++)
++def test_finegrained_tp_enable_requires_weight_sharding(knob, enable_fn, size, enabled):
++    """All four knobs share one convention: 0 and 1 both mean disabled."""
++    config = SimpleNamespace(finegrained_tp_config=SimpleNamespace(**{knob: size}))
++    with mock.patch("vllm_ascend.utils.get_ascend_config", return_value=config):
++        assert getattr(utils, enable_fn)() is enabled
+diff --git a/vllm_ascend/ascend_config.py b/vllm_ascend/ascend_config.py
+index 3a3c234d7..93277e639 100644
+--- a/vllm_ascend/ascend_config.py
++++ b/vllm_ascend/ascend_config.py
+@@ -495,10 +495,10 @@ class AscendConfig:
+                 "full_mode": false
+             },
+             "finegrained_tp_config": {
+-                "oproj_tensor_parallel_size": 0,
+-                "lmhead_tensor_parallel_size": 0,
+-                "embedding_tensor_parallel_size": 0,
+-                "mlp_tensor_parallel_size": 0
++                "oproj_tensor_parallel_size": 1,
++                "lmhead_tensor_parallel_size": 1,
++                "embedding_tensor_parallel_size": 1,
++                "mlp_tensor_parallel_size": 1
+             },
+             "scheduler_config": {
+                 "enable_balance_scheduling": false,
+@@ -834,7 +834,7 @@ class AscendConfig:
+ 
+         finegrained_tp_enabled = (
+             self.finegrained_tp_config.oproj_tensor_parallel_size > 1
+-            or self.finegrained_tp_config.mlp_tensor_parallel_size > 0
++            or self.finegrained_tp_config.mlp_tensor_parallel_size > 1
+         )
+         if finegrained_tp_enabled and not self.scheduler_config.recompute_scheduler_enable:
+             raise AssertionError(
+@@ -961,7 +961,7 @@ class AscendConfig:
+         # per TP rank, while lmhead TP overrides NPUModelRunner.sample with a
+         # whole-group LM-head collective path; the two are mutually exclusive.
+         if vc.parallel_config.enable_batch_sharded_sampling:
+-            if self.finegrained_tp_config.lmhead_tensor_parallel_size > 0:
++            if self.finegrained_tp_config.lmhead_tensor_parallel_size > 1:
+                 raise ValueError(
+                     "enable_batch_sharded_sampling is incompatible with "
+                     "finegrained_tp_config.lmhead_tensor_parallel_size. "
+@@ -1340,12 +1340,16 @@ class FinegrainedTPConfig:
+     a plain method invoked explicitly by ``init_ascend_config`` (Plan B:
+     business validation stays out of pydantic). ``vllm_config`` is no longer a
+     member field.
++
++    Size semantics follow vLLM ``ParallelConfig``: ``1`` (the default) means no
++    sharding and only sizes > 1 enable a knob. ``0`` is tolerated as a disabled
++    alias for older configs but is not part of the documented range.
+     """
+ 
+-    oproj_tensor_parallel_size: int = 0
+-    lmhead_tensor_parallel_size: int = 0
+-    embedding_tensor_parallel_size: int = 0
+-    mlp_tensor_parallel_size: int = 0
++    oproj_tensor_parallel_size: int = 1
++    lmhead_tensor_parallel_size: int = 1
++    embedding_tensor_parallel_size: int = 1
++    mlp_tensor_parallel_size: int = 1
+ 
+     @model_validator(mode="after")
+     def _validate_sizes(self):
+@@ -1417,16 +1421,16 @@ class FinegrainedTPConfig:
+                     str(capture_bound),
+                     max_step,
+                 )
+-                self.oproj_tensor_parallel_size = 0
+-                self.mlp_tensor_parallel_size = 0
++                self.oproj_tensor_parallel_size = 1
++                self.mlp_tensor_parallel_size = 1
+             else:
+                 if self.oproj_tensor_parallel_size > 1:
+                     enabled_configs.append(f"oproj_tensor_parallel_size={self.oproj_tensor_parallel_size}")
+                 if self.mlp_tensor_parallel_size > 1:
+                     enabled_configs.append(f"mlp_tensor_parallel_size={self.mlp_tensor_parallel_size}")
+-        if self.lmhead_tensor_parallel_size > 0:
++        if self.lmhead_tensor_parallel_size > 1:
+             enabled_configs.append(f"lmhead_tensor_parallel_size={self.lmhead_tensor_parallel_size}")
+-        if self.embedding_tensor_parallel_size > 0:
++        if self.embedding_tensor_parallel_size > 1:
+             enabled_configs.append(f"embedding_tensor_parallel_size={self.embedding_tensor_parallel_size}")
+         module_tp_sizes = [
+             self.oproj_tensor_parallel_size,
+@@ -1440,11 +1444,11 @@ class FinegrainedTPConfig:
+             # to greater than 1 in the model launch configuration, its value will be changed to 1 later.
+             # This will cause an issue when finegrained tp is enabled, as it
+             # cannot be split into the data parallel communication group, leading to an error.
+-            if module_tp_size > 0 and not vc.model_config.is_moe:
++            if module_tp_size > 1 and not vc.model_config.is_moe:
+                 raise AssertionError("The finegrained tp sizes can be enabled only for MOE models.")
+-            if module_tp_size > 0 and vc.parallel_config.data_parallel_size % module_tp_size != 0:
++            if module_tp_size > 1 and vc.parallel_config.data_parallel_size % module_tp_size != 0:
+                 raise AssertionError("finegrained tp sizes must divide by data_parallel_size.")
+-        if any(size > 0 for size in module_tp_sizes) and enabled_configs:
++        if any(size > 1 for size in module_tp_sizes) and enabled_configs:
+             logger.info("finegrained_tp_config enabled: %s", ", ".join(enabled_configs))
+ 
+ 
+diff --git a/vllm_ascend/distributed/parallel_state.py b/vllm_ascend/distributed/parallel_state.py
+index 433d7e46d..6774c41a7 100644
+--- a/vllm_ascend/distributed/parallel_state.py
++++ b/vllm_ascend/distributed/parallel_state.py
+@@ -204,11 +204,11 @@ def init_ascend_model_parallel(
+ 
+     if otp_size > 1:
+         _OTP = _create_or_get_group(otp_size, "otp")
+-    if lmhead_tp_size > 0:
++    if lmhead_tp_size > 1:
+         _LMTP = _create_or_get_group(lmhead_tp_size, "lmheadtp")
+-    if embedding_tp_size > 0:
++    if embedding_tp_size > 1:
+         _EMBED_TP = _create_or_get_group(embedding_tp_size, "emtp")
+-    if mlp_tp_size > 0:
++    if mlp_tp_size > 1:
+         _MLP_TP = _create_or_get_group(mlp_tp_size, "mlptp")
+ 
+ 
+diff --git a/vllm_ascend/model_loader/rfork/identity.py b/vllm_ascend/model_loader/rfork/identity.py
+index 406703efc..06a9a6ef5 100644
+--- a/vllm_ascend/model_loader/rfork/identity.py
++++ b/vllm_ascend/model_loader/rfork/identity.py
+@@ -279,7 +279,7 @@ def _resolve_sharded_dp_rank(vllm_config: VllmConfig) -> int | None:
+         getattr(finegrained_tp_config, "mlp_tensor_parallel_size", 0),
+     )
+     finegrained_tp_enabled = any(
+-        isinstance(size, int) and not isinstance(size, bool) and size > 0 for size in finegrained_tp_sizes
++        isinstance(size, int) and not isinstance(size, bool) and size > 1 for size in finegrained_tp_sizes
+     )
+     data_parallel_size = getattr(parallel_config, "data_parallel_size", None)
+     content_sharded = finegrained_tp_enabled or (
+diff --git a/vllm_ascend/utils.py b/vllm_ascend/utils.py
+index 42974597a..85d4fcd64 100644
+--- a/vllm_ascend/utils.py
++++ b/vllm_ascend/utils.py
+@@ -971,7 +971,7 @@ def register_ascend_fla_customop():
+ 
+ 
+ def lmhead_tp_enable() -> bool:
+-    return get_ascend_config().finegrained_tp_config.lmhead_tensor_parallel_size > 0
++    return get_ascend_config().finegrained_tp_config.lmhead_tensor_parallel_size > 1
+ 
+ 
+ def lmhead_tp_max_num_logits(max_num_reqs: int, logits_rows_per_req: int) -> int:
+@@ -998,7 +998,7 @@ def lmhead_tp_pad_rows(rows: torch.Tensor, capacity: int, formula: str) -> torch
+ 
+ 
+ def embedding_tp_enable() -> bool:
+-    return get_ascend_config().finegrained_tp_config.embedding_tensor_parallel_size > 0
++    return get_ascend_config().finegrained_tp_config.embedding_tensor_parallel_size > 1
+ 
+ 
+ def oproj_tp_enable() -> bool:
+@@ -1006,7 +1006,7 @@ def oproj_tp_enable() -> bool:
+ 
+ 
+ def mlp_tp_enable() -> bool:
+-    return get_ascend_config().finegrained_tp_config.mlp_tensor_parallel_size > 0
++    return get_ascend_config().finegrained_tp_config.mlp_tensor_parallel_size > 1
+ 
+ 
+ def enable_sp(vllm_config=None) -> bool:

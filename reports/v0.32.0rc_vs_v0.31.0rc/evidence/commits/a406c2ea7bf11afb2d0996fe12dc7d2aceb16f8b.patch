@@ -1,0 +1,370 @@
+commit a406c2ea7bf11afb2d0996fe12dc7d2aceb16f8b
+Author:     zouyida2052 <zouyida2002@gmail.com>
+AuthorDate: Tue Oct 27 00:01:15 2026 +0800
+Commit:     GitHub <noreply@github.com>
+CommitDate: Tue Oct 27 00:01:15 2026 +0800
+
+    [BugFix][KV Pool] Bound PP/MTP GVA allocations by physical copy extent (#19877)
+    
+    ### What this PR does / why we need it?
+    
+    Follow-up to #19422 and #19421. Keep the physical KV-layer
+    synchronization and make the GVA object large enough for every physical
+    layer, including MTP at the last PP stage.
+    
+    For a GLM configuration with 78 target layers, PP partition `42,36`, and
+    one MTP cache layer, PP1 has 37 physical KV layers. The existing
+    global-layer estimate allocates 7,002,294 bytes, but the unchanged PP
+    byte origin plus the actual packed payload requires 7,092,024 bytes. The
+    SDK rejects the final layer's copy with `BatchCopyWritePath -3102`.
+    
+    Compute the PP byte origin once and share it between allocation and
+    `LayerBatchBuilder`. For metadata-complete GVA groups, allocate
+    `max(existing_shard_size, pp_byte_offset + sum(group_block_len))`. Align
+    the resulting shared DCP shard to the existing 2 MiB boundary before
+    computing the full allocation and shard origins. Preserve the block-key
+    path, metadata fallback, keys, and existing byte layout. No MTP,
+    layerwise, or SSD feature is disabled.
+    
+    Actual failing range, reproduced twice with the fix absent:
+    
+    ```text
+    object base       = 72057626250182656
+    allocated bytes   = 7002294
+    physical layer    = 36 (zero based)
+    copy GVA          = 72057626257157944
+    copy offset       = 6975288
+    copy bytes        = 83968
+    copy end offset   = 7059256 > 7002294
+    SDK result        = -3102
+    last entry end    = 7092024 (another 32768-byte entry follows)
+    ```
+    
+    The SDK-reported address exactly matches the observed out-of-range copy.
+    The SDK rejects the operation before copying; this does not establish
+    that an out-of-bounds write actually occurred.
+    
+    ### Does this PR introduce _any_ user-facing change?
+    
+    Fixes pooled KV save failures for PP stages whose physical KV payload
+    extends beyond the target-model layer estimate. All readers/writers
+    sharing an affected key must use the same layout. Rebuild the affected
+    cache during upgrade: an existing undersized object cannot be made safe
+    by changing the requesting allocation size alone. Validation used
+    isolated task-owned pools; existing public SSD storage was not
+    initialized or cleared.
+    
+    ### How was this patch tested?
+    
+    **Target-branch CPU regression:**
+    
+    ```bash
+    python3 -m pytest -q \
+      tests/ut/kv_offload/test_pool_worker_pp_layer_count.py \
+      tests/ut/kv_offload/test_pool_worker_pp_object_bounds.py
+    ```
+    
+    On each of the two target branches independently: 33 passed with the
+    fix; reverting only the production change causes 10 expected boundary
+    failures and leaves 23 passing; restoring the fix gives 33 passed again.
+    No skipped tests or collection errors. The new tests inspect every
+    actual `LayerBatchBuilder` copy range, covering single/multiple MTP
+    layers, unequal cache entries, PP0/PP1, all four shared DCP shards and 2
+    MiB alignment. Existing DeepSeek multi-group tests, block-key behavior,
+    fallback, and layouts requiring no growth remain covered. CPU execution
+    uses the real worker/builder with NPU interfaces mocked, without an SDK
+    service.
+    
+    **Four-node NPU causal check, SSD enabled throughout:**
+    
+    Frozen runtime: vllm-ascend `394fa92ad2ee3499569dbed625c11866c2319cb9`,
+    vLLM `ced6857afa0ea7b2e3f0846a62e1394e90f15607` (0.30.0),
+    memcache/memfabric 1.3.0, Python 3.12.13, torch 2.10, torch_npu
+    2.10.post7. P: TP16 x PP2, partition 42/36, layerwise and MTP1, eager.
+    D: DP16 x TP2, original MTP5 and FULL_DECODE_ONLY graph settings. Model,
+    dependencies and native extensions were held fixed. No weights were
+    moved.
+    
+    Each hardware stage used the same frozen 507-token input, concurrency 1,
+    temperature 0 and seed 1024. The minimal reproducer caps output at 16;
+    semantic checks allow 512 tokens.
+    
+    | Stage | Result |
+    | --- | --- |
+    | Original allocation | Last physical-layer save rejected with the
+    address/range above and `-3102` |
+    | Apply capacity fix | Allocation 7,092,024 bytes; no save error; two
+    complete, correct arithmetic answers |
+    | Withdraw capacity fix | Same input reproduces `-3102` at the same
+    relative range |
+    | Restore capacity fix | No save error; four complete correct answers;
+    two replays each report 384 pool-hit tokens and request-associated G2L
+    copies succeed, including PP1 layer 36 |
+    
+    For the restored PP1 layer 36, observed G2L entry lengths include both
+    83,968 and 32,768 bytes, result 0, associated with the replay request
+    ID. This checks actual loading as well as saving. The arithmetic prompt
+    asks for `17 + 25`; complete responses correctly answer 42 and stop
+    normally. This is a focused functional/semantic check, not a general
+    accuracy benchmark.
+    
+    **Scope and remaining coverage:**
+    
+    - Hardware A/B/A/B applies the production methods to the frozen runtime
+    above. The three affected methods are AST-identical to this PR and its
+    companion. It does not claim full NPU validation of the latest target
+    branch and its complete dependency stack. Both target branches were
+    separately imported and CPU-tested; main uses its pinned vLLM source.
+    - SSD write coverage is observed: six objects flushed, 42,306,822 bytes.
+    Replays above prove actual external loads, but do **not** establish DRAM
+    eviction followed by SSD rewarm into the current request. The separate 1
+    GiB/worker SSD eviction/rewarm run was prepared but has not run; SSD
+    read acceptance remains unverified.
+    - One restored-stage launch failed because the previous Meta had not
+    fully released its process lock. No model request was issued; it was
+    classified as infrastructure failure and rerun after confirmed shutdown.
+    - Ruff check/format, codespell, forbidden-import,
+    boolean-context-manager, long-function and symbolic-meta checks passed
+    separately on both branches. `bash format.sh ci` was attempted on both
+    but blocked while downloading actionlint (network disconnect/timeout);
+    the complete formatting pipeline is not reported as passed. Full
+    target-stack NPU CI and broad accuracy/performance testing remain
+    outstanding.
+    - Temporary address/request diagnostics used for the hardware experiment
+    are absent from this PR.
+    
+    Companion release PR: #19878.
+    
+    - vLLM main:
+    https://github.com/vllm-project/vllm/commit/c0b6f74bee518aeaf5d72b200a0216e72fbb5e7c
+    
+    <!-- codesmith:footer -->
+    ---
+    <a
+    href="https://app.blacksmith.sh/vllm-project/codesmith/vllm-ascend/pr/19877?autoLogin=true&ref=codesmith_pr_footer"><picture><source
+    media="(prefers-color-scheme: dark)"
+    srcset="https://pr-comments-assets.blacksmith.sh/codesmith/view-with-codesmith-dark-v3.svg"><source
+    media="(prefers-color-scheme: light)"
+    srcset="https://pr-comments-assets.blacksmith.sh/codesmith/view-with-codesmith-light-v3.svg"><img
+    alt="View with [code]smith"
+    src="https://pr-comments-assets.blacksmith.sh/codesmith/view-with-codesmith-dark-v3-3x.png"
+    width="162" height="28"></picture></a> <a
+    href="https://backend.blacksmith.sh/track/enable-autofix?expires=1795618775&installation_model_id=425286&pr_number=19877&ref=codesmith_pr_footer&repository=vllm-project%2Fvllm-ascend&return_to=https%3A%2F%2Fgithub.com%2Fvllm-project%2Fvllm-ascend%2Fpull%2F19877&signature=0ef3f1b559f0ce4561f9c03c8c84054b05df25d2c4a613f496a2de023e0f9c1b"><picture><source
+    media="(prefers-color-scheme: dark)"
+    srcset="https://pr-comments-assets.blacksmith.sh/codesmith/autofix-with-codesmith-dark.svg"><source
+    media="(prefers-color-scheme: light)"
+    srcset="https://pr-comments-assets.blacksmith.sh/codesmith/autofix-with-codesmith-light.svg"><img
+    alt="Autofix with [code]smith"
+    src="https://pr-comments-assets.blacksmith.sh/codesmith/autofix-with-codesmith-dark-3x.png"
+    width="190" height="28"></picture></a>
+    <sup>Need help on this PR? Tag <code>@codesmith-bot</code> with what you
+    need.</sup>
+    
+    <!-- codesmith:autofix:disabled -->
+    <!-- /codesmith:footer -->
+    
+    ---------
+    
+    Signed-off-by: zouyida2052 <zouyida2002@gmail.com>
+
+diff --git a/release_notes/fragments/19877.yaml b/release_notes/fragments/19877.yaml
+new file mode 100644
+index 000000000..7ef561fb9
+--- /dev/null
++++ b/release_notes/fragments/19877.yaml
+@@ -0,0 +1,7 @@
++pr: 19877
++entries:
++  - category: bugfix
++    text: >-
++      Fixed memcache KV-pool allocation failures when physical MTP cache layers
++      extend past a pipeline stage's estimated object capacity. Rebuild affected
++      pooled caches when upgrading all readers and writers to the fixed version.
+diff --git a/tests/ut/kv_offload/test_pool_worker_pp_object_bounds.py b/tests/ut/kv_offload/test_pool_worker_pp_object_bounds.py
+new file mode 100644
+index 000000000..5355cbe4a
+--- /dev/null
++++ b/tests/ut/kv_offload/test_pool_worker_pp_object_bounds.py
+@@ -0,0 +1,123 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""All physical layer copies must fit the GVA object allocated for their key."""
++
++import numpy as np
++import pytest
++
++from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.pool_worker import KVPoolWorker
++
++
++def _worker(layer_entries, offset=42, total_layers=78, dcp_size=1, dcp_rank=0, block_key=False):
++    worker = KVPoolWorker.__new__(KVPoolWorker)
++    worker.pp_size = 2
++    worker.pp_rank = int(offset > 0)
++    worker.layerwise_key_layer_offset = offset
++    worker.total_layers = total_layers
++    worker.num_layers = len(layer_entries)
++    worker.layerwise_key_layers = worker.num_layers - 1
++    worker.num_kv_cache_groups = 1
++    worker.use_layerwise_transfer = not block_key
++    worker.use_block_key_layerwise = block_key
++    worker.dcp_size = dcp_size
++    worker.dcp_rank = dcp_rank
++    worker.put_step = 8 if dcp_size > 1 else 1
++    flat = [size for entries in layer_entries for size in entries]
++    offsets = [0]
++    for entries in layer_entries:
++        offsets.append(offsets[-1] + len(entries))
++    worker.group_num_layers = {0: len(layer_entries)}
++    worker.group_block_len = {0: flat}
++    worker.group_block_stride = {0: [size * 2 for size in flat]}
++    worker.group_kv_caches_base_addr = {0: [10_000_000 + i * 1_000_000 for i in range(len(flat))]}
++    worker.group_layer_cache_entry_offsets = {0: offsets}
++    worker.token_database = worker
++    worker.page_size_bytes = sum(flat)
++    return worker
++
++
++@pytest.mark.parametrize(
++    ("layer_entries", "offset"),
++    [
++        ([[83968]] * 37, 42),
++        ([[83968]] * 39, 42),
++        ([[83968, 128 + i] for i in range(36)] + [[83968, 17]], 42),
++        ([[83968]] * 42, 0),
++    ],
++    ids=["one-mtp", "multiple-mtp", "unequal-cache-entries", "first-stage-control"],
++)
++@pytest.mark.parametrize("block_id", [0, 1])
++def test_pp_physical_copies_fit_allocated_object(layer_entries, offset, block_id):
++    worker = _worker(layer_entries, offset=offset)
++    builder = worker._build_group_layer_builders()[0]
++    allocated = worker._global_group_alloc_size(0)
++    base = 1_000_000_000
++    copied_bytes = 0
++    for layer, entries in enumerate(layer_entries):
++        addrs, sizes, gvas = builder._build_transfer_arrays(np.array([block_id]), np.array([base]), layer)
++        assert len(gvas) == len(entries)
++        assert np.all(gvas >= base)
++        assert np.all(gvas + sizes <= base + allocated)
++        start = worker.group_layer_cache_entry_offsets[0][layer]
++        expected = [
++            worker.group_kv_caches_base_addr[0][start + i] + block_id * worker.group_block_stride[0][start + i]
++            for i in range(len(entries))
++        ]
++        assert addrs.tolist() == expected
++        copied_bytes += int(sizes.sum())
++    assert copied_bytes == sum(worker.group_block_len[0])
++    assert worker.layerwise_key_layers == len(layer_entries)
++    assert builder.page_size_bytes == allocated
++    # The byte origin is unchanged; only an insufficient object grows.
++    assert builder.layer_byte_offset == offset * (copied_bytes // len(layer_entries))
++
++
++@pytest.mark.parametrize("dcp_rank", range(4))
++def test_dcp_stride_covers_extended_stage_before_alignment(dcp_rank):
++    mib = 1024 * 1024
++    worker = _worker([[mib]] * 37, dcp_size=4, dcp_rank=dcp_rank)
++    builder = worker._build_group_layer_builders()[0]
++    allocated = worker._global_group_alloc_size(0)
++    # 78 MiB formerly aligned exactly; the physical stage needs 79 MiB.
++    assert allocated == 4 * 80 * mib
++    stride = allocated // 4
++    base = 1_000_000_000
++    for layer in range(37):
++        _, sizes, gvas = builder._build_transfer_arrays(np.array([0]), np.array([base]), layer)
++        assert np.all(gvas >= base + dcp_rank * stride)
++        assert np.all(gvas + sizes <= base + (dcp_rank + 1) * stride)
++    assert builder.layer_byte_offset == dcp_rank * stride + 42 * mib
++
++
++def test_multigroup_layout_with_sufficient_capacity_is_unchanged():
++    worker = _worker([[32]] * 16, offset=32, total_layers=61)
++    worker.num_layers = 32
++    worker.num_kv_cache_groups = 2
++    worker.group_num_layers = {0: 16, 1: 16}
++    worker.group_block_len[1] = [64] * 16
++    worker.group_block_stride[1] = [128] * 16
++    worker.group_kv_caches_base_addr[1] = [30_000_000 + i * 1000 for i in range(16)]
++    worker.group_layer_cache_entry_offsets[1] = list(range(17))
++    builders = worker._build_group_layer_builders()
++    for group, size in enumerate([32, 64]):
++        assert builders[group].page_size_bytes == 61 * size
++        assert builders[group].layer_byte_offset == 32 * size
++    assert worker.layerwise_key_layers == 32
++
++
++def test_block_key_layout_keeps_stage_local_object():
++    worker = _worker([[83968]] * 37, block_key=True)
++    builder = worker._build_group_layer_builders()[0]
++    assert builder.page_size_bytes == 37 * 83968
++    assert builder.layer_byte_offset == 0
++
++
++@pytest.mark.parametrize("total_layers", [None, 0])
++def test_missing_global_metadata_preserves_local_fallback(total_layers):
++    worker = _worker([[13, 7], [29]], total_layers=total_layers)
++    assert worker._global_group_alloc_size(0) == 49
++
++
++def test_existing_round_up_rule_is_preserved():
++    worker = _worker([[2], [1]], offset=0, total_layers=2)
++    assert worker._global_group_alloc_size(0) == 4
+diff --git a/vllm_ascend/distributed/kv_transfer/kv_pool/ascend_store/pool_worker.py b/vllm_ascend/distributed/kv_transfer/kv_pool/ascend_store/pool_worker.py
+index 7a3122bc1..b46473cd8 100644
+--- a/vllm_ascend/distributed/kv_transfer/kv_pool/ascend_store/pool_worker.py
++++ b/vllm_ascend/distributed/kv_transfer/kv_pool/ascend_store/pool_worker.py
+@@ -671,6 +671,17 @@ class KVPoolWorker:
+             [global_to_local[layer] for layer in independent_layers],
+         )
+ 
++    def _group_pp_byte_offset(self, group_id: int) -> int:
++        """Keep GVA allocation and transfer origins on the same PP layout."""
++        if getattr(self, "pp_size", 1) == 1 or getattr(self, "use_block_key_layerwise", False):
++            return 0
++        block_lens = self.group_block_len.get(group_id) or []
++        num_layers = int(self.group_num_layers.get(group_id, 0))
++        if not block_lens or num_layers <= 0:
++            return 0
++        per_layer = sum(block_lens) // num_layers
++        return int(getattr(self, "layerwise_key_layer_offset", 0)) * per_layer
++
+     def _build_group_layer_builders(self) -> list[LayerBatchBuilder]:
+         builders = []
+         # Sync layerwise_key_layers with the (possibly updated) num_layers.
+@@ -704,12 +715,9 @@ class KVPoolWorker:
+             #       size (unaligned strides yield misaligned GVA addresses).
+             #       With put_step == 1 every rank owns a distinct region key
+             #       and no shard separation is needed.
+-            layer_byte_offset = 0
++            layer_byte_offset = self._group_pp_byte_offset(group_id)
+             gbl = self.group_block_len.get(group_id) or []
+             if not self.use_block_key_layerwise and gbl and group_num_layers > 0:
+-                per_layer = sum(gbl) // group_num_layers
+-                if getattr(self, "pp_size", 1) > 1:
+-                    layer_byte_offset += int(getattr(self, "layerwise_key_layer_offset", 0)) * per_layer
+                 if self.dcp_size > 1 and self.put_step > 1:
+                     # Use the GLOBAL region size (PP-aware) as the basis for
+                     # the per-shard stride; under PP>1 the local sum(gbl) only
+@@ -1082,6 +1090,10 @@ class KVPoolWorker:
+             return sum(gbl)
+         per_layer = (sum(gbl) + n_local - 1) // n_local
+         n_global = max(total_layers, int(self.num_layers), n_local)
++        # Physical cache layers (for example MTP) can extend past the target
++        # model's last layer. Preserve the existing byte origin, but cover the
++        # complete local payload instead of sizing from target layers alone.
++        shard_bytes = max(per_layer * n_global, self._group_pp_byte_offset(group_id) + sum(gbl))
+         # DCP shard-major layout: ranks sharing head_or_tp_rank (put_step>1,
+         # e.g. MLA) hold different context shards of the same logical block
+         # and share ONE region, so the region must cover all shards. The
+@@ -1092,9 +1104,9 @@ class KVPoolWorker:
+         # key and no shard separation is needed.
+         if self.put_step > 1 and self.dcp_size > 1:
+             gva_align = 2 * 1024 * 1024
+-            shard_stride = (per_layer * n_global + gva_align - 1) // gva_align * gva_align
++            shard_stride = (shard_bytes + gva_align - 1) // gva_align * gva_align
+             return shard_stride * self.dcp_size
+-        return per_layer * n_global
++        return shard_bytes
+ 
+     def _infer_cache_group_metadata(self, group_id: int, layer_names: list[str]):
+         group_addrs: list[int] = []

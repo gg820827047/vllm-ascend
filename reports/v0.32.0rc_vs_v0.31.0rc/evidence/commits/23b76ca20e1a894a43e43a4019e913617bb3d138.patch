@@ -1,0 +1,225 @@
+commit 23b76ca20e1a894a43e43a4019e913617bb3d138
+Author:     yFeng-dev <yfeng.github@gmail.com>
+AuthorDate: Thu Oct 29 16:55:00 2026 +0800
+Commit:     GitHub <noreply@github.com>
+CommitDate: Thu Oct 29 16:55:00 2026 +0800
+
+    [BugFix][PD] Handle TP-replicated Mamba state in Mooncake V2 (#19974)
+    
+    ### What this PR does / why we need it?
+    
+    Mooncake V2 currently treats every `MambaSpec` state as sharded across
+    TP/PCP workers. That is incorrect for a state marked
+    `tp_replicated=True`, such as PLE convolution state: each worker owns
+    the complete state. With unequal TP the sharded path can reject the
+    producer rank or attempt an unsupported SHORT_CONV split; with equal TP
+    it unnecessarily requires matching producer/consumer ranks.
+    
+    Honor the existing `tp_replicated` contract when choosing a producer and
+    constructing transfer addresses:
+    
+    - Put all producer PCP/TP workers in one replica group so the existing
+    selection logic chooses one complete copy.
+    - Copy the complete logical state after checking that local/remote
+    shapes and byte lengths agree. Preserve each side's physical block
+    stride.
+    - Keep existing rank, integer-ratio, and slicing rules for
+    non-replicated GDN/Mamba state. Missing `tp_replicated` attributes
+    retain the old behavior through `getattr(..., False)`.
+    
+    This is a standalone fix based on upstream `main` at
+    `c5cf3a6b14a4281a79e12f781b332ff8c09088b7`. A model must supply a spec
+    with `tp_replicated=True` to opt into the replicated-state path; the
+    verified vLLM main revision already provides this field.
+    
+    ### Does this PR introduce _any_ user-facing change?
+    
+    Yes. Mooncake V2 can transfer replicated Mamba/PLE state as a complete
+    copy across different TP ranks and sizes instead of treating it as a
+    head shard. No new flags, environment variables, model code, cache
+    layout changes, or monkey patches are introduced. This does not add
+    general model support or change non-replicated state partitioning.
+    
+    ### How was this patch tested?
+    
+    Validation uses an isolated checkout of the upstream base plus only this
+    fix and its tests, with the repository's verified vLLM main
+    `544f182d9f0c9bfe8bd7645525951d5e3692a542`. These are CPU unit tests in
+    the existing Ascend container; compiled extensions were reused for
+    imports and no model services were restarted.
+    
+    - Before the fix: all **20 new regression cases failed**, 153 existing
+    cases deselected.
+    - After the fix: the complete affected module passed, **173 passed**, 14
+    warnings.
+    
+    ```bash
+    # Run new regressions against the original pull_worker.py, then restore the fix.
+    python -m pytest tests/ut/kv_offload/mooncake_v2/test_pull_worker.py \
+      -k 'replicated_mamba_selects or replicated_short_conv_copies' -q --disable-warnings
+    
+    # Run the complete affected module with the fix.
+    python -m pytest tests/ut/kv_offload/mooncake_v2/test_pull_worker.py \
+      -q --disable-warnings
+    ```
+    
+    New cases cover equal TP, both directions of unequal TP, non-integral TP
+    ratios for replicated state, producer PCP replication, different
+    source/destination ranks, logical lengths smaller than physical strides,
+    and rejection of shape/length mismatches. Existing tests cover
+    non-replicated state behavior.
+    
+    Earlier integrated Ascend 910C/A3 testing exercised the same
+    replicated-state logic with Qwen3.8-Flash-Next-w8a8, MRV2, MTP3, block
+    size 1536, P TP8 → D TP8 and P TP8 → D TP4/DP2. Each topology completed
+    64 concurrent proxy requests with no repeated-exclamation outputs or
+    corrupted-request metric increments. That deployment also included
+    separate model/layout/NHD fixes; this is supporting integration
+    evidence, not an end-to-end result for upstream main plus this
+    standalone patch alone, nor a full GSM8K accuracy claim.
+    
+    Repository-pinned Ruff check/format and `git diff --check` pass. `bash
+    format.sh ci` was attempted but stopped during markdownlint dependency
+    installation with npm `SELF_SIGNED_CERT_IN_CHAIN`; full CI remains
+    pending.
+    
+    ### Checklist
+    
+    - [x] Boundary / edge-case coverage: equal/unequal TP and PCP replica
+    selection.
+    - [x] Regression tests fail against the original production code.
+    - [x] Error paths cover shape and logical-length mismatches.
+    - [x] Tests assert selected transfer groups, byte addresses, and copied
+    lengths.
+    - [ ] Full upstream CI and comparative performance benchmarking.
+    
+    - vLLM main:
+    https://github.com/vllm-project/vllm/commit/544f182d9f0c9bfe8bd7645525951d5e3692a542
+    
+    ---------
+    
+    Signed-off-by: yFeng-dev <yfeng.github@gmail.com>
+
+diff --git a/tests/ut/kv_offload/mooncake_v2/test_pull_worker.py b/tests/ut/kv_offload/mooncake_v2/test_pull_worker.py
+index 018366f37..447a30890 100644
+--- a/tests/ut/kv_offload/mooncake_v2/test_pull_worker.py
++++ b/tests/ut/kv_offload/mooncake_v2/test_pull_worker.py
+@@ -1992,3 +1992,61 @@ def test_compute_block_ids_across_unequal_block_size_dcp_matrix(
+     )
+ 
+     assert result == expected
++
++
++@pytest.mark.parametrize(("local_tp", "remote_tp"), [(4, 8), (8, 4), (4, 4), (2, 3)])
++@pytest.mark.parametrize("remote_pcp", [1, 2])
++def test_replicated_mamba_selects_one_complete_producer_replica(local_tp: int, remote_tp: int, remote_pcp: int) -> None:
++    spec = replace(make_mamba_spec(), tp_replicated=True)
++    thread = make_thread(tp_size=local_tp, tp_rank=local_tp - 1)
++    groups = thread._get_layer_remote_tp_rank_groups(0, 0, spec, make_pp_metadata(), remote_pcp, remote_tp, 1)
++    assert groups == [list(range(remote_pcp * remote_tp))]
++    transfers = thread._compute_group_block_ids(
++        "request", groups, 1, 0, 16, 16, [2], [2], [3], 15, 15, 0, 1, 1, spec, 1
++    )
++    assert transfers == [(1, [2], [3])]
++
++
++@pytest.mark.parametrize(("local_tp", "remote_tp"), [(4, 8), (8, 4), (4, 4), (2, 3)])
++@pytest.mark.parametrize("mismatch", [None, "shape", "length"])
++def test_replicated_short_conv_copies_complete_state_between_different_ranks(
++    local_tp: int, remote_tp: int, mismatch: str | None
++) -> None:
++    spec = replace(
++        make_mamba_spec(),
++        shapes=((3, 16),),
++        dtypes=(torch.float16,),
++        mamba_type=MambaAttentionBackendEnum.SHORT_CONV,
++        tp_replicated=True,
++    )
++    thread = make_thread(
++        tp_size=local_tp,
++        tp_rank=local_tp - 1,
++        kv_caches_base_addr=[[1000]],
++        block_shapes=[[(3, 16)]],
++        block_strides=[[128]],
++        block_lens=[[96]],
++    )
++    remote = make_pp_metadata(
++        block_shapes=[[(6, 8) if mismatch == "shape" else (3, 16)]],
++        block_strides=[[160]],
++        block_lens=[[94 if mismatch == "length" else 96]],
++        tp_base_addrs={0: [[5000]]},
++    )
++    src: list[int] = []
++    dst: list[int] = []
++    lengths: list[int] = []
++
++    def append() -> None:
++        thread._append_mamba_transfer_addresses(
++            spec, 0, 0, remote_tp, {(0, 0): [("request", [1], [2])]}, remote, src, dst, lengths
++        )
++
++    if mismatch is not None:
++        with pytest.raises(ValueError, match="replicated Mamba metadata mismatch"):
++            append()
++    else:
++        append()
++        assert src == [1128]
++        assert dst == [5320]
++        assert lengths == [96]
+diff --git a/vllm_ascend/distributed/kv_transfer/kv_p2p/mooncake/pull_worker.py b/vllm_ascend/distributed/kv_transfer/kv_p2p/mooncake/pull_worker.py
+index 1c7c83a31..0bad2f141 100644
+--- a/vllm_ascend/distributed/kv_transfer/kv_p2p/mooncake/pull_worker.py
++++ b/vllm_ascend/distributed/kv_transfer/kv_p2p/mooncake/pull_worker.py
+@@ -323,6 +323,9 @@ class MooncakePullRecvingThread(threading.Thread):
+     ) -> list[list[int]]:
+         """Infer one matched layer's TP strategy and remote rank groups."""
+         if isinstance(spec, MambaSpec):
++            if getattr(spec, "tp_replicated", False):
++                # PLE keeps the complete state on every PCP/TP worker.
++                return [list(range(remote_pcp_size * remote_tp_size))]
+             return self._get_mamba_remote_tp_rank_groups(
+                 remote_pcp_size,
+                 remote_tp_size,
+@@ -928,7 +931,8 @@ class MooncakePullRecvingThread(threading.Thread):
+         dst_list: list[int],
+         length_list: list[int],
+     ) -> None:
+-        """Append Mamba conv/SSM slices for one producer PCP/TP head shard."""
++        """Append a replicated Mamba state or one producer PCP/TP head shard."""
++        tp_replicated = getattr(spec, "tp_replicated", False)
+         remote_tp_metadata = remote_metadata.metadata_by_pcp_rank[remote_pcp_rank].metadata_by_tp_rank[remote_tp_rank]
+         local_rank = self.tp_rank * self.pcp_size + self.pcp_rank
+         local_size = self.pcp_size * self.tp_size
+@@ -936,12 +940,14 @@ class MooncakePullRecvingThread(threading.Thread):
+         remote_size = len(remote_metadata.metadata_by_pcp_rank) * remote_tp_size
+         larger_tp_size = max(local_size, remote_size)
+         smaller_tp_size = min(local_size, remote_size)
+-        if smaller_tp_size <= 0 or larger_tp_size % smaller_tp_size != 0:
++        if smaller_tp_size <= 0 or (not tp_replicated and larger_tp_size % smaller_tp_size != 0):
+             raise ValueError(
+                 f"Mooncake Mamba TP sizes must have an integer ratio, got local={local_size}, remote={remote_size}"
+             )
+         tp_ratio = larger_tp_size // smaller_tp_size
+-        if remote_size >= local_size:
++        if tp_replicated:
++            rank_offset = 0
++        elif remote_size >= local_size:
+             rank_offset = remote_rank % tp_ratio
+             if remote_rank // tp_ratio != local_rank:
+                 raise ValueError(f"Mooncake Mamba remote TP {remote_rank} does not belong to local TP {local_rank}")
+@@ -975,7 +981,14 @@ class MooncakePullRecvingThread(threading.Thread):
+                 remote_shape = remote_shapes[cache_index]
+ 
+                 address_slices: list[tuple[int, int, int]]
+-                if local_size == remote_size:
++                if tp_replicated:
++                    if local_shape != remote_shape or local_block_len != remote_block_len:
++                        raise ValueError(
++                            f"Mooncake replicated Mamba metadata mismatch for layer "
++                            f"{self.layer_names[local_layer_index]!r}, cache {cache_index}"
++                        )
++                    address_slices = [(0, 0, local_block_len)]
++                elif local_size == remote_size:
+                     if remote_rank != local_rank or local_block_len != remote_block_len:
+                         raise ValueError(
+                             f"Mooncake Mamba equal-TP metadata mismatch for layer "

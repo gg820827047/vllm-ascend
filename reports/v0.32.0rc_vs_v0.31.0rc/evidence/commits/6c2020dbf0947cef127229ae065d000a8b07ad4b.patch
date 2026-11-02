@@ -1,0 +1,579 @@
+commit 6c2020dbf0947cef127229ae065d000a8b07ad4b
+Author:     qijiajin <qijiajin1@huawei.com>
+AuthorDate: Sat Oct 31 14:22:37 2026 +0800
+Commit:     GitHub <noreply@github.com>
+CommitDate: Sat Oct 31 14:22:37 2026 +0800
+
+    [Performance] Optimize Qwen PLE prefill with Triton on Ascend (#20344)
+    
+    ### What this PR does / why we need it
+    
+    Optimize Qwen PLE prefill on Ascend with a prefill-only Triton module.
+    The Ascend model binding selects the path once: prefill calls
+    `ple_conv_prefill`; decode and speculative decoding call upstream
+    `ple_conv`. There is no single-request special case or backend-selection
+    environment variable.
+    
+    The prefill path materializes the four-tap weights as contiguous `[tap,
+    channel]` data, reads channels contiguously, skips history-state loads
+    when a tap comes from the current chunk, and uses a measured
+    2048-channel tile with eight warps. The separate state-writeback kernel
+    preserves old history until every token has read it. Multi-request
+    batches, token remapping, initial history, null state slots, and both
+    state strides are supported. This replaces the earlier PyTorch prefill
+    implementation in this PR.
+    
+    The model-local binding remains under maintainer review. The required
+    Ascend Qwen model adaptation is present in main; this PR supersedes
+    #20269.
+    
+    ### Validation
+    
+    - In `qjj_flash_main` on Ascend 950DT with vLLM
+    `544f182d9f0c9bfe8bd7645525951d5e3692a542`, an isolated checkout of the
+    final PR source passed all four NPU nightly operator tests. The tests
+    verify exact output and final state against upstream, and explicitly
+    verify mode routing through the model binding. Actual import paths were
+    checked before testing.
+    - Earlier diagnostic kernel sweeps covered 62 BF16/FP16 cases, including
+    mode semantics, token maps, both state strides, optional residuals,
+    4096/8192-token inputs, and channel tails. The final PR module is
+    prefill-only; decode/spec use upstream directly. Final module cleanup
+    was revalidated by the nightly suite.
+    - Focused final-dispatcher full-call timing at BF16 and 8192 total
+    tokens: 0.876 ms for one request with channel-stride-12 test state, and
+    0.758 ms for four requests with channel-stride-one state (the current
+    vLLM default layout). These are isolated operator times, not service
+    TTFT.
+    - Focused Ruff lint/format, Python compilation, and diff checks passed.
+    
+    ### Follow-up
+    
+    - Model ownership and patch removal are tracked in #20384; rewire the
+    PLE operator after that refactor is integrated.
+    - Validate service-level TTFT and broader hardware/configuration
+    coverage.
+    
+    - vLLM main:
+    https://github.com/vllm-project/vllm/commit/544f182d9f0c9bfe8bd7645525951d5e3692a542
+    
+    ---------
+    
+    Signed-off-by: qijiajin <qijiajin1@huawei.com>
+
+diff --git a/tests/e2e/nightly/single_node/ops/singlecard_ops/test_triton_ple.py b/tests/e2e/nightly/single_node/ops/singlecard_ops/test_triton_ple.py
+new file mode 100644
+index 000000000..2a1377db9
+--- /dev/null
++++ b/tests/e2e/nightly/single_node/ops/singlecard_ops/test_triton_ple.py
+@@ -0,0 +1,167 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Ascend project
++"""NPU comparisons against upstream PLE, including state writeback."""
++
++from itertools import accumulate
++
++import torch
++import torch_npu  # noqa: F401
++from vllm.models.qwen4_exp.common.ops.ple import ple_conv as upstream_ple_conv
++from vllm.v1.attention.backends.utils import NULL_BLOCK_ID
++
++from vllm_ascend.models.qwen4_exp import ple as ple_adapter
++from vllm_ascend.models.qwen4_exp.ple import _ple_conv_ascend, patch_upstream_ple_short_conv
++
++
++def test_model_dispatch_uses_upstream_decode_and_spec(monkeypatch):
++    from vllm.models.qwen4_exp.amd import ple_layer
++
++    patch_upstream_ple_short_conv()
++    assert ple_layer.ple_conv is _ple_conv_ascend
++    calls = []
++    monkeypatch.setattr(ple_adapter, "ple_conv_prefill", lambda *args, **kwargs: calls.append("prefill"))
++    monkeypatch.setattr(ple_adapter, "upstream_ple_conv", lambda *args, **kwargs: calls.append(kwargs["mode"]))
++    for mode in ("prefill", "decode", "spec"):
++        ple_layer.ple_conv(mode=mode)
++    assert calls == ["prefill", "decode", "spec"]
++
++
++def test_modes_and_token_mapping():
++    torch.manual_seed(29)
++    for mode in ("decode", "spec", "prefill"):
++        for dtype in (torch.bfloat16, torch.float16):
++            for outer_enabled in (False, True):
++                requests = 14
++                tokens = requests if mode == "decode" else (3 * requests if mode == "spec" else 64)
++                channels, dilation, spec_len = 10240, 3, 3
++                state_width = 12
++                x = torch.randn(tokens, channels, device="npu", dtype=dtype)
++                weights = torch.randn(channels, 4, device="npu", dtype=dtype)
++                state = torch.randn(requests + 1, channels, state_width, device="npu", dtype=dtype)
++                residual = torch.randn_like(x)
++                outer = torch.randn_like(x) if outer_enabled else None
++                slots = torch.arange(1, requests + 1, device="npu", dtype=torch.int32)
++                slots[-1] = NULL_BLOCK_ID
++                if mode == "decode":
++                    qsl = None
++                elif mode == "spec":
++                    qsl = torch.arange(0, tokens + 1, 3, device="npu", dtype=torch.int32)
++                else:
++                    lengths = [64 // requests] * requests
++                    for request in range(64 % requests):
++                        lengths[request] += 1
++                    qsl = torch.tensor([0, *accumulate(lengths)], device="npu", dtype=torch.int32)
++                kwargs = dict(
++                    inputs=x,
++                    conv_weights=weights,
++                    state_indices=slots,
++                    outer_residual=outer,
++                    mode=mode,
++                    dilation=dilation,
++                    query_start_loc=qsl,
++                    num_accepted_tokens=(
++                        torch.tensor([r % spec_len + 1 for r in range(requests)], device="npu", dtype=torch.int32)
++                        if mode == "spec"
++                        else None
++                    ),
++                    has_initial_states=(
++                        torch.tensor([r % 2 == 0 for r in range(requests)], device="npu") if mode != "spec" else None
++                    ),
++                    spec_query_len=spec_len,
++                    token_indices=torch.arange(tokens - 1, -1, -1, device="npu", dtype=torch.int32),
++                )
++                if mode == "prefill":
++                    kwargs.pop("num_accepted_tokens")
++                    kwargs.pop("spec_query_len")
++                expected, actual = residual.clone(), residual.clone()
++                expected_state, actual_state = state.clone(), state.clone()
++                upstream_ple_conv(**kwargs, residual=expected, conv_state=expected_state)
++                _ple_conv_ascend(**kwargs, residual=actual, conv_state=actual_state)
++                torch.npu.synchronize()
++                exact = (expected == actual).float().mean().item()
++                max_abs = (expected.float() - actual.float()).abs().max().item()
++                state_exact = torch.equal(expected_state, actual_state)
++                print(
++                    f"CASE mode={mode} dtype={dtype} outer={outer_enabled} "
++                    f"exact={exact:.6f} max_abs={max_abs:.6f} state_exact={state_exact}",
++                    flush=True,
++                )
++                assert exact == 1.0 and state_exact
++
++
++def test_prefill_one_request():
++    torch.manual_seed(37)
++    for dtype in (torch.bfloat16, torch.float16):
++        for tokens in (256, 8192):
++            channels = 10240
++            x = torch.randn(tokens, channels, device="npu", dtype=dtype)
++            weights = torch.randn(channels, 4, device="npu", dtype=dtype)
++            original_state = torch.randn(2, channels, 12, device="npu", dtype=dtype)
++            original_output = torch.randn_like(x)
++            for initialized in (True, False):
++                for null_slot in (False, True):
++                    for outer_enabled in (False, True):
++                        # Keep the long shape to the common valid-state path.
++                        if tokens == 8192 and (not initialized or null_slot):
++                            continue
++                        expected_state = original_state.clone()
++                        actual_state = original_state.clone()
++                        expected_output = original_output.clone()
++                        actual_output = original_output.clone()
++                        outer = torch.randn_like(x) if outer_enabled else None
++                        kwargs = dict(
++                            inputs=x,
++                            conv_weights=weights,
++                            state_indices=torch.tensor(
++                                [NULL_BLOCK_ID if null_slot else 1], device="npu", dtype=torch.int32
++                            ),
++                            outer_residual=outer,
++                            mode="prefill",
++                            dilation=3,
++                            query_start_loc=torch.tensor([0, tokens], device="npu", dtype=torch.int32),
++                            has_initial_states=torch.tensor([initialized], device="npu"),
++                        )
++                        upstream_ple_conv(**kwargs, residual=expected_output, conv_state=expected_state)
++                        _ple_conv_ascend(**kwargs, residual=actual_output, conv_state=actual_state)
++                        torch.npu.synchronize()
++                        exact = (expected_output == actual_output).float().mean().item()
++                        max_abs = (expected_output.float() - actual_output.float()).abs().max().item()
++                        state_exact = torch.equal(expected_state, actual_state)
++                        print(
++                            f"PREFILL dtype={dtype} T={tokens} initial={initialized} null={null_slot} "
++                            f"outer={outer_enabled} exact={exact:.6f} max_abs={max_abs:.6f} "
++                            f"state_exact={state_exact}",
++                            flush=True,
++                        )
++                        assert exact == 1.0 and state_exact
++
++
++def test_prefill_multiple_requests_across_token_chunks():
++    torch.manual_seed(41)
++    tokens, channels = 1031, 256
++    query_start_loc = torch.tensor([0, 1, 1023, 1024, tokens], device="npu", dtype=torch.int32)
++    state_indices = torch.tensor([1, 2, 3, NULL_BLOCK_ID], device="npu", dtype=torch.int32)
++    has_initial_states = torch.tensor([True, False, True, True], device="npu")
++    for dtype in (torch.bfloat16, torch.float16):
++        inputs = torch.randn(tokens, channels, device="npu", dtype=dtype)
++        weights = torch.randn(channels, 4, device="npu", dtype=dtype)
++        state = torch.randn(4, 12, channels, device="npu", dtype=dtype).transpose(1, 2)
++        residual = torch.randn_like(inputs)
++        outer_residual = torch.randn_like(inputs)
++        kwargs = dict(
++            inputs=inputs,
++            conv_weights=weights,
++            state_indices=state_indices,
++            outer_residual=outer_residual,
++            mode="prefill",
++            dilation=3,
++            query_start_loc=query_start_loc,
++            has_initial_states=has_initial_states,
++        )
++        expected, actual = residual.clone(), residual.clone()
++        expected_state, actual_state = state.clone(), state.clone()
++        upstream_ple_conv(**kwargs, residual=expected, conv_state=expected_state)
++        _ple_conv_ascend(**kwargs, residual=actual, conv_state=actual_state)
++        torch.npu.synchronize()
++        assert torch.equal(expected, actual)
++        assert torch.equal(expected_state, actual_state)
+diff --git a/vllm_ascend/models/qwen4_exp/ple.py b/vllm_ascend/models/qwen4_exp/ple.py
+index 5bb1fffb6..0d030657a 100644
+--- a/vllm_ascend/models/qwen4_exp/ple.py
++++ b/vllm_ascend/models/qwen4_exp/ple.py
+@@ -18,15 +18,24 @@ from __future__ import annotations
+ 
+ from collections.abc import Callable
+ from functools import wraps
+-from typing import Any
++from typing import Any, Literal
+ 
+ import torch
+ import torch.nn.functional as F
+ import torch_npu
+ from vllm.logger import logger
++from vllm.models.qwen4_exp.common.ops.ple import ple_conv as upstream_ple_conv
+ from vllm.v1.attention.backends.utils import NULL_BLOCK_ID
+ 
+ from vllm_ascend.attention.utils import wait_for_kv_layer_from_connector
++from vllm_ascend.ops.triton_ple import ple_conv_prefill
++
++
++def _ple_conv_ascend(*args: Any, mode: Literal["decode", "spec", "prefill"], **kwargs: Any) -> None:
++    if mode == "prefill":
++        ple_conv_prefill(*args, **kwargs)
++    else:
++        upstream_ple_conv(*args, mode=mode, **kwargs)
+ 
+ 
+ def _get_allow_internal_format() -> bool:
+@@ -244,6 +253,7 @@ def _patch_legacy_prefill(ple_layer_cls: type[Any]) -> None:
+ 
+ def patch_upstream_ple_short_conv() -> None:
+     """Install Ascend PLE runtime adaptations on the upstream classes."""
++    from vllm.models.qwen4_exp.amd import ple_layer as upstream_ple_layer
+     from vllm.models.qwen4_exp.amd.ple_layer import Qwen4ExpPLELayer
+     from vllm.models.qwen4_exp.common.ngram_embedding import (
+         Qwen4ExpPLEEmbeddingMethod,
+@@ -254,6 +264,10 @@ def patch_upstream_ple_short_conv() -> None:
+         AscendModelSlimConfig,
+     )
+ 
++    # The AMD PLE class binds this function at module import time.  Replace
++    # only that model-local binding; other platforms keep the upstream kernel.
++    upstream_ple_layer.ple_conv = _ple_conv_ascend
++
+     original_attr = "_ascend_original_short_conv"
+     if not hasattr(Qwen4ExpPLELayer, original_attr):
+         original = Qwen4ExpPLELayer._short_conv
+diff --git a/vllm_ascend/ops/triton_ple.py b/vllm_ascend/ops/triton_ple.py
+new file mode 100644
+index 000000000..632a46ebd
+--- /dev/null
++++ b/vllm_ascend/ops/triton_ple.py
+@@ -0,0 +1,288 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Ascend project
++"""Ascend-friendly Qwen PLE prefill short convolution."""
++
++import torch
++from vllm.platforms import current_platform
++from vllm.triton_utils import tl, triton
++from vllm.v1.attention.backends.utils import NULL_BLOCK_ID
++
++PLE_BLOCK_C = 2048
++PLE_NUM_WARPS = 8
++
++
++# Dilated short convolution
++@triton.jit(do_not_specialize=["num_reqs", "bs_iters", "has_token_map"])
++def _ple_conv_kernel(
++    x_ptr,
++    state_ptr,
++    w_ptr,
++    residual_ptr,
++    outer_residual_ptr,
++    state_idx_ptr,
++    qsl_ptr,
++    has_init_ptr,
++    token_idx_ptr,
++    has_token_map,
++    num_reqs,
++    bs_iters,
++    state_idx_stride,
++    state_bs,
++    state_ws,
++    state_cs,
++    C: tl.constexpr,
++    BLOCK_C: tl.constexpr,
++    STATE_LEN: tl.constexpr,
++    DILATION: tl.constexpr,
++    KERNEL_SIZE: tl.constexpr,
++    NULL_STATE_ID: tl.constexpr,
++    FUSE_RESIDUAL: tl.constexpr,
++    launch_pdl: tl.constexpr,
++):
++    t = tl.program_id(0)
++    pid_c = tl.program_id(1)
++    c_offs = pid_c * BLOCK_C + tl.arange(0, BLOCK_C)
++    c_mask = c_offs < C
++
++    if launch_pdl:
++        tl.extra.cuda.gdc_wait()
++
++    # Mixed batches map logical rows back to the original token order.
++    output_t = tl.load(token_idx_ptr + t, mask=has_token_map, other=t).to(tl.int64)
++
++    # Locate the request containing this token.
++    lo = tl.full([], 1, tl.int32)
++    hi = tl.full([], num_reqs + 1, tl.int32)
++    for _ in range(bs_iters):
++        mid = (lo + hi) // 2
++        qmid = tl.load(qsl_ptr + mid, mask=mid <= num_reqs, other=0)
++        pred = qmid <= t
++        lo = tl.where(pred, mid + 1, lo)
++        hi = tl.where(pred, hi, mid)
++    r = tl.minimum(lo - 1, num_reqs - 1)
++    q_start = tl.load(qsl_ptr + r)
++    j = (t - q_start).to(tl.int32)
++    total_real = tl.load(qsl_ptr + num_reqs)
++    in_range = t < total_real
++
++    sid = tl.load(state_idx_ptr + r * state_idx_stride).to(tl.int64)
++    state_ok = sid != NULL_STATE_ID
++    sid_safe = tl.where(state_ok, sid, 0)
++    has_init = tl.load(has_init_ptr + r, mask=state_ok, other=0) != 0
++    read_state = state_ok & has_init
++    out_ok = in_range & state_ok
++
++    # state[sid, w, c] may be a strided view into a shared pool.
++    base_state = state_ptr + sid_safe * state_bs
++    acc = tl.zeros([BLOCK_C], tl.float32)
++    for k in tl.static_range(0, KERNEL_SIZE):
++        h = j + DILATION * k
++        from_state = h <= STATE_LEN - 1
++        state_tap = tl.full([BLOCK_C], 0, state_ptr.dtype.element_ty)
++        if from_state:
++            state_tap = tl.load(
++                base_state + h * state_ws + c_offs * state_cs,
++                mask=c_mask & read_state,
++                other=0.0,
++            )
++        input_t = q_start + h - STATE_LEN
++        input_t = tl.load(
++            token_idx_ptr + input_t,
++            mask=has_token_map & out_ok & (~from_state),
++            other=input_t,
++        ).to(tl.int64)
++        input_tap = tl.load(
++            x_ptr + input_t * C + c_offs,
++            mask=c_mask & out_ok & (~from_state),
++            other=0.0,
++        )
++        tap = tl.where(from_state, state_tap, input_tap).to(tl.float32)
++        weight = tl.load(
++            w_ptr + k * C + c_offs,
++            mask=c_mask,
++            other=0.0,
++        ).to(tl.float32)
++        acc += weight * tap
++
++    # F.conv1d materializes its output dtype before SiLU.
++    conv = acc.to(residual_ptr.dtype.element_ty).to(tl.float32)
++    y = conv * tl.sigmoid(conv)
++    conv_output = tl.where(out_ok, y, 0.0).to(residual_ptr.dtype.element_ty)
++    ple_output = conv_output
++    if FUSE_RESIDUAL:
++        residual = tl.load(
++            residual_ptr + output_t * C + c_offs,
++            mask=c_mask,
++            other=0.0,
++        )
++        # Preserve the original eager operation boundaries: short convolution is
++        # first accumulated into the BF16/FP16 PLE output, then the outer residual
++        # is added to that rounded value.
++        ple_output = (residual + conv_output).to(residual_ptr.dtype.element_ty)
++        outer_residual = tl.load(
++            outer_residual_ptr + output_t * C + c_offs,
++            mask=c_mask,
++            other=0.0,
++        )
++        ple_output = outer_residual.to(tl.float32) + ple_output.to(tl.float32)
++    if launch_pdl:
++        tl.extra.cuda.gdc_launch_dependents()
++    tl.store(
++        residual_ptr + output_t * C + c_offs,
++        ple_output,
++        mask=c_mask,
++    )
++
++
++# Write back separately so every token reads the old state.
++@triton.jit(do_not_specialize=["has_token_map"])
++def _ple_conv_writeback_kernel(
++    x_ptr,
++    state_ptr,
++    state_idx_ptr,
++    qsl_ptr,
++    has_init_ptr,
++    token_idx_ptr,
++    has_token_map,
++    state_idx_stride,
++    state_bs,
++    state_ws,
++    state_cs,
++    C: tl.constexpr,
++    BLOCK_C: tl.constexpr,
++    STATE_LEN: tl.constexpr,
++    NULL_STATE_ID: tl.constexpr,
++):
++    r = tl.program_id(0)
++    pid_c = tl.program_id(1)
++    c_offs = pid_c * BLOCK_C + tl.arange(0, BLOCK_C)
++    c_mask = c_offs < C
++
++    sid = tl.load(state_idx_ptr + r * state_idx_stride).to(tl.int64)
++    state_ok = sid != NULL_STATE_ID
++    if not state_ok:
++        return
++
++    q_start = tl.load(qsl_ptr + r)
++    q_end = tl.load(qsl_ptr + r + 1)
++    qlen = (q_end - q_start).to(tl.int32)
++    if qlen <= 0:
++        return
++
++    has_init = tl.load(has_init_ptr + r) != 0
++    src_ok = state_ok & has_init
++
++    base_state = state_ptr + sid * state_bs
++    for i in tl.static_range(0, STATE_LEN):
++        m = qlen + i
++        from_state = m <= STATE_LEN - 1
++        state_value = tl.load(
++            base_state + m * state_ws + c_offs * state_cs,
++            mask=c_mask & from_state & src_ok,
++            other=0.0,
++        )
++        input_t = q_start + m - STATE_LEN
++        input_t = tl.load(
++            token_idx_ptr + input_t,
++            mask=has_token_map & (~from_state),
++            other=input_t,
++        ).to(tl.int64)
++        input_value = tl.load(
++            x_ptr + input_t * C + c_offs,
++            mask=c_mask & (~from_state),
++            other=0.0,
++        )
++        value = tl.where(from_state, state_value, input_value)
++        tl.store(
++            base_state + i * state_ws + c_offs * state_cs,
++            value,
++            mask=c_mask,
++        )
++
++
++def ple_conv_prefill(
++    inputs: torch.Tensor,
++    residual: torch.Tensor,
++    conv_state: torch.Tensor,
++    conv_weights: torch.Tensor,
++    state_indices: torch.Tensor,
++    outer_residual: torch.Tensor | None,
++    *,
++    dilation: int,
++    query_start_loc: torch.Tensor | None = None,
++    has_initial_states: torch.Tensor | None = None,
++    token_indices: torch.Tensor | None = None,
++) -> None:
++    """Update state and write activated convolution into residual.
++    A non-None outer_residual enables both fused residual additions.
++    """
++    BLOCK_C = PLE_BLOCK_C
++    T, C = inputs.shape
++    K = conv_weights.shape[1]
++    state_len = (K - 1) * dilation
++    if token_indices is not None:
++        T = token_indices.numel()
++    if conv_state.shape[1] != C or conv_state.shape[2] < state_len:
++        raise ValueError(
++            f"conv_state must have shape [slots, channels, window], with channels={C} and window >= {state_len}"
++        )
++    state_bs, state_cs, state_ws = conv_state.stride()
++
++    if query_start_loc is None or has_initial_states is None:
++        raise ValueError("query_start_loc and has_initial_states are required for prefill")
++    num_reqs = state_indices.numel()
++    binary_search_iters = max(num_reqs, 1).bit_length()
++
++    launch_pdl = current_platform.is_arch_support_pdl()
++    # Pure-prefill indices can be a strided block-table column view.
++    state_idx_stride = state_indices.stride(0)
++
++    # Constexpr flags eliminate accesses to optional None arguments. Without a
++    # token map, state_indices is an unused but device-resident placeholder.
++    weights_by_tap = conv_weights.transpose(0, 1).contiguous()
++    _ple_conv_kernel[(T, triton.cdiv(C, BLOCK_C))](
++        inputs,
++        conv_state,
++        weights_by_tap,
++        residual,
++        outer_residual,
++        state_indices,
++        query_start_loc,
++        has_initial_states,
++        token_indices if token_indices is not None else state_indices,
++        token_indices is not None,
++        num_reqs,
++        binary_search_iters,
++        state_idx_stride,
++        state_bs,
++        state_ws,
++        state_cs,
++        C=C,
++        BLOCK_C=BLOCK_C,
++        STATE_LEN=state_len,
++        DILATION=dilation,
++        KERNEL_SIZE=K,
++        FUSE_RESIDUAL=outer_residual is not None,
++        NULL_STATE_ID=NULL_BLOCK_ID,
++        launch_pdl=launch_pdl,
++        num_warps=PLE_NUM_WARPS,
++    )
++    _ple_conv_writeback_kernel[(num_reqs, triton.cdiv(C, BLOCK_C))](
++        inputs,
++        conv_state,
++        state_indices,
++        query_start_loc,
++        has_initial_states,
++        token_indices if token_indices is not None else state_indices,
++        token_indices is not None,
++        state_idx_stride,
++        state_bs,
++        state_ws,
++        state_cs,
++        C=C,
++        BLOCK_C=BLOCK_C,
++        STATE_LEN=state_len,
++        NULL_STATE_ID=NULL_BLOCK_ID,
++        num_warps=PLE_NUM_WARPS,
++    )

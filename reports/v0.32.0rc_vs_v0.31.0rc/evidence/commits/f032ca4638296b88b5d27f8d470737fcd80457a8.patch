@@ -1,0 +1,543 @@
+commit f032ca4638296b88b5d27f8d470737fcd80457a8
+Author:     kx <1670186653@qq.com>
+AuthorDate: Tue Oct 27 16:22:54 2026 +0800
+Commit:     GitHub <noreply@github.com>
+CommitDate: Tue Oct 27 16:22:54 2026 +0800
+
+    [Feature] Speculative Decoding NGram NPU Implementations for MRV2 (#18061)
+    
+    ### What this PR does / why we need it?
+    refer to: https://github.com/vllm-project/vllm/pull/40704 ,
+    https://github.com/vllm-project/vllm-ascend/pull/11925
+    add Speculative Decoding NGram NPU Implementations for MRV2
+    
+    ### How was this patch tested?
+    test result :
+    |metrics|base(mrv1+ngram+async)|this pr(mrv2+ngram+async)|improve|
+     | :---:|:---:|:---:|:---:|
+     |TTFT|63.11ms|61.81ms|-2.05%|
+     |TPOT|12.22ms|8.61ms|-29.54%|
+    
+    this pr script:
+    ```
+    export ASCEND_RT_VISIBLE_DEVICES=0
+    export VLLM_USE_V2_MODEL_RUNNER=1
+    
+    vllm serve /nas/disk1/Qwen3-1.7B --port 8898 --dtype bfloat16 \
+    --tensor-parallel-size 1 --gpu-memory-utilization 0.8 \
+    --max-model-len 32768 --trust-remote-code \
+    --no-enable-prefix-caching \
+    --async-scheduling \
+    --speculative_config '{"method": "ngram_gpu", "num_speculative_tokens": 3, "prompt_lookup_max": 2,"prompt_lookup_min": 2}'
+    ```
+    base script:
+    ```
+    export ASCEND_RT_VISIBLE_DEVICES=0
+    
+    vllm serve /nas/disk1/Qwen3-1.7B --port 8898 --dtype bfloat16 \
+    --tensor-parallel-size 1 --gpu-memory-utilization 0.8 \
+    --max-model-len 32768 --trust-remote-code \
+    --no-enable-prefix-caching \
+    --async-scheduling \
+    --speculative_config '{"method": "ngram_gpu", "num_speculative_tokens": 3, "prompt_lookup_max": 2,"prompt_lookup_min": 2}'
+    ```
+    test script:
+    ```
+    export CONCURRENCY=10
+    
+    vllm bench serve \
+      --port 8898 \
+      --backend vllm \
+      --model /nas/disk1/Qwen3-1.7B \
+      --endpoint /v1/completions \
+      --dataset-name sonnet \
+      --dataset-path /model/xk/vllm/benchmarks/sonnet.txt \
+      --max-concurrency ${CONCURRENCY} \
+      --sonnet-input-len 128 \
+      --sonnet-output-len 100 \
+      --sonnet-prefix-len 10 \
+      --num-prompts 100 \
+      --ignore-eos \
+      --percentile-metrics "ttft,tpot,itl,e2el" \
+    ```
+    
+    
+    - vLLM main:
+    https://github.com/vllm-project/vllm/commit/c0b6f74bee518aeaf5d72b200a0216e72fbb5e7c
+    
+    ---------
+    
+    Signed-off-by: HF-001 <1670186653@qq.com>
+
+diff --git a/tests/e2e/pull_request/one_card/spec_decode/test_ngram_npu.py b/tests/e2e/pull_request/one_card/spec_decode/test_ngram_npu.py
+index 61c7ff18c..ea10c05e9 100644
+--- a/tests/e2e/pull_request/one_card/spec_decode/test_ngram_npu.py
++++ b/tests/e2e/pull_request/one_card/spec_decode/test_ngram_npu.py
+@@ -1,14 +1,140 @@
+ from __future__ import annotations
+ 
++from types import SimpleNamespace
+ from typing import Any
+ 
+ import pytest
++import torch
+ from vllm import SamplingParams
+ from vllm.config import CompilationConfig
+ from vllm.v1.metrics.reader import Counter, Vector
+ 
+ from tests.e2e.conftest import VllmRunner
+ from tests.e2e.pull_request.one_card.spec_decode.utils import calculate_acceptance_per_pos
++from vllm_ascend.worker.v2.spec_decode import init_speculator
++from vllm_ascend.worker.v2.states import AscendRequestState
++
++
++@pytest.mark.parametrize("max_model_len", [32, 257, 4096])
++@pytest.mark.parametrize("k", [1, 3, 5])
++@pytest.mark.parametrize("staged_history", [False, True])
++def test_mrv2_ngram_kernel_matches_reference(max_model_len, k, staged_history):
++    """Check matching, sparse request slots, fallback, and block boundaries on NPU."""
++    device = torch.device("npu")
++    generator = torch.Generator().manual_seed(40704)
++    rows = [
++        [1, 2, 3, 4, 1, 2, 5, 1, 2],
++        torch.randint(0, 8, (max_model_len,), generator=generator).tolist(),
++        [7],
++        [1, 2, 3, 1, 2],
++        [21, 22, 23, 24],
++    ]
++    # Force a longest match across a scan block boundary and at the context cap.
++    boundary = 255 if max_model_len >= 1024 else (127 if max_model_len >= 256 else 15)
++    suffix = [10, 11, 12, 13, 14]
++    rows[1][boundary : boundary + len(suffix)] = suffix
++    rows[1][-len(suffix) :] = suffix
++    slots = [5, 1, 6, 3, 0]
++    num_sampled = [3, 1, 1, 0, 1]
++    last_tokens = [2, rows[1][-1], 7, 2, 24]
++    token_ids = torch.full((8, max_model_len + 7), -1, dtype=torch.int32, device=device)
++    total_len = torch.zeros(8, dtype=torch.int32, device=device)
++    last_sampled = torch.zeros((8, 1), dtype=torch.int64, device=device)
++    states = SimpleNamespace(
++        all_token_ids=SimpleNamespace(gpu=token_ids),
++        total_len=SimpleNamespace(gpu=total_len),
++    )
++    if staged_history:
++        states = AscendRequestState(8, max_model_len, 128, k, 32, device, use_dense_all_token_ids=True)
++        token_ids = states.all_token_ids.gpu
++        total_len = states.total_len.gpu
++        token_ids.fill_(-1)
++    for row, slot, last in zip(rows, slots, last_tokens):
++        if staged_history:
++            states.all_token_ids.stage_write(slot, 0, row)
++            states.total_len.stage_write_elem(slot, len(row))
++        else:
++            token_ids[slot, : len(row)] = torch.tensor(row, dtype=torch.int32, device=device)
++            total_len[slot] = len(row)
++        last_sampled[slot, 0] = last
++    if staged_history:
++        states.apply_staged_writes()
++    history_before = token_ids.clone()
++    lengths_before = total_len.clone()
++    config = SimpleNamespace(
++        speculative_config=SimpleNamespace(
++            method="ngram_gpu", prompt_lookup_min=2, prompt_lookup_max=5, num_speculative_tokens=k
++        ),
++        scheduler_config=SimpleNamespace(max_num_seqs=8),
++        model_config=SimpleNamespace(max_model_len=max_model_len),
++    )
++    speculator = init_speculator(config, device, states)
++    batch = SimpleNamespace(num_reqs=len(rows), idx_mapping=torch.tensor(slots, device=device))
++    args = dict(
++        input_batch=batch,
++        attn_metadata=None,
++        slot_mappings=None,
++        last_hidden_states=torch.empty(0, device=device),
++        aux_hidden_states=None,
++        num_sampled=torch.tensor(num_sampled, dtype=torch.int32, device=device),
++        num_rejected=torch.zeros(len(rows), dtype=torch.int32, device=device),
++        last_sampled=last_sampled,
++        next_prefill_tokens=torch.empty(0, device=device),
++        temperature=torch.empty(0, device=device),
++        seeds=torch.empty(0, device=device),
++        num_speculative_tokens=k,
++    )
++    expected = []
++    for row, sampled, last in zip(rows, num_sampled, last_tokens):
++        matches = [
++            (n, pos) for n in range(2, 6) for pos in range(len(row) - n) if sampled and row[pos : pos + n] == row[-n:]
++        ]
++        continuation = []
++        if matches:
++            n, pos = max(matches)
++            continuation = row[pos + n : pos + n + k]
++        expected.append(continuation + [last] * (k - len(continuation)))
++    assert speculator.propose(**args).cpu().tolist() == expected
++    # A later step with no eligible rows must not reuse scratch from the first call.
++    args["num_sampled"].zero_()
++    assert speculator.propose(**args).cpu().tolist() == [[last] * k for last in last_tokens]
++    assert speculator.propose(**args, dummy_run=True).shape == (len(rows), k)
++    # Unlike MRV1 #11925, MRV2 postprocess has already appended accepted tokens.
++    torch.testing.assert_close(token_ids, history_before)
++    torch.testing.assert_close(total_len, lengths_before)
++
++
++@pytest.mark.parametrize("async_scheduling", [False, True])
++@pytest.mark.parametrize("enforce_eager", [False, True])
++def test_mrv2_ngram_greedy_accuracy(monkeypatch, test_prompts, model_name, async_scheduling, enforce_eager):
++    """Compare target token IDs, including chunked prefill and request slot reuse."""
++    monkeypatch.setenv("VLLM_USE_V2_MODEL_RUNNER", "1")
++    sampling_params = SamplingParams(temperature=0, max_tokens=64)
++    common = dict(
++        max_model_len=2048,
++        max_num_seqs=2,
++        max_num_batched_tokens=128,
++        enable_chunked_prefill=True,
++        enforce_eager=enforce_eager,
++        async_scheduling=async_scheduling,
++        gpu_memory_utilization=0.7,
++    )
++    prompts = test_prompts[:8] * 2
++    with VllmRunner(model_name, **common) as runner:
++        baseline = runner.model.chat(prompts, sampling_params)
++    with VllmRunner(
++        model_name,
++        speculative_config={
++            "method": "ngram_gpu",
++            "prompt_lookup_min": 2,
++            "prompt_lookup_max": 5,
++            "num_speculative_tokens": 3,
++        },
++        **common,
++    ) as runner:
++        speculative = runner.model.chat(prompts, sampling_params)
++    assert [o.outputs[0].token_ids for o in speculative] == [o.outputs[0].token_ids for o in baseline]
++
+ 
+ pytestmark = pytest.mark.skip(reason="Model Runner V1 is outside the default CI path")
+ 
+diff --git a/tests/ut/worker/test_model_runner_v2.py b/tests/ut/worker/test_model_runner_v2.py
+index 27efdc48b..8fe385ab9 100644
+--- a/tests/ut/worker/test_model_runner_v2.py
++++ b/tests/ut/worker/test_model_runner_v2.py
+@@ -1123,7 +1123,7 @@ def _parent_init(self, vllm_config, device, *, full_graph=False, speculative=Fal
+         has_full_cudagraphs=lambda: full_graph,
+     )
+     self.model_config = SimpleNamespace(enforce_eager=not full_graph, architecture="Qwen3_5ForConditionalGeneration")
+-    self.speculative_config = object() if speculative else None
++    self.speculative_config = SimpleNamespace(method="mtp") if speculative else None
+     self.use_pp = use_pp
+     self.is_last_pp_rank = True
+     self.pp_handler = SimpleNamespace() if use_pp else None
+@@ -1181,6 +1181,8 @@ def test_init_without_speculation(use_pp):
+     assert runner.req_states == "req"
+     assert runner.input_buffers == "buf"
+     assert runner.speculator is None
++    assert runner.pd_dspark_aux_layer_ids == ()
++    assert runner._dspark_prefill_progress == {}
+     assert runner.sync_spec_pp_cpu_counts is False
+     assert runner.decode_query_len == 1
+     if use_pp:
+@@ -1189,7 +1191,8 @@ def test_init_without_speculation(use_pp):
+         assert runner.pp_handler is None
+ 
+ 
+-def test_init_spec_pp_full_graph_and_speculator():
++@pytest.mark.parametrize("method", ["mtp", "ngram", "ngram_gpu"])
++def test_init_spec_pp_full_graph_and_speculator(method):
+     vllm_config = SimpleNamespace(parallel_config=SimpleNamespace(enable_eplb=True, pipeline_parallel_size=2))
+     ascend_config = SimpleNamespace(eplb_config=SimpleNamespace(load_collection_phase="decode"), dump_config_path=None)
+ 
+@@ -1202,6 +1205,11 @@ def test_init_spec_pp_full_graph_and_speculator():
+     )
+     spec_pp = SimpleNamespace(needs_aux_hidden_states=True)
+     speculator = SimpleNamespace()
++
++    def parent_init(self, cfg, dev):
++        _parent_init(self, cfg, dev, full_graph=True, speculative=True, use_pp=True)
++        self.speculative_config.method = method
++
+     with (
+         patch("vllm_ascend.worker.v2.model_runner.get_ascend_config", return_value=ascend_config),
+         patch("vllm_ascend.worker.v2.model_runner.set_potential_max_tokens"),
+@@ -1210,11 +1218,11 @@ def test_init_spec_pp_full_graph_and_speculator():
+         patch.object(
+             GPUModelRunner,
+             "__init__",
+-            lambda self, cfg, dev: _parent_init(self, cfg, dev, full_graph=True, speculative=True, use_pp=True),
++            parent_init,
+         ),
+         patch("vllm_ascend.worker.v2.model_runner.AscendEPLBController", return_value="eplb") as eplb_cls,
+-        patch("vllm_ascend.worker.v2.model_runner.init_speculator", return_value=speculator),
+-        patch("vllm_ascend.worker.v2.model_runner.AscendRequestState", return_value="req"),
++        patch("vllm_ascend.worker.v2.model_runner.init_speculator", return_value=speculator) as speculator_factory,
++        patch("vllm_ascend.worker.v2.model_runner.AscendRequestState", return_value="req") as request_state_cls,
+         patch("vllm_ascend.worker.v2.model_runner.AscendInputBuffers", return_value="buf"),
+         patch("vllm_ascend.worker.v2.model_runner.set_cos_and_sin"),
+         patch("vllm_ascend.worker.v2.model_runner.set_mc2_tokens_capacity"),
+@@ -1236,6 +1244,10 @@ def test_init_spec_pp_full_graph_and_speculator():
+     assert runner.use_aclgraph is True
+     assert runner.use_aux_hidden_state_outputs is True
+     assert runner.speculator is speculator
++    assert runner.pd_dspark_aux_layer_ids == ()
++    assert runner._dspark_prefill_progress == {}
++    speculator_factory.assert_called_once_with(vllm_config, runner.device, runner.req_states)
++    assert request_state_cls.call_args.kwargs["use_dense_all_token_ids"] is (method in ("ngram", "ngram_gpu"))
+     assert speculator.update_stream is runner.update_stream
+     assert runner.sync_spec_pp_cpu_counts is True
+     assert vars(runner.pp_handler) == {}
+diff --git a/tests/ut/worker/test_pcp_manager_v2.py b/tests/ut/worker/test_pcp_manager_v2.py
+index dea1c1602..b5d7146c5 100644
+--- a/tests/ut/worker/test_pcp_manager_v2.py
++++ b/tests/ut/worker/test_pcp_manager_v2.py
+@@ -816,6 +816,7 @@ def test_request_state_cpu_and_numpy_tokens_share_storage() -> None:
+         num_speculative_steps,
+         vocab_size,
+         device,
++        use_dense_all_token_ids=False,
+     ) -> None:
+         state.max_num_reqs = max_num_reqs
+         state.num_computed_tokens_np = np.zeros(max_num_reqs, dtype=np.int32)
+diff --git a/tests/ut/worker/v2/test_spec_decode.py b/tests/ut/worker/v2/test_spec_decode.py
+index 7ad51dca9..031546ff0 100644
+--- a/tests/ut/worker/v2/test_spec_decode.py
++++ b/tests/ut/worker/v2/test_spec_decode.py
+@@ -67,6 +67,39 @@ def _mock_speculator_module(monkeypatch, module_name, class_name):
+     return speculator_cls
+ 
+ 
++@pytest.mark.parametrize("method", ["ngram", "ngram_gpu"])
++@pytest.mark.parametrize("enforce_eager", [False, True])
++def test_init_speculator_ngram_uses_current_request_state(monkeypatch, method, enforce_eager):
++    config = _make_config(method)
++    config.speculative_config.enforce_eager = enforce_eager
++    config.compilation_config = SimpleNamespace(mode=CompilationMode.VLLM_COMPILE)
++    device = torch.device("cpu")
++    req_states = object()
++    speculator_cls = _mock_speculator_module(
++        monkeypatch,
++        "vllm.v1.worker.gpu.spec_decode.ngram.speculator",
++        "NgramGPUSpeculator",
++    )
++    result = init_speculator(config, device, req_states)
++    assert result is speculator_cls.return_value
++    speculator_cls.assert_called_once()
++    draft_config, draft_device, draft_states = speculator_cls.call_args.args
++    assert draft_device == device
++    assert draft_states is req_states
++    assert config.compilation_config.mode == CompilationMode.VLLM_COMPILE
++    if enforce_eager:
++        assert draft_config is not config
++        assert draft_config.compilation_config is not config.compilation_config
++        assert draft_config.compilation_config.mode == CompilationMode.NONE
++    else:
++        assert draft_config is config
++
++
++def test_init_speculator_ngram_requires_request_state():
++    with pytest.raises(ValueError, match="requires request states"):
++        init_speculator(_make_config("ngram_gpu"), torch.device("cpu"))
++
++
+ def test_init_speculator_extract_hidden_states(monkeypatch):
+     """Test dispatching extract_hidden_states to the upstream speculator."""
+     config = _make_config("extract_hidden_states")
+diff --git a/tests/ut/worker/v2/test_states.py b/tests/ut/worker/v2/test_states.py
+new file mode 100644
+index 000000000..146f98a6b
+--- /dev/null
++++ b/tests/ut/worker/v2/test_states.py
+@@ -0,0 +1,51 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM Ascend project
++
++from unittest.mock import patch
++
++import numpy as np
++import pytest
++import torch
++from vllm.v1.worker.gpu.states import RequestState
++
++from vllm_ascend.worker.v2.states import AscendRequestState
++
++
++@pytest.mark.parametrize("dense", [False, True])
++@pytest.mark.parametrize("is_release", [False, True])
++def test_request_state_preserves_dense_history_option(dense, is_release):
++    """Forward dense history only on the main compatibility lane."""
++    counts = np.zeros(2, dtype=np.int32)
++
++    # Use strict signatures so passing the new option to the old API fails.
++    def legacy_parent_init(
++        self, max_num_reqs, max_model_len, max_num_batched_tokens, num_speculative_steps, vocab_size, device
++    ):
++        self.num_computed_tokens_np = counts
++
++    dense_options = []
++
++    def current_parent_init(
++        self,
++        max_num_reqs,
++        max_model_len,
++        max_num_batched_tokens,
++        num_speculative_steps,
++        vocab_size,
++        device,
++        use_dense_all_token_ids=False,
++    ):
++        self.num_computed_tokens_np = counts
++        dense_options.append(use_dense_all_token_ids)
++
++    parent_init = legacy_parent_init if is_release else current_parent_init
++    with (
++        patch.object(RequestState, "__init__", parent_init),
++        patch("vllm_ascend.worker.v2.states.vllm_version_is", return_value=is_release) as version_is,
++    ):
++        state = AscendRequestState(2, 32, 8, 3, 16, torch.device("cpu"), use_dense_all_token_ids=dense)
++    version_is.assert_called_once_with("0.31.0")
++    if not is_release:
++        assert dense_options == [dense]
++    state.num_computed_tokens_cpu[0] = 7
++    assert counts[0] == 7
+diff --git a/vllm_ascend/patch/worker/patch_v2/patch_spec_decode_310.py b/vllm_ascend/patch/worker/patch_v2/patch_spec_decode_310.py
+index 75480f46e..404856c3e 100644
+--- a/vllm_ascend/patch/worker/patch_v2/patch_spec_decode_310.py
++++ b/vllm_ascend/patch/worker/patch_v2/patch_spec_decode_310.py
+@@ -43,7 +43,7 @@ if not hasattr(aclgraph_utils_mod.ModelWithContext, "embed_input_ids"):
+ _orig_init_speculator = ascend_spec_decode.init_speculator
+ 
+ 
+-def _init_speculator_310p(vllm_config, device):
++def _init_speculator_310p(vllm_config, device, req_states=None):
+     speculative_config = vllm_config.speculative_config
+     assert speculative_config is not None
+     if (
+@@ -56,7 +56,7 @@ def _init_speculator_310p(vllm_config, device):
+         )
+ 
+         return AscendMTPSpeculator310(vllm_config, device)
+-    return _orig_init_speculator(vllm_config, device)
++    return _orig_init_speculator(vllm_config, device, req_states)
+ 
+ 
+ ascend_spec_decode.init_speculator = _init_speculator_310p
+diff --git a/vllm_ascend/worker/v2/model_runner.py b/vllm_ascend/worker/v2/model_runner.py
+index 9371b26c3..9f132a72c 100644
+--- a/vllm_ascend/worker/v2/model_runner.py
++++ b/vllm_ascend/worker/v2/model_runner.py
+@@ -123,7 +123,6 @@ from vllm_ascend.worker.v2.kvpp import KVPPRuntime
+ from vllm_ascend.worker.v2.pcp_manager import AscendPCPManager
+ from vllm_ascend.worker.v2.pp_transport import resolve_spec_pp_support
+ from vllm_ascend.worker.v2.spec_decode import init_speculator
+-from vllm_ascend.worker.v2.spec_decode.eagle.speculator import AscendEagleSpeculator
+ from vllm_ascend.worker.v2.states import AscendRequestState
+ from vllm_ascend.worker.v2.utils import (
+     AscendV2KVBlockZeroer,
+@@ -212,17 +211,8 @@ class NPUModelRunner(GPUModelRunner):
+         del self.input_buffers
+         del self.speculator
+ 
+-        # we define AscendEagleSpeculator in vllm_ascend.worker.v2.spec_decode.eagle.speculator
+-        # init_speculator will return AscendEagleSpeculator when eagle is used.
+-        # so here we just call init_speculator to reinitialize speculator.
+-        self.speculator: AscendEagleSpeculator | None = None
+         self.pd_dspark_aux_layer_ids: tuple[int, ...] = ()
+         self._dspark_prefill_progress: dict[str, tuple[str, int]] = {}
+-        if self.speculative_config is not None and self.is_last_pp_rank:
+-            self.speculator = init_speculator(self.vllm_config, self.device)
+-            # Shared update_stream: main model (ModelAclGraphManager) and draft
+-            # (Eagle/DFlash/DSpark AclGraphManager) all use this same stream.
+-            self.speculator.update_stream = self.update_stream
+ 
+         # AscendRequestState has extra `num_computed_tokens_cpu` attribute.
+         # so reinitialize req_states here.
+@@ -233,7 +223,19 @@ class NPUModelRunner(GPUModelRunner):
+             num_speculative_steps=self.num_speculative_steps,
+             vocab_size=self.vocab_size,
+             device=self.device,
++            use_dense_all_token_ids=(
++                self.speculative_config is not None and self.speculative_config.method in ("ngram", "ngram_gpu")
++            ),
+         )
++        # The upstream speculator was constructed with the discarded upstream
++        # request state. This construction does not use that speculator: it
++        # binds n-gram to the new state and selects Ascend implementations for
++        # model-based methods through the Ascend factory.
++        self.speculator: Any = None
++        if self.speculative_config is not None and self.is_last_pp_rank:
++            self.speculator = init_speculator(self.vllm_config, self.device, self.req_states)
++            # Share the update stream between the target and draft graph managers.
++            self.speculator.update_stream = self.update_stream
+         # AscendInputBuffers has extra `seq_lens_cpu` attribute.
+         # so reinitialize input_buffers here.
+         self.input_buffers: AscendInputBuffers = AscendInputBuffers(
+diff --git a/vllm_ascend/worker/v2/spec_decode/__init__.py b/vllm_ascend/worker/v2/spec_decode/__init__.py
+index 854bd3764..adb37dd52 100644
+--- a/vllm_ascend/worker/v2/spec_decode/__init__.py
++++ b/vllm_ascend/worker/v2/spec_decode/__init__.py
+@@ -17,14 +17,19 @@
+ # This file is a part of the vllm-ascend project.
+ #
+ import copy
++from typing import TYPE_CHECKING
+ 
+ import torch
+ from vllm.config import CompilationMode, VllmConfig
+ 
++if TYPE_CHECKING:
++    from vllm.v1.worker.gpu.states import RequestState
++
+ 
+ def init_speculator(
+     vllm_config: VllmConfig,
+     device: torch.device,
++    req_states: "RequestState | None" = None,
+ ):
+     """Override GPU init_speculator for Ascend NPUs.
+     Use AscendEagleSpeculator when eagle is used.
+@@ -35,6 +40,17 @@ def init_speculator(
+         vllm_config = copy.copy(vllm_config)
+         vllm_config.compilation_config = copy.copy(vllm_config.compilation_config)
+         vllm_config.compilation_config.mode = CompilationMode.NONE
++    if speculative_config.method in ("ngram", "ngram_gpu"):
++        if req_states is None:
++            raise ValueError("MRV2 n-gram speculative decoding requires request states")
++        # Older vLLM pins lack this module; MRV2 n-gram requires upstream #40704.
++        from vllm.v1.worker.gpu.spec_decode.ngram.speculator import (  # type: ignore[import-not-found]
++            NgramGPUSpeculator,
++        )
++
++        # MRV2 postprocess has already updated history. The MRV1 NPU kernel
++        # appends sampled tokens itself and cannot be used here unchanged.
++        return NgramGPUSpeculator(vllm_config, device, req_states)
+     if speculative_config.method == "extract_hidden_states":
+         # No Ascend-specific behavior beyond update_stream assignment in
+         # NPUModelRunner; reuse upstream ExtractHiddenStatesSpeculator as-is.
+diff --git a/vllm_ascend/worker/v2/states.py b/vllm_ascend/worker/v2/states.py
+index ce45d795e..f5af8c067 100644
+--- a/vllm_ascend/worker/v2/states.py
++++ b/vllm_ascend/worker/v2/states.py
+@@ -20,6 +20,8 @@
+ import torch
+ from vllm.v1.worker.gpu.states import RequestState
+ 
++from vllm_ascend.utils import vllm_version_is
++
+ 
+ class AscendRequestState(RequestState):
+     """Request state for Ascend NPUs."""
+@@ -32,6 +34,7 @@ class AscendRequestState(RequestState):
+         num_speculative_steps: int,
+         vocab_size: int,
+         device: torch.device,
++        use_dense_all_token_ids: bool = False,
+     ):
+         super().__init__(
+             max_num_reqs,
+@@ -40,6 +43,8 @@ class AscendRequestState(RequestState):
+             num_speculative_steps,
+             vocab_size,
+             device,
++            # v0.31.0 predates the dense history option used by MRV2 n-gram.
++            **({} if vllm_version_is("0.31.0") else {"use_dense_all_token_ids": use_dense_all_token_ids}),
+         )
+         # Ascend attention needs a torch CPU view of the upstream NumPy state.
+         # Sharing storage keeps both APIs coherent without duplicate writes.

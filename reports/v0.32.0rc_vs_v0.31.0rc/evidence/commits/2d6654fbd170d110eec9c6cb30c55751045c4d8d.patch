@@ -1,0 +1,231 @@
+commit 2d6654fbd170d110eec9c6cb30c55751045c4d8d
+Author:     Xiaoshuang Wang <1790571317@qq.com>
+AuthorDate: Thu Oct 29 14:39:08 2026 +0800
+Commit:     GitHub <noreply@github.com>
+CommitDate: Thu Oct 29 14:39:08 2026 +0800
+
+    [Bugfix] Fix KV cache memory accounting for Ascend multi-allocation layouts (#20203)
+    
+    ### What this PR does / why we need it?
+    This PR fixes a KV cache initialization failure when serving DeepSeek
+    V4.1 on Ascend, caused by
+    https://github.com/vllm-project/vllm/pull/53558.
+    When https://github.com/vllm-project/vllm-ascend/pull/18359 merged, this
+    patch can be removed.
+    
+    The newer builder-based KV cache planner in vLLM uses`
+    KVCacheConfigBuilder._get_pool_bytes_per_block() `to determine the
+    memory consumption per KV cache block. When this method returns None,
+    vLLM falls back to probing a one-block placement and expects all
+    device-backed KV cache tensors to have the same backing allocation size.
+    However, Ascend's specialized KV cache layouts (including DSV4.1) can
+    involve multiple backing allocations with different sizes.
+    
+    For DSV4.1, this causes the engine to fail during KV cache
+    initialization:
+    
+    ```
+    ValueError: KV cache tensors must share one device
+    backing allocation, but got sizes [131072, 147712].
+    Override KVCacheConfigBuilder._get_pool_bytes_per_block()
+    for placements with several device allocations.
+    ```
+    
+    Ascend already provides specialized per-block memory accounting through
+    _`ascend_pool_bytes_per_block()`, but the newer builder-based planner
+    does not use this existing override because it calls a different hook.
+    
+    ### Does this PR introduce _any_ user-facing change?
+    N/A
+    
+    ### How was this patch tested?
+    ```
+    MODEL_PATH="/root/.cache/modelscope/hub/models/Eco-Tech/DeepSeek-V4.1-Flash-w8a8"
+    
+    export VLLM_USE_V2_MODEL_RUNNER=0
+    export VLLM_ENGINE_READY_TIMEOUT_S=36000
+    export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
+    
+    export HCCL_BUFFSIZE=1024
+    export HCCL_OP_EXPANSION_MODE="AIV"
+    vllm serve "$MODEL_PATH" \
+    --host 0.0.0.0 \
+    --port 8900 \
+    --max-model-len 150000 \
+    --max-num-batched-tokens 8192 \
+    --served-model-name dsv41 \
+    --gpu-memory-utilization 0.95 \
+    --max-num-seqs 32 \
+    --data-parallel-size 4 \
+    --tensor-parallel-size 4 \
+    --enable-expert-parallel \
+    --tokenizer-mode deepseek_v41 \
+    --reasoning-parser deepseek_v41 \
+    --tool-call-parser deepseek_v41 \
+    --enable-auto-tool-choice \
+    --safetensors-load-strategy lazy \
+    --quantization ascend \
+    --block-size 128 \
+    --compilation-config '{"cudagraph_mode":"FULL_DECODE_ONLY"}' \
+    --async-scheduling \
+    --engram-config '{"cpu_offload":true,"dp_shared_memory":true}' \
+    --additional-config '{
+        "ascend_compilation_config":{
+            "enable_npugraph_ex":true,
+            "enable_static_kernel":false
+        },
+        "enable_cpu_binding":true,
+        "enable_fused_mc2":1,
+        "enable_dsa_cp":false,
+        "enable_flashcomm1":false,
+        "enable_shared_expert_dp":true
+    }'
+    ```
+    
+    
+    - vLLM main:
+    https://github.com/vllm-project/vllm/commit/544f182d9f0c9bfe8bd7645525951d5e3692a542
+    
+    ---------
+    
+    Signed-off-by: wxsIcey <1790571317@qq.com>
+
+diff --git a/tests/ut/models/test_glm5next_kda_dispatch.py b/tests/ut/models/test_glm5next_kda_dispatch.py
+index 1ea5ac30d..b3b2fc178 100644
+--- a/tests/ut/models/test_glm5next_kda_dispatch.py
++++ b/tests/ut/models/test_glm5next_kda_dispatch.py
+@@ -299,7 +299,16 @@ def test_decode_and_prefill_use_their_own_metadata_and_merge_outputs(
+         assert correction is layer.kv_cache[2] and kg is layer.kv_cache[3]
+         assert capacity == 2 and a_log.shape == (1,)
+         torch.testing.assert_close(indices, metadata.spec_state_indices_tensor[:, 0])
+-        return recurrent(q, k, v, gate, beta, state, starts, indices)
++        assert state is layer.kv_cache[1]
++        assert q.shape[1] == 2
++        torch.testing.assert_close(starts, torch.tensor([0, q.shape[1]]))
++        torch.testing.assert_close(k, q + 8, rtol=0, atol=0)
++        torch.testing.assert_close(v, q + 16, rtol=0, atol=0)
++        events.append("recover_verify")
++        calls.append("recover_verify")
++        # RecoverSSM verification records compact updates without mutating the
++        # persistent checkpoint. The accepted updates are committed later.
++        return q * 2
+ 
+     monkeypatch.setattr(model_kda, "kda_recoverssm_verify", verify)
+     monkeypatch.setattr(model_kda, "chunk_kda", prefill)
+@@ -316,18 +325,24 @@ def test_decode_and_prefill_use_their_own_metadata_and_merge_outputs(
+     # Rows outside the scheduled token groups are left untouched.
+     assert torch.isnan(out[:, tokens:]).all()
+     expected_state = torch.zeros_like(layer.kv_cache[1])
+-    recurrent_slots = (
+-        metadata.spec_state_indices_tensor.reshape(-1)
+-        if speculative
+-        else metadata.non_spec_state_indices_tensor[: metadata.num_decodes]
+-    )
+-    expected_state.index_fill_(0, recurrent_slots, 2.0)
++    if not recover:
++        recurrent_slots = (
++            metadata.spec_state_indices_tensor.reshape(-1)
++            if speculative
++            else metadata.non_spec_state_indices_tensor[: metadata.num_decodes]
++        )
++        expected_state.index_fill_(0, recurrent_slots, 2.0)
+     if not spec_only:
+         expected_state.index_fill_(0, metadata.prefill_state_indices, 3.0)
+     torch.testing.assert_close(layer.kv_cache[1], expected_state, rtol=0, atol=0)
+-    assert calls == (["recurrent"] if spec_only else ["recurrent", "prefill"])
++    spec_call = "recover_verify" if recover else "recurrent"
++    assert calls == ([spec_call] if spec_only else [spec_call, "prefill"])
+     assert conv_calls == ([1] if spec_only else ([1, 0] if speculative else [0]))
+-    assert events == [("load", "layer"), "compute", *(["state_write"] * len(calls)), "save"]
++    spec_event = "recover_verify" if recover else "state_write"
++    expected_execution_events = [spec_event]
++    if not spec_only:
++        expected_execution_events.append("state_write")
++    assert events == [("load", "layer"), "compute", *expected_execution_events, "save"]
+ 
+ 
+ @pytest.mark.parametrize(("width", "num_spec"), [(1, 0), (5, 0), (3, 3)])
+diff --git a/vllm_ascend/patch/__init__.py b/vllm_ascend/patch/__init__.py
+index 083583ce5..e65b30c71 100644
+--- a/vllm_ascend/patch/__init__.py
++++ b/vllm_ascend/patch/__init__.py
+@@ -301,6 +301,20 @@
+ #    Future Plan:
+ #       Remove this patch once upstream vLLM supports hybrid KV cache + CP for
+ #       non-CUDA backends, or exposes a platform hook for this behavior.
++#   2. `vllm.v1.core.kv_cache_planning.DefaultKVCacheConfigBuilder._get_pool_bytes_per_block`
++#    Why:
++#       The builder-based vLLM planner probes one block and requires every
++#       device tensor to share one backing size. Ascend's DSV4.1, DSV4, GLM5,
++#       and TurboQuant layouts can use several differently sized allocations.
++#    How:
++#       Return the aggregate per-block pool size from existing Ascend layout
++#       accounting for those cache types; leave other layouts on the upstream
++#       placement probe.
++#    Related PR (if no, explain why):
++#       No upstream PR currently handles Ascend's multi-allocation layouts.
++#    Future Plan:
++#       Move this override into an Ascend KVCacheConfigBuilder, or remove it
++#       once upstream provides a platform hook for multi-allocation accounting.
+ #
+ # ** 11. File: platform/patch_mamba_block_aligned_split.py**
+ # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+diff --git a/vllm_ascend/patch/platform/patch_kv_cache_utils.py b/vllm_ascend/patch/platform/patch_kv_cache_utils.py
+index 63d542132..55b378d9e 100644
+--- a/vllm_ascend/patch/platform/patch_kv_cache_utils.py
++++ b/vllm_ascend/patch/platform/patch_kv_cache_utils.py
+@@ -581,6 +581,38 @@ def _ascend_pool_bytes_per_block(  # type: ignore[misc]
+     return sum(page_sizes) * num_layer_tuples
+ 
+ 
++def _has_ascend_multi_allocation_kv_cache_layout(
++    kv_cache_groups: list[KVCacheGroupSpec],
++) -> bool:
++    """Whether Ascend materializes these groups as several device allocations."""
++    return (
++        tq_cache.uses_turboquant_groups(kv_cache_groups)
++        or is_deepseek_v41_cache(kv_cache_groups)
++        or _get_glm5_next_cache_layout(kv_cache_groups) is not None
++        or _is_deepseek_v4_groups(kv_cache_groups)
++    )
++
++
++def _ascend_builder_pool_bytes_per_block(
++    builder: Any,
++    vllm_config: VllmConfig,
++    kv_cache_groups: list[KVCacheGroupSpec],
++) -> int | None:
++    """Report aggregate bytes for layouts backed by several device tensors.
++
++    Newer vLLM KV-cache planning probes the builder with one block and expects
++    all device tensors to have the same backing size. Ascend's packed layouts
++    use several backing tensors with different sizes, so their aggregate pool
++    size must be supplied directly through the builder hook.
++    """
++    if _has_ascend_multi_allocation_kv_cache_layout(kv_cache_groups):
++        return _ascend_pool_bytes_per_block(vllm_config, kv_cache_groups)
++
++    # Keep upstream's one-block placement probe for layouts that use the
++    # default single-allocation placement.
++    return _orig_builder_pool_bytes_per_block(builder, vllm_config, kv_cache_groups)
++
++
+ # vLLM #42309 threads the platform's ``KVCacheConfigBuilder`` through KV cache
+ # admission on main, so ``_max_memory_usage_bytes_from_groups`` gained a leading
+ # ``builder`` argument. The v0.32.0 lane keeps the pre-#42309 two-argument
+@@ -738,6 +770,15 @@ _kv_cache_planning.get_kv_cache_config_from_groups = _ascend_get_kv_cache_config
+ _kv_cache_planning._max_memory_usage_bytes_from_groups = _ascend_max_memory_usage_bytes_from_groups
+ _kv_cache_planning._pool_bytes_per_block = _ascend_pool_bytes_per_block
+ 
++# vLLM's builder-based planner derives the pool size by probing a one-block
++# placement unless the builder overrides this hook. Ascend's DSV4.1, DSV4, GLM5
++# and TurboQuant layouts can contain multiple device allocations, so install
++# the matching aggregate-size hook when this vLLM API is available.
++_default_kv_cache_builder = getattr(_kv_cache_planning, "DefaultKVCacheConfigBuilder", None)
++if _default_kv_cache_builder is not None:
++    _orig_builder_pool_bytes_per_block = _default_kv_cache_builder._get_pool_bytes_per_block
++    _default_kv_cache_builder._get_pool_bytes_per_block = _ascend_builder_pool_bytes_per_block
++
+ # Also patch the reference used by engine/core.py which imports the function directly.
+ import vllm.v1.engine.core  # noqa: E402
+ 

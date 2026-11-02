@@ -1,0 +1,437 @@
+commit 4926e0a22613e66c9bddf4141951845b6397eca7
+Author:     lijiahang226 <216526138+lijiahang226@users.noreply.github.com>
+AuthorDate: Sun Nov 1 17:02:58 2026 +0800
+Commit:     GitHub <noreply@github.com>
+CommitDate: Sun Nov 1 17:02:58 2026 +0800
+
+    [BugFix][v0.32.0rc] Fix GLM-5.3-Flash PCP query, decode and packed KV layouts (#20513)
+    
+    ### What this PR does / why we need it?
+    
+    Backport #20512 to `releases/v0.32.0rc`: align KPool query rows, NoPE
+    metadata capacity, replicated decode and packed-KV slot mapping.
+    
+    KPool decode remains replicated; no new PCP mode or configuration is
+    introduced.
+    
+    The runner now calls `AscendPCPManager.bind_config()` at the existing
+    config-binding point. Decode policy is resolved inside the manager
+    before replication queries, without adding configuration fields.
+    
+    Fixes #20510. Refs #15665.
+    
+    ### Does this PR introduce _any_ user-facing change?
+    
+    Yes. Fixes GLM-5.3-Flash MRV2 PCP failures and incorrect answers in
+    mixed prefill/decode batches.
+    
+    ### How was this patch tested?
+    
+    - Updated worker suites: 270 passed, 1 skipped; source and test mypy
+    checks passed separately. Current-head
+    [pre-commit/mypy](https://github.com/vllm-project/vllm-ascend/actions/runs/41282800763/job/124777973197)
+    passed. Previous-head full CPU CI passed: [vLLM
+    main](https://github.com/vllm-project/vllm-ascend/actions/runs/41215146112/job/124579348114)
+    (14470 tests),
+    [v0.32.0](https://github.com/vllm-project/vllm-ascend/actions/runs/41215146112/job/124579348113)
+    (14454 tests).
+    - Earlier main-fix hardware validation, before this initialization
+    refactor: A3 PCP8/MTP5 cold/warm checks: 32/32 eager and 32/32
+    FULL_DECODE_ONLY. Same-request P control changed from HTTP 500 (20 index
+    rows/24 queries) to HTTP 200. Uses existing KDA fix #20281.
+    - Earlier AIME2026 validation, all 30 problems, model/output limits
+    1048576/131072: colocated 29/30; real PD 28/30. Remaining answers hit
+    the output limit; no engine errors. Five colocated zero-output transport
+    failures were retried with identical bodies. PD verified eager P,
+    target/draft graph replay on D, and successful KV READs for every
+    request. These scores do not establish full accuracy equivalence to an
+    unpatched baseline.
+    
+    - vLLM main:
+    https://github.com/vllm-project/vllm/commit/544f182d9f0c9bfe8bd7645525951d5e3692a542
+    
+    ---------
+    
+    Signed-off-by: Li Jiahang <216526138+lijiahang226@users.noreply.github.com>
+
+diff --git a/release_notes/fragments/20513.yaml b/release_notes/fragments/20513.yaml
+new file mode 100644
+index 000000000..8f659c709
+--- /dev/null
++++ b/release_notes/fragments/20513.yaml
+@@ -0,0 +1,4 @@
++pr: 20513
++entries:
++  - category: bugfix
++    text: Fixed GLM-5.3-Flash PCP query-row mismatches, NoPE metadata capacity, decode input partitioning, and packed KV cache corruption in mixed prefill/decode batches.
+diff --git a/tests/ut/attention/test_sfa_cp.py b/tests/ut/attention/test_sfa_cp.py
+index eb57b7b53..2a51aaad4 100644
+--- a/tests/ut/attention/test_sfa_cp.py
++++ b/tests/ut/attention/test_sfa_cp.py
+@@ -848,6 +848,53 @@ def test_sfa_pcp_packed_kv_writes_gather_order_slots() -> None:
+     assert scatter.call_args.args[2].shape[0] == 2
+ 
+ 
++@pytest.mark.parametrize("pcp_size", [2, 8])
++@pytest.mark.parametrize("num_decode_tokens", [0, 1, 6])
++@pytest.mark.parametrize("decode_sharded", [False, True])
++def test_sfa_pcp_packed_kv_store_matches_gathered_inputs(pcp_size, num_decode_tokens, decode_sharded):
++    impl = AscendSFAPCPImpl.__new__(AscendSFAPCPImpl)
++    impl.is_pcp_decode_sharded = decode_sharded
++    impl.enable_sparse_sfa_c8 = True
++    impl.enable_sparse_sfa_turboquant = False
++    impl.sfa_qsfa_packed_kv_head_dim = 4
++    local_tokens = num_decode_tokens + 3
++    replicated_tokens = 0 if decode_sharded else num_decode_tokens
++    local_values = torch.arange(local_tokens, dtype=torch.float32).view(-1, 1)
++    rank_values = [local_values + rank * local_tokens for rank in range(pcp_size)]
++    slots = torch.arange(pcp_size * local_tokens, dtype=torch.int64).view(pcp_size, local_tokens)
++    if replicated_tokens:
++        slots[1:, :replicated_tokens] = -1
++    slots[:, -1] = -1
++    slots = slots.flatten()
++    metadata = SimpleNamespace(
++        uses_pcp_sharded_layout=True,
++        num_prefills=1,
++        num_decode_tokens=num_decode_tokens,
++        num_input_tokens=local_tokens,
++    )
++    group = SimpleNamespace(
++        world_size=pcp_size,
++        all_gather=lambda tensor, dim: torch.cat([value[replicated_tokens:] for value in rank_values], dim=dim),
++    )
++    with patch("vllm.v1.attention.ops.pcp.get_pcp_group", return_value=group):
++        (gathered,), expected_slots = _gather_prefill_cache_inputs((local_values,), slots, replicated_tokens)
++    rows = gathered.shape[0]
++    with (
++        patch("vllm_ascend.attention.context_parallel.sfa_cp.get_pcp_group", return_value=group),
++        patch("vllm_ascend.attention.sfa_v1.DeviceOperator.scatter_cache") as scatter,
++    ):
++        impl._store_parallel_kv(
++            torch.ones(rows, 1, 1),
++            gathered.view(rows, 1, 1).expand(-1, -1, 2),
++            torch.ones(rows, 1, 1),
++            (torch.empty(pcp_size * local_tokens, 4),),
++            slots,
++            metadata,
++        )
++    torch.testing.assert_close(scatter.call_args.args[1].flatten(), expected_slots)
++    torch.testing.assert_close(scatter.call_args.args[2][:, 0], gathered[:, 0])
++
++
+ def _build_pcp_dcp_slot_metadata(metadata, group):
+     builder = AscendSFAPCPDCPMetadataBuilder.__new__(AscendSFAPCPDCPMetadataBuilder)
+     context = SimpleNamespace(
+diff --git a/tests/ut/attention/test_sfa_nope_metadata.py b/tests/ut/attention/test_sfa_nope_metadata.py
+index c1a15612c..2ec1b67ee 100644
+--- a/tests/ut/attention/test_sfa_nope_metadata.py
++++ b/tests/ut/attention/test_sfa_nope_metadata.py
+@@ -139,6 +139,31 @@ def test_shared_sfa_nope_metadata_pages_and_draft_buffers(monkeypatch, block_siz
+         torch.testing.assert_close(draft.smla_valid_mask[:, 0], torch.tensor([True, True, True, False]))
+ 
+ 
++@pytest.mark.parametrize("pcp_size", [1, 8])
++@pytest.mark.parametrize("a5", [False, True])
++@pytest.mark.parametrize("graph", [False, True])
++def test_nope_metadata_preserves_all_pcp_request_chunks(monkeypatch, pcp_size, a5, graph):
++    builder = _builder(128, a5, monkeypatch, speculative=graph)
++    config = builder.vllm_config
++    config.scheduler_config.max_num_seqs = 8
++    config.scheduler_config.max_num_batched_tokens = 32
++    config.parallel_config.prefill_context_parallel_size = pcp_size
++    state = sparse_mla.SparseMLAMetadataState(SimpleNamespace(block_size=128), config, torch.device("cpu"))
++    address = state.block_table_buffer.data_ptr()
++    rows = 17 if pcp_size > 1 else 9
++    width = state.block_table_buffer.shape[1]
++    for num_rows in ([10] if pcp_size > 1 else []) + [rows, 3, rows]:
++        table = torch.arange(num_rows * width, dtype=torch.int32).reshape(num_rows, width)
++        metadata = SimpleNamespace(
++            block_table=table,
++            positions=torch.zeros(num_rows, dtype=torch.int64),
++            num_actual_tokens=num_rows - 1,
++        )
++        state.prepare(metadata)
++        torch.testing.assert_close(metadata.block_table, table)
++        assert metadata.block_table.data_ptr() == address
++
++
+ def test_a3_sparse_mla_preserves_storage_addresses(monkeypatch):
+     block_size = 2304
+     builder = _builder(block_size, False, monkeypatch)
+diff --git a/tests/ut/models/test_glm5next_kpool_model_backend.py b/tests/ut/models/test_glm5next_kpool_model_backend.py
+index 4a1cc9c07..e00e28334 100644
+--- a/tests/ut/models/test_glm5next_kpool_model_backend.py
++++ b/tests/ut/models/test_glm5next_kpool_model_backend.py
+@@ -329,10 +329,12 @@ class _RecordingKPool(nn.Module):
+         return None
+ 
+ 
+-@pytest.mark.parametrize("graph_mode", [CUDAGraphMode.NONE, CUDAGraphMode.FULL])
++@pytest.mark.parametrize("graph_mode", [CUDAGraphMode.NONE, CUDAGraphMode.PIECEWISE, CUDAGraphMode.FULL])
++@pytest.mark.parametrize("pcp", [False, True])
+ def test_backend_uses_normalized_q_c_and_separate_tail_metadata(
+     monkeypatch,
+     graph_mode,
++    pcp,
+ ) -> None:
+     backend = Glm5NextKPoolIndexerBackend.__new__(Glm5NextKPoolIndexerBackend)
+     nn.Module.__init__(backend)
+@@ -369,9 +371,9 @@ def test_backend_uses_normalized_q_c_and_separate_tail_metadata(
+         ),
+     )
+ 
+-    # A 64-row graph bucket does not imply reuse for eight one-token requests.
+-    normalized_q_c = torch.arange(128, dtype=torch.float32).reshape(64, 2)
+-    hidden = torch.ones(64, 3)
++    input_rows = 64 if pcp or graph_mode == CUDAGraphMode.FULL else 8
++    normalized_q_c = torch.arange(2 * input_rows, dtype=torch.float32).reshape(input_rows, 2)
++    hidden = torch.ones(input_rows, 3)
+     metadata = _indexer_metadata()
+     metadata.cum_query_lens = torch.arange(1, 9, dtype=torch.int32)
+     metadata.raw_seq_lens = torch.ones(8, dtype=torch.int32)
+@@ -391,7 +393,7 @@ def test_backend_uses_normalized_q_c_and_separate_tail_metadata(
+     assert result is not None
+     assert recorder.args is not None
+     assert recorder.kwargs is not None
+-    expected_rows = 64 if graph_mode == CUDAGraphMode.FULL else 8
++    expected_rows = input_rows
+     assert result.shape[0] == expected_rows
+     torch.testing.assert_close(recorder.args[1], normalized_q_c[:expected_rows].repeat(1, 2).view(expected_rows, 2, 2))
+     torch.testing.assert_close(recorder.args[0], hidden[:expected_rows] + 3)
+@@ -537,7 +539,10 @@ def test_cann_indexer_writes_caches_before_optional_selection(
+ 
+ @pytest.mark.parametrize("pcp_local_token_count", [2, 4])
+ @pytest.mark.parametrize("actual_tokens", [0, 2])
+-def test_backend_restores_pcp_keys_before_kpool_cache_write(monkeypatch, pcp_local_token_count, actual_tokens) -> None:
++@pytest.mark.parametrize("compute_topk", [False, True])
++def test_backend_restores_pcp_keys_before_kpool_cache_write(
++    monkeypatch, pcp_local_token_count, actual_tokens, compute_topk
++) -> None:
+     backend = Glm5NextKPoolIndexerBackend.__new__(Glm5NextKPoolIndexerBackend)
+     nn.Module.__init__(backend)
+     backend.n_head = 2
+@@ -589,11 +594,11 @@ def test_backend_restores_pcp_keys_before_kpool_cache_write(monkeypatch, pcp_loc
+     )
+ 
+     result = backend.forward(
+-        torch.ones(2, 3),
+-        torch.ones(2, 2),
+-        torch.full((2, 3), 2.0),
++        torch.ones(pcp_local_token_count, 3),
++        torch.ones(pcp_local_token_count, 2),
++        torch.full((pcp_local_token_count, 3), 2.0),
+         metadata,
+-        compute_topk=True,
++        compute_topk=compute_topk,
+     )
+ 
+     pcp_group.all_gather.assert_called_once()
+@@ -601,9 +606,7 @@ def test_backend_restores_pcp_keys_before_kpool_cache_write(monkeypatch, pcp_loc
+     recorded_kwargs = recorder.kwargs
+     assert recorded_args is not None
+     assert recorded_kwargs is not None
+-    local_hidden = torch.full((actual_tokens, 3), 2.0)
+-    padding = pcp_local_token_count - actual_tokens
+-    padded_hidden = torch.nn.functional.pad(local_hidden, (0, 0, 0, padding))
++    padded_hidden = torch.full((pcp_local_token_count, 3), 2.0)
+     restore = metadata.pcp_hidden_restore_indices
+     assert restore is not None
+     assert pcp_group.all_gather.call_args_list[0].args[0].shape[0] == pcp_local_token_count
+@@ -612,4 +615,8 @@ def test_backend_restores_pcp_keys_before_kpool_cache_write(monkeypatch, pcp_loc
+         torch.cat((padded_hidden, padded_hidden + 10), dim=0)[restore],
+     )
+     assert recorded_args[-2] is metadata
+-    assert result.shape[0] == recorded_args[1].shape[0] == actual_tokens
++    if compute_topk:
++        assert result.shape[0] == recorded_args[1].shape[0] == pcp_local_token_count
++    else:
++        assert result is None
++        assert recorded_args[1:3] == (None, None)
+diff --git a/tests/ut/worker/test_model_runner_v2.py b/tests/ut/worker/test_model_runner_v2.py
+index 7ba9b384f..d7276cccd 100644
+--- a/tests/ut/worker/test_model_runner_v2.py
++++ b/tests/ut/worker/test_model_runner_v2.py
+@@ -1339,7 +1339,7 @@ def test_initialize_kv_cache_installs_aclgraph_factory_and_pcp(a5, architecture)
+     create_kvpp.assert_called_once()
+     assert runner.kvpp == "kvpp"
+     assert runner.model_state.kvpp_runtime == "kvpp"
+-    assert runner.pcp_manager.vllm_config is runner.vllm_config
++    runner.pcp_manager.bind_config.assert_called_once_with(runner.vllm_config)
+     assert runner.model_state.pcp_manager is runner.pcp_manager
+ 
+ 
+diff --git a/tests/ut/worker/test_pcp_manager_v2.py b/tests/ut/worker/test_pcp_manager_v2.py
+index 6af0cfcd2..0a6c1d69a 100644
+--- a/tests/ut/worker/test_pcp_manager_v2.py
++++ b/tests/ut/worker/test_pcp_manager_v2.py
+@@ -108,22 +108,32 @@ def _partition_batch(manager, batch, *, padded_num_tokens=None, batch_desc=None)
+         (CUDAGraphMode.FULL_DECODE_ONLY, True, 2, 1, True),
+     ],
+ )
+-def test_decode_sharding_uses_parallel_config(cudagraph_mode, speculative, pcp_size, dcp_size, expected_sharding):
++@pytest.mark.parametrize("upstream_decode_sharding", [False, True])
++def test_decode_sharding_uses_parallel_config(
++    cudagraph_mode, speculative, pcp_size, dcp_size, expected_sharding, upstream_decode_sharding
++):
+     config = _make_pcp_config(cudagraph_mode)
+     config.parallel_config.prefill_context_parallel_size = pcp_size
+     config.parallel_config.decode_context_parallel_size = dcp_size
+     config.speculative_config = SimpleNamespace(method="mtp") if speculative else None
+     assert is_pcp_decode_sharding_enabled(config) is expected_sharding
+     rank = pcp_size - 1
+-    manager = AscendPCPManager(pcp_size, rank, torch.device("cpu"), dcp_world_size=dcp_size)
+-    manager.vllm_config = config
++    manager = AscendPCPManager(
++        pcp_size, rank, torch.device("cpu"), shard_decode_requests=upstream_decode_sharding, dcp_world_size=dcp_size
++    )
++    manager.bind_config(config)
+     counts = np.array([1, 1], dtype=np.int32)
+     prefilling = np.array([False, False])
+ 
++    assert manager.vllm_config is config
+     assert manager.is_decode_sharded is expected_sharding
+-    np.testing.assert_array_equal(
+-        manager.replicated_requests(counts, prefilling), [not expected_sharding, not expected_sharding]
+-    )
++    expected_upstream_sharding = upstream_decode_sharding and expected_sharding
++    assert manager.shard_decode_requests is expected_upstream_sharding
++    for _ in range(2):
++        np.testing.assert_array_equal(
++            manager.replicated_requests(counts, prefilling), [not expected_sharding, not expected_sharding]
++        )
++        assert manager.shard_decode_requests is expected_upstream_sharding
+     expected = [(1, 0, 1)] if expected_sharding else [(0, 0, 1), (1, 0, 1)]
+     assert list(manager._iter_rank_chunks(rank, counts, prefilling)) == expected
+ 
+@@ -162,18 +172,26 @@ def test_decode_sharding_does_not_add_a_parallel_config_field():
+ 
+ 
+ @pytest.mark.parametrize("speculative", [False, True])
+-def test_kpool_decode_keeps_replicated_pcp_state(speculative: bool):
++@pytest.mark.parametrize("upstream_decode_sharding", [False, True])
++def test_kpool_decode_keeps_replicated_pcp_state(speculative: bool, upstream_decode_sharding: bool):
+     config = _make_pcp_config(CUDAGraphMode.NONE)
+     config.model_config.hf_text_config.index_kpool = 4
+     config.speculative_config = SimpleNamespace(method="mtp") if speculative else None
+-    manager = AscendPCPManager(2, 1, torch.device("cpu"))
+-    manager.vllm_config = config
+-    counts = np.array([1, 1], dtype=np.int32)
++    config.parallel_config = ParallelConfig(prefill_context_parallel_size=2, decode_context_parallel_size=1)
++    manager = AscendPCPManager(2, 1, torch.device("cpu"), shard_decode_requests=upstream_decode_sharding)
++    manager.bind_config(config)
++    assert manager.vllm_config is config
++    assert not manager.shard_decode_requests
++    assert config.parallel_config.pcp_shard_decode_requests is True
++    replace(config.parallel_config)
++    query_len = 6 if speculative else 1
++    counts = np.array([query_len, query_len], dtype=np.int32)
+     prefilling = np.array([False, False])
+ 
+     assert not is_pcp_decode_sharding_enabled(config)
+     np.testing.assert_array_equal(manager.replicated_requests(counts, prefilling), [True, True])
+-    assert list(manager._iter_rank_chunks(1, counts, prefilling)) == [(0, 0, 1), (1, 0, 1)]
++    assert not manager.shard_decode_requests
++    assert list(manager._iter_rank_chunks(1, counts, prefilling)) == [(0, 0, query_len), (1, 0, query_len)]
+ 
+ 
+ def test_validate_config_allows_sparse_mla_full_decode_only():
+diff --git a/vllm_ascend/attention/context_parallel/sfa_cp.py b/vllm_ascend/attention/context_parallel/sfa_cp.py
+index 85a456716..f41078d65 100644
+--- a/vllm_ascend/attention/context_parallel/sfa_cp.py
++++ b/vllm_ascend/attention/context_parallel/sfa_cp.py
+@@ -285,6 +285,35 @@ class AscendSFAPCPImpl(AscendSFAImpl):
+ 
+         return super().exec_kv(kv_no_split, cos, sin, kv_cache, slots, attn_metadata)
+ 
++    def _store_parallel_kv(
++        self,
++        k_pe: torch.Tensor | None,
++        k_nope: torch.Tensor | None,
++        knope_scale: torch.Tensor | None,
++        kv_cache: tuple[torch.Tensor, ...] | None,
++        slot_mapping_sfa: torch.Tensor,
++        attn_metadata: M,
++    ) -> tuple[torch.Tensor | None, torch.Tensor | None]:
++        if (
++            self.uses_packed_sfa_main_cache
++            and k_nope is not None
++            and slot_mapping_sfa.numel() != k_nope.shape[0]
++            and needs_pcp_kv_gather(attn_metadata, self.is_pcp_decode_sharded)
++        ):
++            replicated_tokens = get_pcp_num_replicated_tokens(
++                attn_metadata.num_decode_tokens, self.is_pcp_decode_sharded
++            )
++            if replicated_tokens:
++                pcp_size = get_pcp_group().world_size
++                local_tokens = attn_metadata.num_input_tokens
++                rank_slots = slot_mapping_sfa[: pcp_size * local_tokens].view(pcp_size, local_tokens)
++                # Native preprocessing returns deduplicated KV; its deferred
++                # packed-cache write must use the same decode/prefill order.
++                slot_mapping_sfa = torch.cat(
++                    (rank_slots[0, :replicated_tokens], rank_slots[:, replicated_tokens:].reshape(-1))
++                )
++        return super()._store_parallel_kv(k_pe, k_nope, knope_scale, kv_cache, slot_mapping_sfa, attn_metadata)
++
+ 
+ def as_byte_view(x: torch.Tensor) -> torch.Tensor:
+     """Return a byte view for FP8 tensors, preserving their bit patterns."""
+diff --git a/vllm_ascend/attention/indexer_kpool.py b/vllm_ascend/attention/indexer_kpool.py
+index b4c310816..d356ffebf 100644
+--- a/vllm_ascend/attention/indexer_kpool.py
++++ b/vllm_ascend/attention/indexer_kpool.py
+@@ -622,9 +622,8 @@ class Glm5NextKPoolIndexerBackend(nn.Module):
+         if not isinstance(tail_metadata, AscendIndexerKPoolTailMetadata):
+             raise TypeError("GLM KPool backend requires tail-cache metadata.")
+ 
++        # SFA owns token trimming, including padded PCP and graph query rows.
+         num_tokens = hidden_states.shape[0]
+-        if context.cudagraph_runtime_mode != CUDAGraphMode.FULL:
+-            num_tokens = min(num_tokens, indexer_metadata.num_actual_tokens)
+         hidden = hidden_states[:num_tokens]
+         k_hidden = k_hidden_states[:num_tokens]
+         if self._key_weight is None:
+diff --git a/vllm_ascend/attention/sfa_v1.py b/vllm_ascend/attention/sfa_v1.py
+index 5c3672bb2..5664675c0 100644
+--- a/vllm_ascend/attention/sfa_v1.py
++++ b/vllm_ascend/attention/sfa_v1.py
+@@ -266,7 +266,11 @@ class SparseMLAMetadataState:
+         expand_factor = max(cache_block_size // kernel_block_size, 1)
+         table_width = cdiv(vllm_config.model_config.max_model_len, cache_block_size) * expand_factor
+         capture_sizes = vllm_config.compilation_config.cudagraph_capture_sizes or []
+-        table_rows = max([vllm_config.scheduler_config.max_num_seqs + 1, *capture_sizes])
++        max_num_reqs = vllm_config.scheduler_config.max_num_seqs
++        if vllm_config.parallel_config.prefill_context_parallel_size > 1:
++            # PCP represents each prefill with two rank-local request chunks.
++            max_num_reqs *= 2
++        table_rows = max([max_num_reqs + 1, *capture_sizes])
+         self.block_table_buffer = torch.empty(table_rows, table_width, dtype=torch.int32, device=device)
+         if self.use_smla:
+             config = vllm_config.model_config.hf_text_config
+diff --git a/vllm_ascend/worker/v2/model_runner.py b/vllm_ascend/worker/v2/model_runner.py
+index e3c2dc4e6..d2a101049 100644
+--- a/vllm_ascend/worker/v2/model_runner.py
++++ b/vllm_ascend/worker/v2/model_runner.py
+@@ -497,7 +497,7 @@ class NPUModelRunner(GPUModelRunner):
+             )
+             if self.pcp_manager is not None:
+                 assert isinstance(self.pcp_manager, AscendPCPManager)
+-                self.pcp_manager.vllm_config = self.vllm_config
++                self.pcp_manager.bind_config(self.vllm_config)
+                 self.pcp_manager.kv_cache_config = kv_cache_config
+                 self.pcp_manager.global_input_buffers = self.input_buffers
+                 self.model_state.pcp_manager = self.pcp_manager
+diff --git a/vllm_ascend/worker/v2/pcp_manager.py b/vllm_ascend/worker/v2/pcp_manager.py
+index bfe52cd34..5ea6fa6ac 100644
+--- a/vllm_ascend/worker/v2/pcp_manager.py
++++ b/vllm_ascend/worker/v2/pcp_manager.py
+@@ -141,6 +141,10 @@ class AscendPCPManager(PCPManager):
+         # same global padded length.
+         self._sampling_hidden_restored = False
+ 
++    def bind_config(self, vllm_config: VllmConfig) -> None:
++        self.vllm_config = vllm_config
++        self.shard_decode_requests: bool = self.shard_decode_requests and self.is_decode_sharded
++
+     @property
+     def is_decode_sharded(self) -> bool:
+         """Use the shared policy after the runner injects vllm_config."""

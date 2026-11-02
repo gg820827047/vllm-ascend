@@ -1,0 +1,2885 @@
+commit 4f69e82f9e5f1f9b2d9d8108bf3d44849a9d5f3f
+Author:     Yunxiao Ning <73625538+foraxe@users.noreply.github.com>
+AuthorDate: Fri Oct 30 14:17:09 2026 +0800
+Commit:     GitHub <noreply@github.com>
+CommitDate: Fri Oct 30 14:17:09 2026 +0800
+
+    [Performance][DCP] Refresh native decode layouts and remap fixes for main (#16350)
+    
+    ### What this PR does / why we need it?
+    
+    Reduce layout, copy and cache-publication overhead around native SFA DCP
+    decode, continuing #16349 on main. The registered entry remains
+    `dcp_a2a_fused`.
+    
+    - **Output/LSE exchange:** pack BF16 partial output `[T, H, D]` and FP32
+    LSE `[T, H, 1]` as raw bits, perform one AllToAll, merge in FP32, and
+    return BF16 `[T, H / R, D]`. `T` is the query-token count seen by the
+    operator, including padding; it is not context length. Dimensions and
+    head shards come from the inputs and group. Small payloads retain the
+    existing full-vector kernels; larger output/LSE payloads use bounded
+    native head/feature tiles with tokens distributed across Vector Cores.
+    The 16K-element threshold selects tiling, not a fixed token cap or
+    upstream fallback. Existing power-of-two/layout constraints remain;
+    D512/local-head32 and scheduler-budget/T192 admission limits have been
+    removed.
+    - **Query gather:** derive NoPE/RoPE fragment widths and head counts
+    from inputs; preserve split sizes in the gather context and honor
+    `keep_view`. Eligible power-of-two fragments support BF16/FP16/FP32,
+    without the old 512/64 or T=2–12 whitelist. Other layouts retain the
+    existing preparation path.
+    - **Sparse-index remap:** use exact bit operations for power-of-two
+    DCP/interleave settings without narrowing INT64 indices. Other settings
+    use exact INT64 Torch arithmetic and stable compaction; sorting may
+    involve AICPU.
+    - **Native LI-C8 cache store:** combine final INT8 key publication and
+    FP16 scale conversion/publication at the existing cache-write point.
+    Native quantization and its rounding are unchanged. PCP/DSA-CP and other
+    cache formats keep their existing routes.
+    
+    The native exchange route uses the same tensor/group/mode contract
+    across NPU generations. PCP composition, token scatter, returned-LSE and
+    deferred-combine modes retain their existing implementations. In the
+    current normal SFA prefill path, including PCP+DCP prefill, KV is
+    gathered and attention returns before the decode O/LSE merge; a large
+    prefill `T` does not by itself exercise this decode pack kernel.
+    
+    Operator interfaces, constraints and numerical semantics are documented
+    under `vllm_ascend/ops/triton/docs/` in `sfa_dcp_exchange.md`,
+    `sfa_dcp_merge.md`, `sfa_dcp_query.md` and `sfa_indexer_store.md`.
+    
+    ### Does this PR introduce _any_ user-facing change?
+    
+    Yes: faster DCP decode components, exact large-index remapping, bounded
+    native packing for larger eligible inputs, and single-token dtype-view
+    compatibility. There is no new serving API, environment variable or
+    scheduler-budget parameter, and no change to SuperMem
+    allocation/placement.
+    
+    Release note:
+    [`release_notes/fragments/16350.yaml`](https://github.com/foraxe/vllm-ascend/blob/codex/dcp-decode-layouts/release_notes/fragments/16350.yaml).
+    
+    ### How was this patch tested?
+    
+    **Current runtime code: `7df9b3375`.** The release-note follow-up
+    changes metadata only.
+    
+    - CPU routing, dependency, exact-integer and specialization contracts:
+    **705 passed, 20 skipped**.
+    - Fresh A3 DCP2/4/8: **10 cases passed on every rank** for each group,
+    including T512/513, T256/257, T1025, wide outputs, changing-input
+    ACLGraph replay and revisiting older captures. The large-vector tests
+    assert that the native path is used.
+    - Single-card tiled-pack precision: **6 passed**, checking both LSE
+    storage layouts and exact BF16/FP32 bits, including NaN payloads, Inf
+    and negative zero.
+    - Single-token ordinary, odd-singleton and odd-offset layouts pass graph
+    replay. The odd-singleton failure was reproduced with a constructed
+    tensor; the actual SFA producer returned normal strides and worked on
+    all eight ranks. This is not a claim that normal T1 model requests were
+    failing.
+    - Changed-file manual pre-commit and targeted typing checks passed. The
+    [CI run for
+    `7df9b3375`](https://github.com/vllm-project/vllm-ascend/actions/runs/40855000062)
+    also passed its CI gate, including selected A2/A3/A5/310P tests. CI
+    coverage is separate from the manual benchmarks below.
+    
+    The fresh operator runs reused the existing A3 runtime: Python 3.12,
+    Torch 2.10.0, torch-npu 2.10.0.post4, Triton 3.2.0 and vLLM
+    `ced6857.empty`; msprof was from the CANN 9.1 installation. This is not
+    a fresh full-model or default-dependency validation.
+    
+    **Matched complete-path performance:** previous optimized PR head
+    `65163ad6e` versus `7df9b3375`, including pack → AllToAll → merge →
+    final BF16 output.
+    
+    | A3 configuration | Previous PR | Tiled pack | Latency change |
+    |---|---:|---:|---:|
+    | DCP8 / H64 / D512 / T192 | 206.651 us | 207.101 us | +0.22% |
+    | DCP2 / H64 / D512 / T513 | 1319.364 us | 529.044 us | −59.90% |
+    
+    External msprof `op_summary`, 10 alternating-order pairs ×50 replays per
+    mode: take the slowest rank per replay, then the median per block and
+    across 10 blocks. No outliers were removed. T513 compares against the
+    previous **upstream fallback**; the earlier unbounded native pack failed
+    to compile at this shape. T192 still uses the unchanged small-input pack
+    kernels. These are operator graph intervals, not HTTP TPOT or full-model
+    throughput.
+    
+    The original decode-overhead objective is supported by earlier A3
+    upstream OFF→ON evidence at `ec9b9a786`: T48 **181.37→98.03us** and T192
+    **528.19→203.17us**. Those historical results remain tied to that
+    revision; the current table checks the later change against the already
+    optimized PR.
+    
+    **Specialization and warmup:** `LSE_RANK_STRIDE` remains a measured
+    constexpr exception and can create new merge variants for unseen actual
+    shapes. In the previously tested `FULL_DECODE_ONLY`, no-MTP/no-LoRA,
+    DP1/max batch 192 setup, buckets `[1,2,4,8,16,32,48,64,96,128,192]`
+    cover normal single-token decode batches 1–192 through padding. A CPU
+    enumeration of the actual dispatch methods at both `ced6857` and
+    `544f182` confirmed that mapping; it is not a fresh all-batch model run.
+    Uncovered eager shapes can still compile on first use, and disk-cache
+    loading still has startup cost. See the [focused compilation
+    check](https://github.com/vllm-project/vllm-ascend/pull/16350#issuecomment-6491005525);
+    this PR does not claim token-independent or zero-compilation serving for
+    arbitrary configurations.
+    
+    **Earlier model evidence, with revision boundaries:**
+    
+    - A3 GLM-5.2 W4A8, optimization ON at `6a8c6c0f8`: official AISBench
+    community `gsm8k-lite`, **31/32 (96.875%)**, within its 95±5 reference
+    gate; TP8/DCP8/EP8/MRV2, no MTP/offload/prefix cache. The checkpoint did
+    not select the LI-C8 store path, so this does not validate model-level
+    INT8 cache writes.
+    - A5 full 78-layer GLM-5 MXW4A8 at `5a7bf962` versus base `6ba8bc2d`:
+    GSM8K first 32 examples **31/32→32/32**, and offline generation
+    throughput medians **+0.66% to +2.16%** on shared hardware. This is a
+    smoke subset with small performance deltas, not full-dataset
+    certification or a current-head model rerun. See the [A5 operator
+    validation](https://github.com/vllm-project/vllm-ascend/pull/16350#issuecomment-6396296753)
+    and [A5 model
+    follow-up](https://github.com/vllm-project/vllm-ascend/pull/16350#issuecomment-6408325712).
+    
+    Fresh current-head full-model accuracy/performance, full GPQA,
+    model-level LI-C8 and DCP16 are not claimed by these checks. Large-shape
+    probes establish operator behavior, not that a complete checkpoint fits
+    HBM at every tested shape.
+    
+    Relevant test commands:
+    
+    ```bash
+    python -m pytest --noconftest -q tests/ut/attention/test_sfa_dcp.py
+    python -m pytest --noconftest -q \
+      tests/e2e/nightly/single_node/ops/singlecard_ops/triton/test_sfa_dcp.py -k tiled_pack
+    # Repeat with nproc-per-node=2,4,8 in isolated NPU environments.
+    python -m torch.distributed.run --standalone --nproc-per-node=8 \
+      -m pytest --noconftest -q \
+      tests/e2e/nightly/single_node/ops/multicard_ops_a3/test_sfa_dcp.py \
+      -k 'singleton_stride or tiled_resource'
+    ```
+    
+    - vLLM main:
+    https://github.com/vllm-project/vllm/commit/544f182d9f0c9bfe8bd7645525951d5e3692a542
+    
+    ---------
+    
+    Signed-off-by: yunzhi <ningyunxiao.nyx@antgroup.com>
+    Signed-off-by: Yunxiao Ning <73625538+foraxe@users.noreply.github.com>
+
+diff --git a/release_notes/fragments/16350.yaml b/release_notes/fragments/16350.yaml
+new file mode 100644
+index 000000000..09d0836a5
+--- /dev/null
++++ b/release_notes/fragments/16350.yaml
+@@ -0,0 +1,6 @@
++pr: 16350
++entries:
++  - category: performance
++    text: Optimized native SFA decode query layouts, output/LSE exchange and sparse-index remapping under decode context parallelism. Native C8 indexer cache writes combine scale conversion with key and scale publication.
++  - category: bugfix
++    text: Fixed UB allocation failures when packing large native SFA DCP output/LSE payloads by using bounded tiles. Fixed BF16-to-INT32 view failures for single-token DCP inputs with odd singleton strides.
+diff --git a/tests/e2e/nightly/single_node/ops/multicard_ops_a3/test_sfa_dcp.py b/tests/e2e/nightly/single_node/ops/multicard_ops_a3/test_sfa_dcp.py
+new file mode 100644
+index 000000000..ae030b778
+--- /dev/null
++++ b/tests/e2e/nightly/single_node/ops/multicard_ops_a3/test_sfa_dcp.py
+@@ -0,0 +1,506 @@
++# SPDX-License-Identifier: Apache-2.0
++"""DCP2/4/8 precision tests; launch with torchrun and pytest --noconftest."""
++
++import gc
++import os
++
++import pytest
++import torch
++import torch.distributed as dist
++
++pytest.importorskip("torch_npu")
++
++from vllm.distributed.parallel_state import (  # noqa: E402
++    destroy_distributed_environment,
++    init_distributed_environment,
++    init_model_parallel_group,
++)
++
++from vllm_ascend.ops.triton.dcp import dcp_a2a  # noqa: E402
++from vllm_ascend.ops.triton.dcp.dcp_a2a import (  # noqa: E402
++    dcp_a2a_fused_combine,
++    fused_dcp_lse_combine,
++    pack_dcp_output_lse,
++)
++from vllm_ascend.ops.triton.dcp.sfa_dcp_exchange import can_exchange, exchange  # noqa: E402
++from vllm_ascend.ops.triton.dcp.sfa_dcp_query import prepare_query_head_major, unpack_query  # noqa: E402
++
++RANKS = int(os.environ.get("WORLD_SIZE", "1"))
++pytestmark = pytest.mark.skipif(RANKS not in (2, 4, 8), reason="requires isolated DCP2/4/8")
++
++
++@pytest.mark.skipif(RANKS != 8, reason="DCP8-specific precision regression")
++def test_exchange_matches_upstream_and_reference_with_changed_input_graphs():
++    rank = int(os.environ["RANK"])
++    torch.npu.set_device(int(os.environ["LOCAL_RANK"]))
++    dist.init_process_group("hccl")
++    retained = []
++
++    def inputs(tokens, step):
++        generator = torch.Generator().manual_seed(2026 + step)
++        outputs = torch.randn(8, tokens, 64, 512, generator=generator).to(torch.bfloat16)
++        lses = torch.randn(8, tokens, 64, 1, generator=generator)
++        # All-invalid and mixed-invalid heads cover NaN*0 contamination.
++        lses[:, :, 0] = -torch.inf
++        outputs[:, :, 0] = torch.nan
++        for sender, value in enumerate((torch.nan, torch.inf, -torch.inf)):
++            lses[sender, :, 1] = value
++            outputs[sender, :, 1] = torch.nan
++        return outputs, lses
++
++    for tokens in (1, 6, 12):
++        outputs, lses = inputs(tokens, 0)
++        # Head-major storage exercises a strided token-major view.
++        owner = outputs[rank].transpose(0, 1).contiguous().npu()
++        output = owner.transpose(0, 1)
++        lse = lses[rank].npu()
++
++        def invoke(output=output, lse=lse):
++            return dcp_a2a_fused_combine(output, lse, 8, 1, dist.group.WORLD)
++
++        for _ in range(5):
++            invoke()
++        torch.npu.synchronize()
++        graph = torch.npu.NPUGraph()
++        with torch.npu.graph(graph):
++            result = invoke()
++        for step in range(8):
++            outputs, lses = inputs(tokens, step)
++            owner.copy_(outputs[rank].transpose(0, 1).contiguous())
++            lse.copy_(lses[rank])
++            # These unchanged upstream helpers bypass the new dispatch guard.
++            send = pack_dcp_output_lse(output, lse, 8, 1)
++            recv = torch.empty_like(send)
++            dist.all_to_all_single(recv, send)
++            upstream = fused_dcp_lse_combine(recv, 512, 1)
++            graph.replay()
++            torch.npu.synchronize()
++            finite = torch.isfinite(lses)
++            weights = torch.nan_to_num(torch.softmax(lses.masked_fill(~finite, -torch.inf), dim=0), nan=0.0)
++            expected = (outputs.float().masked_fill(~finite, 0.0) * weights).sum(0)
++            expected = expected[:, rank * 8 : (rank + 1) * 8].to(torch.bfloat16)
++            assert torch.isfinite(result).all()
++            torch.testing.assert_close(result.cpu(), expected, rtol=1e-3, atol=1e-3)
++            torch.testing.assert_close(result, upstream, rtol=1e-3, atol=1e-3)
++        retained.append((graph, result, owner, lse))
++    dist.barrier()
++    dist.destroy_process_group()
++
++
++@pytest.mark.skipif(RANKS != 8, reason="DCP8-specific precision regression")
++def test_large_batch_registered_graph_matches_exact_uniform_merge(monkeypatch):
++    """Exercise the actual registered op with an exactly representable oracle.
++
++    The existing random strict-BF16 test above is retained unchanged. This
++    regression targets new large-batch routing, group lookup and graph reuse.
++    """
++    from vllm.distributed.parallel_state import (
++        destroy_distributed_environment,
++        init_distributed_environment,
++        init_model_parallel_group,
++    )
++
++    from vllm_ascend.ops.triton.dcp import dcp_a2a as dispatch
++    from vllm_ascend.ops.triton.dcp.sfa_dcp_exchange import can_exchange
++
++    calls: dict[int, int] = {}
++    original_exchange = dispatch.exchange
++
++    def observed_exchange(output, lse, group):
++        tokens = output.shape[0]
++        calls[tokens] = calls.get(tokens, 0) + 1
++        return original_exchange(output, lse, group)
++
++    monkeypatch.setattr(dispatch, "exchange", observed_exchange)
++
++    rank = int(os.environ["RANK"])
++    torch.npu.set_device(int(os.environ["LOCAL_RANK"]))
++    init_distributed_environment(
++        world_size=8, rank=rank, local_rank=rank, distributed_init_method="env://", backend="hccl"
++    )
++    group = init_model_parallel_group(
++        [list(range(8))],
++        local_rank=rank,
++        backend="hccl",
++        group_name="large_dcp8_regression",
++        use_device_communicator=False,
++    )
++    retained = []
++    for tokens in (48, 192):
++        base = (torch.arange(tokens * 64 * 512).reshape(tokens, 64, 512) % 31 - 15).float() / 32
++        output = (base + rank / 16).to(torch.bfloat16).npu()
++        lse = torch.zeros((tokens, 64, 1), device="npu", dtype=torch.float32)
++        assert can_exchange(output, lse, group.world_size)
++
++        def invoke(output=output, lse=lse):
++            return torch.ops.vllm.dcp_a2a_fused(output, lse, 8, 1, group.unique_name)
++
++        for _ in range(5):
++            invoke()
++        torch.npu.synchronize()
++        graph = torch.npu.NPUGraph()
++        calls_before_capture = calls.get(tokens, 0)
++        with torch.npu.graph(graph):
++            result = invoke()
++        assert calls.get(tokens, 0) > calls_before_capture, "registered capture bypassed the new exchange"
++        for step in range(8):
++            output.copy_((base + rank / 16 + step / 64).to(torch.bfloat16))
++            lse.fill_(step / 4)
++            graph.replay()
++            torch.npu.synchronize()
++            # Equal LSEs give equal weights. Every arithmetic term is binary-exact.
++            expected = (base[:, rank * 8 : (rank + 1) * 8] + 3.5 / 16 + step / 64).to(torch.bfloat16)
++            assert torch.equal(result.cpu().view(torch.int16), expected.contiguous().view(torch.int16))
++        retained.append((graph, result, output, lse))
++    dist.barrier()
++    retained.clear()
++    del graph, result, output, lse
++    gc.collect()
++    torch.npu.synchronize()
++    group.destroy()
++    destroy_distributed_environment()
++
++
++def _nonuniform_inputs(tokens, step):
++    rng = torch.Generator().manual_seed(16350 + step)
++    outputs = torch.randn(8, tokens, 64, 512, generator=rng).to(torch.bfloat16)
++    lses = torch.randn(8, tokens, 64, 1, generator=rng) * 4
++    # Repeat special cases in every receiver's head shard.
++    lses[:, :, 0::8] = -torch.inf
++    outputs[:, :, 0::8] = torch.nan
++    lses[:4, :, 1::8] = -torch.inf
++    outputs[:4, :, 1::8] = torch.nan
++    lses[:, :, 2::8] = -80
++    lses[step % 8, :, 2::8] = 80
++    lses[:, :, 3::8] = torch.arange(8).view(8, 1, 1, 1) * 1e-3
++    for sender, value in enumerate((torch.nan, torch.inf, -torch.inf)):
++        lses[sender, :, 4::8] = value
++        outputs[sender, :, 4::8] = torch.nan
++    return outputs, lses
++
++
++def _fp64_merge_reference(outputs, lses, rank):
++    values = outputs[:, :, rank * 8 : (rank + 1) * 8].double()
++    stats = lses[:, :, rank * 8 : (rank + 1) * 8].double()
++    valid = torch.isfinite(stats)
++    safe = stats.masked_fill(~valid, -torch.inf)
++    maximum = safe.amax(dim=0, keepdim=True)
++    maximum = torch.where(torch.isfinite(maximum), maximum, 0.0)
++    exponent = torch.exp(safe - maximum)
++    denominator = exponent.sum(dim=0, keepdim=True)
++    weights = exponent / torch.where(denominator > 0, denominator, 1.0)
++    terms = values.masked_fill(~valid, 0.0) * weights
++    return terms.sum(dim=0), terms.abs().sum(dim=0)
++
++
++@pytest.mark.skipif(RANKS != 8, reason="DCP8-specific precision regression")
++def test_nonuniform_large_batch_registered_graph_against_fp64(monkeypatch):
++    """Check FP32 math separately from the registered BF16 output rounding.
++
++    FP32 error budget: 1e-6 + 8 * eps32 * sum(abs(weighted contributions)).
++    BF16 output additionally permits half of one local BF16 ULP. This is a
++    dtype-rounding bound against FP64, not a relaxation of the old strict
++    BF16-to-BF16 test above (which remains unchanged).
++    """
++    from vllm.distributed.parallel_state import (
++        destroy_distributed_environment,
++        init_distributed_environment,
++        init_model_parallel_group,
++    )
++
++    from vllm_ascend.ops.triton.dcp import dcp_a2a as dispatch
++    from vllm_ascend.ops.triton.dcp.sfa_dcp_exchange import exchange
++
++    rank = int(os.environ["RANK"])
++    local_rank = int(os.environ["LOCAL_RANK"])
++    torch.npu.set_device(local_rank)
++    init_distributed_environment(
++        world_size=8, rank=rank, local_rank=local_rank, distributed_init_method="env://", backend="hccl"
++    )
++    group = init_model_parallel_group(
++        [list(range(8))],
++        local_rank=local_rank,
++        backend="hccl",
++        group_name="nonuniform_dcp8",
++        use_device_communicator=False,
++    )
++    calls = []
++
++    def observed(output, lse, process_group):
++        calls.append(output.shape[0])
++        return exchange(output, lse, process_group)
++
++    monkeypatch.setattr(dispatch, "exchange", observed)
++    retained = []
++    for tokens in (13, 191, 192):
++        outputs, lses = _nonuniform_inputs(tokens, 0)
++        owner = outputs[rank].transpose(0, 1).contiguous().npu()
++        output = owner.transpose(0, 1)
++        head_major_lse = tokens != 191
++        lse_owner = (lses[rank].transpose(0, 1).contiguous() if head_major_lse else lses[rank]).npu()
++        lse = lse_owner.transpose(0, 1) if head_major_lse else lse_owner
++
++        def invoke(output=output, lse=lse):
++            fp32 = exchange(output, lse, group.device_group)
++            bf16 = torch.ops.vllm.dcp_a2a_fused(output, lse, 8, 1, group.unique_name)
++            return fp32, bf16
++
++        for _ in range(3):
++            invoke()
++        torch.npu.synchronize()
++        graph = torch.npu.NPUGraph()
++        before = len(calls)
++        with torch.npu.graph(graph):
++            fp32, bf16 = invoke()
++        assert len(calls) > before, "registered capture bypassed optimized exchange"
++        for step in range(4):
++            outputs, lses = _nonuniform_inputs(tokens, step)
++            owner.copy_(outputs[rank].transpose(0, 1).contiguous())
++            lse_owner.copy_(lses[rank].transpose(0, 1).contiguous() if head_major_lse else lses[rank])
++            graph.replay()
++            reference, magnitude = _fp64_merge_reference(outputs, lses, rank)
++            actual32, actual16 = fp32.cpu().double(), bf16.cpu().double()
++            roundoff = 1e-6 + 8 * torch.finfo(torch.float32).eps * magnitude
++            rounded = reference.to(torch.bfloat16)
++            up = torch.nextafter(rounded, torch.full_like(rounded, torch.inf)).double()
++            down = torch.nextafter(rounded, torch.full_like(rounded, -torch.inf)).double()
++            half_ulp = torch.maximum(up - rounded.double(), rounded.double() - down) / 2
++            assert torch.isfinite(actual32).all() and torch.isfinite(actual16).all()
++            assert ((actual32 - reference).abs() <= roundoff).all()
++            assert ((actual16 - reference).abs() <= half_ulp + roundoff).all()
++            assert torch.count_nonzero(actual32[:, 0]) == torch.count_nonzero(actual16[:, 0]) == 0
++        retained.append((graph, fp32, bf16, owner, lse, reference, roundoff, half_ulp))
++    # Revisit older buckets after later captures share the same runtime kernels.
++    for saved_graph, saved32, saved16, _owner, _lse, reference, roundoff, half_ulp in reversed(retained):
++        saved_graph.replay()
++        torch.npu.synchronize()
++        assert ((saved32.cpu().double() - reference).abs() <= roundoff).all()
++        assert ((saved16.cpu().double() - reference).abs() <= half_ulp + roundoff).all()
++    dist.barrier()
++    retained.clear()
++    del graph, fp32, bf16, owner, output, lse
++    gc.collect()
++    torch.npu.synchronize()
++    group.destroy()
++    destroy_distributed_environment()
++
++
++@pytest.fixture(scope="module")
++def context():
++    rank, local_rank = int(os.environ["RANK"]), int(os.environ["LOCAL_RANK"])
++    torch.npu.set_device(local_rank)
++    init_distributed_environment(
++        world_size=RANKS, rank=rank, local_rank=local_rank, distributed_init_method="env://", backend="hccl"
++    )
++    group = init_model_parallel_group(
++        [list(range(RANKS))],
++        local_rank=local_rank,
++        backend="hccl",
++        group_name="generalized_dcp",
++        use_device_communicator=False,
++    )
++    retained: list[tuple] = []
++    yield rank, group, retained
++    # Capture buffers must outlive all graphs sharing this communicator.
++    for graph, checks, _owners in reversed(retained):
++        graph.replay()
++        for actual, expected, budget in checks:
++            assert ((actual.cpu().double() - expected.double()).abs() <= budget).all()
++    torch.npu.synchronize()
++    dist.barrier(group=group.cpu_group)
++    retained.clear()
++    gc.collect()
++    group.destroy()
++    destroy_distributed_environment()
++
++
++@pytest.mark.parametrize("local_heads", [3, 8, 32])
++@pytest.mark.parametrize("column_stride", [1, 2])
++def test_query_group_sizes_and_head_counts(context, local_heads, column_stride):
++    rank, group, retained = context
++    patterns = torch.tensor([0, -32768, 1, 127, 32640, -128, 32705, -63], dtype=torch.int16)
++    steps = 16 if RANKS == 8 and local_heads == 8 else 3
++    for tokens in (2, 6, 12):
++
++        def bits(sender, width, step, tokens=tokens):
++            rows = torch.arange(tokens * local_heads).view(tokens, local_heads, 1)
++            columns = torch.arange(width).view(1, 1, width)
++            values = ((rows * 257 + columns * 17 + sender * 4099 + step * 8191) % 65536 - 32768).to(torch.int16)
++            values[..., : patterns.numel()] = patterns.roll(sender + step)
++            assert not torch.equal(values[0, 0], values[0, 1])
++            assert not torch.equal(values[0, 0], values[1, 0])
++            return values
++
++        n_owner = bits(rank, 512 * column_stride, 0).transpose(0, 1).contiguous().view(torch.bfloat16).npu()
++        r_owner = bits(rank, 64 * column_stride, 0).view(torch.bfloat16).npu()
++        qn, qr = n_owner.transpose(0, 1)[..., ::column_stride], r_owner[..., ::column_stride]
++
++        def invoke(qn=qn, qr=qr, tokens=tokens):
++            send = prepare_query_head_major(qn, qr)
++            gathered = torch.empty((RANKS * local_heads, tokens, 576), dtype=qn.dtype, device=qn.device)
++            dist.all_gather_into_tensor(gathered, send, group=group.device_group)
++            return unpack_query(gathered, (512, 64))
++
++        for _ in range(5):
++            invoke()
++        torch.npu.synchronize()
++        graph = torch.npu.NPUGraph()
++        with torch.npu.graph(graph):
++            result = invoke()
++        for step in range(steps):
++            n_owner.copy_(bits(rank, 512 * column_stride, step).transpose(0, 1).contiguous().view(torch.bfloat16))
++            r_owner.copy_(bits(rank, 64 * column_stride, step).view(torch.bfloat16))
++            graph.replay()
++            for actual, width in zip(result, (512, 64)):
++                expected = torch.cat(
++                    [bits(s, width * column_stride, step)[..., ::column_stride] for s in range(RANKS)], dim=1
++                )
++                assert actual.is_contiguous()
++                assert torch.equal(actual.cpu().view(torch.int16), expected)
++        checks = [
++            (
++                actual.view(torch.int16),
++                torch.cat(
++                    [bits(s, width * column_stride, steps - 1)[..., ::column_stride] for s in range(RANKS)], dim=1
++                ),
++                0,
++            )
++            for actual, width in zip(result, (512, 64))
++        ]
++        retained.append((graph, checks, (n_owner, r_owner)))
++
++
++@pytest.mark.parametrize("local_heads", [3, 8, 32])
++@pytest.mark.parametrize("tokens", [1, 2, 13, 48, 191, 192])
++def test_registered_exchange_group_sizes_against_fp64(context, local_heads, tokens, monkeypatch):
++    rank, group, retained = context
++    heads = RANKS * local_heads
++    calls = []
++
++    def observed(*args):
++        calls.append(True)
++        return exchange(*args)
++
++    monkeypatch.setattr(dcp_a2a, "exchange", observed)
++
++    def inputs(step):
++        generator = torch.Generator().manual_seed(16350 + step)
++        outputs = torch.randn(RANKS, tokens, heads, 512, generator=generator).to(torch.bfloat16)
++        lses = torch.randn(RANKS, tokens, heads, 1, generator=generator) * 4
++        lses[:, :, ::local_heads] = -torch.inf
++        outputs[:, :, ::local_heads] = torch.nan
++        lses[0, :, 1::local_heads] = torch.nan
++        outputs[0, :, 1::local_heads] = torch.nan
++        return outputs, lses
++
++    outputs, lses = inputs(0)
++    owner = outputs[rank].transpose(0, 1).contiguous().npu()
++    output = owner.transpose(0, 1)
++    lse_owner = lses[rank].transpose(0, 1).contiguous().npu()
++    lse = lse_owner.transpose(0, 1)
++
++    optimized = can_exchange(output, lse, RANKS)
++
++    def invoke():
++        fp32 = exchange(output, lse, group.device_group) if optimized else None
++        return fp32, torch.ops.vllm.dcp_a2a_fused(output, lse, RANKS, 1, group.unique_name)
++
++    for _ in range(3):
++        invoke()
++    graph = torch.npu.NPUGraph()
++    before = len(calls)
++    with torch.npu.graph(graph):
++        fp32, bf16 = invoke()
++    assert (len(calls) > before) == optimized, "registered capture ignored tensor eligibility"
++    for step in range(3):
++        outputs, lses = inputs(step)
++        owner.copy_(outputs[rank].transpose(0, 1).contiguous())
++        lse_owner.copy_(lses[rank].transpose(0, 1).contiguous())
++        graph.replay()
++        values = outputs[:, :, rank * local_heads : (rank + 1) * local_heads].double()
++        stats = lses[:, :, rank * local_heads : (rank + 1) * local_heads].double()
++        valid = torch.isfinite(stats)
++        weights = torch.nan_to_num(torch.softmax(stats.masked_fill(~valid, -torch.inf), dim=0), nan=0.0)
++        terms = values.masked_fill(~valid, 0.0) * weights
++        reference = terms.sum(0)
++        budget = 1e-6 + 8 * torch.finfo(torch.float32).eps * terms.abs().sum(0)
++        rounded = reference.to(torch.bfloat16)
++        upper = torch.nextafter(rounded, torch.full_like(rounded, torch.inf)).double()
++        lower = torch.nextafter(rounded, torch.full_like(rounded, -torch.inf)).double()
++        half_ulp = torch.maximum(upper - rounded.double(), rounded.double() - lower) / 2
++        if optimized:
++            assert ((fp32.cpu().double() - reference).abs() <= budget).all()
++        assert ((bf16.cpu().double() - reference).abs() <= half_ulp + budget).all()
++    checks = [(bf16, reference, half_ulp + budget)]
++    if optimized:
++        checks.append((fp32, reference, budget))
++    retained.append((graph, checks, (owner, lse_owner)))
++
++
++@pytest.mark.parametrize("layout", ["ordinary", "odd_singleton", "odd_offset"])
++def test_exchange_t1_singleton_stride_graph(context, layout):
++    rank, group, retained = context
++    heads = RANKS * 8
++    if layout == "odd_singleton":
++        owner = torch.empty((heads, 512, 1), dtype=torch.bfloat16, device="npu")
++        output = owner.permute(2, 0, 1)
++        assert output.is_contiguous() and output.stride(0) == 1
++    elif layout == "odd_offset":
++        owner = torch.empty(heads * 512 + 1, dtype=torch.bfloat16, device="npu")
++        output = owner[1:].view(1, heads, 512)
++    else:
++        owner = output = torch.empty((1, heads, 512), dtype=torch.bfloat16, device="npu")
++    lse = torch.zeros((1, heads, 1), device="npu")
++    base = (torch.arange(heads * 512).reshape(1, heads, 512) % 31 - 15).float() / 32
++    output.copy_(base + rank / 16)
++
++    def invoke():
++        return torch.ops.vllm.dcp_a2a_fused(output, lse, RANKS, 1, group.unique_name)
++
++    for _ in range(3):
++        invoke()
++    graph = torch.npu.NPUGraph()
++    with torch.npu.graph(graph):
++        result = invoke()
++    for step in range(3):
++        output.copy_(base + rank / 16 + step / 64)
++        lse.fill_(step / 4)
++        graph.replay()
++        expected = (base[:, rank * 8 : (rank + 1) * 8] + (RANKS - 1) / 32 + step / 64).bfloat16()
++        assert torch.equal(result.cpu().view(torch.int16), expected.view(torch.int16))
++    retained.append((graph, [(result, expected, 0)], (owner, lse)))
++
++
++@pytest.mark.parametrize(
++    "tokens,local_heads,head_dim",
++    [(512, 32, 512), (513, 32, 512), (1025, 16, 512), (256, 64, 512), (257, 64, 512), (1, 64, 1024), (2, 64, 1024)],
++)
++def test_exchange_tiled_resource_graph(context, tokens, local_heads, head_dim, monkeypatch):
++    rank, group, retained = context
++    heads = RANKS * local_heads
++    owner = torch.empty((heads, tokens, head_dim), dtype=torch.bfloat16, device="npu")
++    output = owner.transpose(0, 1)
++    lse = torch.zeros((tokens, heads, 1), device="npu")
++    assert can_exchange(output, lse, RANKS)
++
++    def unexpected_fallback(*args, **kwargs):
++        raise AssertionError("large vectors must stay on the native exchange path")
++
++    monkeypatch.setattr(dcp_a2a, "pack_dcp_output_lse", unexpected_fallback)
++
++    def invoke():
++        return torch.ops.vllm.dcp_a2a_fused(output, lse, RANKS, 1, group.unique_name)
++
++    output.fill_(rank / 16)
++    for _ in range(3):
++        invoke()
++    graph = torch.npu.NPUGraph()
++    with torch.npu.graph(graph):
++        result = invoke()
++    for step in range(3):
++        output.fill_(rank / 16 + step / 64)
++        lse.fill_(step / 4)
++        graph.replay()
++        expected = torch.full((tokens, local_heads, head_dim), (RANKS - 1) / 32 + step / 64, dtype=torch.bfloat16)
++        assert torch.equal(result.cpu().view(torch.int16), expected.view(torch.int16))
++    retained.append((graph, [(result, expected, 0)], (owner, lse)))
+diff --git a/tests/e2e/nightly/single_node/ops/singlecard_ops/triton/test_sfa_dcp.py b/tests/e2e/nightly/single_node/ops/singlecard_ops/triton/test_sfa_dcp.py
+new file mode 100644
+index 000000000..4431f4b24
+--- /dev/null
++++ b/tests/e2e/nightly/single_node/ops/singlecard_ops/triton/test_sfa_dcp.py
+@@ -0,0 +1,252 @@
++# SPDX-License-Identifier: Apache-2.0
++"""Single-NPU precision and changing-input graph tests for SFA Triton helpers."""
++
++import pytest
++import torch
++
++torch_npu = pytest.importorskip("torch_npu")
++
++from vllm_ascend.ops.triton.dcp.sfa_dcp_exchange import _pack_token_peer_tiled  # noqa: E402
++from vllm_ascend.ops.triton.dcp.sfa_dcp_merge import fused_merge  # noqa: E402
++from vllm_ascend.ops.triton.dcp.sfa_dcp_query import prepare_query_head_major, unpack_query  # noqa: E402
++from vllm_ascend.ops.triton.sfa_indexer_store import store_indexer_key_scale  # noqa: E402
++from vllm_ascend.ops.triton.sparse_index_remap import remap_sparse_indices_triton  # noqa: E402
++
++
++@pytest.mark.parametrize("tokens,local_heads,head_dim", [(513, 32, 512), (257, 64, 512), (1, 64, 1024)])
++@pytest.mark.parametrize("head_major_lse", [False, True])
++def test_tiled_pack_preserves_raw_bits(tokens, local_heads, head_dim, head_major_lse):
++    ranks, heads = 2, 2 * local_heads
++    bits = torch.tensor([0, -32768, 1, 16256, 32640, -128, 32705, -63], dtype=torch.int16)
++    owner_cpu = bits[torch.arange(heads * tokens * head_dim) % bits.numel()].view(heads, tokens, head_dim)
++    output = owner_cpu.npu().view(torch.bfloat16).transpose(0, 1)
++    lse_bits = torch.tensor([0, -2147483648, 1065353216, 2139095040, -8388608, 2143289345], dtype=torch.int32)
++    stats_cpu = lse_bits[torch.arange(tokens * heads) % lse_bits.numel()].view(tokens, heads, 1)
++    lse = stats_cpu.npu().view(torch.float32)
++    if head_major_lse:
++        lse = lse.transpose(0, 1).contiguous().transpose(0, 1)
++    words = output.view(torch.int32)
++    output_size = tokens * local_heads * (head_dim // 2)
++    send = torch.empty((ranks, output_size + tokens * local_heads), dtype=torch.int32, device="npu")
++    _pack_token_peer_tiled[(ranks,)](
++        words,
++        lse,
++        send,
++        words.stride(0),
++        words.stride(1),
++        lse.stride(0),
++        lse.stride(1),
++        tokens,
++        local_heads,
++        head_dim // 2,
++        4096,
++    )
++    actual = send.cpu()
++    expected_words = owner_cpu.transpose(0, 1).view(torch.int32)
++    expected_words = expected_words.reshape(tokens, ranks, local_heads, head_dim // 2).permute(1, 0, 2, 3)
++    expected_stats = stats_cpu.reshape(tokens, ranks, local_heads).permute(1, 0, 2)
++    assert torch.equal(actual[:, :output_size], expected_words.reshape(ranks, -1))
++    assert torch.equal(actual[:, output_size:], expected_stats.reshape(ranks, -1))
++
++
++@pytest.mark.parametrize("widths", [(512, 64), (256, 128), (64, 512)])
++@pytest.mark.parametrize("tokens,heads", [(1, 3), (6, 8), (13, 1), (192, 1)])
++@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])
++@pytest.mark.parametrize("column_stride", [1, 2])
++def test_query_bytes_and_changing_graph_inputs(widths, tokens, heads, dtype, column_stride):
++    torch.npu.set_device(0)
++    owners = [torch.empty(heads, tokens, width * column_stride, dtype=dtype, device="npu") for width in widths]
++    qn, qr = [owner.transpose(0, 1)[..., ::column_stride] for owner in owners]
++
++    def invoke():
++        packed = prepare_query_head_major(qn, qr)
++        return packed, unpack_query(packed, widths)
++
++    for _ in range(3):
++        invoke()
++    torch.npu.synchronize()
++    graph = torch.npu.NPUGraph()
++    with torch.npu.graph(graph):
++        packed, fragments = invoke()
++    bit_dtype = torch.int32 if dtype == torch.float32 else torch.int16
++    for step in range(3):
++        for owner in owners:
++            bits = torch.arange(owner.numel()).mul(17).add(step * 4099).to(bit_dtype).reshape(owner.shape)
++            patterns = (
++                [0, -2147483648, 2139095040, 2143289345] if bit_dtype == torch.int32 else [0, -32768, 32640, 32705]
++            )
++            bits.view(-1)[:4] = torch.tensor(patterns, dtype=bit_dtype)
++            owner.copy_(bits.view(dtype))
++        graph.replay()
++        expected = torch.cat((qn.cpu(), qr.cpu()), dim=-1).transpose(0, 1).contiguous()
++        assert torch.equal(packed.cpu().view(bit_dtype), expected.view(bit_dtype))
++        for actual, source in zip(fragments, (qn, qr)):
++            assert actual.is_contiguous()
++            assert torch.equal(actual.cpu().view(bit_dtype), source.cpu().view(bit_dtype))
++    torch.npu.synchronize()
++
++
++@pytest.mark.parametrize("ranks", [2, 4, 8])
++@pytest.mark.parametrize("token_dim", [1, 2])
++@pytest.mark.parametrize("head_dim", [127, 496, 512, 513])
++@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])
++def test_runtime_merge_dimensions_and_changed_graph_inputs(ranks, token_dim, head_dim, dtype):
++    torch.npu.set_device(0)
++    generator = torch.Generator().manual_seed(16350)
++    values = torch.randn(ranks, 3, 3, head_dim, generator=generator).to(dtype)
++    lses = torch.randn(ranks, 3, 3, generator=generator)
++    device_values, device_lses = values.npu(), lses.npu()
++    for _ in range(3):
++        fused_merge(device_values, device_lses, token_dim)
++    graph = torch.npu.NPUGraph()
++    with torch.npu.graph(graph):
++        result = fused_merge(device_values, device_lses, token_dim)
++    for step in range(3):
++        current = (values.float() + step / 16).to(dtype)
++        stats = lses + torch.arange(ranks).view(ranks, 1, 1) * step
++        stats[:, 0, 0] = -torch.inf
++        current[:, 0, 0] = torch.nan
++        device_values.copy_(current)
++        device_lses.copy_(stats)
++        graph.replay()
++        valid = torch.isfinite(stats)
++        weights = torch.nan_to_num(torch.softmax(stats.double().masked_fill(~valid, -torch.inf), dim=0), nan=0.0)
++        terms = current.double().masked_fill(~valid.unsqueeze(-1), 0.0) * weights.unsqueeze(-1)
++        expected = terms.sum(0).movedim(token_dim - 1, 0)
++        budget = (1e-6 + 8 * torch.finfo(torch.float32).eps * terms.abs().sum(0)).movedim(token_dim - 1, 0)
++        actual = result.cpu().double()
++        assert torch.isfinite(actual).all()
++        assert ((actual - expected).abs() <= budget).all()
++        assert torch.count_nonzero(actual[0, 0]) == 0
++    torch.npu.synchronize()
++
++
++def oracle(indices, rank, ranks=8, interleave=128):
++    expected = torch.full_like(indices, -1)
++    # CPU int64 arithmetic is independent of NPU vector integer division.
++    count = indices.shape[-1]
++    for source, target in zip(indices.long().reshape(-1, count), expected.reshape(-1, count)):
++        owned = source[(source >= 0) & ((source // interleave) % ranks == rank)]
++        target[: owned.numel()] = (owned // (ranks * interleave) * interleave + owned % interleave).to(target.dtype)
++    return expected
++
++
++@pytest.mark.parametrize("rows", [1, 6, 12])
++@pytest.mark.parametrize("ranks,rank", [(ranks, rank) for ranks in (2, 4, 8) for rank in range(ranks)])
++@pytest.mark.parametrize("dtype", [torch.int32, torch.int64])
++@pytest.mark.parametrize("interleave", [1, 64, 128, 256])
++def test_remap_exact_integer_boundaries_and_changed_graph_inputs(rows, ranks, rank, dtype, interleave):
++    torch.npu.set_device(0)
++    rng = torch.Generator().manual_seed(20260911 + rows + rank + interleave)
++    base = torch.randint(0, 2**31 - 1, (rows, 2048), generator=rng, dtype=dtype)
++    boundaries = torch.tensor(
++        [
++            -1,
++            0,
++            interleave - 1,
++            interleave,
++            ranks * interleave - 1,
++            ranks * interleave,
++            2**24 - 1,
++            2**24,
++            2**24 + interleave - 1,
++            2**31 - 1,
++        ],
++        dtype=dtype,
++    )
++    if dtype == torch.int64:
++        base[:, ::3] += 2**40
++        boundaries = torch.cat((boundaries, torch.tensor([2**31, 2**40, 2**62 - 1], dtype=dtype)))
++    device_input = base.npu()
++    for _ in range(5):
++        remap_sparse_indices_triton(device_input, ranks, rank, interleave)
++    graph = torch.npu.NPUGraph()
++    with torch.npu.graph(graph):
++        output = remap_sparse_indices_triton(device_input, ranks, rank, interleave)
++    for step in range(8):
++        current = torch.roll(base, step, dims=-1)
++        current[:, : boundaries.numel()] = boundaries
++        if step == 0:
++            current.fill_(-1)
++        device_input.copy_(current)
++        graph.replay()
++        assert torch.equal(output.cpu(), oracle(current, rank, ranks, interleave))
++    torch.npu.synchronize()
++
++
++@pytest.mark.parametrize("shape", [(0, 2048), (1, 0), (2, 3, 0)])
++def test_remap_empty_input(shape):
++    value = torch.empty(shape, dtype=torch.int32, device="npu")
++    assert remap_sparse_indices_triton(value, 8, 0, 128) is value
++
++
++@pytest.mark.parametrize("ranks,interleave", [(4, 128), (8, 64), (2, 1), (3, 127)])
++@pytest.mark.parametrize("dtype", [torch.int32, torch.int64])
++def test_remap_integer_layout_boundaries_and_graph(ranks, interleave, dtype):
++    torch.npu.set_device(0)
++    rng = torch.Generator().manual_seed(16350)
++    base = torch.randint(0, 2**31 - 1, (2, 3, 257), generator=rng, dtype=dtype)
++    boundary = torch.tensor([-1, 0, 127, 128, 2**24 - 1, 2**24, 2**24 + 1, 2**31 - 1], dtype=dtype)
++    base[..., : boundary.numel()] = boundary
++    for rank in range(ranks):
++        # Exercise noncontiguous input and arbitrary leading dimensions.
++        storage = base.transpose(-1, -2).contiguous().npu()
++        value = storage.transpose(-1, -2)
++        for _ in range(3):
++            remap_sparse_indices_triton(value, ranks, rank, interleave)
++        graph = torch.npu.NPUGraph()
++        with torch.npu.graph(graph):
++            result = remap_sparse_indices_triton(value, ranks, rank, interleave)
++        for step in range(3):
++            current = torch.roll(base, step, dims=-1) if step else torch.full_like(base, -1)
++            storage.copy_(current.transpose(-1, -2).contiguous())
++            graph.replay()
++            assert torch.equal(result.cpu(), oracle(current, rank, ranks, interleave))
++    torch.npu.synchronize()
++
++
++@pytest.mark.parametrize("capacity", [256, 512])
++@pytest.mark.parametrize("slot_dtype", [torch.int32, torch.int64])
++@pytest.mark.parametrize("width", [64, 128, 256])
++def test_native_quantized_cache_bytes_and_changing_graph_slots(capacity, slot_dtype, width):
++    torch.npu.set_device(0)
++    retained = []
++    for rows in (1, 6, 12, 13, 48, 192):
++        x = torch.randn(rows, width, dtype=torch.bfloat16, device="npu")
++        keys, scales = torch_npu.npu_dynamic_quant(x, dst_type=torch.int8)
++        slots = torch.arange(rows, dtype=slot_dtype, device="npu") + 7
++        backing = torch.full((capacity * (width + 2) + 64,), 19, dtype=torch.int8, device="npu")
++        cache = backing[: capacity * width].view(capacity // 128, 128, 1, width)
++        scale_cache = backing[capacity * width : -64].view(torch.float16).view(capacity // 128, 128, 1, 1)
++        for _ in range(5):
++            store_indexer_key_scale(keys, scales, slots, cache, scale_cache)
++        torch.npu.synchronize()
++        graph = torch.npu.NPUGraph()
++        with torch.npu.graph(graph):
++            store_indexer_key_scale(keys, scales, slots, cache, scale_cache)
++        for step in range(16):
++            fresh_keys, fresh_scales = torch_npu.npu_dynamic_quant(torch.randn_like(x), dst_type=torch.int8)
++            keys.copy_(fresh_keys)
++            scales.copy_(fresh_scales)
++            selected = torch.arange(rows, dtype=torch.int64) + 3 + step
++            if step % 2:
++                selected[-1] = -1
++            elif step % 4 == 0:
++                selected[-1] = capacity - 1
++            else:
++                selected[-1] = capacity
++            slots.copy_(selected)
++            backing.fill_(19)
++            scale_cache.fill_(3.25)
++            graph.replay()
++            torch.npu.synchronize()
++            expected_keys = torch.full((capacity, width), 19, dtype=torch.int8)
++            expected_scales = torch.full((capacity, 1), 3.25, dtype=torch.float16)
++            valid = (selected >= 0) & (selected < capacity)
++            expected_keys[selected[valid]] = fresh_keys.cpu()[valid]
++            expected_scales[selected[valid], 0] = fresh_scales.to(torch.float16).cpu()[valid]
++            assert torch.equal(cache.view(capacity, width).cpu(), expected_keys)
++            assert torch.equal(scale_cache.view(capacity, 1).view(torch.int16).cpu(), expected_scales.view(torch.int16))
++            assert bool((backing[-64:] == 19).all())
++        retained.append((graph, backing, keys, scales, slots))
++    torch.npu.synchronize()
+diff --git a/tests/ut/attention/test_indexer.py b/tests/ut/attention/test_indexer.py
+index 9e108cf5a..ee2ad3fba 100644
+--- a/tests/ut/attention/test_indexer.py
++++ b/tests/ut/attention/test_indexer.py
+@@ -44,7 +44,7 @@ def _make_builder(
+     vllm_config.parallel_config = SimpleNamespace(
+         prefill_context_parallel_size=pcp_size,
+         decode_context_parallel_size=dcp_size,
+-        tensor_parallel_size=4,
++        tensor_parallel_size=max(4, dcp_size),
+     )
+     vllm_config.scheduler_config = SimpleNamespace(
+         max_num_seqs=4,
+@@ -211,11 +211,28 @@ def test_sfa_indexer_metadata_builder_emits_full_slot_mapping_under_pcp(mock_cos
+     assert metadata.slot_mapping is common.slot_mapping
+ 
+ 
+-@pytest.mark.parametrize("dcp_size,expected_decode_tokens", [(1, 1), (2, 1)])
++@pytest.mark.parametrize("capture", [False, True])
++@patch("vllm_ascend.attention.indexer.get_ascend_config")
++@patch("vllm_ascend.attention.indexer.get_cos_and_sin_mla")
++def test_sfa_indexer_native_dcp_decode_boundary(mock_cos_sin, mock_get_ascend_config, capture):
++    mock_get_ascend_config.return_value.c8_reshape_optim_enabled = False
++    mock_cos_sin.return_value = (torch.zeros(2, 1, 1, 8), torch.zeros(2, 1, 1, 8))
++    common = _make_common_metadata()
++    common.num_actual_tokens = common.num_input_tokens = 2
++    common.query_start_loc = torch.tensor([0, 1, 2], dtype=torch.int32)
++    common.query_start_loc_cpu = common.query_start_loc.clone()
++    common.max_query_len = 1
++    common.is_prefilling = torch.tensor([False, False])
++    builder = _make_builder(pcp_size=1, dcp_size=8)
++    metadata = builder.build_for_cudagraph_capture(common) if capture else builder.build(0, common)
++    assert metadata.num_decode_tokens == metadata.num_actual_tokens == 2
++
++
++@pytest.mark.parametrize("pcp_size,dcp_size,expected_decode_tokens", [(2, 1, 1), (2, 2, 1), (1, 8, 1)])
+ @patch("vllm_ascend.attention.indexer.get_ascend_config")
+ @patch("vllm_ascend.attention.indexer.get_cos_and_sin_mla")
+ def test_sfa_indexer_metadata_builder_preserves_pcp_decode_boundary(
+-    mock_cos_sin, mock_get_ascend_config, dcp_size, expected_decode_tokens
++    mock_cos_sin, mock_get_ascend_config, pcp_size, dcp_size, expected_decode_tokens
+ ):
+     mock_cos_sin.return_value = (torch.zeros(4, 1, 1, 8), torch.zeros(4, 1, 1, 8))
+     common = _make_common_metadata()
+@@ -226,18 +243,21 @@ def test_sfa_indexer_metadata_builder_preserves_pcp_decode_boundary(
+ 
+     common.pcp_context = _make_decode_pcp_context()
+ 
+-    metadata = _make_builder(pcp_size=2, dcp_size=dcp_size).build(0, common)
++    metadata = _make_builder(pcp_size=pcp_size, dcp_size=dcp_size).build(0, common)
+ 
+-    # Preserve the leading-decode count for PCP with or without DCP.
++    # Preserve the boundary for PCP gathering and native DCP fused stores.
+     assert metadata.num_decode_tokens == expected_decode_tokens
+ 
+ 
++@pytest.mark.parametrize("pcp_size,dcp_size", [(2, 2), (1, 8)])
+ @pytest.mark.parametrize("pd_decode_recompute,expected_decode_tokens", [(False, 0), (True, 2)])
+ @patch("vllm_ascend.attention.indexer.get_ascend_config")
+ @patch("vllm_ascend.attention.indexer.get_cos_and_sin_mla")
+ def test_sfa_indexer_metadata_builder_preserves_rescheduled_prefill_boundary(
+     mock_cos_sin,
+     mock_get_ascend_config,
++    pcp_size,
++    dcp_size,
+     pd_decode_recompute,
+     expected_decode_tokens,
+ ):
+@@ -255,7 +275,7 @@ def test_sfa_indexer_metadata_builder_preserves_rescheduled_prefill_boundary(
+         return_value=pd_decode_recompute,
+     ):
+         common.pcp_context = _make_decode_pcp_context()
+-        metadata = _make_builder(pcp_size=2, dcp_size=2).build(0, common)
++        metadata = _make_builder(pcp_size=pcp_size, dcp_size=dcp_size).build(0, common)
+ 
+     # Short rescheduled prefills remain prefills unless the PD decode
+     # recompute scheduler intentionally treats them as decode requests.
+@@ -477,6 +497,7 @@ def test_indexer_orders_cache_gathers_after_query_dependency(with_dependency, qu
+         return tensor, SimpleNamespace(wait=lambda: events.append("wait_" + label))
+ 
+     indexer.forward_k = forward_k
++    indexer._use_fused_cache_store = False
+     indexer._gather_cache_inputs = lambda *args: AscendSFAIndexerBackend._gather_cache_inputs(indexer, *args)
+     indexer.write_cache = lambda *args, **kwargs: events.append("write_cache")
+     dependency = SimpleNamespace(wait=lambda: events.append("wait_q")) if with_dependency else None
+diff --git a/tests/ut/attention/test_sfa_cp_precision.py b/tests/ut/attention/test_sfa_cp_precision.py
+index abc9cd9f6..40d1d4a98 100644
+--- a/tests/ut/attention/test_sfa_cp_precision.py
++++ b/tests/ut/attention/test_sfa_cp_precision.py
+@@ -169,10 +169,15 @@ def test_dcp_query_gather_preserves_distinct_head_or_token_shards(gather_dim, pc
+     with (
+         patch.object(impl, "_parallel_query_gather_dim", return_value=gather_dim),
+         patch.object(sfa_cp, "get_pcp_group", return_value=SimpleNamespace(world_size=pcp_size)),
++        patch.object(
++            sfa_cp,
++            "prepare_query_head_major",
++            side_effect=lambda q, rope: torch.cat((q, rope), dim=-1).transpose(0, 1).contiguous(),
++        ),
+         patch.object(sfa_cp, "all_gather_async", return_value=(gathered, None)) as gather,
+     ):
+         context = impl._start_dcp_query_gather(q, rope)
+-        result_q, result_rope = impl._finish_dcp_gather(context)
++        result_q, result_rope = impl._finish_dcp_gather(context, keep_view=True)
+     assert gather.call_args.args[1] is impl.dcp_group
+     torch.testing.assert_close(gather.call_args.args[0], send)
+     torch.testing.assert_close(result_q, torch.cat((q, q + 1000), dim=gather_dim))
+diff --git a/tests/ut/attention/test_sfa_dcp.py b/tests/ut/attention/test_sfa_dcp.py
+new file mode 100644
+index 000000000..2efe27042
+--- /dev/null
++++ b/tests/ut/attention/test_sfa_dcp.py
+@@ -0,0 +1,679 @@
++# SPDX-License-Identifier: Apache-2.0
++"""CPU routing, dependency, integer-mapping and specialization contracts for SFA."""
++
++import ast
++from pathlib import Path
++from types import MethodType, SimpleNamespace
++from typing import Any, NamedTuple
++
++import pytest
++import torch
++
++ROOT = Path(__file__).resolve().parents[3]
++TRITON_ROOT = ROOT / "vllm_ascend/ops/triton"
++
++
++def load_function(path, name, namespace):
++    source = ROOT / path
++    tree = ast.parse(source.read_text())
++    method = next(n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == name)
++    future = ast.parse("from __future__ import annotations").body
++    exec(compile(ast.Module(body=future + [method], type_ignores=[]), str(source), "exec"), namespace)
++    return namespace[name]
++
++
++@pytest.mark.parametrize(
++    "tokens,ranks,scatter,supported,pcp",
++    [
++        (1, 8, 1, True, False),
++        (6, 8, 1, True, False),
++        (12, 8, 1, True, False),
++        (13, 8, 1, True, False),
++        (48, 8, 1, True, False),
++        (192, 8, 1, True, False),
++        (193, 8, 1, True, False),
++        (6, 2, 1, True, False),
++        (6, 4, 1, True, False),
++        (6, 16, 1, True, False),
++        (8, 8, 0, True, False),
++        (6, 8, 1, True, True),
++        (6, 1, 1, False, True),
++        (6, 1, 1, False, False),
++    ],
++)
++@pytest.mark.parametrize("a5", [False, True])
++def test_registered_op_keeps_upstream_fallback_and_output_dtype(tokens, ranks, scatter, supported, pcp, a5):
++    # Device generation must not change the tensor/mode eligibility contract.
++    calls = []
++    group = object()
++    output = torch.zeros(tokens, 64, 512, dtype=torch.bfloat16)
++    lse = torch.zeros(tokens, 64, 1)
++    shape = (tokens, 64 // ranks, 512) if scatter else (tokens // ranks, 64, 512)
++
++    def exchange(out, stats, selected_group):
++        assert selected_group is group and out is output and stats is lse
++        calls.append("exchange")
++        return torch.ones(shape, dtype=torch.float32)
++
++    def transfer(recv, send, *, group):
++        calls.append("upstream_collective")
++
++    namespace = {
++        "torch": torch,
++        "dist": SimpleNamespace(all_to_all_single=transfer),
++        "is_950": lambda: a5,
++        "can_exchange": lambda *_: supported,
++        "exchange": exchange,
++        "pack_dcp_output_lse": lambda *_, **kwargs: torch.empty(8, 16),
++        "fused_dcp_lse_combine": lambda *_, **kwargs: torch.ones(shape, dtype=output.dtype),
++    }
++    run = load_function("vllm_ascend/ops/triton/dcp/dcp_a2a.py", "dcp_a2a_fused_combine", namespace)
++
++    def pcp_gather(value, dim):
++        assert dim == 0
++        calls.append("pcp_gather")
++        return value
++
++    pcp_group = SimpleNamespace(all_gather=pcp_gather) if pcp else None
++    result = run(output, lse, ranks, scatter, group, pcp_group)
++    assert result.dtype == output.dtype and result.shape == shape
++    if scatter == 1 and supported and not pcp:
++        assert calls == ["exchange"]
++    else:
++        assert calls == (["upstream_collective"] if ranks > 1 else []) + (["pcp_gather"] if pcp else [])
++
++
++@pytest.mark.parametrize(
++    "tokens,expected", [(0, False), (1, True), (6, True), (12, True), (13, True), (48, True), (192, True), (193, True)]
++)
++def test_exchange_gate(tokens, expected):
++    namespace = {"torch": torch}
++    run = load_function("vllm_ascend/ops/triton/dcp/sfa_dcp_exchange.py", "can_exchange", namespace)
++    device = SimpleNamespace(type="npu")
++    output = SimpleNamespace(device=device, dtype=torch.bfloat16, ndim=3, shape=(tokens, 64, 512))
++    lse = SimpleNamespace(device=device, dtype=torch.float32, shape=(tokens, 64, 1))
++    assert run(output, lse, 8) is expected
++
++
++@pytest.mark.parametrize("ranks", [2, 4, 8, 16, 32])
++@pytest.mark.parametrize("local_heads", [1, 3, 8, 16, 32, 33, 64])
++@pytest.mark.parametrize(
++    "head_dim,vector_compatible",
++    [(0, False), (1, False), (2, True), (128, True), (496, False), (512, True), (513, False), (1024, True)],
++)
++def test_exchange_gate_derives_head_shards_from_group(ranks, local_heads, head_dim, vector_compatible):
++    namespace = {"torch": torch}
++    run = load_function("vllm_ascend/ops/triton/dcp/sfa_dcp_exchange.py", "can_exchange", namespace)
++    device = SimpleNamespace(type="npu")
++    heads = ranks * local_heads
++    output = SimpleNamespace(device=device, dtype=torch.bfloat16, ndim=3, shape=(13, heads, head_dim))
++    lse = SimpleNamespace(device=device, dtype=torch.float32, shape=(13, heads, 1))
++    assert run(output, lse, ranks) is (vector_compatible and local_heads & (local_heads - 1) == 0)
++    output.shape = (13, heads + 1, head_dim)
++    assert not run(output, lse, ranks)
++
++
++@pytest.mark.parametrize(
++    "tokens,heads,head_dim,ranks,expected",
++    [
++        (192, 64, 512, 8, True),
++        (512, 64, 512, 2, True),
++        (513, 64, 512, 2, True),
++        (1024, 64, 512, 4, True),
++        (1025, 64, 512, 4, True),
++        (256, 128, 512, 2, True),
++        (257, 128, 512, 2, True),
++        (1, 128, 512, 2, True),
++        (1, 128, 1024, 2, True),
++    ],
++)
++def test_exchange_gate_accepts_tiled_sizes(tokens, heads, head_dim, ranks, expected):
++    run = load_function("vllm_ascend/ops/triton/dcp/sfa_dcp_exchange.py", "can_exchange", {"torch": torch})
++    output = torch.empty((tokens, heads, head_dim), dtype=torch.bfloat16, device="meta")
++    lse = torch.empty((tokens, heads, 1), device="meta")
++    assert run(output, lse, ranks) is expected
++
++
++def test_custom_op_fake_retains_shape_dtype_and_does_not_collect():
++    run = load_function("vllm_ascend/ops/triton/dcp/dcp_a2a.py", "dcp_a2a_fused_fake", {"torch": torch})
++    output = torch.empty(6, 64, 512, dtype=torch.bfloat16)
++    result = run(output, torch.empty(6, 64, 1), 8, 1, "unused")
++    assert result.shape == (6, 8, 512) and result.dtype == output.dtype
++
++
++@pytest.mark.parametrize("supported", [False, True])
++def test_missing_scatter_group_raises_without_communication(supported):
++    def forbidden(*args, **kwargs):
++        raise AssertionError("communication attempted without a group")
++
++    namespace = {
++        "torch": torch,
++        "can_exchange": lambda *_: supported,
++        "exchange": forbidden,
++        "dist": SimpleNamespace(all_to_all_single=forbidden),
++        "pack_dcp_output_lse": lambda *args, **kwargs: torch.empty(8, 16),
++    }
++    run = load_function("vllm_ascend/ops/triton/dcp/dcp_a2a.py", "dcp_a2a_fused_combine", namespace)
++    with pytest.raises(ValueError, match="explicit All2All group"):
++        run(torch.empty(6, 64, 512, dtype=torch.bfloat16), torch.empty(6, 64, 1), 8, 1, None)
++
++
++@pytest.mark.parametrize("defer", [False, True])
++def test_new_main_merge_modes_never_take_output_only_fast_path(defer):
++    """Sparse-offload callers need packed contributions or the merged LSE."""
++    packed = torch.empty(8, 8, 6, 516)
++    calls = []
++
++    def forbidden(*args, **kwargs):
++        raise AssertionError("output-only fast path loses upstream merge state")
++
++    def combine(recv, head_dim, *, scatter_dim, return_lse):
++        assert recv.shape == packed.shape and head_dim == 512 and scatter_dim == 1
++        assert return_lse
++        calls.append("merge_lse")
++        return torch.empty(6, 8, 513)
++
++    namespace = {
++        "torch": torch,
++        "can_exchange": lambda *_: True,
++        "exchange": forbidden,
++        "dist": SimpleNamespace(all_to_all_single=lambda *args, **kwargs: calls.append("collective")),
++        "pack_dcp_output_lse": lambda *args, **kwargs: packed,
++        "fused_dcp_lse_combine": combine,
++    }
++    run = load_function("vllm_ascend/ops/triton/dcp/dcp_a2a.py", "dcp_a2a_fused_combine", namespace)
++    result = run(
++        torch.empty(6, 64, 512),
++        torch.empty(6, 64, 1),
++        8,
++        1,
++        object(),
++        return_lse=not defer,
++        defer_combine=defer,
++    )
++    assert result.shape == (packed.shape if defer else (6, 8, 513))
++    assert calls == (["collective"] if defer else ["collective", "merge_lse"])
++
++
++def test_registered_operator_forwards_group_and_fake_keeps_shape():
++    group = SimpleNamespace(world_size=8, device_group=object())
++    calls = []
++
++    def combine(*args, **kwargs):
++        calls.append(args[2])
++        return args[0]
++
++    namespace = {"torch": torch, "_groups": {"dcp": lambda: group}, "dcp_a2a_fused_combine": combine}
++    run = load_function("vllm_ascend/ops/triton/dcp/dcp_a2a.py", "dcp_a2a_fused", namespace)
++    fake = load_function("vllm_ascend/ops/triton/dcp/dcp_a2a.py", "dcp_a2a_fused_fake", {"torch": torch})
++    output = torch.empty(48, 64, 512, dtype=torch.bfloat16)
++    lse = torch.empty(48, 64, 1)
++    for ranks in (2, 4, 8):
++        group.world_size = ranks
++        run(output, lse, ranks, 1, "dcp")
++        result = fake(output, lse, ranks, 1, "dcp")
++        assert result.shape == (48, 64 // ranks, 512) and result.dtype == output.dtype
++    assert calls == [2, 4, 8]
++
++
++def test_attention_forwards_its_group_without_scheduler_config():
++    source = ROOT / "vllm_ascend/attention/context_parallel/sfa_cp.py"
++    cls = next(
++        n for n in ast.parse(source.read_text()).body if isinstance(n, ast.ClassDef) and n.name == "AscendSFADCPImpl"
++    )
++    method = next(n for n in cls.body if isinstance(n, ast.FunctionDef) and n.name == "_merge_dcp_outputs")
++    calls = []
++
++    def invoke(*args, **kwargs):
++        calls.append((args[2], args[4]))
++        return args[0]
++
++    namespace: dict[str, Any] = {
++        "torch": SimpleNamespace(ops=SimpleNamespace(vllm=SimpleNamespace(dcp_a2a_fused=invoke))),
++        "get_pcp_group": lambda: SimpleNamespace(world_size=1),
++    }
++    future = ast.parse("from __future__ import annotations").body
++    exec(compile(ast.Module(body=future + [method], type_ignores=[]), str(source), "exec"), namespace)
++    state = SimpleNamespace(
++        dcp_size=8,
++        dcp_group=SimpleNamespace(unique_name="dcp"),
++    )
++    namespace["_merge_dcp_outputs"](state, object(), object())
++    assert calls == [(8, "dcp")]
++
++
++@pytest.mark.parametrize(
++    "tokens,decode,dsa,prepared,pcp_size",
++    [
++        (1, True, False, True, 1),
++        (6, True, False, True, 1),
++        (12, True, False, True, 1),
++        (13, True, False, True, 1),
++        (6, False, False, False, 1),
++        (6, True, True, False, 1),
++        (6, True, False, False, 2),
++        (6, True, False, False, 8),
++    ],
++)
++@pytest.mark.parametrize("keep_view", [False, True])
++@pytest.mark.parametrize("layout", ["native", "fp16", "fp32", "other_width", "non_power_two"])
++@pytest.mark.parametrize("ranks", [2, 4, 8, 16])
++def test_query_gather_waits_before_final_unpack_and_preserves_fallback(
++    tokens, decode, dsa, prepared, pcp_size, ranks, layout, keep_view
++):
++    if pcp_size > ranks:
++        pytest.skip("PCP must divide the DCP group")
++    source = ROOT / "vllm_ascend/attention/context_parallel/sfa_cp.py"
++    tree = ast.parse(source.read_text())
++    context_class = next(n for n in tree.body if isinstance(n, ast.ClassDef) and n.name == "DCPGatherContext")
++    impl = next(n for n in tree.body if isinstance(n, ast.ClassDef) and n.name == "AscendSFADCPImpl")
++    methods = [
++        n
++        for n in impl.body
++        if isinstance(n, ast.FunctionDef)
++        and n.name in ("_start_dcp_query_gather", "_finish_dcp_gather", "_record_query_gather_context")
++    ]
++    for method in methods:
++        method.decorator_list = []
++    events = []
++    group = object()
++    tp_group = object()
++    replicas = ranks // pcp_size
++    handle = SimpleNamespace(wait=lambda: events.append("wait"))
++
++    def gather(value, selected_group):
++        assert selected_group is (tp_group if pcp_size > 1 else group)
++        events.append("gather")
++        return torch.cat([value] * replicas, dim=0), handle
++
++    def prep(qn, qr):
++        events.append("prepare")
++        return torch.cat((qn, qr), dim=-1).permute(1, 0, 2).contiguous()
++
++    def unpack(value, split_sizes):
++        assert events[-1] == "wait"
++        events.append("unpack")
++        return tuple(part.contiguous() for part in value.permute(1, 0, 2).split(split_sizes, dim=-1))
++
++    namespace = {
++        "torch": torch,
++        "M": object,
++        "AscendSFADCPMetadata": SimpleNamespace,
++        "NamedTuple": NamedTuple,
++        "all_gather_async": gather,
++        "get_pcp_group": lambda: SimpleNamespace(world_size=pcp_size),
++        "get_tp_group": lambda: tp_group,
++        "prepare_query_head_major": prep,
++        "unpack_query": unpack,
++    }
++    exec(compile(ast.Module(body=[context_class, *methods], type_ignores=[]), str(source), "exec"), namespace)
++    context_type = namespace["DCPGatherContext"]
++
++    def legacy(value, dim, split_sizes):
++        send = value if dim == 0 else value.permute(1, 0, 2).contiguous()
++        gathered, work = gather(send, group)
++        # Four-argument construction must keep older KV/query callers working.
++        return context_type(gathered, work, None if dim == 0 else (1, 0, 2), split_sizes)
++
++    state = SimpleNamespace(
++        enable_dsa_cp=dsa,
++        dcp_size=ranks,
++        dcp_group=group,
++        _start_dcp_gather=legacy,
++        _parallel_query_gather_dim=lambda: 0 if dsa else 1,
++        _has_prefill=lambda metadata: metadata.num_prefills > 0,
++    )
++    state._start_dcp_query_gather = lambda *args, **kwargs: namespace["_start_dcp_query_gather"](state, *args, **kwargs)
++    dtype = {"fp16": torch.float16, "fp32": torch.float32}.get(layout, torch.bfloat16)
++    nope_dim = {"other_width": 256, "non_power_two": 496}.get(layout, 512)
++    prepared = prepared and layout != "non_power_two"
++    qn = torch.arange(tokens * 8 * nope_dim).to(dtype).view(8, tokens, nope_dim).transpose(0, 1)
++    qr = torch.ones(tokens, 8, 64, dtype=dtype)
++    metadata = SimpleNamespace(num_prefills=0 if decode else 1, dcp_context=SimpleNamespace(gather_context=None))
++    namespace["_record_query_gather_context"](state, qn, qr, metadata)
++    context = metadata.dcp_context.gather_context
++    if not decode:
++        assert context is None and not events
++        return
++    assert context.query_prepared is prepared
++    assert "wait" not in events
++    result = namespace["_finish_dcp_gather"](context, keep_view=keep_view)
++    dim = 0 if dsa else 1
++    assert torch.equal(result[0], torch.cat([qn] * replicas, dim=dim))
++    assert torch.equal(result[1], torch.cat([qr] * replicas, dim=dim))
++    assert events.count("gather") == events.count("wait") == (0 if pcp_size == ranks else 1)
++    assert ("unpack" in events) is (prepared and not keep_view)
++    if prepared and not keep_view:
++        assert all(part.is_contiguous() for part in result)
++    elif prepared:
++        assert all(
++            part.untyped_storage().data_ptr() == context.gathered.untyped_storage().data_ptr() for part in result
++        )
++
++
++@pytest.mark.parametrize(
++    "key_dtype,width,expected",
++    [
++        (torch.int8, 128, True),
++        (torch.float8_e4m3fn, 128, False),
++        (torch.int8, 64, True),
++        (torch.int8, 256, True),
++        (torch.int8, 127, False),
++    ],
++)
++def test_static_store_selection_respects_native_cache_format(key_dtype, width, expected):
++    source = ROOT / "vllm_ascend/attention/indexer.py"
++    cls = next(
++        n
++        for n in ast.parse(source.read_text()).body
++        if isinstance(n, ast.ClassDef) and n.name == "AscendSFAIndexerBackend"
++    )
++    init = next(n for n in cls.body if isinstance(n, ast.FunctionDef) and n.name == "__init__")
++    policy = next(
++        n
++        for n in ast.walk(init)
++        if isinstance(n, ast.Assign)
++        and any(isinstance(t, ast.Attribute) and t.attr == "_use_fused_cache_store" for t in n.targets)
++    )
++    state = SimpleNamespace(
++        use_pcp=False,
++        _dsa_cp_active=False,
++        enable_sparse_li_c8=True,
++        c8_k_cache_dtype=key_dtype,
++        head_dim=width,
++    )
++    namespace = {"torch": torch, "self": state, "AscendSFAIndexerBackend": SimpleNamespace}
++    exec(compile(ast.Module(body=[policy], type_ignores=[]), str(source), "exec"), namespace)
++    assert state._use_fused_cache_store is expected
++
++
++@pytest.mark.parametrize(
++    "variant", ["native", "prefill", "mixed", "pcp", "dsa", "dcp1", "dcp2", "dcp4", "large", "subclass", "c4"]
++)
++@pytest.mark.parametrize("with_dependency", [False, True])
++def test_native_quantization_and_cache_pipeline_routing(variant, with_dependency):
++    """Keep quantization exact and finish parallel-layout transforms before writing."""
++    source = ROOT / "vllm_ascend/attention/indexer.py"
++    cls = next(
++        n
++        for n in ast.parse(source.read_text()).body
++        if isinstance(n, ast.ClassDef) and n.name == "AscendSFAIndexerBackend"
++    )
++    methods = [
++        n
++        for n in cls.body
++        if isinstance(n, ast.FunctionDef)
++        and n.name in ("forward", "forward_k", "_gather_cache_inputs", "_quantize_li_tensor")
++    ]
++    events = []
++    rows = 13 if variant == "large" else 6
++    quant = torch.arange(rows * 128).remainder(127).to(torch.int8).view(rows, 128)
++    scales = torch.full((rows,), 0.12345, dtype=torch.float32)
++    caches = (torch.zeros(256, 128, dtype=torch.int8), torch.zeros(256, 1, dtype=torch.float16))
++    if variant == "c4":
++        quant = torch.arange(rows * 64).remainder(127).to(torch.uint8).view(rows, 64)
++        scales = torch.arange(rows * 4).to(torch.uint8).view(rows, 2, 2)
++        caches = (torch.zeros(256, 64, dtype=torch.uint8), torch.zeros(256, 1, 2, 2, dtype=torch.uint8))
++
++    class Backend(SimpleNamespace):
++        q_hadamard = torch.eye(128, dtype=torch.bfloat16)
++
++    class OtherBackend(Backend):
++        pass
++
++    def native_quant(*args, **kwargs):
++        events.append("quant")
++        return quant, scales
++
++    def store(keys, stats, slots, key_cache, scale_cache):
++        assert events[-1] == "gather_done" and stats.dtype == torch.float32
++        events.append("fused")
++        key_cache.index_copy_(0, slots, keys)
++        scale_cache.index_copy_(0, slots, stats.to(torch.float16))
++
++    namespace = {
++        "torch": torch,
++        "HAS_TRITON": True,
++        "AscendSFAIndexerBackend": Backend,
++        "torch_npu": SimpleNamespace(npu_dynamic_quant=native_quant, npu_dynamic_mx_quant=native_quant),
++        "rope_forward_triton_siso": lambda x, *args, **kwargs: x,
++        "store_indexer_key_scale": store,
++        "INDEXER_K_CACHE_SLOT": 0,
++        "INDEXER_SCALE_CACHE_SLOT": 1,
++        "_gather_prefill_cache_inputs": lambda tensors, slots, count: (tensors, slots),
++        "all_gather_async": lambda value, *args, **kwargs: (value, None),
++        "get_tp_group": lambda: None,
++        "get_pcp_num_replicated_tokens": lambda count, sharded: 0 if sharded else count,
++    }
++    future = ast.parse("from __future__ import annotations").body
++    exec(compile(ast.Module(body=[*future, *methods], type_ignores=[]), str(source), "exec"), namespace)
++    state = OtherBackend() if variant == "subclass" else Backend()
++    state._dcp_size = int(variant[-1]) if variant in ("dcp1", "dcp2", "dcp4") else 8
++    state.use_pcp, state._dsa_cp_active = variant == "pcp", variant == "dsa"
++    state._is_pcp_decode_sharded = False
++    state.enable_sparse_li_c8 = variant != "c4"
++    state.enable_sparse_li_c4 = variant == "c4"
++    state.enable_sparse_li_quant = True
++    init = next(n for n in cls.body if isinstance(n, ast.FunctionDef) and n.name == "__init__")
++    policy = next(
++        n
++        for n in ast.walk(init)
++        if isinstance(n, ast.Assign)
++        and any(isinstance(t, ast.Attribute) and t.attr == "_use_fused_cache_store" for t in n.targets)
++    )
++    state.k_cache = SimpleNamespace(kv_cache=caches)
++    projected = torch.arange(rows * 160).reshape(rows, 160).to(torch.bfloat16)
++    state.wk_weights_proj = lambda x: (projected, None)
++    state.k_norm = lambda x: x
++    state.head_dim, state.qk_rope_head_dim, state.is_rope_neox_style = 128, 64, False
++    state.c8_k_cache_dtype, state.c8_k_scale_cache_dtype = torch.int8, torch.float16
++    exec(compile(ast.Module(body=[policy], type_ignores=[]), str(source), "exec"), {**namespace, "self": state})
++    state.c4_k_op_dtype, state.c4_k_scale_cache_dtype = torch.uint8, torch.uint8
++    state._quantize_li_tensor = MethodType(namespace["_quantize_li_tensor"], state)
++    state.forward_k = MethodType(namespace["forward_k"], state)
++
++    def gather(*args):
++        result = namespace["_gather_cache_inputs"](state, *args)
++        events.append("gather_done")
++        return result
++
++    def legacy(keys, stats, slots, **kwargs):
++        assert events[-1] == "gather_done" and stats.dtype == (torch.uint8 if variant == "c4" else torch.float16)
++        events.append("legacy")
++        caches[0].index_copy_(0, slots, keys)
++        caches[1].index_copy_(0, slots, stats)
++
++    state._gather_cache_inputs, state.write_cache = gather, legacy
++    decode = 0 if variant == "prefill" else (1 if variant == "mixed" else rows)
++    metadata = SimpleNamespace(
++        num_actual_tokens=rows,
++        num_decode_tokens=decode,
++        uses_pcp_sharded_layout=variant == "pcp",
++        slot_mapping=torch.arange(rows, dtype=torch.int64) + 5,
++        cos=torch.ones(rows, 64),
++        sin=torch.zeros(rows, 64),
++    )
++    x = torch.zeros(rows, 4)
++    dependency = SimpleNamespace(wait=lambda: events.append("wait_q")) if with_dependency else None
++    result = namespace["forward"](state, x, None, x, metadata, compute_topk=False, attn_q_gather_handle=dependency)
++    assert result is None and events == (
++        ["quant"]
++        + (["wait_q"] if with_dependency else [])
++        + ["gather_done", "fused" if variant in ("native", "dcp1", "dcp2", "dcp4", "large") else "legacy"]
++    )
++    assert torch.equal(caches[0][metadata.slot_mapping], quant)
++    expected_scales = scales.view(rows, 1, 2, 2) if variant == "c4" else scales.to(torch.float16).view(rows, 1)
++    assert torch.equal(caches[1][metadata.slot_mapping], expected_scales)
++    # Current main reuses this tail for top-k instead of repeating the GEMM.
++    _, _, indexer_weights = state.forward_k(x, metadata.cos, metadata.sin)
++    assert torch.equal(indexer_weights, projected[:, 128:])
++
++
++ALIGNMENT_METADATA = {
++    "_pack_token_peer": {
++        "output_stride_token_words",
++        "output_stride_head_words",
++        "lse_stride_token",
++        "lse_stride_head",
++    },
++    "_fused_merge_kernel": {"out_stride_rank", "out_stride_axis1", "out_stride_axis2", "head_dim"},
++    "_prepare_query_head_major": {
++        "nope_stride_token",
++        "nope_stride_head",
++        "nope_stride_feature",
++        "rope_stride_token",
++        "rope_stride_head",
++        "rope_stride_feature",
++    },
++}
++
++
++CASES: list[tuple[str, str, set[str], set[str]]] = [
++    ("dcp/sfa_dcp_exchange.py", "_pack_t1_peer", {"LOCAL_HEADS", "HEAD_WORDS"}, set()),
++    (
++        "dcp/sfa_dcp_exchange.py",
++        "_pack_token_peer",
++        {"LOCAL_HEADS", "HEAD_WORDS", "STATS_TILE"},
++        {"output_stride_token_words", "output_stride_head_words", "lse_stride_token", "lse_stride_head", "tokens"},
++    ),
++    (
++        "dcp/sfa_dcp_merge.py",
++        "_fused_merge_kernel",
++        {"RANKS", "NATIVE_LAYOUT", "BLOCK_D", "LSE_RANK_STRIDE"},
++        {
++            "out_stride_rank",
++            "out_stride_axis1",
++            "out_stride_axis2",
++            "lse_stride_axis1",
++            "head_count",
++            "head_dim",
++            "total_tiles",
++            "num_programs",
++        },
++    ),
++    (
++        "dcp/sfa_dcp_query.py",
++        "_prepare_query_head_major",
++        {"NOPE_DIM", "ROPE_DIM"},
++        {
++            "nope_stride_token",
++            "nope_stride_head",
++            "nope_stride_feature",
++            "rope_stride_token",
++            "rope_stride_head",
++            "rope_stride_feature",
++            "tokens",
++            "programs",
++            "heads",
++        },
++    ),
++    ("dcp/sfa_dcp_query.py", "_unpack_query_fragments", {"NOPE_DIM", "ROPE_DIM"}, {"tokens", "programs", "heads"}),
++    ("sfa_indexer_store.py", "_store_indexer_key_scale", {"KEY_WIDTH"}, {"capacity"}),
++]
++
++
++@pytest.mark.parametrize("filename,kernel,configuration,runtime", CASES)
++def test_kernel_parameter_classification(filename, kernel, configuration, runtime):
++    tree = ast.parse((TRITON_ROOT / filename).read_text())
++    function = next(n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef) and n.name == kernel)
++    constants = {
++        a.arg
++        for a in function.args.args
++        if isinstance(a.annotation, ast.Attribute) and a.annotation.attr == "constexpr"
++    }
++    assert constants == configuration
++    assert all(name.isupper() for name in constants)
++    if runtime:
++        jit = next(d for d in function.decorator_list if isinstance(d, ast.Call))
++        excluded = ast.literal_eval(next(k.value for k in jit.keywords if k.arg == "do_not_specialize"))
++        alignment = ALIGNMENT_METADATA.get(kernel, set())
++        assert runtime - alignment <= set(excluded)
++        assert not alignment & set(excluded), "do not discard useful runtime layout metadata"
++    used = {
++        n.id
++        for statement in function.body
++        for n in ast.walk(statement)
++        if isinstance(n, ast.Name) and isinstance(n.ctx, ast.Load)
++    }
++    assert {a.arg for a in function.args.args} <= used, "unused arguments must not create specialization keys"
++
++
++@pytest.mark.parametrize("shape", [(0, 2048), (1, 0), (2, 3, 0)])
++def test_empty_remap_preserves_shape_dtype_and_avoids_launch(shape):
++    source = Path(__file__).resolve().parents[3] / "vllm_ascend/ops/triton/sparse_index_remap.py"
++    tree = ast.parse(source.read_text())
++    function = next(n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == "remap_sparse_indices_triton")
++    namespace = {"torch": torch}
++    exec(compile(ast.Module(body=[function], type_ignores=[]), str(source), "exec"), namespace)
++    value = torch.empty(shape, dtype=torch.int32)
++    assert namespace["remap_sparse_indices_triton"](value, 8, 0, 128) is value
++
++
++@pytest.mark.parametrize("ranks", [1, 2, 4, 8, 16])
++@pytest.mark.parametrize("interleave", [1, 2, 64, 128, 256])
++def test_bitwise_mapping_matches_python_integer_contract(ranks, interleave):
++    source = Path(__file__).resolve().parents[3] / "vllm_ascend/ops/triton/sparse_index_remap.py"
++    function = next(
++        n
++        for n in ast.walk(ast.parse(source.read_text()))
++        if isinstance(n, ast.FunctionDef) and n.name == "remap_sparse_indices_fused_kernel"
++    )
++    statements: list[ast.stmt] = [
++        n
++        for n in function.body
++        if isinstance(n, ast.Assign)
++        and isinstance(n.targets[0], ast.Name)
++        and n.targets[0].id in ("owner", "remapped", "valid")
++    ]
++    indices = [
++        -1,
++        0,
++        interleave - 1,
++        interleave,
++        ranks * interleave - 1,
++        ranks * interleave,
++        2**24 - 1,
++        2**24 + 127,
++        2**31 - 1,
++        2**40 + 255,
++        2**62 - 1,
++    ]
++    for rank in range(ranks):
++        namespace = dict(
++            idx=torch.tensor(indices, dtype=torch.int64),
++            dcp_rank=rank,
++            DCP_BITS=ranks.bit_length() - 1,
++            INTERLEAVE_BITS=interleave.bit_length() - 1,
++        )
++        exec(compile(ast.Module(body=statements, type_ignores=[]), str(source), "exec"), namespace)
++        valid = [i >= 0 and (i // interleave) % ranks == rank for i in indices]
++        mapped = [(i // (ranks * interleave)) * interleave + i % interleave for i in indices]
++        assert namespace["valid"].tolist() == valid
++        assert namespace["remapped"][valid].tolist() == [m for m, v in zip(mapped, valid) if v]
++
++
++@pytest.mark.parametrize("ranks,interleave", [(1, 3), (3, 128), (8, 65), (2, 3), (3, 127), (5, 129)])
++@pytest.mark.parametrize("dtype", [torch.int32, torch.int64])
++def test_generic_wrapper_routes_to_exact_integer_fallback(ranks, interleave, dtype):
++    source = Path(__file__).resolve().parents[3] / "vllm_ascend/ops/triton/sparse_index_remap.py"
++    tree = ast.parse(source.read_text())
++    functions: list[ast.stmt] = [
++        node
++        for node in tree.body
++        if isinstance(node, ast.FunctionDef)
++        and node.name in ("_remap_sparse_indices_integer", "remap_sparse_indices_triton")
++    ]
++    # No Triton launch objects: a generic call must reach the actual fallback.
++    namespace = {"torch": torch}
++    exec(compile(ast.Module(body=functions, type_ignores=[]), str(source), "exec"), namespace)
++    value = torch.tensor([-1, 0, 1, 127, 128, 2**24 - 1, 2**24, 2**24 + 1, 2**31 - 2, 2**31 - 1], dtype=dtype)
++    value = value.repeat(2, 3, 1).transpose(0, 1)
++    for rank in range(ranks):
++        expected = torch.full_like(value, -1)
++        for i in range(3):
++            for j in range(2):
++                owned = [int(x) for x in value[i, j] if int(x) >= 0 and (int(x) // interleave) % ranks == rank]
++                mapped = [(x // (ranks * interleave)) * interleave + x % interleave for x in owned]
++                expected[i, j, : len(mapped)] = torch.tensor(mapped, dtype=dtype)
++        actual = namespace["remap_sparse_indices_triton"](value, ranks, rank, interleave)
++        assert torch.equal(actual, expected)
+diff --git a/tests/ut/attention/test_sfa_v1.py b/tests/ut/attention/test_sfa_v1.py
+index 18b1142ad..93a0c444d 100644
+--- a/tests/ut/attention/test_sfa_v1.py
++++ b/tests/ut/attention/test_sfa_v1.py
+@@ -704,6 +704,7 @@ class TestAscendSFAKPathFusion(TestBase):
+         indexer.k_cache = SimpleNamespace(kv_cache=torch.zeros(2, 16, 1, 128))
+         indexer.use_pcp = False
+         indexer._dsa_cp_active = False
++        indexer._use_fused_cache_store = False
+         indexer.write_cache = MagicMock()
+ 
+         hidden_states = torch.randn(num_tokens, head_dim + weights_dim)
+diff --git a/tests/ut/ops/test_mla.py b/tests/ut/ops/test_mla.py
+index 4072adc0c..dc9cdb379 100644
+--- a/tests/ut/ops/test_mla.py
++++ b/tests/ut/ops/test_mla.py
+@@ -120,6 +120,7 @@ class TestAscendSFAIndexerBackend(TestBase):
+         indexer.enable_sparse_li_c8 = False
+         indexer.enable_sparse_li_c4 = False
+         indexer.use_torch_npu_lightning_indexer = False
++        indexer._use_fused_cache_store = False
+         indexer.wk_weights_proj = MagicMock(return_value=(torch.zeros(2, 128 + 4), None))
+         indexer.wq_b = MagicMock(return_value=(torch.zeros(2, 2 * 128), None))
+         indexer.use_pcp = False
+diff --git a/vllm_ascend/attention/context_parallel/sfa_cp.py b/vllm_ascend/attention/context_parallel/sfa_cp.py
+index 8c45d41cf..224f8a298 100644
+--- a/vllm_ascend/attention/context_parallel/sfa_cp.py
++++ b/vllm_ascend/attention/context_parallel/sfa_cp.py
+@@ -46,6 +46,7 @@ from vllm_ascend.attention.utils import (
+ )
+ from vllm_ascend.device.device_op import DeviceOperator
+ from vllm_ascend.distributed.utils import all_gather_async
++from vllm_ascend.ops.triton.dcp.sfa_dcp_query import prepare_query_head_major, unpack_query
+ from vllm_ascend.ops.triton.pcp_kv_cache import copy_pcp_kv_cache
+ from vllm_ascend.quantization.methods import AscendLinearScheme
+ from vllm_ascend.utils import (
+@@ -431,6 +432,7 @@ class DCPGatherContext(NamedTuple):
+     handle: torch.distributed.Work | None
+     restore_perm: tuple[int, ...] | None
+     split_sizes: tuple[int, ...]
++    query_prepared: bool = False
+ 
+ 
+ @dataclass
+@@ -1502,6 +1504,8 @@ class AscendSFADCPImpl(DCPImplMixin, AscendSFAImpl):
+     ) -> tuple[torch.Tensor, ...]:
+         if context.handle is not None:
+             context.handle.wait()
++        if context.query_prepared and not keep_view:
++            return unpack_query(context.gathered, context.split_sizes)
+         gathered = context.gathered
+         if context.restore_perm is not None:
+             gathered = gathered.permute(context.restore_perm)
+@@ -1654,6 +1658,28 @@ class AscendSFADCPImpl(DCPImplMixin, AscendSFAImpl):
+                 split_sizes=(ql_nope.shape[-1], q_pe.shape[-1]),
+             )
+ 
++        # Decode-only callers reach this method; PCP+DCP keeps
++        # its separate TP-group override and DSA-CP gathers tokens on dim 0.
++        nope_dim, rope_dim = ql_nope.shape[-1], q_pe.shape[-1]
++        if (
++            query_gather_dim == 1
++            and ql_nope.dtype in (torch.bfloat16, torch.float16, torch.float32)
++            and ql_nope.shape[0] > 0
++            and nope_dim > 0
++            and rope_dim > 0
++            and nope_dim & (nope_dim - 1) == 0  # Each fragment uses a full tl.arange vector.
++            and rope_dim & (rope_dim - 1) == 0
++        ):
++            prepared = prepare_query_head_major(ql_nope, q_pe)
++            gathered, handle = all_gather_async(prepared, self.dcp_group)
++            return DCPGatherContext(
++                gathered=gathered,
++                handle=handle,
++                restore_perm=(1, 0, 2),
++                split_sizes=(nope_dim, rope_dim),
++                query_prepared=True,
++            )
++
+         # Avoid back-to-back DCP all_gather calls for the two SFA query
+         # fragments. On Ascend the separate gathers can leave SFA with an
+         # incomplete stream dependency on the first prefill. DSA-CP restores
+diff --git a/vllm_ascend/attention/indexer.py b/vllm_ascend/attention/indexer.py
+index ed0a6e3e1..085ee0467 100644
+--- a/vllm_ascend/attention/indexer.py
++++ b/vllm_ascend/attention/indexer.py
+@@ -41,6 +41,7 @@ from vllm_ascend.device.device_op import DeviceOperator
+ from vllm_ascend.distributed.utils import all_gather_async
+ from vllm_ascend.ops.rotary_embedding import get_cos_and_sin_mla
+ from vllm_ascend.ops.triton.rope import rope_forward_triton_siso
++from vllm_ascend.ops.triton.sfa_indexer_store import store_indexer_key_scale
+ from vllm_ascend.utils import (
+     _round_up,
+     enable_dsa_cp,
+@@ -224,6 +225,14 @@ class AscendSFAIndexerBackend(nn.Module, AttentionBackend):
+         self.use_pcp = parallel_config.prefill_context_parallel_size > 1
+         self._is_pcp_decode_sharded = is_pcp_decode_sharding_enabled(get_current_vllm_config())
+         self._dsa_cp_active = enable_dsa_cp()
++        self._use_fused_cache_store = (
++            type(self) is AscendSFAIndexerBackend
++            and not self.use_pcp  # Keep PCP cache gathering and slot remapping on the existing path.
++            and not self._dsa_cp_active
++            and self.enable_sparse_li_c8
++            and self.c8_k_cache_dtype == torch.int8  # INT8 config uses FP16 scales; C8 may also be FP8.
++            and self.head_dim & (self.head_dim - 1) == 0  # Full-row tl.arange requires a power-of-two width.
++        )
+ 
+         # The LI C8 Hadamard matrices are created while the sleep-mode weights
+         # mem-pool is active and are read by every forward, so they must survive
+@@ -254,7 +263,9 @@ class AscendSFAIndexerBackend(nn.Module, AttentionBackend):
+         ``kv_cache`` tuple (k cache only, or k cache plus scale cache)."""
+         return 2 if self.enable_sparse_li_quant else 1
+ 
+-    def _quantize_li_tensor(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
++    def _quantize_li_tensor(
++        self, x: torch.Tensor, *, defer_scale_cast: bool = False
++    ) -> tuple[torch.Tensor, torch.Tensor]:
+         """Apply Hadamard transform and quantize for LI C8 or C4 path."""
+         assert self.q_hadamard is not None
+         x = x @ self.q_hadamard
+@@ -265,7 +276,7 @@ class AscendSFAIndexerBackend(nn.Module, AttentionBackend):
+             scale = scale.view(*shape_ori[:-1], *scale.shape[-2:])
+             return x, scale.view(self.c4_k_scale_cache_dtype)
+         x, scale = torch_npu.npu_dynamic_quant(x, dst_type=self.c8_k_cache_dtype)
+-        return x, scale.to(self.c8_k_scale_cache_dtype)
++        return x, scale if defer_scale_cast else scale.to(self.c8_k_scale_cache_dtype)
+ 
+     def write_cache(
+         self,
+@@ -312,6 +323,8 @@ class AscendSFAIndexerBackend(nn.Module, AttentionBackend):
+         hidden_states: torch.Tensor,
+         cos: torch.Tensor,
+         sin: torch.Tensor,
++        *,
++        defer_scale_cast: bool = False,
+     ) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor]:
+         """k path: compute ``k_li`` (and ``k_li_scale`` when LI C8 is
+         enabled) from the hidden-states stage SFA hands in (raw states on
+@@ -352,7 +365,10 @@ class AscendSFAIndexerBackend(nn.Module, AttentionBackend):
+             k_li = torch.cat([k_li_pe, k_li_nope], dim=-1)  # [b*s,128]
+ 
+         if self.enable_sparse_li_quant:
+-            k_li, k_li_scale = self._quantize_li_tensor(k_li)
++            if defer_scale_cast:
++                k_li, k_li_scale = self._quantize_li_tensor(k_li, defer_scale_cast=True)
++            else:
++                k_li, k_li_scale = self._quantize_li_tensor(k_li)
+             if self.enable_sparse_li_c8:
+                 k_li_scale = k_li_scale.unsqueeze(-1)
+         else:
+@@ -431,14 +447,32 @@ class AscendSFAIndexerBackend(nn.Module, AttentionBackend):
+         inputs."""
+         cos = indexer_metadata.cos
+         sin = indexer_metadata.sin
+-        k_li, k_li_scale, indexer_weights = self.forward_k(k_hidden_states, cos, sin)
++        # Only the native backend may bypass its ordinary write_cache method.
++        # PCP/DSA-CP and custom cache subclasses keep their established layout.
++        fuse_store = (
++            self._use_fused_cache_store
++            and indexer_metadata.num_actual_tokens > 0
++            and indexer_metadata.num_decode_tokens == indexer_metadata.num_actual_tokens
++        )
++        if fuse_store:
++            k_li, k_li_scale, indexer_weights = self.forward_k(k_hidden_states, cos, sin, defer_scale_cast=True)
++        else:
++            k_li, k_li_scale, indexer_weights = self.forward_k(k_hidden_states, cos, sin)
+         if attn_q_gather_handle is not None:
+-            # Keep the k projection overlapped with Q communication, but order
+-            # the TP cache gathers after Q to avoid concurrent cross-group AIV
+-            # collectives during graph replay. wait() adds a stream dependency.
++            # Preserve main's ordering between Q communication and cache gathers.
+             attn_q_gather_handle.wait()
+         k_li, k_li_scale, slot_mapping = self._gather_cache_inputs(k_li, k_li_scale, indexer_metadata)
+-        self.write_cache(k_li, k_li_scale, slot_mapping)
++        if fuse_store:
++            assert k_li_scale is not None
++            store_indexer_key_scale(
++                k_li,
++                k_li_scale,
++                slot_mapping,
++                self.k_cache.kv_cache[INDEXER_K_CACHE_SLOT],
++                self.k_cache.kv_cache[INDEXER_SCALE_CACHE_SLOT],
++            )
++        else:
++            self.write_cache(k_li, k_li_scale, slot_mapping)
+         if not compute_topk:
+             return None
+ 
+@@ -1083,8 +1117,8 @@ class AscendSFAIndexerMetadataBuilder(AttentionMetadataBuilder[AscendSFAIndexerM
+             )
+ 
+         num_decode_tokens = 0
+-        if is_pcp_sharded:
+-            # Preserve the decode boundary for PCP's cache-write gather.
++        if is_pcp_sharded or self.use_dcp:
++            # PCP's gather and native DCP's fused store need the decode boundary.
+             _, _, num_decode_tokens, _ = split_decodes_and_prefills(
+                 common_attn_metadata,
+                 decode_threshold=self.decode_threshold,
+diff --git a/vllm_ascend/ops/triton/dcp/dcp_a2a.py b/vllm_ascend/ops/triton/dcp/dcp_a2a.py
+index 12a08b735..3453b8ed4 100644
+--- a/vllm_ascend/ops/triton/dcp/dcp_a2a.py
++++ b/vllm_ascend/ops/triton/dcp/dcp_a2a.py
+@@ -13,6 +13,7 @@ from vllm_ascend.ops.triton.dcp.dcp_a2a_batched import (
+     _fused_dcp_lse_combine_batched_kernel,
+     _pack_dcp_output_lse_batched_kernel,
+ )
++from vllm_ascend.ops.triton.dcp.sfa_dcp_exchange import can_exchange, exchange
+ from vllm_ascend.ops.triton.triton_utils import get_vectorcore_num, init_device_properties_triton
+ 
+ 
+@@ -487,6 +488,18 @@ def dcp_a2a_fused_combine(
+     scatter_size is the All2All group size, not the unified DCP size when
+     stacking PCP and DCP. Use 1 when Q heads were not gathered over TP.
+     """
++    # Keep PCP composition and token-scatter paths on the upstream implementation.
++    if (
++        pcp_group is None
++        and not return_lse
++        and not defer_combine
++        and scatter_dim == 1
++        and can_exchange(partial_output, softmax_lse, scatter_size)
++    ):
++        if scatter_group is None:
++            raise ValueError("SFA output scatter requires an explicit All2All group.")
++        return exchange(partial_output, softmax_lse, scatter_group).to(partial_output.dtype)
++
+     send = pack_dcp_output_lse(
+         partial_output,
+         softmax_lse,
+diff --git a/vllm_ascend/ops/triton/dcp/sfa_dcp_exchange.py b/vllm_ascend/ops/triton/dcp/sfa_dcp_exchange.py
+new file mode 100644
+index 000000000..ad0e8185e
+--- /dev/null
++++ b/vllm_ascend/ops/triton/dcp/sfa_dcp_exchange.py
+@@ -0,0 +1,250 @@
++# SPDX-License-Identifier: Apache-2.0
++"""Bit-preserving native-DCP output/LSE exchange for small decode batches."""
++
++import torch
++import torch.distributed as dist
++from vllm.triton_utils import tl, triton
++
++from vllm_ascend.ops.triton.dcp.sfa_dcp_merge import fused_merge
++from vllm_ascend.ops.triton.triton_utils import get_vectorcore_num, init_device_properties_triton
++
++# Keep the measured full-vector path for small inputs; tile larger payloads.
++_FULL_PACK_VECTOR_ELEMENTS = 16384
++_PACK_BLOCK_ELEMENTS = 4096
++
++
++@triton.jit
++def _pack_t1_peer(output_words_ptr, lse_ptr, send_ptr, LOCAL_HEADS: tl.constexpr, HEAD_WORDS: tl.constexpr):
++    peer = tl.program_id(0)
++    OUTPUT_WORDS: tl.constexpr = LOCAL_HEADS * HEAD_WORDS
++    PEER_WORDS: tl.constexpr = OUTPUT_WORDS + LOCAL_HEADS
++    word = tl.arange(0, OUTPUT_WORDS)
++    values = tl.load(output_words_ptr + peer * OUTPUT_WORDS + word, mask=word < OUTPUT_WORDS, other=0)
++    tl.store(send_ptr + peer * PEER_WORDS + word, values, mask=word < OUTPUT_WORDS)
++    local_head = tl.arange(0, LOCAL_HEADS)
++    stats = tl.load(
++        lse_ptr + peer * LOCAL_HEADS + local_head,
++        mask=local_head < LOCAL_HEADS,
++        other=0.0,
++    )
++    tl.store(
++        send_ptr + peer * PEER_WORDS + OUTPUT_WORDS + local_head,
++        stats.to(tl.int32, bitcast=True),
++        mask=local_head < LOCAL_HEADS,
++    )
++
++
++@triton.jit(do_not_specialize=["tokens"])
++def _pack_token_peer(
++    output_words_ptr,
++    lse_ptr,
++    send_ptr,
++    output_stride_token_words,
++    output_stride_head_words,
++    lse_stride_token,
++    lse_stride_head,
++    tokens,
++    LOCAL_HEADS: tl.constexpr,
++    HEAD_WORDS: tl.constexpr,
++    STATS_TILE: tl.constexpr,
++):
++    peer = tl.program_id(0)
++    OUTPUT_WORDS: tl.constexpr = LOCAL_HEADS * HEAD_WORDS
++    peer_words = tokens * (OUTPUT_WORDS + LOCAL_HEADS)
++    word = tl.arange(0, OUTPUT_WORDS)
++    local_head = word // HEAD_WORDS
++    dim_word = word % HEAD_WORDS
++    peer_base = peer * peer_words
++    for token in range(tokens):
++        values = tl.load(
++            output_words_ptr
++            + token * output_stride_token_words
++            + (peer * LOCAL_HEADS + local_head) * output_stride_head_words
++            + dim_word
++        )
++        tl.store(send_ptr + peer_base + token * OUTPUT_WORDS + word, values)
++    index = tl.arange(0, STATS_TILE)
++    token, head = index // LOCAL_HEADS, index % LOCAL_HEADS
++    stats = tl.load(
++        lse_ptr + token * lse_stride_token + (peer * LOCAL_HEADS + head) * lse_stride_head,
++        mask=index < tokens * LOCAL_HEADS,
++        other=0.0,
++    )
++    tl.store(
++        send_ptr + peer_base + tokens * OUTPUT_WORDS + index,
++        stats.to(tl.int32, bitcast=True),
++        mask=index < tokens * LOCAL_HEADS,
++    )
++
++
++@triton.jit(do_not_specialize=["tokens"])
++def _pack_token_peer_tiled(
++    output_words_ptr,
++    lse_ptr,
++    send_ptr,
++    output_stride_token_words,
++    output_stride_head_words,
++    lse_stride_token,
++    lse_stride_head,
++    tokens,
++    LOCAL_HEADS: tl.constexpr,
++    HEAD_WORDS: tl.constexpr,
++    BLOCK: tl.constexpr,
++):
++    peer = tl.program_id(0).to(tl.int64)
++    OUTPUT_WORDS: tl.constexpr = LOCAL_HEADS * HEAD_WORDS
++    BLOCK_D: tl.constexpr = HEAD_WORDS if HEAD_WORDS < 256 else 256
++    BLOCK_H: tl.constexpr = LOCAL_HEADS if LOCAL_HEADS < BLOCK // BLOCK_D else BLOCK // BLOCK_D
++    output_size = tl.cast(tokens, tl.int64) * OUTPUT_WORDS
++    peer_base = peer * (output_size + tl.cast(tokens, tl.int64) * LOCAL_HEADS)
++    # Explicit head/feature tiles preserve contiguous feature copies; a flat
++    # runtime index can lower to scalar GM gathers on this backend.
++    heads = tl.arange(0, BLOCK_H)
++    dims = tl.arange(0, BLOCK_D)
++    for token in range(tl.program_id(1), tokens, tl.num_programs(1)):
++        for head_start in range(0, LOCAL_HEADS, BLOCK_H):
++            head = head_start + heads
++            for dim_start in range(0, HEAD_WORDS, BLOCK_D):
++                dim = dim_start + dims
++                values = tl.load(
++                    output_words_ptr
++                    + tl.cast(token, tl.int64) * output_stride_token_words
++                    + (peer * LOCAL_HEADS + head[:, None]) * output_stride_head_words
++                    + dim[None, :]
++                )
++                tl.store(
++                    send_ptr
++                    + peer_base
++                    + tl.cast(token, tl.int64) * OUTPUT_WORDS
++                    + head[:, None] * HEAD_WORDS
++                    + dim[None, :],
++                    values,
++                )
++            stats = tl.load(lse_ptr + token * lse_stride_token + (peer * LOCAL_HEADS + head) * lse_stride_head)
++            tl.store(
++                send_ptr + peer_base + output_size + tl.cast(token, tl.int64) * LOCAL_HEADS + head,
++                stats.to(tl.int32, bitcast=True),
++            )
++
++
++def can_exchange(output: torch.Tensor, lse: torch.Tensor, ranks: int) -> bool:
++    """Kernel layout constraints shared by registered-operator callers."""
++    # These properties are uniform within a valid DCP group. Do not choose
++    # different collective counts based on rank-local allocation/stride state.
++    if output.dtype != torch.bfloat16 or output.ndim != 3 or ranks <= 1:
++        return False
++    tokens, heads, head_dim = output.shape
++    local_heads = heads // ranks
++    head_words = head_dim // 2
++    return (
++        ranks & (ranks - 1) == 0  # Merge's tl.arange(0, RANKS) requires a power-of-two length.
++        and tokens > 0
++        and head_dim > 0
++        and head_dim % 2 == 0  # Each INT32 word holds two BF16 values.
++        and head_words & (head_words - 1) == 0  # Full-word tl.arange vector length.
++        and heads % ranks == 0
++        and local_heads > 0
++        # Full vectors preserve the unmasked copy lowering. Other head counts
++        # retain upstream packing rather than scalarizing a masked token loop.
++        and local_heads & (local_heads - 1) == 0
++        and lse.dtype == torch.float32
++        and tuple(lse.shape) == (tokens, heads, 1)
++    )
++
++
++def _exchange_tokens(output: torch.Tensor, lse: torch.Tensor, group, ranks: int) -> torch.Tensor:
++    tokens = output.shape[0]
++    head_dim = output.shape[-1]
++    local_heads = output.shape[1] // ranks
++    head_words = head_dim // 2  # Two BF16 values per INT32 word.
++    output_words = local_heads * head_words
++    # Stride-dependent normalization stays inside the one-collective path.
++    if output.stride(-1) != 1 or any(stride % 2 for stride in output.stride()[:2]):
++        output = output.contiguous()
++    if output.storage_offset() % 2:
++        output = output.clone()
++    words = output.view(torch.int32)
++    peer_words = tokens * (output_words + local_heads)
++    send = torch.empty((ranks, peer_words), dtype=torch.int32, device=output.device)
++    # Preserve the small-vector kernel; large output and LSE vectors are both tiled.
++    full_vectors = max(output_words, tokens * local_heads) <= _FULL_PACK_VECTOR_ELEMENTS
++    pack = _pack_token_peer if full_vectors else _pack_token_peer_tiled
++    grid: tuple[int, ...] = (ranks,)
++    if not full_vectors:
++        init_device_properties_triton()
++        grid = (ranks, max(1, min(tokens, get_vectorcore_num() // ranks)))
++    pack[grid](
++        words,
++        lse,
++        send,
++        words.stride(0),
++        words.stride(1),
++        lse.stride(0),
++        lse.stride(1),
++        tokens,
++        local_heads,
++        head_words,
++        triton.next_power_of_2(tokens * local_heads) if full_vectors else _PACK_BLOCK_ELEMENTS,
++    )
++    recv = torch.empty_like(send)
++    dist.all_to_all_single(recv, send, group=group)
++    # Final receiver layout is token-major: no transpose or receive-side copy.
++    parts = recv.view(output.dtype).as_strided(
++        (ranks, tokens, local_heads, head_dim),
++        (peer_words * 2, local_heads * head_dim, head_dim, 1),
++    )
++    stats = recv.view(torch.float32).as_strided(
++        (ranks, tokens, local_heads),
++        (peer_words, local_heads, 1),
++        storage_offset=tokens * output_words,
++    )
++    return fused_merge(parts, stats, token_dim=1)
++
++
++def exchange(output: torch.Tensor, lse: torch.Tensor, group) -> torch.Tensor:
++    """Exchange head shards, retaining FP32 LSE bits and merge math."""
++    ranks = dist.get_world_size(group)
++    if output.shape[0] != 1:
++        return _exchange_tokens(output, lse, group, ranks)
++    head_dim = output.shape[-1]
++    local_heads = output.shape[1] // ranks
++    head_words = head_dim // 2  # Two BF16 values per INT32 word.
++    output_words = local_heads * head_words
++    peer_words = output_words + local_heads
++    output = output.contiguous()
++    if output.storage_offset() % 2:
++        output = output.clone()
++    lse = lse.contiguous()
++    # A contiguous T1 view can retain an odd singleton stride. Flattening is
++    # metadata-only and removes that stride before widening BF16 to INT32.
++    words = output.view(-1).view(torch.int32)
++    send = torch.empty((ranks, peer_words), dtype=torch.int32, device=output.device)
++    # T1 normalizes LSE to contiguous [1, heads, 1], so the head stride is one.
++    if max(output_words, local_heads) <= _FULL_PACK_VECTOR_ELEMENTS:
++        _pack_t1_peer[(ranks,)](words, lse, send, local_heads, head_words)
++    else:
++        _pack_token_peer_tiled[(ranks,)](
++            words,
++            lse,
++            send,
++            output.shape[1] * head_words,
++            head_words,
++            lse.stride(0),
++            lse.stride(1),
++            1,
++            local_heads,
++            head_words,
++            _PACK_BLOCK_ELEMENTS,
++        )
++    recv = torch.empty_like(send)
++    dist.all_to_all_single(recv, send, group=group)
++    parts = recv.view(output.dtype).as_strided(
++        (ranks, local_heads, 1, head_dim),
++        (peer_words * 2, head_dim, head_dim, 1),
++    )
++    stats = recv.view(torch.float32).as_strided(
++        (ranks, local_heads, 1),
++        (peer_words, 1, 1),
++        storage_offset=output_words,
++    )
++    return fused_merge(parts, stats, token_dim=2)
+diff --git a/vllm_ascend/ops/triton/dcp/sfa_dcp_merge.py b/vllm_ascend/ops/triton/dcp/sfa_dcp_merge.py
+new file mode 100644
+index 000000000..8e56a0277
+--- /dev/null
++++ b/vllm_ascend/ops/triton/dcp/sfa_dcp_merge.py
+@@ -0,0 +1,112 @@
++# SPDX-License-Identifier: Apache-2.0
++"""FP32 local merge for the small-batch DCP exchange."""
++
++from __future__ import annotations
++
++import math
++
++import torch
++from vllm.triton_utils import tl, triton
++
++from vllm_ascend.ops.triton.triton_utils import get_element, get_vectorcore_num, init_device_properties_triton
++
++
++@triton.jit(
++    do_not_specialize=[
++        "lse_stride_axis1",
++        "head_count",
++        "total_tiles",
++        "num_programs",
++    ]
++)
++def _fused_merge_kernel(
++    out_ptr,
++    lse_ptr,
++    result_ptr,
++    out_stride_rank,
++    out_stride_axis1,
++    out_stride_axis2,
++    LSE_RANK_STRIDE: tl.constexpr,
++    lse_stride_axis1,
++    head_count,
++    head_dim,
++    total_tiles,
++    num_programs,
++    RANKS: tl.constexpr,
++    NATIVE_LAYOUT: tl.constexpr,
++    BLOCK_D: tl.constexpr,
++):
++    pid = tl.program_id(0)
++    rank_ids = tl.arange(0, RANKS)
++    for tile in tl.range(pid, total_tiles, num_programs):
++        row = tile // tl.cdiv(head_dim, BLOCK_D)
++        dim = (tile % tl.cdiv(head_dim, BLOCK_D)) * BLOCK_D + tl.arange(0, BLOCK_D)
++        mask = dim < head_dim
++        token = row // head_count
++        head = row % head_count
++        if NATIVE_LAYOUT:
++            lse_offsets = rank_ids * LSE_RANK_STRIDE + head * lse_stride_axis1 + token
++        else:
++            lse_offsets = rank_ids * LSE_RANK_STRIDE + token * lse_stride_axis1 + head
++        raw_lse = tl.load(lse_ptr + lse_offsets).to(tl.float32)
++        finite = (raw_lse == raw_lse) & (raw_lse > float("-inf")) & (raw_lse < float("inf"))
++        safe_lse = tl.where(finite, raw_lse, float("-inf"))
++        max_lse = tl.max(safe_lse, axis=0)
++        # An all-invalid row must not evaluate -inf - (-inf), even in a
++        # branch later discarded by tl.where.
++        safe_max = tl.where(max_lse > float("-inf"), max_lse, 0.0)
++        shifted = tl.where(finite, safe_lse - safe_max, 0.0)
++        exponent = tl.where(finite, tl.exp(shifted), 0.0)
++        denominator = tl.sum(exponent, axis=0)
++        safe_denominator = tl.where(denominator > 0.0, denominator, 1.0)
++        weights = exponent / safe_denominator
++        result = tl.zeros((BLOCK_D,), dtype=tl.float32)
++        for rank in tl.static_range(0, RANKS):
++            weight = get_element(weights, (rank,))
++            if NATIVE_LAYOUT:
++                out_offsets = rank * out_stride_rank + head * out_stride_axis1 + token * out_stride_axis2 + dim
++            else:
++                out_offsets = rank * out_stride_rank + token * out_stride_axis1 + head * out_stride_axis2 + dim
++            values = tl.load(out_ptr + out_offsets, mask=mask, other=0.0).to(tl.float32)
++            # Match upstream: invalid-rank NaN/Inf outputs must not leak
++            # through a zero LSE weight (NaN * 0 is still NaN).
++            values = tl.where(get_element(finite, (rank,)), values, 0.0)
++            result += values * weight
++        tl.store(result_ptr + (token * head_count + head) * head_dim + dim, result, mask=mask)
++
++
++def fused_merge(out_recv: torch.Tensor, lse_recv: torch.Tensor, token_dim: int) -> torch.Tensor:
++    """Merge the validated rank/token/head payload produced by exchange."""
++    ranks = out_recv.shape[0]
++    if token_dim == 2:
++        _, heads, tokens, head_dim = out_recv.shape
++        native_layout = True
++    else:
++        _, tokens, heads, head_dim = out_recv.shape
++        native_layout = False
++    result = torch.empty((tokens, heads, head_dim), dtype=torch.float32, device=out_recv.device)
++    # Bound each program to one feature accumulator and a rank-weight vector.
++    block_d = min(triton.next_power_of_2(head_dim), 512)
++    tiles = tokens * heads * math.ceil(head_dim / block_d)
++    init_device_properties_triton()
++    programs = min(tiles, get_vectorcore_num())
++    _fused_merge_kernel[(programs,)](
++        out_recv,
++        lse_recv,
++        result,
++        # Eligibility guarantees unit innermost strides. The result is always
++        # allocated contiguous, so those strides need no kernel arguments.
++        out_recv.stride(0),
++        out_recv.stride(1),
++        out_recv.stride(2),
++        lse_recv.stride(0),
++        lse_recv.stride(1),
++        heads,
++        head_dim,
++        total_tiles=tiles,
++        num_programs=programs,
++        RANKS=ranks,
++        NATIVE_LAYOUT=native_layout,
++        BLOCK_D=block_d,
++    )
++    return result
+diff --git a/vllm_ascend/ops/triton/dcp/sfa_dcp_query.py b/vllm_ascend/ops/triton/dcp/sfa_dcp_query.py
+new file mode 100644
+index 000000000..5ab732b94
+--- /dev/null
++++ b/vllm_ascend/ops/triton/dcp/sfa_dcp_query.py
+@@ -0,0 +1,105 @@
++# SPDX-License-Identifier: Apache-2.0
++"""Direct gather-input packing and final SFA query unpacking for DCP decode."""
++
++import torch
++from vllm.triton_utils import tl, triton
++
++from vllm_ascend.ops.triton.triton_utils import get_vectorcore_num, init_device_properties_triton
++
++
++@triton.jit(do_not_specialize=["tokens", "programs", "heads"])
++def _prepare_query_head_major(
++    nope_ptr,
++    rope_ptr,
++    packed_ptr,
++    nope_stride_token,
++    nope_stride_head,
++    nope_stride_feature,
++    rope_stride_token,
++    rope_stride_head,
++    rope_stride_feature,
++    tokens,
++    programs,
++    heads,
++    NOPE_DIM: tl.constexpr,
++    ROPE_DIM: tl.constexpr,
++):
++    n = tl.arange(0, NOPE_DIM)
++    r = tl.arange(0, ROPE_DIM)
++    for row in tl.range(tl.program_id(0), heads * tokens, programs):
++        head, token = row // tokens, row % tokens
++        a = tl.load(nope_ptr + token * nope_stride_token + head * nope_stride_head + n * nope_stride_feature)
++        b = tl.load(rope_ptr + token * rope_stride_token + head * rope_stride_head + r * rope_stride_feature)
++        tl.store(packed_ptr + row * (NOPE_DIM + ROPE_DIM) + n, a)
++        tl.store(packed_ptr + row * (NOPE_DIM + ROPE_DIM) + NOPE_DIM + r, b)
++
++
++@triton.jit(do_not_specialize=["tokens", "programs", "heads"])
++def _unpack_query_fragments(
++    gathered_ptr,
++    nope_ptr,
++    rope_ptr,
++    tokens,
++    programs,
++    heads,
++    NOPE_DIM: tl.constexpr,
++    ROPE_DIM: tl.constexpr,
++):
++    n = tl.arange(0, NOPE_DIM)
++    r = tl.arange(0, ROPE_DIM)
++    for row in tl.range(tl.program_id(0), tokens * heads, programs):
++        token, head = row // heads, row % heads
++        base = (head * tokens + token) * (NOPE_DIM + ROPE_DIM)
++        a = tl.load(gathered_ptr + base + n)
++        b = tl.load(gathered_ptr + base + NOPE_DIM + r)
++        tl.store(nope_ptr + row * NOPE_DIM + n, a)
++        tl.store(rope_ptr + row * ROPE_DIM + r, b)
++
++
++def prepare_query_head_major(qn: torch.Tensor, qr: torch.Tensor) -> torch.Tensor:
++    tokens = qn.shape[0]
++    local_heads = qn.shape[1]
++    nope_dim, rope_dim = qn.shape[-1], qr.shape[-1]
++    result = torch.empty((local_heads, tokens, nope_dim + rope_dim), dtype=qn.dtype, device=qn.device)
++    init_device_properties_triton()
++    cores = get_vectorcore_num()
++    programs = min(local_heads * tokens, cores)
++    _prepare_query_head_major[(programs,)](
++        qn,
++        qr,
++        result,
++        qn.stride(0),
++        qn.stride(1),
++        qn.stride(2),
++        qr.stride(0),
++        qr.stride(1),
++        qr.stride(2),
++        tokens,
++        programs,
++        local_heads,
++        nope_dim,
++        rope_dim,
++    )
++    return result
++
++
++def unpack_query(gathered: torch.Tensor, split_sizes: tuple[int, ...]) -> tuple[torch.Tensor, torch.Tensor]:
++    tokens = gathered.shape[1]
++    heads = gathered.shape[0]
++    nope_dim, rope_dim = split_sizes
++    qn = torch.empty((tokens, heads, nope_dim), dtype=gathered.dtype, device=gathered.device)
++    qr = torch.empty((tokens, heads, rope_dim), dtype=gathered.dtype, device=gathered.device)
++    init_device_properties_triton()
++    cores = get_vectorcore_num()
++    programs = min(tokens * heads, cores)
++    _unpack_query_fragments[(programs,)](
++        gathered,
++        qn,
++        qr,
++        tokens,
++        programs,
++        heads,
++        nope_dim,
++        rope_dim,
++    )
++    return qn, qr
+diff --git a/vllm_ascend/ops/triton/docs/dcp_a2a_fused.md b/vllm_ascend/ops/triton/docs/dcp_a2a_fused.md
+index ceb1fd97b..a73b4ec53 100644
+--- a/vllm_ascend/ops/triton/docs/dcp_a2a_fused.md
++++ b/vllm_ascend/ops/triton/docs/dcp_a2a_fused.md
+@@ -20,6 +20,13 @@ stages:
+ The individual kernels are described in [pack_dcp_output_lse](pack_dcp_output_lse.md)
+ and [fused_dcp_lse_combine](fused_dcp_lse_combine.md).
+ 
++The small native BF16/D512 head-scatter route uses the bit-preserving
++[SFA DCP exchange](sfa_dcp_exchange.md) and [local merge](sfa_dcp_merge.md).
++It derives the payload from the input and actual group rather than assuming
++DCP8/H64. Query layout preparation is described in [SFA DCP query](sfa_dcp_query.md).
++The public operator has no scheduler-budget parameter; the backend owns
++scheduling and each layout route owns its kernel-specific selection policy.
++
+ ## Inputs and output
+ 
+ | Argument | Shape or type | Description |
+diff --git a/vllm_ascend/ops/triton/docs/sfa_dcp_exchange.md b/vllm_ascend/ops/triton/docs/sfa_dcp_exchange.md
+new file mode 100644
+index 000000000..e99c25e63
+--- /dev/null
++++ b/vllm_ascend/ops/triton/docs/sfa_dcp_exchange.md
+@@ -0,0 +1,43 @@
++# SFA DCP output/LSE exchange
++
++## Description
++
++- **Function**: Packs partial attention output and FP32 LSE into one bit-preserving payload, exchanges it once, and merges the received contributions in FP32. The registered entry point remains `dcp_a2a_fused`.
++- **Formula**: With `R` ranks, `H` gathered heads, `L = H / R` and feature width `D`, each peer receives `T * L * (D / 2 + 1)` INT32 words: two BF16 output values per word and one word per FP32 LSE. No floating-point LSE conversion is performed.
++- **Algorithm flow**: Pack the local output words followed by LSE bits for each peer; invoke `all_to_all_single`; create strided views of received output/LSE without a receive-side transpose; invoke [SFA DCP merge](sfa_dcp_merge.md), then convert the final output to BF16.
++- **Supported modes**: NPU eager execution and ACLGraph capture/replay, using the same API on all NPU generations. Execution/performance evidence is from Atlas A3.
++
++## Parameters
++
++| Parameter | Input/Output/Attribute | Description | Data type | Data format |
++| --- | --- | --- | --- | --- |
++| `output` | Input | Partial output, `[T, H, D]` | BF16 | ND |
++| `lse` | Input | Matching LSE, `[T, H, 1]` | FP32 | ND, strided |
++| `group` | Attribute | Actual head-scatter process group | HCCL process group | N/A |
++| merged output | Output | This rank's slice, `[T, H / R, D]` | FP32 internally, BF16 at registered operator | ND, contiguous |
++
++## Constraints
++
++- Group size must divide `H`. The local merge's reduction vector requires a power-of-two rank dimension.
++- Feature width and local head count are derived from the input and group, without D512 or32-head routing limits. BF16 features must form complete INT32 words, and both `D / 2` and the local head count must be powers of two for the full-vector copies. Other layouts retain upstream packing.
++- `LOCAL_HEADS` is static vector configuration because it determines `tl.arange` widths, including the T1 pack. Token counts and ordinary strides remain runtime values, not exact-value constexpr keys.
++- Empty inputs are excluded. There is no fixed token cap or dependency on scheduler configuration.
++- The existing full-vector pack is retained when both `T * (H / R)` and `(H / R) * (D / 2)` fit within16384 32-bit elements. Larger payloads use native head/feature tiles of at most4096 elements and bounded LSE chunks, with tokens distributed across Vector Cores. The payload layout and single All2All are unchanged; this threshold selects tiling rather than rejecting larger shapes.
++- Output feature storage must permit INT32 reinterpretation. The exchange normalizes non-unit features, odd outer strides or odd BF16 storage offsets inside the one-collective path; it does not change collective counts based on rank-local storage.
++- T1 flattens contiguous output before dtype reinterpretation. This removes odd singleton strides without copying data; `contiguous()` alone can preserve such strides.
++- PCP composition, token scatter, returned-LSE and deferred-combine requests retain their existing implementations and semantics.
++- Eligibility is selected once at the registered operator. The internal exchange and merge wrappers trust that contract rather than repeat defensive shape/dtype checks.
++
++## Origin and Differences
++
++- **Origin**: The shared `dcp_a2a_fused` pack/All2All/merge pipeline.
++- **Differences**: Uses raw INT32 payloads to preserve BF16/FP32 bits and separates the received output/LSE views for the fused merge. Peer head counts, payload sizes and strides come from the input and group, not a fixed DCP8/H64 layout. T1 uses its existing compact packing kernel; multi-token packing keeps a runtime token loop.
++
++## Test Cases
++
++The distributed tests cover T1/2/13/48/191/192, multiple head counts, head-major storage, nonuniform and invalid LSE, graph replay with changing inputs and revisiting older captures. FP32 math is checked against an independent FP64 reference; BF16 adds its dtype-rounding bound. This does not replace or loosen existing strict BF16 tests. Distributed NPU execution has covered DCP2/4/8, not every possible power-of-two group size.
++
++```bash
++torchrun --standalone --nproc-per-node=8 -m pytest --noconftest -sv \
++  tests/e2e/nightly/single_node/ops/multicard_ops_a3/test_sfa_dcp.py -k exchange
++```
+diff --git a/vllm_ascend/ops/triton/docs/sfa_dcp_merge.md b/vllm_ascend/ops/triton/docs/sfa_dcp_merge.md
+new file mode 100644
+index 000000000..1e1aafdfe
+--- /dev/null
++++ b/vllm_ascend/ops/triton/docs/sfa_dcp_merge.md
+@@ -0,0 +1,38 @@
++# SFA DCP local merge
++
++## Description
++
++- **Function**: Combines received partial attention outputs using their FP32 LSE weights. It does not perform communication.
++- **Formula**: For finite LSE values, `w_r = exp(lse_r - max_valid_lse) / sum_valid(exp(lse - max_valid_lse))` and `out = sum_valid(w_r * partial_r)`. Nonfinite-LSE ranks contribute zero; an all-invalid position returns zero.
++- **Algorithm flow**: Load the rank-wise LSE vector; derive finite weights using a finite substitute for an all-invalid maximum; accumulate one FP32 output vector rank by rank. Mask invalid output values before weighting so `NaN * 0` cannot contaminate the result.
++- **Supported modes**: NPU eager execution and ACLGraph capture/replay. The implementation uses shared Triton capability helpers rather than hardware-generation branches; Atlas A3 has execution evidence.
++
++## Parameters
++
++| Parameter | Input/Output/Attribute | Description | Data type | Data format |
++| --- | --- | --- | --- | --- |
++| `out_recv` | Input | `[R, T, H, D]` or `[R, H, T, D]` | BF16, FP16 or FP32 | ND, unit innermost stride |
++| `lse_recv` | Input | Corresponding `[R, T, H]` or `[R, H, T]` | FP32 | ND, unit innermost stride |
++| `token_dim` | Attribute | 1 for token-major, 2 for head-major received payload | integer | scalar |
++| result | Output | `[T, H, D]` | FP32 | ND, contiguous |
++
++## Constraints
++
++- The rank dimension is positive and a power of two, as required by the static reduction vector. Shapes and source strides must describe the exchange payload; the caller owns these layout preconditions.
++- Feature tails are masked. A single program keeps at most512 FP32 feature elements plus the rank vector, rather than materializing an `R x D` working tile.
++- Finite-LSE filtering, finite `safe_max`, zero-denominator handling and invalid-output masking are part of numerical semantics, not optional defensive checks.
++- Runtime head counts, work counts and ordinary strides are not exact-value constexpr keys. `LSE_RANK_STRIDE` remains a measured specialization exception; previously unseen layouts can therefore compile new variants.
++- This is an internal NPU kernel API, not a Torch CPU fallback implementation. The public DCP operator retains upstream routing for modes not using this payload.
++
++## Origin and Differences
++
++- **Origin**: The weighted reduction after DCP All2All.
++- **Differences**: Keeps one FP32 accumulator and a rank-weight vector live; returns contiguous token-major output and preserves invalid-rank semantics without an intermediate invalid subtraction.
++
++## Test Cases
++
++The single-card matrix covers R2/4/8, both layouts, D127/496/512/513, BF16/FP16/FP32, all-invalid positions and changed-input graph replay against FP64. Distributed exchange tests additionally cover the actual packed payload and collective ordering.
++
++```bash
++pytest -sv tests/e2e/nightly/single_node/ops/singlecard_ops/triton/test_sfa_dcp.py -k merge
++```
+diff --git a/vllm_ascend/ops/triton/docs/sfa_dcp_query.md b/vllm_ascend/ops/triton/docs/sfa_dcp_query.md
+new file mode 100644
+index 000000000..9237bc351
+--- /dev/null
++++ b/vllm_ascend/ops/triton/docs/sfa_dcp_query.md
+@@ -0,0 +1,42 @@
++# SFA DCP query layout
++
++## Description
++
++- **Function**: Packs the nope/rope query fragments into head-major storage before DCP AllGather. After waiting for communication, the caller either retains views or unpacks directly into contiguous fragments, according to `keep_view`.
++- **Formula**: `packed[h, t] = concat(q_nope[t, h], q_rope[t, h])`; split the gathered result using the original nope/rope widths retained in the gather context.
++- **Algorithm flow**: Prepare one query row per grid-stride iteration, with vector loads/stores across its features; let the attention caller issue AllGather and wait for its dependency. With `keep_view=True`, return permuted/split views without an unpack launch; otherwise unpack one token/head row per iteration. Neither kernel performs communication or a reduction.
++- **Supported modes**: NPU eager execution and ACLGraph capture/replay. The API is hardware-generation independent; execution has been verified on Atlas A3.
++
++## Parameters
++
++| Parameter | Input/Output/Attribute | Description | Data type | Data format |
++| --- | --- | --- | --- | --- |
++| `qn` | Input | Nope query, `[T, local_heads, N]` | BF16, FP16 or FP32 | ND, strided |
++| `qr` | Input | Rope query, `[T, local_heads, P]` | Same as `qn` | ND, strided |
++| prepared query | Output | AllGather input, `[local_heads, T, N + P]` | Same as `qn` | ND, contiguous |
++| `gathered` | Input | Rank-ordered AllGather output, `[gathered_heads, T, N + P]` | Same as `qn` | ND, contiguous |
++| `split_sizes` | Attribute | Original `(N, P)` for unpacking | Integer pair | N/A |
++| unpacked queries | Output | `[T, gathered_heads, N]` and `[T, gathered_heads, P]` | Same as `qn` | ND, contiguous |
++
++## Constraints
++
++- These are NPU-only internal kernel entry points. The attention backend owns input compatibility and communication ordering; the kernel wrappers do not implement a CPU execution mode or repeat those checks.
++- Local and gathered head counts are derived from the tensors, not fixed to 8/64 or a particular DCP size.
++- Fragment widths come from the input tensors, without fixed512/64 dimensions or a T2–12 whitelist. Each fragment must have positive power-of-two width for its full `tl.arange` vector. Empty and non-power-of-two layouts retain the existing query path.
++- The context retains both fragment widths: their sum alone cannot recover the split. `keep_view` selects the consumer's storage layout rather than using token count as a proxy.
++- Native head gathering and token-scattered DSA-CP are different layouts. Physical PCP composition retains its TP-head gather path.
++- Payload movement is bit-preserving, including BF16 NaN/Inf encodings. The caller must wait for asynchronous communication before unpacking.
++
++## Origin and Differences
++
++- **Origin**: The native DCP query gather in `AscendSFADCPImpl`.
++- **Differences**: Fuses query concatenation with layout preparation and final fragment copies. Runtime token/head/work counts and ordinary strides are not exact-value constexpr keys; only vector widths are static kernel configuration.
++
++## Test Cases
++
++`tests/e2e/nightly/single_node/ops/multicard_ops_a3/test_sfa_dcp.py` covers rank-ordered gathering, multiple local/gathered head counts, input column strides1/2 and changed-input graph replay, using bit-exact comparisons. Group sizes2/4/8 have distributed NPU execution evidence.
++
++```bash
++torchrun --standalone --nproc-per-node=4 -m pytest --noconftest -sv \
++  tests/e2e/nightly/single_node/ops/multicard_ops_a3/test_sfa_dcp.py -k query
++```
+diff --git a/vllm_ascend/ops/triton/docs/sfa_indexer_store.md b/vllm_ascend/ops/triton/docs/sfa_indexer_store.md
+new file mode 100644
+index 000000000..2336d74e6
+--- /dev/null
++++ b/vllm_ascend/ops/triton/docs/sfa_indexer_store.md
+@@ -0,0 +1,39 @@
++# Native SFA indexer key/scale store
++
++## Description
++
++- **Function**: Stores native-quantized INT8 keys and converts their FP32 scales to the FP16 cache representation in one kernel. Quantization remains in the existing backend path, preserving its tie behavior.
++- **Formula**: For each valid slot `s`, `key_cache[s, :] = quant[row, :]` and `scale_cache[s] = FP16(scales[row])`. Negative padding slots and slots outside cache capacity perform no stores.
++- **Algorithm flow**: The backend computes native quantization, finishes required stream/layout dependencies and publishes key and scale together at the existing cache-write point.
++- **Supported modes**: NPU eager execution and ACLGraph capture/replay. The store itself has no DCP-size dependency; Atlas A3 has operator-level execution evidence.
++
++## Parameters
++
++| Parameter | Input/Output/Attribute | Description | Data type | Data format |
++| --- | --- | --- | --- | --- |
++| `quant` | Input | Native quantized keys, `[rows, width]` | INT8 | ND, contiguous |
++| `scales` | Input | Native scales before cache conversion, one per row | FP32 | ND, contiguous |
++| `slots` | Input | Cache destination for each row | INT32 or INT64 | ND, contiguous |
++| `cache` | Output | Key cache with matching trailing width | INT8 | ND, contiguous |
++| `scale_cache` | Output | One scale per key-cache slot | FP16 | ND, contiguous |
++
++## Constraints
++
++- Valid slots must be unique within a launch, as guaranteed by decode slot mapping. The kernel does not resolve competing writes to the same valid slot.
++- The framework selects this store only for native INT8 keys, FP16 scales and a power-of-two feature width in decode-only batches. Width is derived from the model and quantized input. C8 can also use FP8, which retains its existing write path, as do C4, PCP/DSA-CP layouts and custom backends. Static selection is computed at initialization; only the request phase is checked in `forward`.
++- The native backend's cache specification and metadata builder supply dense cache storage and matching integer slot mappings. The store does not repeat these framework contracts as per-request capability checks. Negative and out-of-capacity slots are still masked inside the kernel.
++- Feature width is model configuration and a constexpr kernel argument; rows only determine the launch grid. The previous12-row limit was a test setting and is not enforced as an eligibility limit.
++- Capacity is a runtime argument, not a constexpr specialization key. Slot bounds masking remains necessary for padded rows and memory safety.
++
++## Origin and Differences
++
++- **Origin**: Native indexer key/scale cache publication.
++- **Differences**: Fuses scale conversion and the two scatters, not quantization or communication. Moving conversion to the publication kernel does not move publication before connector/query dependencies.
++
++## Test Cases
++
++The operator tests compare cache bits exactly, including invalid/padded slots, changing input graphs, capacities and both slot dtypes. CPU routing tests check native quantization and dependency ordering, with C4 and parallel-layout fallbacks. Operator coverage is distinct from model-level C8 coverage: the checkpoint used by the recorded GLM-5.2 model evaluation did not select this store.
++
++```bash
++pytest -sv tests/e2e/nightly/single_node/ops/singlecard_ops/triton/test_sfa_dcp.py -k native_quantized
++```
+diff --git a/vllm_ascend/ops/triton/docs/sparse_index_remap.md b/vllm_ascend/ops/triton/docs/sparse_index_remap.md
+index fa28b3ad3..6ae637c53 100644
+--- a/vllm_ascend/ops/triton/docs/sparse_index_remap.md
++++ b/vllm_ascend/ops/triton/docs/sparse_index_remap.md
+@@ -2,7 +2,7 @@
+ 
+ ## Description
+ 
+-- **Function**: Remaps the DCP sparse-attention top-k indices from the replicated view to DCP-local KV positions on the SFA DCP decode path, keeps only the entries owned by the current DCP rank, compacts them to the front of the last dimension preserving top-k order, and pads the tail with `-1`. It replaces the ~30-op host-side torch chain in `AscendSFADCPImpl._remap_sparse_indices` with two Triton kernels.
++- **Function**: Remaps DCP sparse-attention top-k indices from the replicated view to DCP-local KV positions, retains entries owned by the current rank, compacts them in top-k order and pads the tail with `-1`. The current power-of-two DCP/interleave route uses two Triton kernels; other configurations use exact INT64 Torch arithmetic and order-preserving compaction.
+ - **Formula** (per row, all integer arithmetic; `idx >= 0` marks valid lanes):
+     - `block_idx = idx // interleave_size`
+     - `owner = block_idx % dcp_size`
+@@ -11,39 +11,41 @@
+     - otherwise: `remapped = (idx // (dcp_size * interleave_size)) * interleave_size + (idx - block_idx * interleave_size)`
+     - valid remapped values are compacted to the row front in top-k order; the tail is `-1`
+ - **Algorithm flow** (processed per row, chunked for parallelism):
+-  1. Fused kernel, grid `(num_chunks, rows)`: each program loads `BLOCK = min(128, next_power_of_2(topk_count))` indices, computes the remap and the owner-validity mask vectorized (int32), then serial-compacts the chunk's valid entries to the front of its `chunk_out` slot with scalar `get_element` operations, writes the chunk's valid count, and pre-fills the chunk's region of the output with `-1`.
++  1. Fused kernel, grid `(num_chunks, rows)`: each program loads `BLOCK = min(128, next_power_of_2(topk_count))` indices, uses exact bit shifts/masks for the owner and local index, then serial-compacts valid entries to its `chunk_out` slot with scalar `get_element`, records the count and pre-fills its output region with `-1`. Input integer width is retained.
+   2. Gather kernel, grid `(rows,)`: per row, iterates over the chunks and masked-copies `chunk_out[:cnt]` to the row front in chunk order, restoring top-k order across chunks.
+-- **Supported modes**: Atlas A2 and Atlas A3 (verified on both); 950PR&950DT Products N/A. The routing in `sfa_cp.py` is `HAS_TRITON and topk_indices.is_npu`, so any NPU device with triton-ascend takes the Triton path; the torch implementation remains the fallback. Used by the SFA DCP decode path of sparse-attention models (e.g. GLM5.2) in both eager and graph-capture modes.
++- **Supported modes**: NPU eager execution and ACLGraph capture/replay through a hardware-generation-independent API. The current integer-boundary and graph tests have Atlas A3 execution evidence; no new 950 validation is claimed.
+ 
+ ## Parameters
+ 
+ | Parameter | Input/Output/Attribute | Description | Data type | Data format |
+ | --- | --- | --- | --- | --- |
+-| `topk_indices` | Input | Replicated-view top-k indices `[..., topk_count]`; `-1` marks padding/invalid lanes. Arbitrary leading dims are supported (the real DCP shape is `[dcp_size, 1, topk_count]` after `dcp_group.all_gather(dim=0)`) | int32 | ND |
++| `topk_indices` | Input | Replicated-view top-k indices `[..., topk_count]`; negative values mark invalid lanes. Arbitrary leading dims are supported | INT32 or INT64 | ND |
+ | `dcp_size` | Input (attribute) | Number of DCP ranks | int32 | scalar |
+ | `dcp_rank` | Input (attribute) | This rank's index in the DCP group | int32 | scalar |
+ | `interleave_size` | Input (attribute) | KV cache interleave size of the replicated view | int32 | scalar |
+-| `out` | Output | Remapped and compacted indices with the same shape and dtype as `topk_indices`, tail padded with `-1` | int32 | ND |
++| `out` | Output | Remapped and compacted indices with the same shape and dtype as `topk_indices`, tail padded with `-1` | Same as input | ND |
+ 
+ ## Constraints
+ 
+ - `topk_count` must not exceed the configured `index_topk` (checked by the caller).
+-- Valid index values are in `[0, topk_count * dcp_size * interleave_size)`; `-1` is the padding value. The integer math is bit-exact with the fp32 torch fallback (indices are far below the 2^24 fp32 exactness bound).
++- Index values are logical KV positions, not bounded by top-k count. Nonnegative values within the input dtype's range must retain exact integer boundaries, including values above `2**24` and INT64 values above `2**31`. Do not use FP32 division as an oracle or a fallback.
++- For power-of-two DCP and interleave, let `b = log2(interleave_size)` and `r = log2(dcp_size)`: `owner = (idx >> b) & (dcp_size - 1)` and `local = ((idx >> (b + r)) << b) + (idx & (interleave_size - 1))`. Both bit counts are static configuration; the current rank and top-k work count remain runtime parameters.
++- Other layouts use INT64 quotient/remainder and unique order keys for compaction. Integer argsort may use AICPU; this path prioritizes correctness, not a generic-path speedup claim.
+ - `BLOCK` is capped at 128 and the compaction is deliberately serial: a `tl.cumsum` prefix-sum compaction produces nondeterministic garbage on A2 and traps the vector core under repeated launches on A3 (triton-ascend 3.2.0 / CANN 9.1, re-verified 2026-08). Re-validate if the compiler is upgraded.
+ - Two kernels are required: cross-program ordering (top-k order across chunks) cannot be expressed inside a single kernel without a global barrier, and an atomic-based reservation would make the output order nondeterministic.
+-- Inference only (decode path); no dtype other than int32 is required by the caller.
++- Inference only (decode path). Both INT32 and INT64 input/output are preserved; the fast path must not narrow INT64 indices.
+ 
+ ## Origin and Differences
+ 
+ - **Origin**: Developed from scratch as a Triton replacement of the torch remap in `vllm_ascend/attention/context_parallel/sfa_cp.py` (`AscendSFADCPImpl._remap_sparse_indices`), whose fp32 torch implementation was introduced with the replicate-indexer SFA DCP feature (PR #11443).
+ - **Differences**:
+-    - NPU adaptation for performance: fuses remap + per-chunk compaction + output tail pre-fill into one kernel plus a small gather kernel, replacing the ~30 host-dispatched torch ops (`Cast/Floor/SelectV2/Sort/Gather` chain on `[6, 1, 2048]` tensors) that showed up as host-bound overhead on the DCP decode path;
+-    - Modified for a specific vllm-ascend logic: uses int32 math instead of the fallback's fp32 math (bit-exact results; the two variants measured within 0.97x-1.00x on NPU), and keeps the serial compaction instead of the vectorized prefix-sum variant for compiler reliability (see Constraints).
++    - NPU adaptation: fuses remap, per-chunk compaction and tail pre-fill into one kernel plus a gather kernel, rather than dispatching the separate Torch cast/divide/select/sort/gather expressions;
++    - Exactness repair: avoids backend vector integer division that can lose boundaries above `2**24`; the bitwise route and INT64 fallback preserve owner selection and stable top-k order. Serial compaction is retained for compiler reliability (see Constraints).
+ 
+ ## Test Cases
+ 
+-The accuracy test uses the real inference shape `[6, 1, 2048]` (dcp_size=6, topk=2048) plus a broader grid of `dcp_size {2, 4, 6} x interleave_size {1, 2, 4} x topk {1, 8, 48, 256, 2048}` over every DCP rank, against an independent fp32 torch reference. As a pure integer index remap, the unified precision tolerance is bit-exact (`rtol=0, atol=0`). ATK verification on A3 additionally reports 180/180 accuracy pass and an e2e npu/cpu ratio of 2.50x for the real `[6, 1, 2048]` shape (device kernel time 19.9us; micro shapes are launch-bound).
++The current integer-repair tests cover top-k2048, rows1/6/12, every logical DCP2/4/8 rank, INT32/INT64, interleaves1/64/128/256, large integer boundaries, all-invalid rows and changing-input graph replay. Strided tensors, arbitrary leading dimensions and other DCP/interleave configurations are checked against an independent CPU integer oracle. As an index-only operator, the precision requirement is bit-exact (`rtol=0, atol=0`). Historical FP32-reference timing is not evidence for the corrected large-index implementation.
+ 
+ ```bash
+-pytest -sv tests/e2e/nightly/single_node/ops/singlecard_ops/triton/test_sparse_index_remap_triton.py
++pytest -sv tests/e2e/nightly/single_node/ops/singlecard_ops/triton/test_sfa_dcp.py -k remap
+ ```
+diff --git a/vllm_ascend/ops/triton/sfa_indexer_store.py b/vllm_ascend/ops/triton/sfa_indexer_store.py
+new file mode 100644
+index 000000000..9c2334623
+--- /dev/null
++++ b/vllm_ascend/ops/triton/sfa_indexer_store.py
+@@ -0,0 +1,44 @@
++# SPDX-License-Identifier: Apache-2.0
++"""Store native-quantized indexer keys and FP16 scales in one kernel.
++
++Keep native quantization and its INT8 tie behavior. Only final scale conversion
++and the two scatters are fused. Valid cache slots must be unique, as provided
++by decode slot mapping; padded negative slots are skipped.
++"""
++
++import torch
++from vllm.triton_utils import tl, triton
++
++
++@triton.jit(do_not_specialize=["capacity"])
++def _store_indexer_key_scale(
++    quant_ptr,
++    scales_ptr,
++    slots_ptr,
++    cache_ptr,
++    scale_cache_ptr,
++    capacity,
++    KEY_WIDTH: tl.constexpr,
++):
++    row = tl.program_id(0)
++    column = tl.arange(0, KEY_WIDTH)
++    key = tl.load(quant_ptr + row * KEY_WIDTH + column)
++    scale = tl.load(scales_ptr + row)
++    slot = tl.load(slots_ptr + row).to(tl.int64)
++    valid = (slot >= 0) & (slot < capacity)
++    tl.store(cache_ptr + slot * KEY_WIDTH + column, key, valid)
++    tl.store(scale_cache_ptr + slot, scale, valid)
++
++
++def store_indexer_key_scale(
++    quant: torch.Tensor,
++    scales: torch.Tensor,
++    slots: torch.Tensor,
++    cache: torch.Tensor,
++    scale_cache: torch.Tensor,
++) -> None:
++    """Publish at the existing cache-write point, after the connector wait."""
++    rows = slots.numel()
++    key_width = quant.shape[-1]
++    # Rows only set the launch grid; 12 was a test setting, not a kernel limit.
++    _store_indexer_key_scale[(rows,)](quant, scales, slots, cache, scale_cache, cache.numel() // key_width, key_width)
+diff --git a/vllm_ascend/ops/triton/sparse_index_remap.py b/vllm_ascend/ops/triton/sparse_index_remap.py
+index a25c78e94..342540371 100644
+--- a/vllm_ascend/ops/triton/sparse_index_remap.py
++++ b/vllm_ascend/ops/triton/sparse_index_remap.py
+@@ -23,17 +23,16 @@ from vllm.utils.math_utils import next_power_of_2
+ from vllm_ascend.ops.triton.triton_utils import get_element
+ 
+ 
+-@triton.jit(do_not_specialize=["topk_count", "dcp_size", "interleave_size", "dcp_rank"])
++@triton.jit(do_not_specialize=["topk_count", "dcp_rank"])
+ def remap_sparse_indices_fused_kernel(
+     indices_ptr,  # [rows, topk_count] int32, replicated-view topk indices
+     chunk_out_ptr,  # [rows * num_chunks, BLOCK] int32 (output)
+     chunk_count_ptr,  # [rows, num_chunks] int32 (output)
+     out_ptr,  # [rows, topk_count] int32 (output): tail pre-filled with -1 here
+     topk_count,
+-    dcp_size,
+-    interleave_size,
+     dcp_rank,
+-    INTERLEAVE_ONE: tl.constexpr,
++    DCP_BITS: tl.constexpr,
++    INTERLEAVE_BITS: tl.constexpr,
+     BLOCK: tl.constexpr,
+     NUM_CHUNKS: tl.constexpr,
+ ):
+@@ -53,19 +52,12 @@ def remap_sparse_indices_fused_kernel(
+     in_bounds = offsets < topk_count
+ 
+     idx = tl.load(indices_ptr + row * topk_count + offsets, mask=in_bounds, other=-1)
+-    # Integer remap math: matches the fp32 torch fallback bit-exactly
+-    # (indices are far below 2^24), and the int32/fp32 variants measured
+-    # identically on NPU.
+-    block_idx = idx // interleave_size
+-    owner = block_idx - (block_idx // dcp_size) * dcp_size
++    # This backend's vector divsi loses integer boundaries above 2**24.
++    # Power-of-two topology uses exact shifts, never rounded vector division.
++    owner = (idx >> INTERLEAVE_BITS) & ((1 << DCP_BITS) - 1)
++    remapped = ((idx >> (INTERLEAVE_BITS + DCP_BITS)) << INTERLEAVE_BITS) + (idx & ((1 << INTERLEAVE_BITS) - 1))
+     valid = (idx >= 0) & (owner == dcp_rank)
+ 
+-    if INTERLEAVE_ONE:
+-        remapped = idx // dcp_size
+-    else:
+-        local_offsets = idx - block_idx * interleave_size
+-        remapped = (idx // (dcp_size * interleave_size)) * interleave_size + local_offsets
+-
+     valid_i32 = valid.to(tl.int32)
+     chunk_out = chunk_out_ptr + (row * NUM_CHUNKS + chunk) * BLOCK
+     # Pre-fill this chunk's output region with -1 first; the serial stores
+@@ -104,6 +96,25 @@ def remap_sparse_indices_compact_gather_kernel(
+         write_pos += cnt
+ 
+ 
++def _remap_sparse_indices_integer(
++    indices: torch.Tensor, dcp_size: int, dcp_rank: int, interleave_size: int
++) -> torch.Tensor:
++    """Exact fallback; do not reintroduce FP32 index arithmetic above 2**24.
++
++    Integer sorting may use AICPU on Ascend. This fallback favors correctness
++    outside the power-of-two DCP/interleave two-kernel fast path.
++    """
++    integer = indices.to(torch.int64)
++    blocks = torch.div(integer, interleave_size, rounding_mode="floor")
++    valid = (integer >= 0) & (blocks.remainder(dcp_size) == dcp_rank)
++    mapped = torch.div(blocks, dcp_size, rounding_mode="floor") * interleave_size + integer.remainder(interleave_size)
++    mapped = torch.where(valid, mapped, -1).to(indices.dtype)
++    count = indices.shape[-1]
++    order = torch.arange(count, dtype=torch.int64, device=indices.device)
++    keys = (~valid).to(torch.int64) * count + order
++    return torch.gather(mapped, -1, keys.argsort(dim=-1))
++
++
+ def remap_sparse_indices_triton(
+     topk_indices: torch.Tensor,
+     dcp_size: int,
+@@ -135,15 +146,17 @@ def remap_sparse_indices_triton(
+       is pre-filled in the fused kernel with a plain ``in_bounds`` mask
+       instead, so this path has only two device ops (fused + gather).
+     """
++    if topk_indices.numel() == 0:
++        return topk_indices
++    if dcp_size <= 0 or dcp_size & (dcp_size - 1) or interleave_size <= 0 or interleave_size & (interleave_size - 1):
++        return _remap_sparse_indices_integer(topk_indices, dcp_size, dcp_rank, interleave_size)
+     orig_dtype = topk_indices.dtype
+     orig_shape = topk_indices.shape
+     if not topk_indices.is_contiguous():
+         topk_indices = topk_indices.contiguous()
+-    indices = topk_indices if topk_indices.dtype == torch.int32 else topk_indices.to(torch.int32)
++    indices = topk_indices if topk_indices.dtype in (torch.int32, torch.int64) else topk_indices.to(torch.int32)
+     topk_count = indices.shape[-1]
+     rows = indices.numel() // topk_count
+-    if rows == 0 or topk_count == 0:
+-        return topk_indices
+     # The torch implementation operates per-row on the last dim, so arbitrary
+     # leading dims (e.g. [dcp_size, 1, topk_count] from the DCP all_gather) can
+     # be flattened to a 2D view and restored afterwards.
+@@ -161,10 +174,9 @@ def remap_sparse_indices_triton(
+         chunk_count,
+         out,
+         topk_count,
+-        dcp_size,
+-        interleave_size,
+         dcp_rank,
+-        INTERLEAVE_ONE=interleave_size == 1,
++        DCP_BITS=dcp_size.bit_length() - 1,
++        INTERLEAVE_BITS=interleave_size.bit_length() - 1,
+         BLOCK=block,
+         NUM_CHUNKS=num_chunks,
+         multibuffer=False,

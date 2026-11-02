@@ -1,0 +1,449 @@
+commit 723590bc5653801bcf7b7bc659c7587516e426d2
+Author:     meng <92282390+czydyy@users.noreply.github.com>
+AuthorDate: Tue Oct 27 14:21:15 2026 +0800
+Commit:     GitHub <noreply@github.com>
+CommitDate: Tue Oct 27 14:21:15 2026 +0800
+
+    [BugFix][CI] Align bisect rebuilds and AOP diagnostics with nightly (#17977)
+    
+    ### What this PR does / why we need it?
+    
+    Follow-up to #17902. Besides aligning candidate rebuilds with the
+    nightly uv installer, this migrates the remaining AOP/bisect hardening
+    from the test branch so the bisect pipeline matches nightly end to end:
+    
+    - Candidate rebuilds now use `uv pip install -e . --no-deps` and `uv pip
+    install -r requirements-dev.txt` (nightly uv installer, no dependency
+    resolution), so a rebuilt candidate can no longer diverge from the
+    nightly baseline environment and skew bisect verdicts.
+    - `csrc/build` is cleaned before each rebuild: the custom-op build
+    preserves `CMakeCache.txt`, which can pin `HI_PYTHON` to a short-lived
+    uv build-environment interpreter and break the next candidate build in a
+    new isolated environment.
+    - Failed installs now record CMake Python-path diagnostics (`HI_PYTHON`,
+    `Python3_EXECUTABLE`, ...) before/after, append the tails of
+    `CMakeConfigureLog.yaml` / `CMakeError.log`, and surface the last 4 KB
+    of the build log in the job log — previously only "(see build log)" was
+    printed and the log died with the runner container. Candidate deployment
+    failures are logged as well.
+    - The single-node, 560T and multi-node nightly workflows now always
+    collect and upload AOP bisect diagnostics (bisect work dir, pytest logs,
+    initial test logs) as GitHub artifacts with 7-day retention, even when
+    the bisect step fails.
+    - Multi-node `run.sh` scopes bisect reports to the current LWS instance
+    (`BISECT_WORK_DIR` under `LOG_PREFIX`) so uploads do not mix in older
+    PVC runs.
+    - Single-node runners fall back to the legacy config dir
+    (`tests/e2e/nightly/single_node/models/configs`) when a bisected
+    candidate predates the config relocation.
+    - `tools/bisect` docs (README / USAGE_zh) updated to reflect the uv
+    commands.
+    
+    Supersedes #17902 (includes its uv-installer alignment).
+    
+    ### Does this PR introduce _any_ user-facing change?
+    
+    Auto-bisect candidate rebuilds use `uv pip install` instead of plain
+    `pip install`. No vLLM-Ascend runtime behavior changes; ordinary nightly
+    test execution is unchanged.
+    
+    ### How was this patch tested?
+    
+    - `python -m py_compile` on the modified `tools/bisect` modules,
+    `yaml.safe_load` on the three modified workflow files, and `bash -n` on
+    `run.sh` all pass locally.
+    - No new unit tests: the change is CI/diagnostic tooling that requires
+    the nightly image and package indexes to exercise (uv rebuild, artifact
+    uploads, CMake cache behavior). CI validation pending.
+    
+    - vLLM main:
+    https://github.com/vllm-project/vllm/commit/a98247ab4db686ee03c66d5feb3c761e52a2f8ab
+    
+    Signed-off-by: chenzeyu <2978509328@qq.com>
+
+diff --git a/.github/workflows/_e2e_nightly_multi_node.yaml b/.github/workflows/_e2e_nightly_multi_node.yaml
+index ae9edb0b8..cca6e934f 100644
+--- a/.github/workflows/_e2e_nightly_multi_node.yaml
++++ b/.github/workflows/_e2e_nightly_multi_node.yaml
+@@ -647,6 +647,33 @@ jobs:
+            steps.profile_artifact.outcome != 'success')
+         run: python3 -m tools.profiling.artifacts summary --root "$RUNNER_TEMP/profile_artifact"
+ 
++      - name: Collect AOP bisect diagnostics
++        if: ${{ always() && inputs.aop_multi_enabled }}
++        continue-on-error: true
++        run: |
++          set -euo pipefail
++          DEST=/tmp/aop-bisect-diagnostics
++          mkdir -p "$DEST"
++          SRC="${LOG_PREFIX}/nightly_bisect_runs"
++          if [ -d "$SRC" ]; then
++            cp -a "$SRC" "$DEST/bisect_runs"
++          fi
++          for log in "${LOG_PREFIX}"/node_*_pytest.log; do
++            if [ -f "$log" ]; then
++              cp "$log" "$DEST/"
++            fi
++          done
++
++      - name: Upload AOP bisect diagnostics (GitHub Artifacts)
++        if: ${{ always() && inputs.aop_multi_enabled }}
++        continue-on-error: true
++        uses: actions/upload-artifact@v7
++        with:
++          name: ${{ steps.vars.outputs.artifact_name }}-aop-bisect
++          path: /tmp/aop-bisect-diagnostics/
++          if-no-files-found: warn
++          retention-days: 7
++
+       - name: Fetch benchmark results from PVC
+         if: always()
+         run: |
+diff --git a/.github/workflows/_e2e_nightly_single_node.yaml b/.github/workflows/_e2e_nightly_single_node.yaml
+index 75e1594f5..64de19466 100644
+--- a/.github/workflows/_e2e_nightly_single_node.yaml
++++ b/.github/workflows/_e2e_nightly_single_node.yaml
+@@ -522,6 +522,11 @@ jobs:
+           BISECT_FORCE_INITIAL_BUILD: ${{ inputs.bisect_force_initial_build }}
+           BISECT_CONFIG_BASE_PATH: ${{ inputs.bisect_config_base_path }}
+         run: |
++          BISECT_WORK_DIR=$(mktemp -d /tmp/aop-bisect.XXXXXX)
++          export BISECT_WORK_DIR
++          mkdir -p /tmp/test-logs
++          set +e
++          set -o pipefail
+           bash tests/e2e/nightly/scripts/aop_process.sh \
+             "${{ steps.classify.outputs.failure_type }}" \
+             "${{ steps.commit-age.outputs.commit_age_days }}" \
+@@ -543,7 +548,33 @@ jobs:
+             "$BISECT_NO_VERIFY_GOOD" \
+             "$BISECT_NO_VERIFY_BAD" \
+             "$BISECT_FORCE_INITIAL_BUILD" \
+-            "$BISECT_CONFIG_BASE_PATH"
++            "$BISECT_CONFIG_BASE_PATH" 2>&1 | tee /tmp/test-logs/aop-process.log
++          process_rc=${PIPESTATUS[0]}
++          mkdir -p /tmp/aop-bisect-diagnostics
++          cp -a "$BISECT_WORK_DIR" /tmp/aop-bisect-diagnostics/bisect_runs || \
++            echo "Warning: could not collect bisect logs from $BISECT_WORK_DIR"
++          exit "$process_rc"
++
++      - name: Collect AOP bisect diagnostics
++        if: ${{ always() && inputs.aop_single_enabled }}
++        continue-on-error: true
++        run: |
++          set -euo pipefail
++          DEST=/tmp/aop-bisect-diagnostics
++          mkdir -p "$DEST"
++          if [ -d /tmp/test-logs ]; then
++            cp -a /tmp/test-logs "$DEST/initial_tests"
++          fi
++
++      - name: Upload AOP bisect diagnostics (GitHub Artifacts)
++        if: ${{ always() && inputs.aop_single_enabled }}
++        continue-on-error: true
++        uses: actions/upload-artifact@v7
++        with:
++          name: aop-bisect-${{ inputs.vllm_ascend_branch }}-${{ inputs.name || github.job }}-${{ github.run_id }}-${{ github.run_attempt }}
++          path: /tmp/aop-bisect-diagnostics/
++          if-no-files-found: warn
++          retention-days: 7
+ 
+       - name: On success
+         if: ${{ always() && inputs.aop_single_enabled && steps.test-result.outputs.result == 'success' }}
+diff --git a/.github/workflows/_e2e_nightly_single_node_560t.yaml b/.github/workflows/_e2e_nightly_single_node_560t.yaml
+index e402605f7..dd78eb06b 100644
+--- a/.github/workflows/_e2e_nightly_single_node_560t.yaml
++++ b/.github/workflows/_e2e_nightly_single_node_560t.yaml
+@@ -505,6 +505,11 @@ jobs:
+           BISECT_FORCE_INITIAL_BUILD: ${{ inputs.bisect_force_initial_build }}
+           BISECT_CONFIG_BASE_PATH: ${{ inputs.bisect_config_base_path }}
+         run: |
++          BISECT_WORK_DIR=$(mktemp -d /tmp/aop-bisect.XXXXXX)
++          export BISECT_WORK_DIR
++          mkdir -p /tmp/test-logs
++          set +e
++          set -o pipefail
+           bash tests/e2e/nightly/scripts/aop_process.sh \
+             "${{ steps.classify.outputs.failure_type }}" \
+             "${{ steps.commit-age.outputs.commit_age_days }}" \
+@@ -526,7 +531,33 @@ jobs:
+             "$BISECT_NO_VERIFY_GOOD" \
+             "$BISECT_NO_VERIFY_BAD" \
+             "$BISECT_FORCE_INITIAL_BUILD" \
+-            "$BISECT_CONFIG_BASE_PATH"
++            "$BISECT_CONFIG_BASE_PATH" 2>&1 | tee /tmp/test-logs/aop-process.log
++          process_rc=${PIPESTATUS[0]}
++          mkdir -p /tmp/aop-bisect-diagnostics
++          cp -a "$BISECT_WORK_DIR" /tmp/aop-bisect-diagnostics/bisect_runs || \
++            echo "Warning: could not collect bisect logs from $BISECT_WORK_DIR"
++          exit "$process_rc"
++
++      - name: Collect AOP bisect diagnostics
++        if: ${{ always() && inputs.aop_single_enabled }}
++        continue-on-error: true
++        run: |
++          set -euo pipefail
++          DEST=/tmp/aop-bisect-diagnostics
++          mkdir -p "$DEST"
++          if [ -d /tmp/test-logs ]; then
++            cp -a /tmp/test-logs "$DEST/initial_tests"
++          fi
++
++      - name: Upload AOP bisect diagnostics (GitHub Artifacts)
++        if: ${{ always() && inputs.aop_single_enabled }}
++        continue-on-error: true
++        uses: actions/upload-artifact@v7
++        with:
++          name: aop-bisect-${{ inputs.vllm_ascend_branch }}-${{ inputs.name || github.job }}-${{ github.run_id }}-${{ github.run_attempt }}
++          path: /tmp/aop-bisect-diagnostics/
++          if-no-files-found: warn
++          retention-days: 7
+ 
+       - name: On success
+         if: ${{ always() && inputs.aop_single_enabled && steps.test-result.outputs.result == 'success' }}
+diff --git a/tests/e2e/common/multi_node/run.sh b/tests/e2e/common/multi_node/run.sh
+index 7caa46f3e..afcfa845b 100644
+--- a/tests/e2e/common/multi_node/run.sh
++++ b/tests/e2e/common/multi_node/run.sh
+@@ -617,6 +617,9 @@ finish_without_aop() {
+ main() {
+     if [ "${AOP_MULTI_ENABLED:-}" = "true" ]; then
+         trap finish_run EXIT
++        # Keep bisect reports and round logs scoped to this LWS instance so
++        # the workflow can upload them without mixing in older PVC runs.
++        export BISECT_WORK_DIR="${BISECT_WORK_DIR:-${LOG_PREFIX}/nightly_bisect_runs}"
+     else
+         trap finish_without_aop EXIT
+     fi
+diff --git a/tools/bisect/README.md b/tools/bisect/README.md
+index 89fe73e18..56cc36418 100644
+--- a/tools/bisect/README.md
++++ b/tools/bisect/README.md
+@@ -16,7 +16,7 @@ trigger (case FAIL)
+   -> verify endpoints (good must PASS, bad must FAIL)
+   -> binary search:
+        for each midpoint commit:
+-         checkout  (+ pip install -e . ONLY if that commit touched native/cpp files)
++         checkout  (+ uv pip install -e . ONLY if that commit touched native/cpp files)
+          run the WHOLE yaml (all test_cases) via the nightly entry
+          verdict from pytest rc + benchmark_results/*.json
+          print [PASS]/[FAIL]/[SKIP] <PR/commit>
+diff --git a/tools/bisect/USAGE_zh.md b/tools/bisect/USAGE_zh.md
+index 9ec9c82f4..ca8aaaf8a 100644
+--- a/tools/bisect/USAGE_zh.md
++++ b/tools/bisect/USAGE_zh.md
+@@ -17,7 +17,7 @@
+ 
+ 1. 在 **NPU 容器**内、`vllm-ascend` 仓库根目录下运行(例如 `/workspace/vllm-ascend`)。
+ 2. 直接用 `python -m tools.bisect.auto_bisect ...` 运行(在仓库根目录下,包可被导入)。
+-3. **vllm-ascend 必须是 editable 安装**(`pip install -e`)——这样纯 `.py` 改动 checkout 后即时生效、无需重装。nightly 容器默认就是 editable。
++3. **vllm-ascend 必须是 editable 安装**(`uv pip install -e .`)——这样纯 `.py` 改动 checkout 后即时生效、无需重装。nightly 容器默认就是 editable。
+ 4. **vLLM 不需要改动**,容器里现有的 vLLM 即为配套版本(本工具只切换 vllm-ascend)。
+ 5. 依赖:`pytest`、`openai`、`aisbench`、`psutil`、`filelock`、`regex`(nightly 容器已具备)。
+ 
+@@ -126,7 +126,7 @@ python -m tools.bisect.auto_bisect \
+ 每切到一个 commit,工具**根据该 commit 改动的文件类型**决定是否重新编译 vllm-ascend:
+ 
+ - 改动**全是非 native**(`.py`/yaml/md 等)→ **只 `git checkout`,不编译**(editable 安装即时生效);
+-- 改动命中 **native/构建文件**(`*.cpp/*.cc/*.cu/*.h/*.hpp/*.cuh`、`csrc/**`、`CMakeLists.txt`、`setup.py`)→ 执行 `pip install -e .` 重新编译;
++- 改动命中 **native/构建文件**(`*.cpp/*.cc/*.cu/*.h/*.hpp/*.cuh`、`csrc/**`、`CMakeLists.txt`、`setup.py`)→ 执行 `uv pip install -e .` 重新编译;
+ - `requirements*.txt` 变化 → 只重装依赖。
+ 
+ 相关开关(一般用默认即可):
+@@ -251,7 +251,7 @@ vLLM 切换优先使用配置的 vLLM 源码目录(nightly 默认 `/vllm-workspa
+ - **作用**:按硬件代际过滤 Good 表,避免 A2/A3/310P 的同名用例互相命中。
+ - **默认**:`None`;CI workflow 会自动传入。
+ 
+-### 9.4 编译控制(决定何时 `pip install -e .`)
++### 9.4 编译控制(决定何时 `uv pip install -e .`)
+ 
+ #### `--native-check`
+ 
+diff --git a/tools/bisect/auto_bisect.py b/tools/bisect/auto_bisect.py
+index b08d40c8f..874deece8 100644
+--- a/tools/bisect/auto_bisect.py
++++ b/tools/bisect/auto_bisect.py
+@@ -101,6 +101,7 @@ class Bisector:
+                 note=note,
+             )
+         except DEPLOY_ERRORS as exc:
++            logger.error("Candidate %s deployment failed: %s", candidate.short, exc)
+             result = TrialResult(
+                 candidate=candidate,
+                 verdict="SKIP",
+diff --git a/tools/bisect/build_manager.py b/tools/bisect/build_manager.py
+index e9531dcb4..0c8287078 100644
+--- a/tools/bisect/build_manager.py
++++ b/tools/bisect/build_manager.py
+@@ -25,6 +25,7 @@ Decision rule (the compile-optimisation core):
+   the editable install picks the change up live.
+ """
+ 
++import contextlib
+ import logging
+ import shutil
+ import subprocess
+@@ -45,7 +46,10 @@ logger = logging.getLogger(__name__)
+ 
+ # Build artifacts removed before a rebuild so stale ``.so`` files can never be
+ # loaded against a new checkout.
+-_STALE_ARTIFACTS = ("build", "*.egg-info", "dist")
++# The custom-op build script preserves csrc/build, including CMakeCache.txt.
++# That cache can point HI_PYTHON at a short-lived uv build-environment path,
++# so discard it before rebuilding a candidate in a new isolated environment.
++_STALE_ARTIFACTS = ("build", "csrc/build", "*.egg-info", "dist")
+ 
+ 
+ @dataclass
+@@ -144,10 +148,10 @@ class BuildManager:
+                 "[build] compiling/installing (this can take a while); follow progress with: tail -f %s", log_file
+             )
+         if decision.reinstall_reqs:
+-            self._run(self.opt.pip_requirements_cmd, log_file, "pip install requirements")
++            self._run(self.opt.pip_requirements_cmd, log_file, "uv pip install requirements")
+         if decision.rebuild:
+             self._clean_artifacts()
+-            self._run(self.opt.pip_install_cmd, log_file, "pip install -e .")
++            self._run(self.opt.pip_install_cmd, log_file, "uv pip install -e .")
+ 
+         # Only advance the baseline once the binary actually matches the source.
+         if decision.rebuild or self.last_built_commit is None:
+@@ -171,14 +175,63 @@ class BuildManager:
+         logger.info("[build] running: %s", " ".join(cmd))
+         if log_file is not None:
+             with open(log_file, "a", encoding="utf-8") as out:
++                out.write(self._cmake_python_diagnostics("before install"))
++                out.flush()
+                 proc = subprocess.run(cmd, cwd=str(self.repo), stdout=out, stderr=subprocess.STDOUT, text=True)
+             tail = "(see build log)"
++            if proc.returncode != 0:
++                with open(log_file, "a", encoding="utf-8") as out:
++                    out.write(self._cmake_python_diagnostics("after failed install"))
++                    out.write(self._cmake_failure_logs())
++                # Surface the tail of the build log in the job log: the log
++                # file lives in the runner container and is lost when the job
++                # ends, so "(see build log)" alone leaves nothing to debug.
++                with contextlib.suppress(OSError):
++                    tail = log_file.read_text(encoding="utf-8", errors="replace")[-4000:]
+         else:
+             proc = subprocess.run(cmd, cwd=str(self.repo), capture_output=True, text=True)
+             tail = (proc.stdout or "")[-2000:]
+         if proc.returncode != 0:
+             raise BuildError(f"{label} failed (rc={proc.returncode}):\n{tail}")
+ 
++    def _cmake_python_diagnostics(self, phase: str) -> str:
++        """Report only the CMake Python paths, not the full potentially sensitive cache."""
++        cache = self.repo / "csrc" / "build" / "CMakeCache.txt"
++        lines = [f"\n[build] CMake diagnostics ({phase}): {cache}\n"]
++        if not cache.is_file():
++            lines.append("[build] CMakeCache.txt does not exist\n")
++            return "".join(lines)
++        try:
++            entries = cache.read_text(encoding="utf-8", errors="replace").splitlines()
++        except OSError as exc:
++            lines.append(f"[build] cannot read CMakeCache.txt: {exc}\n")
++            return "".join(lines)
++        for key in ("HI_PYTHON", "Python3_EXECUTABLE", "_Python3_EXECUTABLE"):
++            matches = [entry.partition("=")[2] for entry in entries if entry.startswith(f"{key}:")]
++            if not matches:
++                lines.append(f"[build] {key}: not cached\n")
++                continue
++            value = matches[-1]
++            lines.append(f"[build] {key}: {value} (exists={Path(value).is_file()})\n")
++        if phase == "after failed install":
++            lines.append("[build] uv may remove temporary build Python on exit; compare the before-install paths\n")
++        return "".join(lines)
++
++    def _cmake_failure_logs(self) -> str:
++        cmake_files = self.repo / "csrc" / "build" / "CMakeFiles"
++        lines = []
++        for name in ("CMakeConfigureLog.yaml", "CMakeError.log"):
++            path = cmake_files / name
++            if not path.is_file():
++                continue
++            try:
++                tail = path.read_text(encoding="utf-8", errors="replace")[-4000:]
++            except OSError as exc:
++                lines.append(f"[build] cannot read {path}: {exc}\n")
++            else:
++                lines.append(f"\n[build] tail of {path}:\n{tail}\n")
++        return "".join(lines)
++
+ 
+ class BuildError(RuntimeError):
+     pass
+diff --git a/tools/bisect/config.py b/tools/bisect/config.py
+index 8438e5bda..4aafd43c3 100644
+--- a/tools/bisect/config.py
++++ b/tools/bisect/config.py
+@@ -174,26 +174,24 @@ class BisectOptions:
+     # Verify the endpoints before searching (good must PASS, bad must FAIL).
+     verify_good: bool = True
+     verify_bad: bool = True
+-    # Editable reinstall command pieces. --no-input avoids any interactive
+-    # prompt that could hang the (silent, log-redirected) build step.
++    # Match the nightly install path when a candidate needs rebuilding.
+     pip_install_cmd: list[str] = field(
+         default_factory=lambda: [
++            "uv",
+             "pip",
+             "install",
+             "-e",
+             ".",
+-            "--no-input",
+-            "--disable-pip-version-check",
++            "--no-deps",
+         ]
+     )
+     pip_requirements_cmd: list[str] = field(
+         default_factory=lambda: [
++            "uv",
+             "pip",
+             "install",
+             "-r",
+             "requirements-dev.txt",
+-            "--no-input",
+-            "--disable-pip-version-check",
+         ]
+     )
+     # The nightly container is already built+installed at its current HEAD (the
+diff --git a/tools/bisect/runner.py b/tools/bisect/runner.py
+index 420783605..6eb268cc2 100644
+--- a/tools/bisect/runner.py
++++ b/tools/bisect/runner.py
+@@ -39,6 +39,7 @@ from tools.bisect import git_ops
+ from tools.bisect.build_manager import DEPLOY_ERRORS, BuildManager
+ from tools.bisect.config import (
+     MULTI_NODE_RUN_SH,
++    SCENE_SINGLE,
+     SINGLE_NODE_TEST_PATH,
+     BisectInput,
+     BisectOptions,
+@@ -54,6 +55,7 @@ logger = logging.getLogger(__name__)
+ # commits created before the framework moved under tests/e2e/common or before
+ # the common multi-node dispatcher existed.
+ _LEGACY_SINGLE_NODE_TEST = "tests/e2e/nightly/single_node/models/scripts/test_single_node.py"
++_LEGACY_SINGLE_NODE_CONFIG_DIR = "tests/e2e/nightly/single_node/models/configs"
+ _MULTI_NODE_TEST = "tests/e2e/common/multi_node/test_multi_node.py"
+ _LEGACY_MULTI_NODE_TEST = "tests/e2e/nightly/multi_node/scripts/test_multi_node.py"
+ _INTERNAL_DP_TEST = "tests/e2e/nightly/multi_node/internal_dp/scripts/test_multi_node.py"
+@@ -145,8 +147,17 @@ class BaseRunner:
+     def _base_env(self) -> dict[str, str]:
+         env = dict(os.environ)
+         env["CONFIG_YAML_PATH"] = self.inp.config_yaml
+-        if self.inp.config_base_path:
+-            env["CONFIG_BASE_PATH"] = self.inp.config_base_path
++        config_base_path = self.inp.config_base_path
++        if self.inp.scene == SCENE_SINGLE and config_base_path:
++            requested = self.repo / config_base_path / self.inp.config_yaml
++            legacy_base = self.repo / _LEGACY_SINGLE_NODE_CONFIG_DIR
++            legacy_config = legacy_base / Path(self.inp.config_yaml).name
++            if not requested.is_file() and legacy_config.is_file():
++                config_base_path = str(legacy_base)
++                env["CONFIG_YAML_PATH"] = legacy_config.name
++                logger.info("[single] config moved in candidate; using %s", legacy_config)
++        if config_base_path:
++            env["CONFIG_BASE_PATH"] = config_base_path
+         return env
+ 
+     @staticmethod

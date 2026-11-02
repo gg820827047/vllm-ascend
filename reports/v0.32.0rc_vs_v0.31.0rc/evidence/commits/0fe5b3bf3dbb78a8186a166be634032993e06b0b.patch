@@ -1,0 +1,324 @@
+commit 0fe5b3bf3dbb78a8186a166be634032993e06b0b
+Author:     Pingzii <109567708+Pingzii@users.noreply.github.com>
+AuthorDate: Sat Oct 31 09:27:29 2026 +0800
+Commit:     GitHub <noreply@github.com>
+CommitDate: Sat Oct 31 09:27:29 2026 +0800
+
+    [BugFix][Platform] Keep the DeepSeek V4 block size the cache is built with (#19125)
+    
+    ### What this PR does / why we need it?
+    
+    DeepSeek-V4 on A5 dies at cache-spec construction unless `--block-size`
+    is passed. Reproduced on A5 (ascend950), DeepSeek-V4-Flash, DP8 + EP, no
+    `--block-size`:
+    
+    ```
+    [interface.py:693] Setting kv cache block size to 4096 for
+        ASCEND_DSA_SWA/ASCEND_DSA_C4_STATE/ASCEND_DSA_C4/ASCEND_DSA_C128_STATE/ASCEND_DSA_C128 backend(s).
+    
+    File ".../vllm_ascend/models/deepseek_v4/compressor.py", line 61, in get_kv_cache_spec
+        pads = dsv4_block_sizes(vllm_config)[vllm_config.cache_config.block_size][1]
+    KeyError: 4096
+    ```
+    
+    Line references in this description are from **vLLM v0.31.0
+    (`db9527a`)**, the version the A5 run used.
+    
+    The page-padding tables are keyed on the physical block size, and only
+    32/64/128 are keys. `refresh_block_size` settles that value during
+    configuration, but the executor afterwards calls
+    `Platform.update_block_size_for_backend`, whose Phase 1 replaces it with
+    a size derived from `get_supported_kernel_block_sizes()`. Ascend's
+    compressed-cache backends answer that in logical (raw scheduler token)
+    units -- the same physical pages restated:
+    
+    | backend | `get_supported_kernel_block_sizes()` | the same pages, in
+    physical tokens |
+    |---|---|---|
+    | `AscendDSAC4Backend` | `[128, 256, 512]` | `[32, 64, 128]` |
+    | `AscendDSAC128Backend` | `[4096, 8192, 16384]` | `[32, 64, 128]` |
+    
+    So the settled value was applied, and then overwritten. The ordering is
+    the bug; the settling itself is correct.
+    
+    ### What this changes
+    
+    **`vllm_ascend/platform.py`**: `update_block_size_for_backend` returns
+    early for DeepSeek V4, leaving the size `refresh_block_size` settled.
+    Nothing the hook would do applies to these models:
+    
+    - Phase 1 of the parent hook is the derivation above;
+    - Phase 2 is for hybrid models;
+    - Phase 3 is for a block pool shared by several KV dtypes;
+    - the mamba handling at the end of the method is gated on
+    `mamba_cache_mode`.
+    
+    Every other model goes through the parent hook and that mamba handling
+    exactly as before.
+    
+    **`vllm_ascend/utils.py`**, one dead-code deletion: the DeepSeek V4
+    branch of `refresh_block_size` handled `block_size is None` by setting
+    32, but the function replaces a `None` with 128 earlier
+    (`utils.py:1431`), so that arm could not run. It goes, along with its
+    `elif`. The branch condition, the normalization and the warning are
+    unchanged.
+    
+    ### Scope
+    
+    This fixes the uniform-KV-dtype configuration these models are launched
+    with. It does **not** add per-layer KV dtype support:
+    
+    - the attention layers build one KV cache spec each from the global
+    cache dtype (`models/layer/attention/layer.py:191-216`), so a
+    mixed-dtype alignment has nothing to align to;
+    - on vLLM v0.32.0 and later the parent hook ends with
+    `_check_aligned_block_size()`. A DeepSeek V4 launch that configured skip
+    layers would no longer reach either the parent hook or that check,
+    because this method returns first -- so such a launch would keep its
+    settled block size while the padding fields a mixed-dtype alignment
+    records stay unset.
+    
+    The claim is therefore: the reported `KeyError` no longer happens for
+    DeepSeek V4 on the supported path. Mixed KV dtype remains unsupported
+    and would need its own change.
+    
+    ### DeepSeek V4.1
+    
+    Not part of this PR. V4.1 also reaches `KeyError: 4096` without
+    `--block-size`, but its documented size is different -- every launch
+    command in `DeepSeek-V4.1-Flash.md` passes `--block-size 128`, and Phase
+    1 is skipped whenever that flag is set, so nothing in the documented
+    path is broken today. That case deserves its own change.
+    
+    ### Where the derived value is consumed
+    
+    Nothing downstream needs it. The first consumer is the
+    `compressor.py:61` table lookup, which raises before anything else runs.
+    The framework does not treat `cache_config.block_size` as authoritative
+    either -- `vllm/v1/engine/core.py:346` overwrites it with `min(group
+    spec block sizes)`; and the scheduler/hash block sizes used for
+    accounting come from the group specs in `resolve_kv_cache_block_sizes`
+    (`vllm/v1/core/kv_cache_utils.py:739-770`), which reads this field only
+    in the single-group case.
+    
+    ### Related
+    
+    Related to but distinct from #14479 (`refresh_block_size` replacing a
+    *user-specified* `--block-size`): that is about the value being replaced
+    silently, and it should be handled on its own. #11346 / #10040 / #12882
+    all extend which sizes a user may pick (32/64/128, or 16); none of them
+    touches `update_block_size_for_backend` / `get_preferred_block_size`.
+    
+    ### Does this PR introduce _any_ user-facing change?
+    
+    Yes, one: `vllm serve <DeepSeek-V4>` without `--block-size` no longer
+    fails with `KeyError: 4096`. The block size it settles on is the same as
+    before, and the existing warning still fires whenever a value outside
+    32/64/128 is normalized.
+    
+    ### How was this patch tested?
+    
+    **Why this had no coverage:** every existing e2e case passes
+    `--block-size`. That flag sets `user_specified_block_size`, which makes
+    the parent hook skip Phase 1 entirely, so no test ever launched DeepSeek
+    V4 without it.
+    
+    Tests in `tests/ut/test_platform.py`, next to the existing
+    `update_block_size_for_backend` cases:
+    
+    - DeepSeek V4 leaves the settled size alone for physical 32 / 64 / 128,
+    and the parent hook is not called;
+    - the derivation that would have replaced it is exercised for real: with
+    the real `AscendDSASWABackend` / `AscendDSAC4Backend` /
+    `AscendDSAC128Backend` classes, `_preferred_block_size_for_backends`
+    settles on 4096 for the full set and on 128 for a SWA+C4-only stage --
+    the value that collides with a physical table key -- while the hook
+    still leaves the physical size in place;
+    - the whole chain, 16 settling to 32 in `refresh_block_size` and
+    surviving the hook;
+    - any other model still goes through the parent hook.
+    
+    What these do not cover is a real launch with a real layer set and a
+    real cache build -- that half is the A5 evidence below. A startup-only
+    e2e case without `--block-size` would close that gap and is not in this
+    diff.
+    
+    On A5 (ascend950), DeepSeek-V4-Flash, DP8 + EP, no `--block-size`:
+    
+    - without this patch: `KeyError: 4096` at `compressor.py:61`, preceded
+    by the `Setting kv cache block size to 4096` line quoted above;
+    - with this patch: all eight DP workers reach `Application startup
+    complete`, ACL graph replay is active, and `POST /v1/completions`
+    answers `200 OK` with `system_fingerprint: vllm-0.31.0-dp8-ep-95277650`.
+    Verified with both `--kv-cache-dtype bfloat16` and `--kv-cache-dtype
+    fp8`; the hook only touches `cache_config.block_size`, so the dtype does
+    not enter into it.
+    
+    - vLLM main:
+    https://github.com/vllm-project/vllm/commit/544f182d9f0c9bfe8bd7645525951d5e3692a542
+    
+    Signed-off-by: 宋元盟 <songyuanmeng1@huawei.com>
+    Co-authored-by: 宋元盟 <songyuanmeng1@huawei.com>
+
+diff --git a/tests/ut/test_platform.py b/tests/ut/test_platform.py
+index a58de9337..8fc7f4871 100644
+--- a/tests/ut/test_platform.py
++++ b/tests/ut/test_platform.py
+@@ -7,6 +7,7 @@ import torch
+ from vllm.config import CompilationConfig, VllmConfig, set_current_vllm_config
+ from vllm.config.compilation import CompilationMode, CUDAGraphMode
+ from vllm.platforms import PlatformEnum
++from vllm.platforms.interface import Platform
+ from vllm.v1.attention.backends.registry import AttentionBackendEnum
+ from vllm.v1.attention.selector import AttentionSelectorConfig  # type: ignore
+ from vllm.v1.cudagraph_dispatcher import CudagraphDispatcher
+@@ -2165,6 +2166,100 @@ class TestNPUPlatform(TestBase):
+ 
+         self.assertEqual(vllm_config.cache_config.block_size, 512)
+ 
++    def _run_hook_with_derived_size(self, model_type: str, block_size: int, derived: int):
++        vllm_config = TestNPUPlatform.mock_vllm_config()
++        vllm_config.model_config.hf_config.model_type = model_type
++        vllm_config.cache_config.block_size = block_size
++        vllm_config.cache_config.enable_prefix_caching = True
++
++        def write_derived_size(cls, config):
++            config.cache_config.block_size = derived
++
++        with patch.object(Platform, "update_block_size_for_backend", classmethod(write_derived_size)):
++            self.platform.update_block_size_for_backend(vllm_config)
++
++        return vllm_config.cache_config.block_size
++
++    def test_update_block_size_for_backend_leaves_dsv4_alone(self):
++        for block_size in (32, 64, 128):
++            with self.subTest(block_size=block_size):
++                vllm_config = TestNPUPlatform.mock_vllm_config()
++                vllm_config.model_config.hf_config.model_type = "deepseek_v4"
++                vllm_config.cache_config.block_size = block_size
++
++                with patch.object(Platform, "update_block_size_for_backend") as parent_hook:
++                    self.platform.update_block_size_for_backend(vllm_config)
++
++                parent_hook.assert_not_called()
++                self.assertEqual(vllm_config.cache_config.block_size, block_size)
++
++    def test_update_block_size_for_backend_keeps_the_parent_value_for_other_models(self):
++        self.assertEqual(self._run_hook_with_derived_size("qwen3_moe", 32, 4096), 4096)
++
++    def test_update_block_size_for_backend_does_not_reach_the_real_derivation(self):
++        """The parent would settle on a logical size; the hook must not reach it.
++
++        The full Ascend backend set derives 4096 (the logical page); a stage carrying only
++        SWA and C4 layers derives 128, which collides with a physical table key.
++        """
++        from vllm_ascend.attention.dsa_v1 import (
++            AscendDSAC4Backend,
++            AscendDSAC128Backend,
++            AscendDSASWABackend,
++        )
++
++        cases = (
++            ([AscendDSASWABackend, AscendDSAC4Backend, AscendDSAC128Backend], 4096),
++            ([AscendDSASWABackend, AscendDSAC4Backend], 128),
++        )
++        for backends, expected_derived in cases:
++            for block_size in (32, 64, 128):
++                with self.subTest(backends=[b.get_name() for b in backends], block_size=block_size):
++                    vllm_config = TestNPUPlatform.mock_vllm_config()
++                    vllm_config.model_config.hf_config.model_type = "deepseek_v4"
++                    vllm_config.cache_config.block_size = block_size
++                    vllm_config.cache_config.user_specified_block_size = False
++                    vllm_config.cache_config.kv_cache_dtype_skip_layers = []
++                    vllm_config.cache_config.enable_prefix_caching = True
++
++                    # What the parent would settle on, before the restore runs.
++                    self.assertEqual(
++                        Platform._preferred_block_size_for_backends(backends, 16, vllm_config),
++                        expected_derived,
++                    )
++
++                    with patch.object(Platform, "_find_non_ssm_backends", return_value=backends):
++                        self.platform.update_block_size_for_backend(vllm_config)
++
++                    self.assertEqual(vllm_config.cache_config.block_size, block_size)
++
++    def test_refresh_block_size_then_the_hook_keeps_the_physical_size(self):
++        """The whole chain: default 16 settles to 32, the parent derives 4096, 32 survives."""
++        from vllm_ascend import utils as vllm_ascend_utils
++        from vllm_ascend.attention.dsa_v1 import (
++            AscendDSAC4Backend,
++            AscendDSAC128Backend,
++            AscendDSASWABackend,
++        )
++
++        backends = [AscendDSASWABackend, AscendDSAC4Backend, AscendDSAC128Backend]
++        vllm_config = TestNPUPlatform.mock_vllm_config()
++        vllm_config.model_config.hf_config.model_type = "deepseek_v4"
++        vllm_config.cache_config.block_size = 16
++        vllm_config.cache_config.user_specified_block_size = False
++        vllm_config.cache_config.kv_cache_dtype_skip_layers = []
++        vllm_config.cache_config.enable_prefix_caching = True
++        vllm_config.cache_config.mamba_cache_mode = None
++        vllm_config.speculative_config = None
++
++        with patch.object(vllm_ascend_utils, "is_c8_mxfp_kv_quant", return_value=False):
++            vllm_ascend_utils.refresh_block_size(vllm_config)
++        self.assertEqual(vllm_config.cache_config.block_size, 32)
++
++        with patch.object(Platform, "_find_non_ssm_backends", return_value=backends):
++            self.platform.update_block_size_for_backend(vllm_config)
++        self.assertEqual(vllm_config.cache_config.block_size, 32)
++
+     def test_validate_parallel_config_rejects_pcp_for_model_runner_v1(self):
+         vllm_config = TestNPUPlatform.mock_vllm_config()
+         vllm_config.parallel_config.prefill_context_parallel_size = 2
+diff --git a/vllm_ascend/platform.py b/vllm_ascend/platform.py
+index eddaf511a..5d368f4a1 100644
+--- a/vllm_ascend/platform.py
++++ b/vllm_ascend/platform.py
+@@ -458,6 +458,18 @@ class NPUPlatform(Platform):
+ 
+     @classmethod
+     def update_block_size_for_backend(cls, vllm_config: VllmConfig) -> None:
++        cache_config = vllm_config.cache_config
++        model_config = vllm_config.model_config
++        # DeepSeek V4 keys its page-padding tables on the physical block size, which
++        # check_and_update_config has already settled, and nothing this hook would do
++        # applies to it. The parent's Phase 1 would replace that size with one derived from
++        # get_supported_kernel_block_sizes(), and the compressed cache backends answer that
++        # in logical units -- AscendDSAC128Backend reports 4096 for the same physical page.
++        # Phase 2 is for hybrid models, Phase 3 for mixed KV dtypes, and the mamba handling
++        # below is gated on mamba_cache_mode; none of those is a DeepSeek V4 configuration.
++        if model_config is not None and model_config.hf_config.model_type == "deepseek_v4":
++            return
++
+         super().update_block_size_for_backend(vllm_config)
+ 
+         # TODO: NPU still sets block_size in check_and_update_config.
+@@ -465,8 +477,6 @@ class NPUPlatform(Platform):
+         using_kv_transfer_with_hybrid = (
+             not vllm_config.scheduler_config.disable_hybrid_kv_cache_manager and vllm_config.kv_transfer_config
+         )
+-        cache_config = vllm_config.cache_config
+-        model_config = vllm_config.model_config
+         if (
+             not cache_config.enable_prefix_caching
+             and using_kv_transfer_with_hybrid
+diff --git a/vllm_ascend/utils.py b/vllm_ascend/utils.py
+index 932bf2430..f3f8093a2 100644
+--- a/vllm_ascend/utils.py
++++ b/vllm_ascend/utils.py
+@@ -1450,9 +1450,9 @@ def refresh_block_size(vllm_config):
+         return
+ 
+     if model_config.hf_config.model_type == "deepseek_v4":
+-        if cache_config.block_size is None:
+-            cache_config.block_size = 32
+-        elif cache_config.block_size not in [32, 64, 128]:
++        # CacheConfig resolves an omitted --block-size on its own default above, so
++        # block_size cannot be None here.
++        if cache_config.block_size not in [32, 64, 128]:
+             logger.warning(
+                 "For deepseek_v4 model, block size should be 32, 64 or 128. "
+                 "Setting block size to 32 for better performance."

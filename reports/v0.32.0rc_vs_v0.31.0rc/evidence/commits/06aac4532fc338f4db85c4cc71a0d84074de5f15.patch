@@ -1,0 +1,165 @@
+commit 06aac4532fc338f4db85c4cc71a0d84074de5f15
+Author:     Foriv <82882366+Foriv@users.noreply.github.com>
+AuthorDate: Mon Oct 26 17:38:04 2026 +0800
+Commit:     GitHub <noreply@github.com>
+CommitDate: Mon Oct 26 17:38:04 2026 +0800
+
+    [BugFix][Triton] Cast SwiGLU sigmoid input to FP32 (#19519)
+    
+    ### What this PR does / why we need it?
+    
+    Cast the `swiglu_quant` sigmoid input to FP32 to fix BF16 compilation
+    failures with Triton Ascend 3.6.0, which rejects BF16 input to
+    `tl.sigmoid`.
+    
+    ### Does this PR introduce _any_ user-facing change?
+    
+    Yes. Restores the BF16 path with Triton Ascend 3.6.0. Intermediate
+    computation uses FP32; output dtypes are unchanged.
+    
+    ### How was this patch tested?
+    
+    Validated on **A2 (Ascend910B4-1)** and **A5 (Ascend950PR)** with formal
+    triton-ascend **3.6.0**, Torch 2.10.0 and CANN 9.2.0. A2 used Python
+    3.12.13; A5 used Python 3.11.10 with the existing vLLM 0.31.0 release
+    environment.
+    
+    | Target | A2 | A5 |
+    | --- | --- | --- |
+    | `triton/test_swiglu_quant.py` | 8 passed | 8 passed |
+    | `test_fused_moe.py::test_token_dispatcher_with_all_gather_quant` | 108
+    passed | 108 passed |
+    | **Total per device** | **116 passed, 0 failed, 0 skipped** | **116
+    passed, 0 failed, 0 skipped** |
+    
+    The original BF16 compilation failure was reproduced on both devices.
+    All 108 MoE cases on each device entered the BF16 `swiglu_quant` path.
+    Tests and assertions were unchanged; all patched pytest processes exited
+    0.
+    
+    Existing isolated runtimes and native artifacts were reused. The A2
+    environment retained NumPy/ONNX Runtime ABI and exit-time `ERR99999`
+    logs. These were targeted tests, not full-directory, model-accuracy or
+    performance validation.
+    
+    Results precede the subsequent comment-only removal; executable code is
+    unchanged.
+    
+    ---
+    
+    ### Checklist
+    
+    #### Testing
+    
+    - [ ] **Boundary / edge-case coverage**: Relevant cases reviewed and
+    tested.
+    - [x] **Regression test**: BF16 regression verified with Triton Ascend
+    3.6.0.
+    - [ ] **Error / failure path coverage**: Abnormal paths covered.
+    - [x] **Meaningful & reliable tests**: Relevant tests executed and
+    results recorded.
+    - [ ] **Performance impact**: Hardware benchmarks and model regression
+    results attached.
+    
+    - vLLM main:
+    https://github.com/vllm-project/vllm/commit/c0b6f74bee518aeaf5d72b200a0216e72fbb5e7c
+    
+    ---------
+    
+    Signed-off-by: Foriv <2293567056@qq.com>
+
+diff --git a/vllm_ascend/ops/triton/activation/swiglu_quant.py b/vllm_ascend/ops/triton/activation/swiglu_quant.py
+index eee719f94..35f37e434 100644
+--- a/vllm_ascend/ops/triton/activation/swiglu_quant.py
++++ b/vllm_ascend/ops/triton/activation/swiglu_quant.py
+@@ -42,7 +42,7 @@ def _swiglu_quant_kernel(
+         cur_x = tl.load(x_ptr + x_offsets)
+         x1 = extract_slice(cur_x, offsets=(0,), sizes=(HALF_COLS,), strides=(1,))
+         x2 = extract_slice(cur_x, offsets=(HALF_COLS,), sizes=(HALF_COLS,), strides=(1,))
+-        out = x1 * tl.sigmoid(x1) * x2
++        out = x1 * tl.sigmoid(x1.to(tl.float32)) * x2
+ 
+         # quant
+         if SCALE:
+diff --git a/vllm_ascend/ops/triton/docs/swiglu_quant.md b/vllm_ascend/ops/triton/docs/swiglu_quant.md
+new file mode 100644
+index 000000000..fb0ea4d50
+--- /dev/null
++++ b/vllm_ascend/ops/triton/docs/swiglu_quant.md
+@@ -0,0 +1,76 @@
++# swiglu_quant
++
++## Description
++
++- **Location**: [`activation/swiglu_quant.py`](../activation/swiglu_quant.py), wrapper `swiglu_quant` and kernel `_swiglu_quant_kernel`.
++- **Function**: Computes SwiGLU from concatenated gate/up activations, optionally followed by per-token symmetric INT8 quantization. The W8A8 Dynamic MoE non-fused, non-MC2 path calls this implementation when Triton is available.
++- **Formula** for input `x` with shape `[S, 2N]`, per token `i`:
++    - `gate = x[i, :N]`, `up = x[i, N:]`.
++    - `y = gate * sigmoid(gate.to(fp32)) * up`.
++    - With `need_quant=True`: `scale[i] = max(abs(y)) / 127`; `out[i] = saturating_int8(cast_to_input_dtype(y / scale[i]))`.
++    - With `need_quant=False`: `out[i] = cast_to_input_dtype(y)`.
++- **Algorithm flow**:
++    1. Read the number of valid token rows from the expert group metadata: the last cumulative count for `group_list_type=0`, or the sum of counts for `group_list_type=1`.
++    2. Distribute contiguous row ranges across vector cores. Each program processes its assigned rows independently.
++    3. Load one concatenated gate/up row, split it with `extract_slice`, and cast the gate to FP32 before sigmoid.
++    4. Compute SwiGLU. If quantization is enabled, reduce the row maximum, write its FP32 scale, and convert output chunks to INT8. Otherwise, store the activation in the input dtype.
++- **Supported modes**: Ascend NPU inference. Targeted eager-mode tests for this change passed on Atlas A2 (Ascend910B4-1) and 950PR with Triton Ascend 3.6.0. Additional hardware and graph-capture validation for this change: N/A.
++
++## Parameters
++
++`x`, `group_list`, and `group_list_type` are required. `need_quant` is optional and defaults to `True`.
++
++| Parameter | Input/Output/Attribute | Description | Data type | Data format |
++| --- | --- | --- | --- | --- |
++| `x` | Input | Contiguous concatenated gate/up activations, shape `[S, 2N]` | FP16 / BF16 | ND |
++| `group_list` | Input | Per-expert cumulative token counts or individual counts, shape `[num_experts]` | INT32 / INT64 | ND |
++| `group_list_type` | Attribute | `0` for cumulative counts; `1` for individual counts | Python int | Scalar |
++| `need_quant` | Attribute | Enable per-token INT8 quantization; default `True` | Python bool | Scalar |
++| `out` | Output | Shape `[S, N]`; INT8 when quantization is enabled, otherwise the input dtype | INT8 / FP16 / BF16 | ND |
++| `scale` | Output | Shape `[S]`; per-token quantization scale. Its values are only defined when `need_quant=True` | FP32 | ND |
++
++## Constraints
++
++- All input tensors must be on the same NPU. The kernel uses flat row-major indexing; the wrapper does not make non-contiguous inputs contiguous.
++- `x` must be two-dimensional with an even last dimension. The validated floating-point input types are FP16 and BF16; INT8 is the quantized output type, not a validated input type for this operator.
++- `group_list` must be one-dimensional and non-empty. Individual expert counts must be non-negative; cumulative counts must be non-negative and non-decreasing. Zero-token experts are allowed.
++- For all allocated output rows to be valid, the last cumulative count or the sum of individual counts must equal `S`. The wrapper validates the metadata dtype and `group_list_type`, but does not validate these count values or initialize unused output rows.
++- Quantization uses the row maximum directly as the scale numerator; the implementation has no explicit zero-scale guard for an all-zero activation row.
++- When `need_quant=False`, the returned `scale` tensor is allocated but not written and must not be used.
++
++### Triton Ascend 3.6.0 compatibility
++
++Triton Ascend 3.6.0 does not support BF16 input to `tl.sigmoid`: sigmoid evaluates `1 / (1 + exp(-x))`, and its exponential step rejects BF16 input. Passing the BF16 gate directly to sigmoid therefore fails during compilation.
++
++This operator explicitly casts the gate to FP32 before calling sigmoid:
++
++```python
++out = x1 * tl.sigmoid(x1.to(tl.float32)) * x2
++```
++
++The cast applies to both FP16 and BF16 inputs and moves FP32 conversion before the exponential and addition. The sigmoid result remains FP32 for the following multiplications. This works around the compiler's BF16 restriction while preserving the wrapper's floating-point input support; it does not add native BF16 sigmoid support to Triton Ascend.
++
++Final output dtypes are unchanged: quantized output is INT8 with FP32 scales, and non-quantized output has the input dtype. Intermediate numerical values, including derived scales and INT8 results, can differ due to the higher precision of the sigmoid calculation.
++
++## Origin and Differences
++
++- **Origin**: The vLLM-Ascend Triton implementation was introduced in [PR #5161](https://github.com/vllm-project/vllm-ascend/pull/5161). An upstream vLLM source operator used as its base: N/A.
++- **Differences**:
++    - Uses Ascend vector cores and `extract_slice` to process gate/up rows within a single kernel launch.
++    - Accepts expert token metadata in either cumulative-count or individual-count form.
++    - Fuses SwiGLU and optional per-token quantization. The normalized activation is cast through the input dtype before saturating INT8 conversion.
++    - Casts the sigmoid input to FP32 to avoid the BF16 compilation failure with Triton Ascend 3.6.0, as described above.
++
++## Test Cases
++
++[`test_swiglu_quant.py`](../../../../tests/e2e/nightly/single_node/ops/singlecard_ops/triton/test_swiglu_quant.py) contains eight cases:
++
++- Quantized correctness: FP16 `[1, 4096]` and BF16 `[65, 14336]`, each with both group-list modes. The BF16 case includes zero-token experts and multiple token rows.
++- Non-quantized correctness: FP16 and BF16 `[9, 4096]`, including a zero-token expert.
++- Invalid metadata: unsupported `group_list_type` and unsupported group-list dtype.
++
++The numerical reference computes SwiGLU in FP32. Quantized output is checked with `rtol=0, atol=1`; scale tolerances are `(rtol=5e-3, atol=1e-5)` for FP16 and `(rtol=2e-2, atol=1e-4)` for BF16. Non-quantized output uses `rtol=atol=5e-3` for FP16 and `rtol=atol=2e-2` for BF16. Output shapes and dtypes are also checked.
++
++```bash
++pytest -sv tests/e2e/nightly/single_node/ops/singlecard_ops/triton/test_swiglu_quant.py
++```

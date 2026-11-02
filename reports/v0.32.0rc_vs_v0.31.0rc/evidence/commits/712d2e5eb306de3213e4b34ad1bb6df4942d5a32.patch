@@ -1,0 +1,1670 @@
+commit 712d2e5eb306de3213e4b34ad1bb6df4942d5a32
+Author:     freyfwt <110148731+freyfwt@users.noreply.github.com>
+AuthorDate: Sat Oct 31 12:51:25 2026 +0800
+Commit:     GitHub <noreply@github.com>
+CommitDate: Sat Oct 31 12:51:25 2026 +0800
+
+    [BugFix][MoE] Fix A5 AllGather with MRV2 EPLB (#18549)
+    
+    ### What this PR does / why we need it?
+    
+    Fix MRV2 EPLB when A5 selects AllGather. Every rank routes the same
+    gathered rows, so rank-dependent replica selection can execute a route
+    twice or omit it.
+    
+    - Use a rank-independent replica table for AllGather, preserving the
+    existing MC2/AlltoAll selection.
+    - Count eligible routes once on their physical owner, excluding source
+    padding and non-collecting phases. Preserve draft source masks across
+    prefill, decode, dummy runs and graph replay.
+    - Refresh captured routing tables in place after placement changes,
+    discard stale load history and handle elastic active-map resizing.
+    - Keep this change scoped to MRV2. Restore MRV1 load collection and the
+    existing input-id AllGather implementation to baseline.
+    - Consolidate MRV2 mask construction, AllGather alignment, owner
+    counting, validation and load writes in
+    `AscendEplbLayerState.record_load()`. `forward_impl` saves the source
+    row count before preparation and calls the state method after FFN
+    execution and before output finalization. The mask filters load
+    statistics and does not alter routing or GMM counts.
+    
+    ### Does this PR introduce _any_ user-facing change?
+    
+    Yes. Fix incorrect routing and load accounting with A5 AllGather and
+    MRV2 EPLB, including redundant experts. The communication selector is
+    unchanged. Moving recording into the layer state adds no further
+    user-facing change.
+    
+    ### How was this patch tested?
+    
+    Validation at `e409edd82afb4b532d919f87f5362766a1599d7f`, against the
+    pinned vLLM revision below:
+    
+    - Related CPU/mock regressions: **330 passed** across the AllGather,
+    load-recording, routed-expert, fused-MoE, EPLB state/controller and
+    speculator tests. Coverage includes post-FFN mask communication order,
+    differing source/prepared row counts, ubatch and TP masks, padding
+    precedence, both count formats, source-ineligible owners, shared step
+    flags, V2 with no EPLB state and uninitialized recording fields.
+    - `bash format.sh ci`: passed.
+    - Full `tools/mypy.sh 1` for Python 3.10, 3.11 and 3.12: passed across
+    `vllm_ascend`, `examples` and `tests` in a Linux lint environment.
+    - Real Ascend A5 four-device regression: **2 passed, 1 deselected**,
+    with TP2/DP2/EP4, eager execution and full graph capture/replay. The
+    test directly invokes `AscendEplbLayerState.record_load()`, covering
+    ineligible sources, zero valid source rows and placement refresh under
+    replay. Runtime: CANN 9.2.0-beta.2, PyTorch 2.10.0 and torch_npu
+    2.10.0.post4.
+    
+      ```bash
+      VLLM_VERSION=0.32.1.dev0 VLLM_USE_V2_MODEL_RUNNER=1 \
+        python -m pytest -sv -rs \
+        tests/e2e/pull_request/four_card/test_data_parallel_tp2.py \
+        -k a5_dp2_tp2_allgather_eplb
+      ```
+    
+    This is weight-free component/graph validation using identity experts.
+    The version override selects compatibility paths for the pinned source
+    checkout. No native custom-op or performance result is claimed.
+    
+    A separate CANN 9.1.0 environment segfaulted on both the previous PR
+    head and this refactor; that run is not counted as passing evidence. The
+    initial CANN 9.2.0-beta.2 attempt hit an occupied HCCL listener before
+    load recording; the successful run used disjoint process-local HCCL
+    host/NPU socket port ranges.
+    
+    Previous full-model diagnostics did not establish strict token equality.
+    That limitation remains unresolved; full-model accuracy and performance
+    were not rerun for this refactor. Broader model/logit consistency,
+    MTP/SP integration and matched throughput/TTFT measurements remain
+    pre-merge validation.
+    
+    - vLLM main:
+    https://github.com/vllm-project/vllm/commit/544f182d9f0c9bfe8bd7645525951d5e3692a542
+    
+    ---------
+    
+    Signed-off-by: freyfwt <freytian1996@gmail.com>
+
+diff --git a/release_notes/fragments/18549.yaml b/release_notes/fragments/18549.yaml
+new file mode 100644
+index 000000000..908b4a63e
+--- /dev/null
++++ b/release_notes/fragments/18549.yaml
+@@ -0,0 +1,4 @@
++pr: 18549
++entries:
++  - category: bugfix
++    text: Fixed incorrect routing and load accounting with redundant experts when A5 uses AllGather with Model Runner V2 EPLB.
+diff --git a/tests/e2e/pull_request/four_card/test_data_parallel_tp2.py b/tests/e2e/pull_request/four_card/test_data_parallel_tp2.py
+index a9c75c47d..f5431c7c4 100644
+--- a/tests/e2e/pull_request/four_card/test_data_parallel_tp2.py
++++ b/tests/e2e/pull_request/four_card/test_data_parallel_tp2.py
+@@ -1,16 +1,47 @@
+ import os
+ import subprocess
+ import sys
++import time
++from datetime import timedelta
+ from pathlib import Path
++from types import SimpleNamespace
+ from unittest.mock import patch
+ 
+ import pytest
++import torch
++import torch.multiprocessing as mp
++from vllm.config import ParallelConfig, VllmConfig, set_current_vllm_config
++from vllm.distributed.parallel_state import (
++    destroy_distributed_environment,
++    destroy_model_parallel,
++    get_dp_group,
++    get_ep_group,
++    init_distributed_environment,
++    initialize_model_parallel,
++)
++from vllm.forward_context import create_forward_context, override_forward_context
++from vllm.utils.network_utils import get_open_port
+ 
+ from tests.e2e.conftest import wait_until_npu_memory_free
++from vllm_ascend.ascend_forward_context import _EXTRA_CTX, MoECommType
++from vllm_ascend.distributed.eplb.eplb_state import AscendEplbLayerState, refresh_model_routing_tables
++from vllm_ascend.ops.fused_moe.dataclass.moe_quant import MoEQuantParams
++from vllm_ascend.ops.fused_moe.dataclass.router_input import MoeRouterInput
++from vllm_ascend.ops.fused_moe.dataclass.token_dispatcher import MoETokenDispatchInput
++from vllm_ascend.ops.fused_moe.prepare_finalize import PrepareAndFinalizeWithAllGather
++from vllm_ascend.ops.fused_moe.token_dispatcher import TokenDispatcherWithAllGather
++from vllm_ascend.patch.platform.patch_fused_moe import _ascend_apply_eplb_mapping
++from vllm_ascend.utils import is_950
+ 
+ MODELS = ["Qwen/Qwen3-30B-A3B"]
+ REPO_ROOT = Path(__file__).resolve().parents[4]
+ DATA_PARALLEL_SCRIPT = REPO_ROOT / "examples" / "offline_data_parallel.py"
++EPLB_WORLD_SIZE = 4
++EPLB_LOGICAL_EXPERTS = 8
++EPLB_LOCAL_EXPERTS = 3
++EPLB_ROWS = 4
++EPLB_HIDDEN_SIZE = 128
++EPLB_TIMEOUT = 300
+ 
+ 
+ @pytest.mark.skip(reason="broken, fix me")
+@@ -47,3 +78,207 @@ def test_qwen3_inference_dp2_tp2(model, max_tokens):
+     assert "DP rank 1 needs to process" in output
+     assert "Generated text:" in output
+     assert proc.returncode == 0
++
++
++@torch.inference_mode()
++def _run_a5_allgather_eplb(rank, port, graph_mode):
++    torch.npu.set_device(rank)
++    # Initialize the global world before enabling DP rank offsets.
++    with set_current_vllm_config(VllmConfig()):
++        init_distributed_environment(
++            world_size=EPLB_WORLD_SIZE,
++            rank=rank,
++            local_rank=rank,
++            distributed_init_method=f"tcp://127.0.0.1:{port}",
++            backend="hccl",
++            timeout=timedelta(seconds=EPLB_TIMEOUT),
++        )
++    config = VllmConfig(
++        parallel_config=ParallelConfig(
++            tensor_parallel_size=2,
++            data_parallel_size=2,
++            data_parallel_rank=rank // 2,
++            enable_expert_parallel=True,
++        )
++    )
++    try:
++        with set_current_vllm_config(config), override_forward_context(create_forward_context(None, config)):
++            initialize_model_parallel(tensor_model_parallel_size=2, backend="hccl")
++            _EXTRA_CTX.moe_comm_type = MoECommType.ALLGATHER
++            _EXTRA_CTX.max_tokens_across_dp = EPLB_ROWS
++            device = torch.device("npu", rank)
++            physical_count = EPLB_WORLD_SIZE * EPLB_LOCAL_EXPERTS
++            placement = torch.cat([torch.arange(EPLB_LOGICAL_EXPERTS), torch.arange(4)])
++            logical_map = torch.full((1, EPLB_LOGICAL_EXPERTS, 2), -1, dtype=torch.int64, device=device)
++            replicas = torch.ones((1, EPLB_LOGICAL_EXPERTS), dtype=torch.int64, device=device)
++
++            def set_placement():
++                for logical in range(EPLB_LOGICAL_EXPERTS):
++                    slots = torch.where(placement == logical)[0]
++                    logical_map[0, logical].fill_(-1)
++                    logical_map[0, logical, : slots.numel()].copy_(slots)
++                    replicas[0, logical] = slots.numel()
++
++            set_placement()
++            loads = torch.zeros((1, physical_count), dtype=torch.int32, device=device)
++            state = AscendEplbLayerState()
++            state.set_layer_state(0, loads, logical_map, replicas)
++            state.should_record_tensor = torch.tensor(True, device=device)
++            state.allgather_record_tensor = torch.zeros((), dtype=torch.int32, device=device)
++            router = SimpleNamespace(eplb_state=state, _validate_eplb_state=lambda: None)
++            model_state = SimpleNamespace(
++                model=SimpleNamespace(moe_layers=[router]),
++                physical_to_logical_map=placement.unsqueeze(0).to(device),
++                _allgather_physical_map=placement.unsqueeze(0).to(device),
++                expert_load_pass=loads,
++                expert_load_window=torch.zeros((2, 1, physical_count), dtype=torch.int32, device=device),
++                _load_mapping_generation=0,
++            )
++            table_pointer = state.allgather_expert_replica_routing_table.data_ptr()
++            prepare = PrepareAndFinalizeWithAllGather(
++                SimpleNamespace(is_sequence_parallel=False, dp_size=2, pcp_size=1, dp_group=get_dp_group())
++            )
++            dispatcher = TokenDispatcherWithAllGather(
++                top_k=1, num_experts=physical_count, num_local_experts=EPLB_LOCAL_EXPERTS
++            )
++            expert_map = torch.full((physical_count,), -1, dtype=torch.int32, device=device)
++            start = rank * EPLB_LOCAL_EXPERTS
++            expert_map[start : start + EPLB_LOCAL_EXPERTS] = torch.arange(EPLB_LOCAL_EXPERTS, device=device)
++            hidden = (
++                torch.arange(EPLB_ROWS, device=device, dtype=torch.float32)[:, None]
++                .expand(-1, EPLB_HIDDEN_SIZE)
++                .contiguous()
++                .to(torch.bfloat16)
++            )
++            hidden.add_(1 + rank // 2 * EPLB_ROWS)
++            logits = torch.zeros((EPLB_ROWS, EPLB_LOGICAL_EXPERTS), device=device)
++            padding = torch.ones(EPLB_ROWS, dtype=torch.bool, device=device)
++            logical_ids = torch.ones((EPLB_ROWS * 2, 1), dtype=torch.int32, device=device)
++            weights = torch.ones_like(logical_ids, dtype=torch.float32)
++            num_tokens = torch.tensor(EPLB_ROWS, device=device)
++            state.num_unpadded_tokens_tensors = [num_tokens]
++            state.allgather_source_is_padding = padding
++            gather_mask = prepare.all_gather_eplb_mask
++            mask = None
++
++            def capture_mask(source_mask):
++                nonlocal mask
++                mask = gather_mask(source_mask)
++                return mask
++
++            prepare.all_gather_eplb_mask = capture_mask
++
++            def forward():
++                prepared = prepare.prepare(hidden, logits)
++                physical = _ascend_apply_eplb_mapping(router, logical_ids)
++                dispatched = dispatcher.token_dispatch(
++                    MoETokenDispatchInput(
++                        prepared.hidden_states,
++                        weights,
++                        physical,
++                        MoeRouterInput(expert_map, 0, None, False),
++                        MoEQuantParams(),
++                    )
++                )
++                # Identity experts isolate dispatch/combine ownership from FFN numerics.
++                output = dispatcher.token_combine(dispatched.hidden_states, dispatched.combine_metadata)
++                state.record_load(
++                    dispatched.group_list,
++                    dispatched.group_list_type,
++                    topk_ids=physical,
++                    num_source_tokens=EPLB_ROWS,
++                    is_sequence_parallel=False,
++                    prepare_finalize=prepare,
++                )
++                assert mask is not None
++                owners = ((physical >= start) & (physical < start + EPLB_LOCAL_EXPERTS)).to(torch.int32)
++                return output, owners, physical, mask, prepared.hidden_states
++
++            # Compile kernels and initialize HCCL before capture.
++            forward()
++            torch.npu.synchronize()
++            graph = None
++            if graph_mode == "full_graph":
++                graph = torch.npu.NPUGraph()
++                with torch.npu.graph(graph):
++                    result = forward()
++
++            for valid_rows, eligible in [((3, 2), (True, False)), ((0, 2), (False, True)), ((0, 0), (False, False))]:
++                dp_rank = rank // 2
++                padding.fill_(True)
++                padding[: valid_rows[dp_rank]] = False
++                state.should_record_tensor.fill_(eligible[dp_rank])
++                state.allgather_record_tensor.fill_(-1)
++                loads.zero_()
++                if graph is None:
++                    result = forward()
++                else:
++                    graph.replay()
++                output, owners, physical, mask, gathered = result
++                torch.distributed.all_reduce(output, group=get_ep_group().device_group)
++                torch.distributed.all_reduce(owners, group=get_ep_group().device_group)
++                torch.testing.assert_close(output, gathered)
++                torch.testing.assert_close(owners, torch.ones_like(owners))
++                expected_mask = torch.tensor(
++                    [row < valid_rows[dp] and eligible[dp] for dp in range(2) for row in range(EPLB_ROWS)]
++                )
++                torch.testing.assert_close(mask.cpu(), expected_mask)
++                assert state.allgather_record_tensor.item() == int(expected_mask.any())
++                slots = torch.where(placement == 1)[0]
++                expected_physical = slots[(torch.arange(EPLB_ROWS * 2) + 1) % slots.numel()][:, None]
++                torch.testing.assert_close(physical.cpu().long(), expected_physical)
++                expected_load = torch.bincount(expected_physical[expected_mask].flatten(), minlength=physical_count)
++                torch.distributed.all_reduce(loads, group=get_ep_group().device_group)
++                torch.testing.assert_close(loads.cpu().flatten().long(), expected_load)
++
++                # A changed placement must preserve captured pointers and discard old history.
++                placement = placement.roll(1)
++                set_placement()
++                model_state.physical_to_logical_map.copy_(placement.unsqueeze(0))
++                model_state.expert_load_window.fill_(1)
++                refresh_model_routing_tables(model_state)
++                assert state.allgather_expert_replica_routing_table.data_ptr() == table_pointer
++                assert not loads.any()
++                assert not model_state.expert_load_window.any()
++                generation = model_state._load_mapping_generation
++                model_state.expert_load_window.fill_(1)
++                refresh_model_routing_tables(model_state)
++                assert model_state.expert_load_window.all()
++                assert model_state._load_mapping_generation == generation
++    finally:
++        destroy_model_parallel()
++        destroy_distributed_environment()
++
++
++@pytest.mark.parametrize(
++    "graph_mode",
++    [
++        pytest.param(
++            mode,
++            marks=pytest.mark.e2e_coverage(
++                arch="moe",
++                feature="eplb",
++                parallel="DP,TP,EP",
++                deploy="",
++                hardware="A5",
++                quantization="BF16",
++                graph_mode=mode,
++            ),
++        )
++        for mode in ("eager", "full_graph")
++    ],
++)
++def test_a5_dp2_tp2_allgather_eplb(graph_mode):
++    if not is_950():
++        pytest.skip("A5 AllGather EPLB regression")
++    assert torch.npu.device_count() >= EPLB_WORLD_SIZE
++    workers = mp.spawn(_run_a5_allgather_eplb, args=(get_open_port(), graph_mode), nprocs=EPLB_WORLD_SIZE, join=False)
++    deadline = time.monotonic() + EPLB_TIMEOUT
++    try:
++        while not workers.join(timeout=10):
++            assert time.monotonic() < deadline, "A5 AllGather EPLB workers timed out"
++    finally:
++        for process in workers.processes:
++            if process.is_alive():
++                process.terminate()
++            process.join(timeout=10)
+diff --git a/tests/ut/distributed/eplb/test_policy_load_stats.py b/tests/ut/distributed/eplb/test_policy_load_stats.py
+index 1e65314dc..54da62665 100644
+--- a/tests/ut/distributed/eplb/test_policy_load_stats.py
++++ b/tests/ut/distributed/eplb/test_policy_load_stats.py
+@@ -5,6 +5,7 @@ from types import SimpleNamespace
+ from unittest.mock import MagicMock
+ 
+ import numpy as np
++import pytest
+ import torch
+ from vllm.distributed.eplb import eplb_state as upstream_eplb_state
+ 
+@@ -59,6 +60,56 @@ def test_step_keeps_skipped_samples_on_shared_time_axis(monkeypatch):
+     assert upstream_step.call_count == 2
+ 
+ 
++@pytest.mark.parametrize(
++    "is_dummy,source_eligible,gathered,expected",
++    [
++        (True, False, 1, True),
++        (False, False, 1, True),
++        (False, True, 0, False),
++        (True, False, 0, False),
++    ],
++)
++def test_allgather_step_uses_remote_eligibility_for_owner_load(
++    monkeypatch, is_dummy, source_eligible, gathered, expected
++):
++    upstream_step = MagicMock()
++    monkeypatch.setattr(upstream_eplb_state.EplbState, "step", upstream_step)
++    state = AscendEplbState.__new__(AscendEplbState)
++    state._hixl_session = None
++    state._close_error = None
++    state.policy = None
++    state._is_load_sampling_step = True
++    state._should_collect_local_load = source_eligible
++    state._uses_phase_filter = True
++    state.allgather_record_tensor = torch.tensor(gathered)
++    state._has_fresh_recorded_load = False
++    state.step(is_dummy=is_dummy)
++    assert state._has_fresh_recorded_load == expected
++    assert upstream_step.call_args.kwargs["is_dummy"] == (is_dummy and not expected)
++
++
++def test_a5_default_policy_marks_freshness_only_on_actual_step(monkeypatch):
++    monkeypatch.setattr(upstream_eplb_state.EplbState, "step", MagicMock())
++    state = AscendEplbState.__new__(AscendEplbState)
++    state._hixl_session = None
++    state._close_error = None
++    state.policy = None
++    state._is_load_sampling_step = True
++    state._should_collect_local_load = True
++    state.allgather_record_tensor = torch.tensor(1)
++    state._has_fresh_recorded_load = False
++    state.step(is_profile=True)
++    assert not state._has_fresh_recorded_load
++    state._is_load_sampling_step = True
++    state.step()
++    # step consumes the forward flags: a new forward must publish eligibility.
++    assert not state._has_fresh_recorded_load
++    state._is_load_sampling_step = True
++    state._should_collect_local_load = True
++    state.step()
++    assert state._has_fresh_recorded_load
++
++
+ def test_mapping_change_discards_old_samples():
+     state = AscendEplbState.__new__(AscendEplbState)
+     model_state = _model_state(
+diff --git a/tests/ut/distributed/eplb/test_state.py b/tests/ut/distributed/eplb/test_state.py
+index bb02e469c..575904c25 100644
+--- a/tests/ut/distributed/eplb/test_state.py
++++ b/tests/ut/distributed/eplb/test_state.py
+@@ -10,6 +10,8 @@ import torch
+ from vllm.distributed.eplb import eplb_state as upstream_eplb_state
+ 
+ from vllm_ascend.ascend_config import StairConfig
++from vllm_ascend.device.hardware import AscendDeviceType
++from vllm_ascend.device.hardware_profile import get_hardware_profile
+ from vllm_ascend.distributed.eplb import eplb_state
+ from vllm_ascend.distributed.eplb.eplb_communicator import AscendHixlEplbCommunicator, _HixlSession
+ from vllm_ascend.distributed.eplb.eplb_state import (
+@@ -170,6 +172,55 @@ def test_layer_state_builds_routing_table_and_preserves_captured_tensor(
+     torch.testing.assert_close(captured_routing_table, new_routing_table)
+ 
+ 
++def test_a5_common_table_refreshes_in_place_and_invalidates_only_changed_layout(monkeypatch):
++    monkeypatch.setattr(eplb_state, "get_current_hardware_profile", lambda: get_hardware_profile(AscendDeviceType.A5))
++    monkeypatch.setattr(eplb_state, "get_ep_group", lambda: SimpleNamespace(rank_in_group=1, world_size=2))
++    layer_state = AscendEplbLayerState()
++    layer_state.set_layer_state(
++        0, torch.zeros((1, 4), dtype=torch.int32), torch.tensor([[[0, 2], [1, 3]]]), torch.tensor([[2, 2]])
++    )
++    common = layer_state.allgather_expert_replica_routing_table
++    ranked = layer_state.expert_replica_routing_table
++    assert common is not None and ranked is not None
++    assert common[0].tolist() == [0, 3] and ranked[0].tolist() == [2, 1]
++    physical = torch.tensor([[0, 1, 0, 1]])
++    model_state = SimpleNamespace(
++        model=SimpleNamespace(moe_layers=[SimpleNamespace(eplb_state=layer_state)]),
++        physical_to_logical_map=physical,
++        _allgather_physical_map=physical.clone(),
++        expert_load_pass=torch.ones(1, 4),
++        expert_load_window=torch.ones(2, 1, 4),
++        _load_mapping_generation=0,
++    )
++    eplb_state.refresh_model_routing_tables(model_state)
++    assert model_state.expert_load_window.sum() == 8
++    physical.copy_(torch.tensor([[1, 0, 0, 1]]))
++    layer_state.logical_to_physical_map.copy_(torch.tensor([[1, 2], [0, 3]]))
++    eplb_state.refresh_model_routing_tables(model_state)
++    assert layer_state.allgather_expert_replica_routing_table is common
++    assert common[0].tolist() == [1, 3]
++    assert model_state.expert_load_pass.sum() == model_state.expert_load_window.sum() == 0
++    assert model_state._load_mapping_generation == 1
++
++
++@pytest.mark.parametrize("old_width,new_width", [(4, 6), (6, 4)])
++def test_allgather_history_snapshot_tracks_elastic_active_width(old_width, new_width):
++    model_state = SimpleNamespace(
++        model=SimpleNamespace(moe_layers=[]),
++        physical_to_logical_map=torch.zeros(1, new_width, dtype=torch.long),
++        _allgather_physical_map=torch.zeros(1, old_width, dtype=torch.long),
++        expert_load_pass=torch.ones(1, new_width),
++        expert_load_window=torch.ones(2, 1, new_width),
++        _load_mapping_generation=0,
++    )
++    eplb_state.refresh_model_routing_tables(model_state)
++    torch.testing.assert_close(model_state._allgather_physical_map, model_state.physical_to_logical_map)
++    assert not model_state.expert_load_pass.any() and not model_state.expert_load_window.any()
++    assert model_state._load_mapping_generation == 1
++    eplb_state.refresh_model_routing_tables(model_state)
++    assert model_state._load_mapping_generation == 1
++
++
+ def test_sync_rearrange_refreshes_all_model_routing_tables(monkeypatch):
+     sentinel = object()
+     model_states = {"model": object()}
+diff --git a/tests/ut/ops/test_allgather_eplb.py b/tests/ut/ops/test_allgather_eplb.py
+new file mode 100644
+index 000000000..a544b9fc4
+--- /dev/null
++++ b/tests/ut/ops/test_allgather_eplb.py
+@@ -0,0 +1,333 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM Ascend project
++
++from types import SimpleNamespace
++from unittest.mock import MagicMock
++
++import pytest
++import torch
++
++from vllm_ascend import ascend_forward_context as afc
++from vllm_ascend.device.hardware import AscendDeviceType
++from vllm_ascend.device.hardware_profile import get_hardware_profile
++from vllm_ascend.distributed.eplb import eplb_state as state_module
++from vllm_ascend.distributed.eplb.eplb_state import AscendEplbLayerState
++from vllm_ascend.ops.fused_moe import eplb as eplb_ops
++from vllm_ascend.ops.fused_moe import routed_experts as routed_module
++from vllm_ascend.ops.fused_moe.eplb import (
++    build_expert_replica_routing_table,
++    count_allgather_tokens,
++    make_allgather_mask,
++    map_to_physical,
++    record_expert_tokens,
++)
++from vllm_ascend.ops.fused_moe.moe_comm_method import FusedExpertsResult
++from vllm_ascend.ops.fused_moe.prepare_finalize import PrepareAndFinalizeWithAllGather
++from vllm_ascend.ops.fused_moe.routed_experts import AscendRoutedExperts
++from vllm_ascend.patch.platform.patch_fused_moe import _ascend_apply_eplb_mapping
++
++
++@pytest.fixture(autouse=True)
++def v2_forward_context(monkeypatch):
++    monkeypatch.setattr(afc, "_USE_V2_EXTRA_KWARGS", True)
++
++
++@pytest.mark.parametrize("tp_size", [1, 2, 4])
++def test_allgather_routes_execute_and_count_each_token_once(monkeypatch, tp_size):
++    profile = get_hardware_profile(AscendDeviceType.A5)
++    monkeypatch.setattr("vllm_ascend.ops.fused_moe.eplb.get_current_hardware_profile", lambda: profile)
++    monkeypatch.setattr(
++        afc,
++        "get_forward_context",
++        lambda: SimpleNamespace(additional_kwargs={"moe_comm_type": afc.MoECommType.ALLGATHER}),
++    )
++    monkeypatch.setattr(torch.ops.vllm, "ascend_eplb_map_to_physical", map_to_physical)
++    # Default initial layout: four owners, eight logical experts, four replicas.
++    # Expert 1's copies live on ranks 0 and 3, so rank-dependent choices
++    # disagree on whether either owner should execute the same token.
++    placement = torch.cat([torch.arange(8), torch.arange(4)]).reshape(4, 3)
++    logical_map = torch.full((8, 2), -1)
++    replicas = torch.ones(8, dtype=torch.int64)
++    for logical in range(8):
++        physical_slots = torch.where(placement.flatten() == logical)[0]
++        logical_map[logical, : physical_slots.numel()] = physical_slots
++        replicas[logical] = physical_slots.numel()
++    table = build_expert_replica_routing_table(logical_map, replicas, ep_rank=0)
++    dp_size = 4 // tp_size
++    num_gathered_rows = 7 * dp_size
++    logical_ids = torch.arange(8).expand(num_gathered_rows, -1)
++    weights = torch.arange(1, 9, dtype=torch.float32).expand(num_gathered_rows, -1) / 36
++    hidden = torch.arange(1, num_gathered_rows + 1, dtype=torch.float32)
++    validity = torch.tensor([True, True, False, True, False, True, False]).repeat(dp_size)
++    owners = torch.zeros_like(logical_ids)
++    output = torch.zeros_like(hidden)
++    old_output = torch.zeros_like(hidden)
++    counts = []
++    for rank in range(4):
++        layer_state = SimpleNamespace(
++            expert_replica_routing_table=build_expert_replica_routing_table(logical_map, replicas, rank),
++            allgather_expert_replica_routing_table=table,
++        )
++        router = SimpleNamespace(eplb_state=layer_state, _validate_eplb_state=lambda: None)
++        physical = _ascend_apply_eplb_mapping(router, logical_ids)
++        local = (physical >= rank * 3) & (physical < (rank + 1) * 3)
++        owners.add_(local)
++        # TP ranks have the same inputs; ownership, rather than dividing load
++        # after the fact, ensures each route contributes exactly once.
++        logical_weights = placement.flatten()[physical.long()].float() + 1
++        output += (hidden[:, None] * logical_weights * weights * local).sum(dim=1)
++        mask = make_allgather_mask(
++            num_gathered_rows, torch.tensor(4 * dp_size), torch.tensor(True), is_padding=~validity
++        )
++        counts.append(count_allgather_tokens(physical, mask, rank * 3, 3))
++        old_physical = map_to_physical(logical_ids, build_expert_replica_routing_table(logical_map, replicas, rank))
++        old_local = (old_physical >= rank * 3) & (old_physical < (rank + 1) * 3)
++        old_output += (hidden[:, None] * (logical_ids + 1) * weights * old_local).sum(dim=1)
++    reference = hidden * ((torch.arange(8).float() + 1) * weights[0]).sum()
++    torch.testing.assert_close(owners, torch.ones_like(owners))
++    torch.testing.assert_close(output, reference)
++    assert not torch.allclose(old_output, reference)
++    assert torch.stack(counts).sum() == validity.sum() * 8
++
++
++@pytest.mark.parametrize("tp_size", [1, 2, 4])
++def test_sp_mask_tracks_padding_and_source_phase(tp_size):
++    padding = torch.tensor([False, True, False, False, True, False, True])
++    local_rows = (padding.numel() + tp_size - 1) // tp_size
++    masks = [
++        make_allgather_mask(
++            local_rows, torch.tensor(4), torch.tensor(True), is_padding=padding, tp_size=tp_size, tp_rank=rank
++        )
++        for rank in range(tp_size)
++    ]
++    gathered = torch.cat(masks)[: padding.numel()]
++    torch.testing.assert_close(gathered, ~padding)
++    assert not make_allgather_mask(local_rows, torch.tensor(4), torch.tensor(False), tp_size=tp_size, tp_rank=0).any()
++    fallback = torch.cat(
++        [
++            make_allgather_mask(local_rows, torch.tensor(4), torch.tensor(True), tp_size=tp_size, tp_rank=rank)
++            for rank in range(tp_size)
++        ]
++    )
++    assert fallback.sum() == 4
++
++
++def test_dp_mask_uses_same_padded_rows_as_logits(monkeypatch):
++    from vllm_ascend.ops.fused_moe import prepare_finalize as prepare_module
++
++    monkeypatch.setattr(
++        afc, "get_forward_context", lambda: SimpleNamespace(additional_kwargs={"max_tokens_across_dp": 4})
++    )
++    peer_logits = torch.tensor([[20.0], [21.0], [0.0], [0.0]])
++    peer_mask = torch.tensor([1, 0, 0, 0], dtype=torch.int32)
++
++    def gather(rows, dim):
++        return torch.cat([rows, peer_logits if rows.ndim == 2 else peer_mask])
++
++    config = SimpleNamespace(
++        is_sequence_parallel=False, dp_size=2, pcp_size=1, dp_group=SimpleNamespace(all_gather=gather)
++    )
++    monkeypatch.setattr(prepare_module, "get_dynamic_mx_quant_scale_alg", lambda: None)
++    prepare = PrepareAndFinalizeWithAllGather(config)
++    logits = torch.tensor([[10.0], [11.0], [12.0]])
++    prepared = prepare.prepare(logits, logits)
++    mask = prepare.all_gather_eplb_mask(torch.tensor([True, True, False]))
++    assert prepared.router_logits.flatten().tolist() == [10, 11, 12, 0, 20, 21, 0, 0]
++    assert mask.tolist() == [True, True, False, False, True, False, False, False]
++
++
++@pytest.mark.parametrize(
++    "device,comm",
++    [
++        (AscendDeviceType.A5, afc.MoECommType.MC2),
++        (AscendDeviceType.A5, afc.MoECommType.ALLTOALL),
++        (AscendDeviceType.A3, afc.MoECommType.ALLGATHER),
++    ],
++)
++def test_other_paths_keep_rank_dependent_mapping(monkeypatch, device, comm):
++    monkeypatch.setattr(
++        "vllm_ascend.ops.fused_moe.eplb.get_current_hardware_profile", lambda: get_hardware_profile(device)
++    )
++    monkeypatch.setattr(afc, "get_forward_context", lambda: SimpleNamespace(additional_kwargs={"moe_comm_type": comm}))
++    monkeypatch.setattr(torch.ops.vllm, "ascend_eplb_map_to_physical", map_to_physical)
++    ranked = torch.full((1024, 2), 3, dtype=torch.int32)
++    router = SimpleNamespace(
++        _validate_eplb_state=lambda: None,
++        eplb_state=SimpleNamespace(
++            expert_replica_routing_table=ranked, allgather_expert_replica_routing_table=torch.zeros_like(ranked)
++        ),
++    )
++    assert _ascend_apply_eplb_mapping(router, torch.tensor([[0, 1]])).tolist() == [[3, 3]]
++
++
++@pytest.mark.parametrize(
++    "device,comm",
++    [
++        (AscendDeviceType.A5, afc.MoECommType.MC2),
++        (AscendDeviceType.A5, afc.MoECommType.ALLTOALL),
++        (AscendDeviceType.A3, afc.MoECommType.ALLGATHER),
++    ],
++)
++def test_source_mask_is_unused_outside_a5_allgather(monkeypatch, device, comm):
++    state = AscendEplbLayerState()
++    state.expert_load_view = torch.zeros(2, dtype=torch.int32)
++    state.should_record_tensor = torch.tensor(True)
++    state.local_expert_start = 0
++    state.local_expert_count = 2
++    context = SimpleNamespace(additional_kwargs={"moe_comm_type": comm})
++    monkeypatch.setattr(afc, "get_forward_context", lambda: context)
++    monkeypatch.setattr(
++        "vllm_ascend.ops.fused_moe.eplb.get_current_hardware_profile", lambda: get_hardware_profile(device)
++    )
++    prepare = MagicMock(spec=PrepareAndFinalizeWithAllGather)
++    monkeypatch.setattr(torch.ops.vllm, "ascend_eplb_record_expert_tokens", record_expert_tokens)
++    state.record_load(
++        torch.tensor([2, 3]),
++        1,
++        topk_ids=torch.empty(0, 1, dtype=torch.int32),
++        num_source_tokens=2,
++        is_sequence_parallel=False,
++        prepare_finalize=prepare,
++    )
++    assert state.expert_load_view.tolist() == [2, 3]
++    prepare.all_gather_eplb_mask.assert_not_called()
++
++
++@pytest.mark.parametrize("padding_source", ["draft", "context", "unpadded_count"])
++@pytest.mark.parametrize("sequence_parallel", [False, True])
++def test_source_mask_preserves_ubatch_padding_and_tp_slice(monkeypatch, padding_source, sequence_parallel):
++    state = AscendEplbLayerState()
++    state.num_unpadded_tokens_tensors = [torch.tensor(0), torch.tensor(3)]
++    state.should_record_tensor = torch.tensor(True)
++    state.allgather_source_is_padding = torch.tensor([False, False, False, True]) if padding_source == "draft" else None
++    state.allgather_record_tensor = torch.tensor(-1, dtype=torch.int32)
++    state.expert_load_view = torch.zeros(1, dtype=torch.int32)
++    state.local_expert_start = 0
++    state.local_expert_count = 1
++    context = SimpleNamespace(
++        is_padding=None if padding_source == "unpadded_count" else torch.tensor([False, True, True, False])
++    )
++    monkeypatch.setattr(eplb_ops, "use_allgather_eplb", lambda enabled: enabled)
++    monkeypatch.setattr(state_module, "get_forward_context", lambda: context)
++    monkeypatch.setattr(state_module, "dbo_current_ubatch_id", lambda: 1)
++    monkeypatch.setattr(state_module, "get_tensor_model_parallel_world_size", lambda: 2)
++    monkeypatch.setattr(state_module, "get_tensor_model_parallel_rank", lambda: 1)
++    monkeypatch.setattr(torch.ops.vllm, "ascend_eplb_record_expert_tokens", record_expert_tokens)
++    prepare = MagicMock(spec=PrepareAndFinalizeWithAllGather)
++    prepare.all_gather_eplb_mask.side_effect = lambda mask: mask
++    expected = {
++        (False, "draft"): [True, True],
++        (False, "context"): [True, False],
++        (False, "unpadded_count"): [True, True],
++        (True, "draft"): [True, False],
++        (True, "context"): [False, True],
++        (True, "unpadded_count"): [True, False],
++    }[sequence_parallel, padding_source]
++
++    def record():
++        state.record_load(
++            torch.tensor([2]),
++            1,
++            topk_ids=torch.zeros(2, 1, dtype=torch.int32),
++            num_source_tokens=2,
++            is_sequence_parallel=sequence_parallel,
++            prepare_finalize=prepare,
++        )
++
++    record()
++    assert prepare.all_gather_eplb_mask.call_args.args[0].tolist() == expected
++    assert state.expert_load_view.item() == sum(expected)
++    state.should_record_tensor.fill_(False)
++    record()
++    assert prepare.all_gather_eplb_mask.call_args.args[0].tolist() == [False, False]
++    assert state.expert_load_view.item() == sum(expected)
++    assert prepare.all_gather_eplb_mask.call_count == 2
++
++
++@pytest.mark.parametrize("source_padding,expected", [([False, False, False, True], 3), ([True] * 4, 0)])
++@pytest.mark.parametrize("dp_size", [1, 2])
++def test_draft_source_mask_overrides_synthetic_model_padding(monkeypatch, source_padding, expected, dp_size):
++    events = []
++    state = AscendEplbLayerState()
++    state.num_unpadded_tokens_tensors = [torch.tensor(4)]
++    state.should_record_tensor = torch.tensor(True)
++    state.allgather_source_is_padding = torch.tensor(source_padding)
++    state.allgather_record_tensor = torch.tensor(-1, dtype=torch.int32)
++    state.expert_load_view = torch.zeros(1, dtype=torch.int32)
++    state.local_expert_count = 1
++    state.local_expert_start = 0
++    config = SimpleNamespace(
++        is_sequence_parallel=False,
++        dp_size=dp_size,
++        pcp_size=1,
++        ep_rank=0,
++        num_local_experts=1,
++        dp_group=SimpleNamespace(all_gather=lambda rows, dim: torch.cat([rows, torch.zeros_like(rows)])),
++    )
++    prepare = PrepareAndFinalizeWithAllGather(config)
++    make_mask = eplb_ops.make_allgather_mask
++    gather_mask = prepare.all_gather_eplb_mask
++
++    def source_mask(*args, **kwargs):
++        events.append("source_mask")
++        assert args[0] == 4
++        return make_mask(*args, **kwargs)
++
++    def prepare_inputs(**kwargs):
++        events.append("prepare")
++        return prepare.prepare(**kwargs)
++
++    def gather_source_mask(mask):
++        events.append("gather_mask")
++        return gather_mask(mask)
++
++    def select_experts(**kwargs):
++        events.append("route")
++        assert kwargs["hidden_states"].shape[0] == 4 * dp_size
++        return torch.ones(4 * dp_size, 1), torch.zeros(4 * dp_size, 1, dtype=torch.int32)
++
++    def apply_experts(**kwargs):
++        events.append("ffn")
++        return FusedExpertsResult(
++            routed_out=torch.ones(4 * dp_size, 2), expert_tokens=torch.tensor([4 * dp_size]), group_list_type=1
++        )
++
++    def record_load(*args):
++        events.append("record_load")
++        return record_expert_tokens(*args)
++
++    def finalize(**kwargs):
++        events.append("finalize")
++        return kwargs["hidden_states"]
++
++    comm = SimpleNamespace(
++        prepare_finalize=prepare,
++        prepare=prepare_inputs,
++        finalize=finalize,
++    )
++    layer = AscendRoutedExperts.__new__(AscendRoutedExperts)
++    layer.router = SimpleNamespace(eplb_state=state)
++    layer._use_v2_model_runner = True
++    layer.enable_npugraph_ex_static_kernel = False
++    layer.moe_config = config
++    layer._select_experts = select_experts
++    object.__setattr__(layer, "quant_method", SimpleNamespace(apply=apply_experts))
++    layer.dynamic_eplb = False
++    layer.return_with_event = False
++    context = SimpleNamespace(
++        is_padding=torch.zeros(4, dtype=torch.bool), additional_kwargs={"max_tokens_across_dp": 4}
++    )
++    monkeypatch.setattr(routed_module, "get_forward_context", lambda: context)
++    monkeypatch.setattr(afc, "get_forward_context", lambda: context)
++    monkeypatch.setattr(
++        routed_module, "_EXTRA_CTX", SimpleNamespace(in_profile_run=False, moe_comm_type=afc.MoECommType.ALLGATHER)
++    )
++    monkeypatch.setattr(routed_module, "get_moe_comm_method", lambda *_: comm)
++    monkeypatch.setattr(eplb_ops, "use_allgather_eplb", lambda enabled: enabled)
++    monkeypatch.setattr(eplb_ops, "make_allgather_mask", source_mask)
++    monkeypatch.setattr(prepare, "all_gather_eplb_mask", gather_source_mask)
++    monkeypatch.setattr(torch.ops.vllm, "ascend_eplb_record_expert_tokens", record_load)
++    AscendRoutedExperts.forward_impl(layer, hidden_states=torch.ones(4, 2), router_logits=torch.ones(4, 1))
++    assert events == ["prepare", "route", "ffn", "source_mask", "gather_mask", "record_load", "finalize"]
++    assert state.expert_load_view.item() == expected
++    assert state.allgather_record_tensor.item() == int(expected > 0)
+diff --git a/tests/ut/ops/test_eplb_v2_recording.py b/tests/ut/ops/test_eplb_v2_recording.py
+index 405ef9908..16aad43e7 100644
+--- a/tests/ut/ops/test_eplb_v2_recording.py
++++ b/tests/ut/ops/test_eplb_v2_recording.py
+@@ -2,51 +2,136 @@
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM Ascend project
+ 
+ from types import SimpleNamespace
+-from unittest.mock import patch
++from unittest.mock import MagicMock, patch
+ 
+ import pytest
+ import torch
+ 
+-from vllm_ascend.ops.fused_moe.moe_comm_method import FusedExpertsResult
+-from vllm_ascend.ops.fused_moe.routed_experts import _record_v2_eplb_load
++from vllm_ascend.distributed.eplb import eplb_state as state_module
++from vllm_ascend.distributed.eplb.eplb_state import AscendEplbLayerState
++from vllm_ascend.ops.fused_moe import eplb as eplb_ops
++from vllm_ascend.ops.fused_moe.eplb import record_expert_tokens
++from vllm_ascend.ops.fused_moe.prepare_finalize import PrepareAndFinalizeWithAllGather
+ 
+ 
+-def _router(record_enabled: bool = True):
+-    return SimpleNamespace(
+-        eplb_state=SimpleNamespace(
+-            expert_load_view=torch.zeros(8, dtype=torch.int32),
+-            should_record_tensor=torch.tensor(record_enabled),
+-            local_expert_start=4,
+-            local_expert_count=2,
+-        )
+-    )
++@pytest.fixture
++def prepare_finalize(monkeypatch):
++    monkeypatch.setattr(eplb_ops, "use_allgather_eplb", lambda enabled: False)
++    return MagicMock(spec=PrepareAndFinalizeWithAllGather)
+ 
+ 
+-def test_record_v2_eplb_load_uses_operator_counts():
+-    router = _router()
+-    counts = torch.tensor([2, 3], dtype=torch.int64)
+-    result = FusedExpertsResult(routed_out=torch.empty(0), expert_tokens=counts)
++def _state(record_enabled: bool = True):
++    state = AscendEplbLayerState()
++    state.expert_load_view = torch.zeros(8, dtype=torch.int32)
++    state.should_record_tensor = torch.tensor(record_enabled)
++    state.local_expert_start = 4
++    state.local_expert_count = 2
++    state.num_unpadded_tokens_tensors = [torch.tensor(3)]
++    return state
+ 
+-    with patch.object(torch.ops.vllm, "ascend_eplb_record_expert_tokens") as record_op:
+-        _record_v2_eplb_load(router, result)
+ 
+-    record_op.assert_called_once_with(
+-        counts,
+-        router.eplb_state.expert_load_view,
+-        router.eplb_state.should_record_tensor,
+-        1,
+-        4,
+-    )
++def test_record_load_uses_operator_counts(prepare_finalize):
++    state = _state()
++    counts = torch.tensor([2, 3], dtype=torch.int64)
++    with patch.object(torch.ops.vllm, "ascend_eplb_record_expert_tokens") as record_op:
++        state.record_load(
++            counts,
++            1,
++            topk_ids=torch.empty(0, 1, dtype=torch.int32),
++            num_source_tokens=0,
++            is_sequence_parallel=False,
++            prepare_finalize=prepare_finalize,
++        )
++    record_op.assert_called_once_with(counts, state.expert_load_view, state.should_record_tensor, 1, 4)
+ 
+ 
+-def test_record_v2_eplb_load_requires_counts_even_when_collection_is_disabled():
+-    router = _router(record_enabled=False)
+-    result = FusedExpertsResult(routed_out=torch.empty(0), expert_tokens=None)
++def test_record_load_requires_counts_even_when_collection_is_disabled(prepare_finalize):
+     with pytest.raises(RuntimeError, match="operator-provided expert counts"):
+-        _record_v2_eplb_load(router, result)
++        _state(record_enabled=False).record_load(
++            None,
++            1,
++            topk_ids=torch.empty(0, 1, dtype=torch.int32),
++            num_source_tokens=0,
++            is_sequence_parallel=False,
++            prepare_finalize=prepare_finalize,
++        )
+ 
+ 
+-def test_record_v2_eplb_load_rejects_wrong_local_count():
+-    result = FusedExpertsResult(routed_out=torch.empty(0), expert_tokens=torch.zeros(3))
++def test_record_load_rejects_wrong_local_count(prepare_finalize):
+     with pytest.raises(RuntimeError, match="does not match local EPLB experts"):
+-        _record_v2_eplb_load(_router(), result)
++        _state().record_load(
++            torch.zeros(3),
++            1,
++            topk_ids=torch.empty(0, 1, dtype=torch.int32),
++            num_source_tokens=0,
++            is_sequence_parallel=False,
++            prepare_finalize=prepare_finalize,
++        )
++
++
++@pytest.mark.parametrize("field", ["expert_load_view", "should_record_tensor"])
++def test_record_load_requires_initialized_state(field, prepare_finalize):
++    state = _state()
++    setattr(state, field, None)
++    with pytest.raises(RuntimeError, match="load-recording state is not initialized"):
++        state.record_load(
++            torch.tensor([2, 3]),
++            1,
++            topk_ids=torch.empty(0, 1, dtype=torch.int32),
++            num_source_tokens=0,
++            is_sequence_parallel=False,
++            prepare_finalize=prepare_finalize,
++        )
++
++
++def test_allgather_records_masked_load_on_source_ineligible_owner(monkeypatch, prepare_finalize):
++    state = _state(record_enabled=False)
++    state.allgather_record_tensor = torch.tensor(-1, dtype=torch.int32)
++    record_pointer = state.allgather_record_tensor.data_ptr()
++    # Operator counts include communication/graph padding and ineligible sources.
++    counts = torch.tensor([9, 8])
++    topk_ids = torch.tensor([[0, 0], [0, 0], [0, 0], [4, 5], [4, 0], [4, 5]])
++    peer_mask = torch.tensor([True, True, False])
++
++    def gather_mask(local_mask):
++        assert not local_mask.any()
++        return torch.cat([local_mask, peer_mask])
++
++    prepare_finalize.all_gather_eplb_mask.side_effect = gather_mask
++    monkeypatch.setattr(eplb_ops, "use_allgather_eplb", lambda enabled: enabled)
++    monkeypatch.setattr(state_module, "get_forward_context", lambda: SimpleNamespace(is_padding=None))
++    monkeypatch.setattr(torch.ops.vllm, "ascend_eplb_record_expert_tokens", record_expert_tokens)
++    state.record_load(
++        counts, 1, topk_ids=topk_ids, num_source_tokens=3, is_sequence_parallel=False, prepare_finalize=prepare_finalize
++    )
++    expected = torch.tensor([0, 0, 0, 0, 2, 1, 0, 0], dtype=torch.int32)
++    torch.testing.assert_close(state.expert_load_view, expected)
++    assert state.allgather_record_tensor.item() == 1
++    # An ineligible later layer/draft must not clear the shared step decision.
++    peer_mask.zero_()
++    state.record_load(
++        counts, 1, topk_ids=topk_ids, num_source_tokens=3, is_sequence_parallel=False, prepare_finalize=prepare_finalize
++    )
++    assert prepare_finalize.all_gather_eplb_mask.call_count == 2
++    assert state.allgather_record_tensor.item() == 1
++    assert state.allgather_record_tensor.data_ptr() == record_pointer
++    torch.testing.assert_close(counts, torch.tensor([9, 8]))
++    torch.testing.assert_close(state.expert_load_view, expected)
++
++
++@pytest.mark.parametrize("group_list_type", [0, 1])
++@pytest.mark.parametrize("record_enabled", [False, True])
++def test_record_load_preserves_operator_count_formats(monkeypatch, group_list_type, record_enabled, prepare_finalize):
++    state = _state(record_enabled)
++    counts = torch.tensor([2, 5] if group_list_type == 0 else [2, 3])
++    monkeypatch.setattr(torch.ops.vllm, "ascend_eplb_record_expert_tokens", record_expert_tokens)
++    state.record_load(
++        counts,
++        group_list_type,
++        topk_ids=torch.empty(0, 1, dtype=torch.int32),
++        num_source_tokens=0,
++        is_sequence_parallel=False,
++        prepare_finalize=prepare_finalize,
++    )
++    expected = [0, 0, 0, 0, 2, 3, 0, 0] if record_enabled else [0] * 8
++    torch.testing.assert_close(state.expert_load_view, torch.tensor(expected, dtype=torch.int32))
+diff --git a/tests/ut/ops/test_fused_moe.py b/tests/ut/ops/test_fused_moe.py
+index 27995a0db..61f184476 100644
+--- a/tests/ut/ops/test_fused_moe.py
++++ b/tests/ut/ops/test_fused_moe.py
+@@ -18,7 +18,9 @@ from vllm.model_executor.layers.activation import SituAndMul
+ from vllm_ascend.ascend_forward_context import MoECommType
+ from vllm_ascend.device.hardware import AscendDeviceType
+ from vllm_ascend.device.hardware_profile import HardwareCapability, get_hardware_profile
++from vllm_ascend.distributed.eplb.eplb_state import AscendEplbLayerState
+ from vllm_ascend.ops import register_custom_ops as custom_ops
++from vllm_ascend.ops.fused_moe import eplb as eplb_ops
+ from vllm_ascend.ops.fused_moe import fused_moe as fused_moe_module
+ from vllm_ascend.ops.fused_moe import routed_experts as routed_experts_module
+ from vllm_ascend.ops.fused_moe import shared_experts as shared_experts_module
+@@ -951,9 +953,11 @@ def test_hash_router_chunks_unaligned_input_ids_for_sequence_parallel(monkeypatc
+ 
+ 
+ @pytest.mark.parametrize("return_with_event", [False, True])
+-@pytest.mark.parametrize("v2_eplb", [False, True])
++@pytest.mark.parametrize("use_v2,v2_eplb", [(False, False), (True, False), (True, True)])
+ @pytest.mark.parametrize("is_sequence_parallel", [False, True])
+-def test_routed_experts_forward_impl_runs_current_flow(monkeypatch, return_with_event, v2_eplb, is_sequence_parallel):
++def test_routed_experts_forward_impl_runs_current_flow(
++    monkeypatch, return_with_event, use_v2, v2_eplb, is_sequence_parallel
++):
+     """Verify routed-expert forward preserves the current dispatch flow."""
+     _disable_force_eplb(monkeypatch)
+     routed_experts = AscendRoutedExperts.__new__(AscendRoutedExperts)
+@@ -982,18 +986,15 @@ def test_routed_experts_forward_impl_runs_current_flow(monkeypatch, return_with_
+     object.__setattr__(routed_experts, "quant_method", quant_method)
+     topk_weights = torch.tensor([[0.25, 0.75], [0.6, 0.4]], dtype=torch.float32)
+     topk_ids = torch.tensor([[0, 1], [1, 0]], dtype=torch.int64)
++    state = AscendEplbLayerState() if v2_eplb else None
++    if state is not None:
++        state.expert_load_view = expert_load
++        state.should_record_tensor = torch.tensor(False)
++        state.local_expert_count = 2
++        state.local_expert_start = 2
+     routed_experts.router = SimpleNamespace(
+         _select_experts=MagicMock(return_value=(topk_weights, topk_ids)),
+-        eplb_state=(
+-            SimpleNamespace(
+-                expert_load_view=expert_load,
+-                should_record_tensor=torch.tensor(False),
+-                local_expert_count=2,
+-                local_expert_start=2,
+-            )
+-            if v2_eplb
+-            else None
+-        ),
++        eplb_state=state,
+     )
+     routed_experts.top_k = 2
+     routed_experts.renormalize = True
+@@ -1016,7 +1017,7 @@ def test_routed_experts_forward_impl_runs_current_flow(monkeypatch, return_with_
+     routed_experts.log2phy = None
+     routed_experts.global_redundant_expert_num = 0
+     routed_experts.n_shared_experts = 0
+-    routed_experts._use_v2_model_runner = v2_eplb
++    routed_experts._use_v2_model_runner = use_v2
+     routed_experts.dynamic_eplb = False
+     routed_experts.return_with_event = return_with_event
+     moe_comm_method = MagicMock()
+@@ -1044,6 +1045,7 @@ def test_routed_experts_forward_impl_runs_current_flow(monkeypatch, return_with_
+     monkeypatch.setattr(routed_experts_module, "get_moe_num_logical_experts", lambda *args, **kwargs: 3)
+     monkeypatch.setattr(routed_experts_module, "get_ascend_config", lambda: SimpleNamespace(enable_force_eplb=False))
+     record_expert_tokens = MagicMock()
++    monkeypatch.setattr(eplb_ops, "use_allgather_eplb", lambda enabled: False)
+     monkeypatch.setattr(torch.ops.vllm, "ascend_eplb_record_expert_tokens", record_expert_tokens)
+ 
+     result = routed_experts.forward_impl(
+diff --git a/tests/ut/worker/v2/test_eplb_controller.py b/tests/ut/worker/v2/test_eplb_controller.py
+index 28b972026..5a10e41b8 100644
+--- a/tests/ut/worker/v2/test_eplb_controller.py
++++ b/tests/ut/worker/v2/test_eplb_controller.py
+@@ -9,10 +9,32 @@ import torch
+ import torch.nn as nn
+ from vllm.model_executor.models.interfaces import SupportsMultiModal
+ 
++from vllm_ascend.device.hardware import AscendDeviceType
++from vllm_ascend.device.hardware_profile import get_hardware_profile
+ from vllm_ascend.worker.v2.eplb import AscendEPLBController, _unwrap_moe
+ 
+ 
+ class TestAscendEPLBController(unittest.TestCase):
++    def test_a5_default_policy_prepares_unpadded_count_and_sampling(self):
++        controller = self._make_controller(policy="default")
++        state = MagicMock()
++        state.uses_custom_load_stats = False
++        state.should_record_tensor = torch.tensor(False)
++        state.allgather_record_tensor = torch.tensor(1)
++        state._has_fresh_recorded_load = False
++        state._should_record_current_step.return_value = True
++        controller.state = state
++        config = SimpleNamespace()
++        with patch(
++            "vllm_ascend.worker.v2.eplb.get_current_hardware_profile",
++            return_value=get_hardware_profile(AscendDeviceType.A5),
++        ):
++            controller.prepare_forward(config, 3)
++        state.prepare_forward.assert_called_once_with(config, 3, None)
++        assert state.should_record_tensor.item()
++        assert state.allgather_record_tensor.item() == -1
++        assert not state._has_fresh_recorded_load
++
+     @staticmethod
+     def _make_controller(*, enable_eplb=True, log_balancedness=False, policy="stair"):
+         parallel_config = SimpleNamespace(
+diff --git a/tests/ut/worker/v2/test_speculator.py b/tests/ut/worker/v2/test_speculator.py
+index 584e43f37..9938acb63 100644
+--- a/tests/ut/worker/v2/test_speculator.py
++++ b/tests/ut/worker/v2/test_speculator.py
+@@ -17,6 +17,7 @@ from vllm_ascend.attention.attention_v1 import AscendAttentionBackend, AscendAtt
+ from vllm_ascend.attention.dsa_v1 import AscendDSABackend
+ from vllm_ascend.attention.mla_v1 import AscendMLABackend
+ from vllm_ascend.attention.sfa_v1 import AscendSFABackend
++from vllm_ascend.ops.fused_moe.eplb import make_allgather_mask
+ from vllm_ascend.utils import vllm_version_is
+ from vllm_ascend.worker.v2.input_batch import AscendInputBuffers
+ from vllm_ascend.worker.v2.pcp_manager import AscendPCPManager
+@@ -628,6 +629,7 @@ def test_capture_multi_step_captures_decode():
+     speculator.replicated_pcp = False
+     speculator.kv_cache_config = object()
+     speculator.num_speculative_steps = 3
++    speculator._eplb_source_is_padding = torch.zeros(8, dtype=torch.bool)
+     with (
+         patch(
+             "vllm_ascend.worker.v2.spec_decode.target_dependent_ar.speculator.disable_target_pcp_for_replicated_draft",
+@@ -639,6 +641,7 @@ def test_capture_multi_step_captures_decode():
+         ),
+     ):
+         speculator.capture()
++    assert speculator._eplb_source_is_padding.all()
+     speculator.prefill_cudagraph_manager.capture.assert_called_once()
+     speculator.decode_cudagraph_manager.capture.assert_called_once()
+ 
+@@ -848,3 +851,47 @@ def test_update_decode_attn_metadata_mla_with_dcp():
+     assert update_kwargs["cp_kv_cache_interleave_size"] == 1
+ 
+     assert torch.equal(metadata.seq_lens_cpu, expected)
++
++
++def test_eplb_draft_mask_tracks_prefill_decode_and_dummy_replay():
++    speculator = AscendTargetDependentARSpeculator.__new__(AscendTargetDependentARSpeculator)
++    speculator.input_buffers = SimpleNamespace(is_padding=torch.zeros(8, dtype=torch.bool))
++    speculator._eplb_source_is_padding = None
++    speculator._eplb_dummy_run = False
++    speculator.speculative_config = SimpleNamespace(draft_model_config=SimpleNamespace(compute_hash=lambda: "draft"))
++    layer_state = SimpleNamespace()
++    state = SimpleNamespace(
++        allgather_record_tensor=torch.tensor(-1),
++        model_states={
++            "draft": SimpleNamespace(model=SimpleNamespace(moe_layers=[SimpleNamespace(eplb_state=layer_state)]))
++        },
++    )
++    speculator.set_eplb_state(state)
++    mask = layer_state.allgather_source_is_padding
++    speculator.set_eplb_state(state)
++    assert layer_state.allgather_source_is_padding is mask
++    assert mask.all()
++    # A restored PCP view may retain a longer backing mask with valid tail
++    # rows; only the actual prefill extent belongs to this forward.
++    speculator.input_batch = SimpleNamespace(
++        num_tokens_after_padding=4, is_padding=torch.tensor([False, True, False, False, False, False])
++    )
++    speculator.on_prefill_begin(1)
++    assert mask.tolist() == [False, True, False, False, True, True, True, True]
++    # Even when captured _prepare_eplb_forward fills a padded count, source
++    # validity keeps graph padding out of each SP shard.
++    gathered = torch.cat(
++        [
++            make_allgather_mask(2, torch.tensor(4), torch.tensor(True), is_padding=mask, tp_size=2, tp_rank=rank)
++            for rank in range(2)
++        ]
++    )
++    assert gathered.tolist() == [True, False, True, True]
++    for dummy, num_reqs in ((False, 3), (True, 4), (False, 1)):
++        speculator._eplb_dummy_run = dummy
++        speculator.on_multi_step_decode_begin(num_reqs)
++        assert layer_state.allgather_source_is_padding is mask
++        assert int((~mask).sum()) == (0 if dummy else num_reqs)
++    speculator._eplb_dummy_run = True
++    speculator.on_prefill_begin(1)
++    assert mask.all()
+diff --git a/vllm_ascend/distributed/eplb/eplb_state.py b/vllm_ascend/distributed/eplb/eplb_state.py
+index 9e4a5d206..a8e64b2b3 100644
+--- a/vllm_ascend/distributed/eplb/eplb_state.py
++++ b/vllm_ascend/distributed/eplb/eplb_state.py
+@@ -19,12 +19,20 @@ from torch.distributed import all_reduce
+ from vllm.distributed import get_ep_group, get_eplb_group
+ from vllm.distributed.eplb import eplb_state as _eplb_state
+ from vllm.distributed.eplb.policy import AbstractEplbPolicy
+-from vllm.distributed.parallel_state import in_the_same_node_as
++from vllm.distributed.parallel_state import (
++    get_tensor_model_parallel_rank,
++    get_tensor_model_parallel_world_size,
++    in_the_same_node_as,
++)
++from vllm.forward_context import get_forward_context
+ from vllm.logger import logger
++from vllm.v1.worker.ubatching import dbo_current_ubatch_id
+ 
++from vllm_ascend.device.hardware_profile import MoECommPolicy, get_current_hardware_profile
+ from vllm_ascend.distributed.eplb.eplb_communicator import AscendHixlEplbCommunicator, _HixlSession
+ from vllm_ascend.distributed.eplb.policy import PreparedLoadStats
+ from vllm_ascend.ops.fused_moe import eplb as _eplb_ops
++from vllm_ascend.ops.fused_moe.prepare_finalize import PrepareAndFinalize, PrepareAndFinalizeWithAllGather
+ 
+ ASYNC_EPLB_CYCLE_COMMITTED_LOG = "Ascend async EPLB cycle committed"
+ _EPLB_CLOSE_TIMEOUT_SECONDS = 300
+@@ -57,6 +65,9 @@ class AscendEplbLayerState(_eplb_state.EplbLayerState):
+     def __init__(self) -> None:
+         super().__init__()
+         self.expert_replica_routing_table: torch.Tensor | None = None
++        self.allgather_expert_replica_routing_table: torch.Tensor | None = None
++        self.allgather_record_tensor: torch.Tensor | None = None
++        self.allgather_source_is_padding: torch.Tensor | None = None
+         self.local_expert_start = 0
+         self.local_expert_count = 0
+ 
+@@ -96,6 +107,67 @@ class AscendEplbLayerState(_eplb_state.EplbLayerState):
+         self._set_local_expert_range(expert_load_view)
+         self.refresh_expert_replica_routing_table()
+ 
++    def record_load(
++        self,
++        expert_tokens: torch.Tensor | None,
++        group_list_type: int,
++        *,
++        topk_ids: torch.Tensor,
++        num_source_tokens: int,
++        is_sequence_parallel: bool,
++        prepare_finalize: PrepareAndFinalize,
++    ) -> None:
++        """Record this layer's MRV2 load after FFN and before output finalization."""
++        local_load = None
++        if _eplb_ops.use_allgather_eplb(True):
++            assert self.num_unpadded_tokens_tensors is not None and self.should_record_tensor is not None
++            num_unpadded_tokens = self.num_unpadded_tokens_tensors[dbo_current_ubatch_id()]
++            is_padding = self.allgather_source_is_padding
++            if is_padding is None:
++                is_padding = getattr(get_forward_context(), "is_padding", None)
++            token_mask = _eplb_ops.make_allgather_mask(
++                num_source_tokens,
++                num_unpadded_tokens,
++                self.should_record_tensor,
++                is_padding=is_padding,
++                tp_size=get_tensor_model_parallel_world_size() if is_sequence_parallel else 1,
++                tp_rank=get_tensor_model_parallel_rank() if is_sequence_parallel else 0,
++            )
++            assert isinstance(prepare_finalize, PrepareAndFinalizeWithAllGather)
++            token_mask = prepare_finalize.all_gather_eplb_mask(token_mask)
++            local_load = _eplb_ops.count_allgather_tokens(
++                topk_ids, token_mask, self.local_expert_start, self.local_expert_count
++            )
++            assert self.allgather_record_tensor is not None
++            torch.maximum(
++                self.allgather_record_tensor,
++                token_mask.any().to(torch.int32),
++                out=self.allgather_record_tensor,
++            )
++        if expert_tokens is None:
++            raise RuntimeError("MRV2 EPLB requires operator-provided expert counts")
++        expert_load_view = self.expert_load_view
++        record_enabled = self.should_record_tensor
++        if local_load is not None:
++            expert_tokens = local_load
++            assert self.allgather_record_tensor is not None
++            record_enabled = self.allgather_record_tensor > 0
++            group_list_type = 1
++        if expert_load_view is None or record_enabled is None:
++            raise RuntimeError("MRV2 EPLB load-recording state is not initialized")
++        if expert_tokens.numel() != self.local_expert_count:
++            raise RuntimeError(
++                "MoE expert count does not match local EPLB experts: "
++                f"{expert_tokens.numel()} != {self.local_expert_count}"
++            )
++        torch.ops.vllm.ascend_eplb_record_expert_tokens(
++            expert_tokens,
++            expert_load_view,
++            record_enabled,
++            group_list_type,
++            self.local_expert_start,
++        )
++
+     def refresh_expert_replica_routing_table(self) -> None:
+         logical_to_physical_map = self.logical_to_physical_map
+         logical_replica_count = self.logical_replica_count
+@@ -117,6 +189,14 @@ class AscendEplbLayerState(_eplb_state.EplbLayerState):
+             )
+         else:
+             self.expert_replica_routing_table = new_routing_table
++        if get_current_hardware_profile().moe_comm_policy is MoECommPolicy.CAPACITY_AND_WORLD_SIZE:
++            common_table = _eplb_ops.build_expert_replica_routing_table(
++                logical_to_physical_map, logical_replica_count, ep_rank=0
++            )
++            if self.allgather_expert_replica_routing_table is None:
++                self.allgather_expert_replica_routing_table = common_table
++            else:
++                self.allgather_expert_replica_routing_table.copy_(common_table, non_blocking=True)
+ 
+ 
+ def refresh_model_routing_tables(
+@@ -130,6 +210,17 @@ def refresh_model_routing_tables(
+         layer_state = layer.eplb_state
+         if isinstance(layer_state, AscendEplbLayerState):
+             layer_state.refresh_expert_replica_routing_table()
++    if hasattr(model_state, "_allgather_physical_map"):
++        current_map = model_state.physical_to_logical_map
++        if not torch.equal(current_map, model_state._allgather_physical_map):
++            if model_state._allgather_physical_map.shape == current_map.shape:
++                model_state._allgather_physical_map.copy_(current_map)
++            else:
++                model_state._allgather_physical_map = current_map.clone()
++            model_state.expert_load_pass.zero_()
++            model_state.expert_load_window.zero_()
++            if hasattr(model_state, "_load_mapping_generation"):
++                model_state._load_mapping_generation += 1
+ 
+ 
+ def _raise_if_async_worker_stopped(state: Any) -> None:
+@@ -165,6 +256,8 @@ class AscendEplbState(_eplb_state.EplbState):
+         self._has_fresh_recorded_load = False
+         self._is_load_sampling_step = False
+         self._should_collect_local_load = False
++        self.allgather_record_tensor: torch.Tensor | None = None
++        self._uses_phase_filter = False
+         self._stop_async = threading.Event()
+         self._suspended = False
+         self._close_error: Exception | None = None
+@@ -193,9 +286,24 @@ class AscendEplbState(_eplb_state.EplbState):
+                 super().add_model(model, model_config, model_name=model_name)
+         finally:
+             EXPERT_MAPPING_EP_SIZE.reset(token)
++        if get_current_hardware_profile().moe_comm_policy is MoECommPolicy.CAPACITY_AND_WORLD_SIZE:
++            model_state = self.model_states[model_config.compute_hash()]
++            model_state._allgather_physical_map = model_state.physical_to_logical_map.clone()
+         if self.uses_custom_load_stats:
+             self._initialize_load_stats_state(self.model_states[model_config.compute_hash()])
+ 
++    def _propagate_shared_tensors(self, model, num_unpadded_tokens_tensors) -> None:
++        super()._propagate_shared_tensors(model, num_unpadded_tokens_tensors)
++        if get_current_hardware_profile().moe_comm_policy is not MoECommPolicy.CAPACITY_AND_WORLD_SIZE:
++            return
++        if self.should_record_tensor is None:
++            return
++        if self.allgather_record_tensor is None:
++            self.allgather_record_tensor = torch.full((), -1, dtype=torch.int32, device=self.device)
++        for layer in model.moe_layers:
++            if isinstance(layer.eplb_state, AscendEplbLayerState):
++                layer.eplb_state.allgather_record_tensor = self.allgather_record_tensor
++
+     def wait_for_rearrangement(self, stream) -> bool:
+         """Allow an idle worker to stop without recording a fake device event."""
+         while not self.rearrange_event._recorded.wait(_EPLB_EVENT_POLL_SECONDS):
+@@ -351,8 +459,21 @@ class AscendEplbState(_eplb_state.EplbState):
+         self.raise_if_close_failed()
+         if self._hixl_session is not None:
+             _raise_if_async_worker_stopped(self)
+-        is_sampling = getattr(self, "_is_load_sampling_step", False) and not is_dummy and not is_profile
++        is_sampling = getattr(self, "_is_load_sampling_step", False) and not is_profile
+         should_collect = getattr(self, "_should_collect_local_load", False)
++        allgather_record = getattr(self, "allgather_record_tensor", None)
++        if is_sampling and allgather_record is not None:
++            if is_dummy or getattr(self, "_uses_phase_filter", False):
++                # A source-idle owner can still execute remote tokens. The
++                # device decision also preserves phase filtering under replay.
++                gathered = int(allgather_record.item())
++                if gathered >= 0:
++                    should_collect = gathered != 0
++                    if should_collect:
++                        is_dummy = False
++            if not is_dummy and should_collect:
++                self._has_fresh_recorded_load = True
++        is_sampling = is_sampling and not is_dummy
+         self._is_load_sampling_step = False
+         self._should_collect_local_load = False
+         if self.uses_custom_load_stats:
+@@ -612,4 +733,6 @@ class AscendEplbState(_eplb_state.EplbState):
+                 state._initialize_load_stats_state(model_state)
+         for model_state in state.model_states.values():
+             refresh_model_routing_tables(model_state)
++            if get_current_hardware_profile().moe_comm_policy is MoECommPolicy.CAPACITY_AND_WORLD_SIZE:
++                model_state._allgather_physical_map = model_state.physical_to_logical_map.clone()
+         return state
+diff --git a/vllm_ascend/ops/fused_moe/eplb.py b/vllm_ascend/ops/fused_moe/eplb.py
+index 0c99915d0..085d51ebc 100644
+--- a/vllm_ascend/ops/fused_moe/eplb.py
++++ b/vllm_ascend/ops/fused_moe/eplb.py
+@@ -4,9 +4,60 @@
+ import torch
+ from vllm.utils.torch_utils import direct_register_custom_op
+ 
++from vllm_ascend.device.hardware_profile import MoECommPolicy, get_current_hardware_profile
++
+ EXPERT_REPLICA_ROUTING_TABLE_NUM_ROWS = 1024
+ 
+ 
++def use_allgather_eplb(enabled: bool) -> bool:
++    # The forward context imports the MoE implementations during setup.
++    from vllm_ascend.ascend_forward_context import _EXTRA_CTX, MoECommType
++
++    return (
++        enabled
++        and get_current_hardware_profile().moe_comm_policy is MoECommPolicy.CAPACITY_AND_WORLD_SIZE
++        and _EXTRA_CTX.moe_comm_type is MoECommType.ALLGATHER
++    )
++
++
++def make_allgather_mask(
++    num_tokens: int,
++    num_unpadded_tokens: torch.Tensor,
++    record_enabled: torch.Tensor,
++    *,
++    is_padding: torch.Tensor | None = None,
++    tp_size: int = 1,
++    tp_rank: int = 0,
++) -> torch.Tensor:
++    """Describe valid source rows before the same gather/unpad as MoE inputs."""
++    start = tp_rank * num_tokens
++    if is_padding is None:
++        rows = torch.arange(start, start + num_tokens, device=num_unpadded_tokens.device)
++        valid = rows < num_unpadded_tokens
++    elif is_padding.numel() == num_tokens:
++        valid = ~is_padding
++    else:
++        padding = max(0, num_tokens * tp_size - is_padding.numel())
++        padded = torch.nn.functional.pad(is_padding[: num_tokens * tp_size], (0, padding), value=True)
++        valid = ~padded[start : start + num_tokens]
++    return valid & record_enabled.to(torch.bool)
++
++
++def count_allgather_tokens(
++    topk_ids: torch.Tensor,
++    token_mask: torch.Tensor,
++    local_expert_start: int,
++    local_expert_count: int,
++) -> torch.Tensor:
++    """Count eligible routes owned locally without changing the GMM counts."""
++    local_ids = topk_ids.to(torch.int64) - local_expert_start
++    eligible = token_mask[:, None] & (local_ids >= 0) & (local_ids < local_expert_count)
++    indices = local_ids.clamp(0, local_expert_count - 1).reshape(-1)
++    counts = torch.zeros(local_expert_count, dtype=torch.int64, device=topk_ids.device)
++    counts.scatter_add_(0, indices, eligible.to(torch.int64).reshape(-1))
++    return counts
++
++
+ def build_expert_replica_routing_table(
+     logical_to_physical_map: torch.Tensor,
+     logical_replica_count: torch.Tensor,
+diff --git a/vllm_ascend/ops/fused_moe/prepare_finalize.py b/vllm_ascend/ops/fused_moe/prepare_finalize.py
+index f654befd5..121889dd5 100644
+--- a/vllm_ascend/ops/fused_moe/prepare_finalize.py
++++ b/vllm_ascend/ops/fused_moe/prepare_finalize.py
+@@ -517,6 +517,10 @@ class PrepareAndFinalizeWithAllGather(PrepareAndFinalize):
+ 
+         return input_ids
+ 
++    def all_gather_eplb_mask(self, token_mask: torch.Tensor) -> torch.Tensor:
++        # Match input-id row alignment with a supported collective dtype.
++        return self.all_gather_input_ids(token_mask.to(torch.int32)).to(torch.bool)
++
+     def finalize(
+         self,
+         hidden_states: torch.Tensor,
+diff --git a/vllm_ascend/ops/fused_moe/routed_experts.py b/vllm_ascend/ops/fused_moe/routed_experts.py
+index 27fb63f15..ede35f261 100644
+--- a/vllm_ascend/ops/fused_moe/routed_experts.py
++++ b/vllm_ascend/ops/fused_moe/routed_experts.py
+@@ -32,6 +32,7 @@ from vllm.model_executor.utils import replace_parameter
+ from vllm_ascend.ascend_config import get_ascend_config
+ from vllm_ascend.ascend_forward_context import _EXTRA_CTX, use_cann_megamoe
+ from vllm_ascend.device.hardware_profile import HardwareCapability, get_current_hardware_profile
++from vllm_ascend.distributed.eplb.eplb_state import AscendEplbLayerState
+ from vllm_ascend.eplb.adaptor.vllm_adaptor import VllmEplbAdaptor
+ from vllm_ascend.eplb.core.eplb_utils import init_eplb_config
+ from vllm_ascend.lora.fused_moe import sync_lora_context
+@@ -330,32 +331,6 @@ def make_eplb_placement_config(eplb_config, num_redundant_experts: int) -> Simpl
+     )
+ 
+ 
+-def _record_v2_eplb_load(router: FusedMoERouter, result: FusedExpertsResult) -> None:
+-    """Record the local expert counts supplied by the MoE operator."""
+-    eplb_state = router.eplb_state
+-    if eplb_state is None:
+-        return
+-    expert_tokens = result.expert_tokens
+-    if expert_tokens is None:
+-        raise RuntimeError("MRV2 EPLB requires operator-provided expert counts")
+-    expert_load_view = eplb_state.expert_load_view
+-    record_enabled = eplb_state.should_record_tensor
+-    if expert_load_view is None or record_enabled is None:
+-        raise RuntimeError("MRV2 EPLB load-recording state is not initialized")
+-    if expert_tokens.numel() != eplb_state.local_expert_count:
+-        raise RuntimeError(
+-            "MoE expert count does not match local EPLB experts: "
+-            f"{expert_tokens.numel()} != {eplb_state.local_expert_count}"
+-        )
+-    torch.ops.vllm.ascend_eplb_record_expert_tokens(
+-        expert_tokens,
+-        expert_load_view,
+-        record_enabled,
+-        result.group_list_type,
+-        eplb_state.local_expert_start,
+-    )
+-
+-
+ def _empty_like_preserving_npu_format(tensor: torch.Tensor) -> torch.Tensor:
+     """Allocate an EPLB buffer with the source tensor's NPU storage format."""
+     if tensor.device.type != "npu":
+@@ -725,6 +700,7 @@ class AscendRoutedExperts(RoutedExperts):  # type: ignore[no-redef]
+         if lora_context is not None:
+             sync_lora_context(self.quant_method, lora_context)
+ 
++        num_source_tokens = hidden_states.shape[0]
+         prepare_output = moe_comm_method.prepare(
+             hidden_states=hidden_states,
+             router_logits=router_logits,
+@@ -761,7 +737,17 @@ class AscendRoutedExperts(RoutedExperts):  # type: ignore[no-redef]
+             self.ascend_mc2_mask = None
+ 
+         if self._use_v2_model_runner:
+-            _record_v2_eplb_load(self.router, fused_experts_results)
++            eplb_state = self.router.eplb_state
++            if eplb_state is not None:
++                assert isinstance(eplb_state, AscendEplbLayerState)
++                eplb_state.record_load(
++                    fused_experts_results.expert_tokens,
++                    fused_experts_results.group_list_type,
++                    topk_ids=topk_ids,
++                    num_source_tokens=num_source_tokens,
++                    is_sequence_parallel=self.moe_config.is_sequence_parallel,
++                    prepare_finalize=moe_comm_method.prepare_finalize,
++                )
+ 
+         if self.dynamic_eplb and _EXTRA_CTX.eplb_heat_collection_status:
+             expert_tokens = fused_experts_results.expert_tokens
+diff --git a/vllm_ascend/patch/platform/patch_fused_moe.py b/vllm_ascend/patch/platform/patch_fused_moe.py
+index 70365bca7..feb90d117 100644
+--- a/vllm_ascend/patch/platform/patch_fused_moe.py
++++ b/vllm_ascend/patch/platform/patch_fused_moe.py
+@@ -41,6 +41,7 @@ from vllm.model_executor.layers.fused_moe.router.fused_moe_router import FusedMo
+ 
+ from vllm_ascend.ascend_config import get_ascend_config
+ from vllm_ascend.distributed.eplb.eplb_state import AscendEplbLayerState
++from vllm_ascend.ops.fused_moe.eplb import use_allgather_eplb
+ from vllm_ascend.ops.fused_moe.router.router_factory import create_ascend_fused_moe_router
+ 
+ _EPLB_ROUTER_ADAPTED = "_vllm_ascend_eplb_router_adapted"
+@@ -77,6 +78,8 @@ def _ascend_apply_eplb_mapping(self, topk_ids: torch.Tensor) -> torch.Tensor:
+         return topk_ids
+     self._validate_eplb_state()
+     expert_replica_routing_table = eplb_state.expert_replica_routing_table
++    if use_allgather_eplb(True):
++        expert_replica_routing_table = eplb_state.allgather_expert_replica_routing_table
+     if expert_replica_routing_table is None:
+         raise RuntimeError("Ascend EPLB expert replica routing table is not initialized.")
+     return torch.ops.vllm.ascend_eplb_map_to_physical(
+diff --git a/vllm_ascend/worker/v2/eplb.py b/vllm_ascend/worker/v2/eplb.py
+index f05250e12..761412e19 100644
+--- a/vllm_ascend/worker/v2/eplb.py
++++ b/vllm_ascend/worker/v2/eplb.py
+@@ -12,6 +12,7 @@ from vllm.model_executor.models.interfaces import (
+ from vllm.v1.worker.gpu.eplb_utils import EPLBController
+ 
+ from vllm_ascend.ascend_config import EplbConfig
++from vllm_ascend.device.hardware_profile import MoECommPolicy, get_current_hardware_profile
+ from vllm_ascend.distributed.eplb.eplb_state import AscendEplbState
+ from vllm_ascend.distributed.eplb.policy.factory import create_eplb_policy
+ from vllm_ascend.patch.platform.patch_eplb import resolve_ascend_eplb_communicator
+@@ -92,17 +93,23 @@ class AscendEPLBController(EPLBController):
+         state = self.state
+         if state is None or not self.parallel_config.enable_eplb:
+             return
+-        if not state.uses_custom_load_stats:
++        supports_allgather = get_current_hardware_profile().moe_comm_policy is MoECommPolicy.CAPACITY_AND_WORLD_SIZE
++        if not state.uses_custom_load_stats or supports_allgather:
+             state.prepare_forward(model_config, num_unpadded_tokens, ubatch_slices)
+-            return
+-        # Operator-provided counts make the upstream unpadded-token tensor unused.
++            if not supports_allgather:
++                return
++        if supports_allgather:
++            state._uses_phase_filter = self.load_collection_phase != "all"
++            if state.allgather_record_tensor is not None:
++                state.allgather_record_tensor.fill_(-1)
++        # AllGather needs source validity; other paths use operator counts.
+         if state.should_record_tensor is not None:
+             is_sampling = state._should_record_current_step(log_stats=self.parallel_config.eplb_config.log_balancedness)
+             should_record = is_sampling and self._load_collection_phase_matched
+             state.should_record_tensor.fill_(should_record)
+             state._is_load_sampling_step = is_sampling
+             state._should_collect_local_load = should_record
+-            if should_record:
++            if should_record and not supports_allgather:
+                 state._has_fresh_recorded_load = True
+ 
+     # The two supported upstream revisions intentionally expose different signatures.
+diff --git a/vllm_ascend/worker/v2/spec_decode/target_dependent_ar/speculator.py b/vllm_ascend/worker/v2/spec_decode/target_dependent_ar/speculator.py
+index bda6ca4f2..a0d237984 100644
+--- a/vllm_ascend/worker/v2/spec_decode/target_dependent_ar/speculator.py
++++ b/vllm_ascend/worker/v2/spec_decode/target_dependent_ar/speculator.py
+@@ -122,6 +122,8 @@ class AscendTargetDependentARSpeculator(LmheadTPDraftSamplingMixin, TargetDepend
+         # when in decode phase of eagle speculator, we need some value in
+         # draft model's input_batch. so we keep a reference here.
+         self.input_batch: InputBatch | None = None
++        self._eplb_source_is_padding: torch.Tensor | None = None
++        self._eplb_dummy_run = False
+         self.pcp_manager: AscendPCPManager | None = None
+         self._sparse_kv_offload_metadata = SparseKVOffloadMetadata(
+             enabled=get_ascend_config().sparse_kv_offload_config.enabled,
+@@ -302,6 +304,34 @@ class AscendTargetDependentARSpeculator(LmheadTPDraftSamplingMixin, TargetDepend
+         self.prefill_cudagraph_manager.update_stream = self.update_stream
+         self.decode_cudagraph_manager.update_stream = self.update_stream
+ 
++    def set_eplb_state(self, eplb_state: Any) -> None:
++        super().set_eplb_state(eplb_state)
++        if eplb_state.allgather_record_tensor is None:
++            return
++        # Only graph-external phase hooks update draft source validity.
++        if self._eplb_source_is_padding is None:
++            self._eplb_source_is_padding = torch.ones_like(self.input_buffers.is_padding)
++        model_state = eplb_state.model_states[self.speculative_config.draft_model_config.compute_hash()]
++        for layer in model_state.model.moe_layers:
++            layer.eplb_state.allgather_source_is_padding = self._eplb_source_is_padding
++
++    def on_prefill_begin(self, num_reqs: int) -> None:
++        super().on_prefill_begin(num_reqs)
++        source_mask = getattr(self, "_eplb_source_is_padding", None)
++        if source_mask is not None:
++            source_mask.fill_(True)
++            if not self._eplb_dummy_run and self.input_batch is not None:
++                num_tokens = self.input_batch.num_tokens_after_padding
++                source_mask[:num_tokens].copy_(self.input_batch.is_padding[:num_tokens])
++
++    def on_multi_step_decode_begin(self, num_reqs: int) -> None:
++        super().on_multi_step_decode_begin(num_reqs)
++        source_mask = getattr(self, "_eplb_source_is_padding", None)
++        if source_mask is not None:
++            source_mask.fill_(True)
++            if not self._eplb_dummy_run:
++                source_mask[:num_reqs].fill_(False)
++
+     def propose(
+         self,
+         input_batch: InputBatch,
+@@ -328,6 +358,7 @@ class AscendTargetDependentARSpeculator(LmheadTPDraftSamplingMixin, TargetDepend
+         generate_draft.
+         """
+         self.input_batch = input_batch
++        self._eplb_dummy_run = dummy_run
+         # Replicated drafts use global tokens, unlike the PCP-local target.
+         # Every DP rank must take the draft sync, including decode and idle ranks.
+         sync_state = None if self.replicated_pcp else dp_sync_state
+@@ -395,6 +426,7 @@ class AscendTargetDependentARSpeculator(LmheadTPDraftSamplingMixin, TargetDepend
+             raise ValueError(f"Unsupported attention backend: {self.attn_backend}")
+ 
+     def capture(self) -> None:
++        self._eplb_dummy_run = True
+         logger.info("Capturing model for speculator...")
+         # Reset indices to zeros to prevent stale values from prior
+         # dummy runs to cause out-of-bounds indexing during capture.

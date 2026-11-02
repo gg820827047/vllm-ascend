@@ -1,0 +1,256 @@
+commit 9e5b62e97a1ed04da3a789ed623ad933a242fe9e
+Author:     wuruiyun <86221670+wuruiyun@users.noreply.github.com>
+AuthorDate: Fri Oct 23 17:40:07 2026 +0800
+Commit:     GitHub <noreply@github.com>
+CommitDate: Fri Oct 23 17:40:07 2026 +0800
+
+    [Bugfix][Worker] Fix routing replay capturing TP-local expert ids when DP=1 (#18502)
+    
+    ### What this PR does / why we need it?
+    Fixes #15451. The routed-experts (R3 / routing replay) capture patch
+    normalises `topk_ids` for data
+    parallelism, but the strategies that split the token dimension inside
+    the **TP** group were never handled
+    for `DP == 1`.
+    
+    The patch only reconstructed the batch when `ctx.dp_metadata is not
+    None`, so with `DP == 1` it treated the
+    shard as the complete batch:
+    
+    ```python
+    if ctx.dp_metadata is None:  # single dp
+        token_num_per_dp = topk_ids.shape[0]   # only batch / tp_size rows
+    ```
+    
+    Only `device_buffer[:batch / tp_size]` was written. The remaining rows
+    kept whatever they held before:
+    zeros on a freshly started worker, **another batch's expert ids** after
+    warmup. R3 then replays them, and
+    nothing about it is visible in the response text.
+    
+    Measured on Qwen3-30B-A3B, TP=2 + EP, DP=1, 6-token prefill (shard
+    length 3):
+    
+    ```
+    routed_experts shape=(13, 48, 8)
+    rows(all-zero) = [0, 0, 0, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0]
+                      ^^^^^^^^^^^^^ rows 3,4,5 == the second TP rank's half
+    ```
+    
+    The fix gathers the per-rank shards back before writing the buffer:
+    
+    1. **`_TP_SHARDED_COMM_TYPES`** names the strategies whose `prepare()`
+    splits inside the TP group
+    (`ALLTOALL`, `MC2`, `FUSED_MC2`). `ALLGATHER` is deliberately absent: it
+    gathers the batch across the
+    EP/DP group *before* routing, so its `topk_ids` already spans the whole
+    batch and gathering again would
+       be wrong.
+    2. **In the `dp_metadata is None` branch**, when `tp_size > 1` and the
+    active comm type is in that set, the
+    shards are all-gathered into the padded batch before the buffer write.
+    
+    ### Does this PR introduce _any_ user-facing change?
+    
+    ### How was this patch tested?
+    ============================= test session starts
+    ==============================
+    === environment ===
+    vllm-ascend : 44e25d505 [Bugfix][Worker] Fix routing replay capturing
+    TP-local expert ids when DP=1
+    vllm : c4df37dfcc [ROCm][BugFix][The Rock] Fix mori build for the rock
+    (#59372)
+    model : Qwen/Qwen3-30B-A3B, TP=2 + EP, DP=1,
+    cudagraph_capture_sizes=[1,2,4,8]
+    test : the pre-existing test_moe_routing_replay, extended (two prompts,
+    row checks)
+    
+    === WITH the fix ===
+    =========== 1 passed, 1 deselected in 161.69s (0:02:41) ===========
+    
+    === WITHOUT the fix (upstream capture patch) ===
+    f"rows {empty_rows} of {expected_rows} carry no routing data for a "
+    E AssertionError: rows [4, 5] of 10 carry no routing data for a 6-token
+    prompt
+    =========== 1 failed, 1 deselected in 153.45s (0:02:33) ===========
+    
+    
+    - vLLM main:
+    https://github.com/vllm-project/vllm/commit/c4df37dfcc7f72ca41cd43801a468526ecf99a2b
+    
+    ---------
+    
+    Signed-off-by: wuruiyun <1251540982@qq.com>
+
+diff --git a/tests/e2e/pull_request/two_card/rlhf/consistency/test_moe_routing_replay.py b/tests/e2e/pull_request/two_card/rlhf/consistency/test_moe_routing_replay.py
+index a1744271a..e3ba5dd3b 100644
+--- a/tests/e2e/pull_request/two_card/rlhf/consistency/test_moe_routing_replay.py
++++ b/tests/e2e/pull_request/two_card/rlhf/consistency/test_moe_routing_replay.py
+@@ -27,8 +27,25 @@ MODELS = [
+ @pytest.mark.parametrize("model", MODELS)
+ @patch.dict(os.environ, {"OMP_NUM_THREADS": "1", "VLLM_USE_V2_MODEL_RUNNER": "1"})
+ def test_moe_routing_replay(model):
+-    """Routed experts output is valid and non-empty for MoE models (MRV2)."""
+-    prompts = ["Hello, please introduce yourself."]
++    """Every token row carries its own routing decision (regression for #15451).
++
++    With DP == 1 and TP > 1 the TP-sharded strategies still pad and split the
++    token dimension inside the TP group, so ``select_experts`` only routes this
++    rank's shard; a capture that treats that shard as the whole batch leaves the
++    rows owned by the other TP ranks unwritten.
++
++    Both strategies are covered from this one engine. ``set_moe_comm_method``
++    picks MC2 for a batch of at most ``mc2_tokens_capacity`` tokens and ALLTOALL
++    above it, and ``set_mc2_tokens_capacity`` derives that capacity from
++    ``max_cudagraph_capture_size`` when ``cudagraph_capture_sizes`` is set -- 8
++    tokens here, split over the two TP ranks. The prompts are submitted one at a
++    time so each prefill is a step of its own: the short one prefills inside the
++    size-8 graph (still MC2), the long one goes through ALLTOALL.
++    """
++    prompts = [
++        "Hello, please introduce yourself.",  # 6 tokens -> MC2
++        "Hello, please introduce yourself. " * 8,  # 49 tokens -> ALLTOALL
++    ]
+     with VllmRunner(
+         model,
+         tensor_parallel_size=2,
+@@ -44,10 +61,20 @@ def test_moe_routing_replay(model):
+             top_p=0.95,
+             output_kind=RequestOutputKind.FINAL_ONLY,
+         )
+-        inputs = vllm_model.get_inputs(prompts=prompts)
+-        outputs = vllm_model.model.generate(prompts=inputs, sampling_params=sampling_params)
+-        assert outputs[0].finished
+-        assert len(outputs[0].outputs[0].text) > 0
+-        routed_experts = outputs[0].outputs[0].routed_experts
+-        assert routed_experts is not None
+-        assert routed_experts.size > 0
++        for prompt in prompts:
++            inputs = vllm_model.get_inputs(prompts=[prompt])
++            outputs = vllm_model.model.generate(prompts=inputs, sampling_params=sampling_params)
++            assert outputs[0].finished
++            completion = outputs[0].outputs[0]
++            assert len(completion.text) > 0
++            routed_experts = completion.routed_experts
++            assert routed_experts is not None
++            assert routed_experts.size > 0
++            # The last sampled token has not been forwarded yet, so it has no routing.
++            expected_rows = len(outputs[0].prompt_token_ids) + len(completion.token_ids) - 1
++            assert routed_experts.shape[0] == expected_rows
++            empty_rows = [row for row in range(expected_rows) if not routed_experts[row].any()]
++            assert not empty_rows, (
++                f"rows {empty_rows} of {expected_rows} carry no routing data for a "
++                f"{len(outputs[0].prompt_token_ids)}-token prompt"
++            )
+diff --git a/vllm_ascend/patch/worker/patch_routed_experts_capture.py b/vllm_ascend/patch/worker/patch_routed_experts_capture.py
+index 0b2958bb4..1253a8d2a 100644
+--- a/vllm_ascend/patch/worker/patch_routed_experts_capture.py
++++ b/vllm_ascend/patch/worker/patch_routed_experts_capture.py
+@@ -31,6 +31,72 @@ from vllm_ascend.ascend_forward_context import _EXTRA_CTX, MoECommType
+ 
+ logger = logging.getLogger(__name__)
+ 
++# Strategies whose ``prepare()`` splits the token dimension across the TP group.
++# ALLGATHER is absent on purpose: it gathers the batch before routing.
++_TP_SHARDED_COMM_TYPES = frozenset(
++    {
++        MoECommType.ALLTOALL,
++        MoECommType.MC2,
++        MoECommType.FUSED_MC2,
++    }
++)
++
++
++def _padded_batch_rows(tp_size: int) -> int:
++    """Row count the MoE dispatch padded the token dimension to before splitting it.
++
++    Taken from the target ``prepare()`` padded to rather than from this rank's
++    shard, which only adds up to the total when the split is even: All2All splits
++    a batch with ``num_tokens >= tp_size`` unevenly whenever it is not a multiple
++    of the TP size. There is deliberately no ``shard_rows * tp_size`` fallback --
++    it would silently bring that rank-dependent length back.
++    """
++    prepare_finalize = getattr(_EXTRA_CTX.moe_comm_method, "prepare_finalize", None)
++    padded_num_tokens = getattr(_EXTRA_CTX, "padded_num_tokens", None)
++    num_tokens = getattr(prepare_finalize, "num_tokens", None)
++
++    if getattr(prepare_finalize, "replace_allreduce", False):
++        # Sequence parallel: the model wrapper already chunked the sequence to a
++        # multiple of the TP size, so this batch-wide target is the padded length.
++        total_rows = padded_num_tokens if isinstance(padded_num_tokens, int) else None
++    elif _EXTRA_CTX.moe_comm_type == MoECommType.ALLTOALL:
++        # All2All pads to the TP size, and only when the batch is smaller than it.
++        total_rows = max(num_tokens, tp_size) if isinstance(num_tokens, int) else None
++    elif isinstance(num_tokens, int) and isinstance(padded_num_tokens, int):
++        # MC2/FUSED_MC2 pad to ``padded_num_tokens``, and only when the batch is
++        # smaller than that target.
++        total_rows = max(num_tokens, padded_num_tokens)
++    else:
++        total_rows = None
++
++    if total_rows is None:
++        raise AssertionError(
++            "RoutedExpertsCapturer: cannot rebuild the TP-sharded routing batch, the MoE dispatch "
++            f"metadata is missing (comm_type={_EXTRA_CTX.moe_comm_type}, num_tokens={num_tokens!r}, "
++            f"padded_num_tokens={padded_num_tokens!r}). Refusing to infer the length from this rank's "
++            "shard, which is only valid when the split is even."
++        )
++    return total_rows
++
++
++def _gather_tp_sharded_topk_ids(topk_ids: torch.Tensor, tp_size: int, total_rows: int) -> torch.Tensor:
++    """Rebuild the pre-split batch from every TP rank's routing shard.
++
++    ``tensor_split`` reproduces the chunks ``prepare()``/``finalize()`` use, so
++    the all-gather restores the original row order.
++    """
++    gathered = torch.empty(
++        (total_rows, topk_ids.shape[1]),
++        dtype=topk_ids.dtype,
++        device=topk_ids.device,
++    )
++    dist.all_gather(
++        list(torch.tensor_split(gathered, tp_size, dim=0)),
++        topk_ids.contiguous(),
++        get_tp_group().device_group,
++    )
++    return gathered
++
+ 
+ def capture(self, layer_id: int, topk_ids: torch.Tensor) -> None:
+     """Capture expert routing decisions for a specific layer.
+@@ -61,6 +127,10 @@ def capture(self, layer_id: int, topk_ids: torch.Tensor) -> None:
+         few trailing padding rows which are trimmed by the downstream
+         ``[:token_num_per_dp]`` slice.
+ 
++    The TP split also happens with ``DP == 1``: ``ctx.dp_metadata`` does not
++    describe it, but All2All/MC2 still split inside the TP group, so the same
++    all-gather is needed there. ALLGATHER does not split and needs none.
++
+     Args:
+         layer_id: The layer index.
+         topk_ids: Tensor of shape (batch_size, num_routed_experts).
+@@ -69,8 +139,21 @@ def capture(self, layer_id: int, topk_ids: torch.Tensor) -> None:
+     ctx = get_forward_context()
+     if ctx.dp_metadata is None:  # single dp
+         start_loc = 0
+-        end_loc = topk_ids.shape[0]
+-        token_num_per_dp = topk_ids.shape[0]
++        end_loc = token_num_per_dp = topk_ids.shape[0]
++
++        # All2All/MC2 split the token dimension across the TP group even with
++        # DP=1, so ``topk_ids`` only holds this rank's shard. Capturing it as the
++        # whole batch leaves the other ``device_buffer`` rows stale, and routing
++        # replay then serves wrong expert ids for them. The condition is
++        # rank-invariant, so every TP rank gathers in lockstep.
++        if self.tp_size > 1 and _EXTRA_CTX.moe_comm_type in _TP_SHARDED_COMM_TYPES:
++            total_rows = _padded_batch_rows(self.tp_size)
++            topk_ids = _gather_tp_sharded_topk_ids(topk_ids, self.tp_size, total_rows)
++            # Rows past the batch are the padding ``prepare()`` appended, and the
++            # consumer only reads ``device_buffer[:num_tokens]``. Writing the whole
++            # gathered tensor avoids a second token-count estimate; the clamp only
++            # guards an over-padded gather against the buffer size.
++            end_loc = token_num_per_dp = min(topk_ids.shape[0], self.device_buffer.shape[0])
+     else:  # multi dp
+         num_tokens_dp = ctx.dp_metadata.num_tokens_across_dp_cpu
+         token_num_per_dp = int(num_tokens_dp[self.dp_rank].item())

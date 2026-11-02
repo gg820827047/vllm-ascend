@@ -1,0 +1,150 @@
+commit dfeabf39eabb80d142212eb60cee5f47d089b073
+Author:     freyfwt <110148731+freyfwt@users.noreply.github.com>
+AuthorDate: Fri Oct 23 18:02:20 2026 +0800
+Commit:     GitHub <noreply@github.com>
+CommitDate: Fri Oct 23 18:02:20 2026 +0800
+
+    [BugFix][EPLB] Stage NZ Gloo receives on device (#18425)
+    
+    ### What this PR does / why we need it?
+    
+    Ascend950 rejects the Gloo communicator's direct copy from pinned CPU
+    staging memory into a FRACTAL_NZ receive buffer. For NZ destinations,
+    first transfer the data to the NPU, cast the temporary tensor to NZ on
+    the transfer stream, then copy it into the existing buffer. ND and CPU
+    destinations retain their direct-copy path.
+    
+    ### Does this PR introduce _any_ user-facing change?
+    
+    Fixes Gloo EPLB receives into NZ expert buffers on Ascend950. NZ D2D
+    copies require a torch_npu build containing [Ascend/pytorch
+    !47666](https://gitcode.com/Ascend/pytorch/merge_requests/47666), with
+    contiguous, non-view tensors covering their complete storage. Validation
+    used `torch_npu 2.10.0.post7.dev20261012` at
+    `6e95d34264161b46179d79acf2bf23a2c2ea6ffa`.
+    
+    ### How was this patch tested?
+    
+    - `python -m pytest -q tests/ut/distributed/eplb/test_communicator.py`:
+    **7 passed** on CPU, covering NZ conversion and unchanged ND/CPU copies.
+    - `bash format.sh ci`: passed.
+    - Full `tools/mypy.sh 1` checks for Python 3.10, 3.11, and 3.12: passed
+    in a Linux lint environment using a native-extension discovery stub.
+    - Real Ascend950 / CANN 9.1.1: two Gloo processes sharing one NPU,
+    loading the exact published upstream and Ascend communicator class
+    definitions with framework imports isolated. Across FP16/BF16/INT8,
+    aligned/padded shapes, ND/NZ buffers, default/custom streams, and
+    `TASK_QUEUE_ENABLE=0/1`: **48/48 patched transfers passed** with exact
+    data equality; all **24 base NZ receives failed** as expected. Source
+    blobs matched the tested commits.
+    
+    Full-model EPLB migration and performance were not tested.
+    
+    - vLLM main:
+    https://github.com/vllm-project/vllm/commit/8cc9aa5ad350f6f80cf3bebb298d410803ff75a9
+    
+    ---------
+    
+    Signed-off-by: freyfwt <freytian1996@gmail.com>
+
+diff --git a/tests/ut/distributed/eplb/test_communicator.py b/tests/ut/distributed/eplb/test_communicator.py
+index 9b30b9545..2f06f8427 100644
+--- a/tests/ut/distributed/eplb/test_communicator.py
++++ b/tests/ut/distributed/eplb/test_communicator.py
+@@ -5,12 +5,14 @@ from unittest.mock import MagicMock, call
+ 
+ import pytest
+ import torch
++import torch_npu
+ from vllm.distributed.eplb.eplb_communicator import (
+     EplbCommunicator,
+     TorchDistGlooStagedEplbCommunicator,
+ )
+ 
+ from vllm_ascend.distributed.eplb.eplb_communicator import AscendGlooEplbCommunicator
++from vllm_ascend.utils import ACL_FORMAT_FRACTAL_ND, ACL_FORMAT_FRACTAL_NZ
+ 
+ 
+ @pytest.fixture
+@@ -86,3 +88,42 @@ def test_execute_uses_current_device_stream_when_stream_is_unset(communicator, m
+     communicator.execute()
+ 
+     current_stream.synchronize.assert_called_once_with()
++
++
++@pytest.mark.parametrize(
++    "device_type,npu_format",
++    [("cpu", ACL_FORMAT_FRACTAL_ND), ("npu", ACL_FORMAT_FRACTAL_ND), ("npu", ACL_FORMAT_FRACTAL_NZ)],
++)
++def test_execute_converts_nz_receives_on_device(communicator, monkeypatch, device_type, npu_format):
++    recv_tensor = MagicMock()
++    recv_tensor.device.type = device_type
++    staging_tensor = MagicMock()
++    nz_tensor = MagicMock()
++    communicator._ops.append(("recv", recv_tensor, 0))
++    monkeypatch.setattr(communicator, "_acquire_staging_buffer", lambda *_args: staging_tensor)
++    monkeypatch.setattr(
++        "vllm_ascend.distributed.eplb.eplb_communicator.P2POp",
++        lambda *_args, **_kwargs: object(),
++    )
++    monkeypatch.setattr(
++        "vllm_ascend.distributed.eplb.eplb_communicator.batch_isend_irecv",
++        lambda _ops: [],
++    )
++    monkeypatch.setattr(torch.accelerator, "current_stream", MagicMock())
++    get_format = MagicMock(return_value=npu_format)
++    format_cast = MagicMock(return_value=nz_tensor)
++    monkeypatch.setattr(torch_npu, "get_npu_format", get_format, raising=False)
++    monkeypatch.setattr(torch_npu, "npu_format_cast", format_cast)
++
++    communicator.execute()
++
++    if device_type == "npu" and npu_format == ACL_FORMAT_FRACTAL_NZ:
++        staging_tensor.to.assert_called_once_with(recv_tensor.device, non_blocking=True)
++        format_cast.assert_called_once_with(staging_tensor.to.return_value, ACL_FORMAT_FRACTAL_NZ)
++        recv_tensor.copy_.assert_called_once_with(nz_tensor, non_blocking=True)
++    else:
++        staging_tensor.to.assert_not_called()
++        format_cast.assert_not_called()
++        recv_tensor.copy_.assert_called_once_with(staging_tensor, non_blocking=True)
++    if device_type == "cpu":
++        get_format.assert_not_called()
+diff --git a/vllm_ascend/distributed/eplb/eplb_communicator.py b/vllm_ascend/distributed/eplb/eplb_communicator.py
+index 3db8b5af0..e102e844e 100644
+--- a/vllm_ascend/distributed/eplb/eplb_communicator.py
++++ b/vllm_ascend/distributed/eplb/eplb_communicator.py
+@@ -13,6 +13,7 @@ from typing import Any
+ import numpy as np
+ import torch
+ import torch.distributed as dist
++import torch_npu
+ from torch.distributed import P2POp, ProcessGroup, batch_isend_irecv
+ from vllm.distributed.eplb.eplb_communicator import (
+     EplbCommunicator,
+@@ -23,6 +24,8 @@ from vllm.logger import logger
+ from vllm.utils.gpu_sync_debug import gpu_sync_allowed
+ from vllm.utils.network_utils import get_ip, get_open_port, join_host_port
+ 
++from vllm_ascend.utils import ACL_FORMAT_FRACTAL_NZ
++
+ _HIXL_MEMORY_ALIGNMENT = 2 * 1024 * 1024
+ _HIXL_MAX_REGISTERED_REGIONS = 4000
+ _TRANSFER_TIMEOUT_SECONDS = 300
+@@ -141,8 +144,15 @@ class AscendGlooEplbCommunicator(TorchDistGlooStagedEplbCommunicator):
+             request.wait()
+ 
+         with stream if stream is not None else contextlib.nullcontext():
+-            for dst_tensor, cpu_tensor in recv_staging:
+-                dst_tensor.copy_(cpu_tensor, non_blocking=True)
++            for dst_tensor, src_tensor in recv_staging:
++                if dst_tensor.device.type == "npu" and torch_npu.get_npu_format(dst_tensor) == ACL_FORMAT_FRACTAL_NZ:
++                    # Ascend950 cannot copy CPU tensors directly into NZ storage.
++                    # TODO: Remove this workaround once copy_ supports H2D
++                    # copies into NZ storage on Ascend950.
++                    src_tensor = torch_npu.npu_format_cast(
++                        src_tensor.to(dst_tensor.device, non_blocking=True), ACL_FORMAT_FRACTAL_NZ
++                    )
++                dst_tensor.copy_(src_tensor, non_blocking=True)
+ 
+     @property
+     def needs_profile_buffer_reservation(self) -> bool:

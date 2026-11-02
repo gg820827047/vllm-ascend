@@ -1,0 +1,666 @@
+commit 948eadb23e08826547bc1061bc6e21b33e326f39
+Author:     swimming2007-doge <swimmingguest2007@gmail.com>
+AuthorDate: Fri Oct 23 13:39:48 2026 +0800
+Commit:     GitHub <noreply@github.com>
+CommitDate: Fri Oct 23 13:39:48 2026 +0800
+
+    [Feature][Spec Decode] To support Gemma4 MTP on Model Runner V2 (#17492)
+    
+    ### What this PR does / why we need it?
+    
+    Adds **Gemma4 MTP speculative decoding** on **Model Runner V2**
+    (`VLLM_USE_V2_MODEL_RUNNER=1`).
+    
+    Previously, `init_speculator()` could route Gemma4 MTP to
+    `AscendEagleSpeculator`: `use_eagle()` is true for method `"mtp"`, while
+    the regular MTP branch excluded Gemma4. This bypassed Gemma4's
+    cross-model KV sharing, leaving the Q-only draft reading an empty cache
+    and producing 0% acceptance in the original reproduction.
+    
+    The current implementation routes Gemma4 to
+    `AscendGemma4Speculator(AscendAutoRegressiveSpeculator,
+    Gemma4Speculator)`, combining Ascend execution with upstream Gemma4
+    behavior.
+    
+    #### Current implementation and latest review changes
+    
+    - **Upstream API compatibility:** the October 22 review requested
+    `dp_sync_state` and `num_speculative_tokens` compatibility to avoid
+    runner-call `TypeError`s. The temporary compatibility wrapper in
+    `fc49f78d4` was subsequently removed entirely in `6cbe0edfe`. At the
+    current head, Gemma4 inherits the Ascend base `propose()`: its main
+    branch accepts `dp_sync_state` and forwards `num_speculative_tokens`;
+    the v0.31.0 branch retains `dp_sync`. There is no Gemma4-specific
+    `propose()` wrapper left.
+    - **KV-sharing setup:** override `_setup_gemma4_kv_sharing()`, call the
+    upstream hook first, then propagate each late-bound
+    `kv_sharing_target_layer_name` to the Ascend attention implementation.
+    This ensures the draft reads the target KV cache at the correct
+    initialization point and removes the redundant `load_draft_model()`
+    override (`bb1950ae3`).
+    - **Remove unused state:** delete `_g4_committed` and its unused
+    committed-boundary calculation (`c31ff9e67`).
+    - **Remove ineffective hidden-state retiming:** delete the retiming
+    hook, its `propose()` wrapper, and `_g4_stash` (`6cbe0edfe`). Upstream
+    already aligns the shifted token IDs with target hidden states and
+    gathers/updates feedback rows for subsequent draft steps. The extra
+    hidden-state shift was overwritten by the upstream target-hidden copy.
+    The A/B results below support removing it.
+    - **Draft prefill:** copy attention metadata only when needed and change
+    `PrefillNoCache` to `PrefillCacheHit`, so the Q-only draft reads the
+    shared cache without mutating the target's metadata.
+    - **FIA prefill graph parameters:** emit one parameter entry per draft
+    attention layer, using that layer's metadata and block table, instead of
+    returning only the first layer.
+    - **Draft configuration:** preserve the inherited attention backend;
+    explicitly set draft PCP to 1 and disable draft EP/EPLB because the MTP
+    head is dense, including when used with a MoE target.
+    
+    #### Scope and remaining validation limits
+    
+    The measurements below cover Gemma4-31B-it on Ascend 950DT with TP. They
+    do not establish Gemma4 correctness for PCP/DCP or EP/EPLB combinations;
+    draft PCP/EP/EPLB overrides are implementation details, not validation
+    of all target parallelism combinations.
+    
+    The review also requested CPU sequence-length and FIA graph updates to
+    honor `advance_draft_positions=False`
+    ([thread](https://github.com/vllm-project/vllm-ascend/pull/17492#discussion_r4347106960)).
+    The current parent FIA decode path still adds `step`; this PR must not
+    be described as having completed that alignment. The later approvals do
+    not change what the current code implements.
+    
+    ### Does this PR introduce _any_ user-facing change?
+    
+    Additive: Gemma4 MTP can use Model Runner V2 with `--speculative-config
+    '{"method":"mtp",...}'`. The original description reported 0% → 89.3%
+    after routing; the detailed TP2 result below is 89.54%. These are
+    acceptance measurements, not end-to-end latency or throughput speedups.
+    
+    ### How was this patch tested?
+    
+    The original acceptance and GPQA results are retained below. They are
+    prior reported measurements; the explicitly reported latest-head
+    regression experiment is the retiming-removal A/B, listed separately.
+    
+    #### Acceptance
+    
+    Gemma4-31B-it MTP, k=3, greedy (temp=0), coding prompt suite (5 prompts
+    × 3 =
+    15 reqs):
+    `vllm:spec_decode_num_accepted_tokens_per_pos` ÷
+    `vllm:spec_decode_num_drafts`,
+    scraped from `/metrics`. Ascend 950DT:
+    
+    | engine | TP | graph | pos0 | pos1 | pos2 | agg | accepted/step |
+    |---|---|---|---|---|---|---|---|
+    | MRv2, main (routing bug) | 1 | FULL | 0.0 | 0.0 | 0.0 | **0.0%** | 0/3
+    |
+    | MRv2 + this PR | 2 | FULL | 95.89 | 89.44 | 83.28 | 89.54% | 2.69/3 |
+    
+    
+    Here is the prompts:
+    ```python
+    #{"question": "Complete the following Python function. Only output the function body, no explanation.\n\ndef binary_search(arr, target):\n    \"\"\"Return the index of target in sorted array arr, or -1 if not found.\"\"\"", "max_out_len": 512, "answer": ""}
+    #{"question": "Complete the following Python function. Only output the function body, no explanation.\n\ndef merge_sort(arr):\n    \"\"\"Sort the array arr in ascending order and return it.\"\"\"", "max_out_len": 512, "answer": ""}
+    #{"question": "Complete the following Python function. Only output the function body, no explanation.\n\ndef lru_cache_get(cache, key):\n    \"\"\"Return value for key from an OrderedDict-backed LRU cache, or None. Mark as recently used on hit.\"\"\"", "max_out_len": 512, "answer": ""}
+    #{"question": "Complete the following Python function. Only output the function body, no explanation.\n\ndef is_balanced(s):\n    \"\"\"Return True if the string s has balanced parentheses/brackets/braces, else False.\"\"\"", "max_out_len": 512, "answer": ""}
+    #{"question": "Complete the following Python function. Only output the function body, no explanation.\n\ndef flatten(nested):\n    \"\"\"Yield elements from an arbitrarily nested list, depth-first.\"\"\"", "max_out_len": 512, "answer": ""}
+    ```
+    
+    #### Accuracy
+    
+    gpqa_diamond, 198 samples, greedy (temp=0), evalscope protocol (same
+    prompt
+    template, deterministic choice shuffle, answer extraction; local
+    ModelScope `AI-ModelScope/gpqa_diamond`), Ascend 950DT:
+    
+    | engine | TP | max_tokens | Score |
+    |---|---|---|---|
+    | v1 engine path (mml 256K) | 4 | 4096 | 0.7778 (154/198) |
+    | **MRv2 + this PR (mml 256K)** | 4 | 4096 | **0.7828 (155/198)** |
+    
+    #### Latest retiming-removal A/B (October 22)
+    
+    Reported for commit
+    [6cbe0edfe](https://github.com/vllm-project/vllm-ascend/commit/6cbe0edfe3e628600f1e2ebaf61d6144149aec71)
+    in the [review
+    reply](https://github.com/vllm-project/vllm-ascend/pull/17492#discussion_r4347191852),
+    using the PR's acceptance suite:
+    
+    | Mode | With retiming | Without retiming |
+    |---|---:|---:|
+    | eager | 94.60% | 94.60% |
+    | FULL_DECODE_ONLY | 89.54% | 89.54% |
+    
+    The author reported the A/B runs as bit-identical. This verifies no
+    observed acceptance regression in that experiment; it is not a new GPQA
+    evaluation, a latency/throughput benchmark, or evidence that every CI
+    test ran.
+    
+    #### Automated coverage and CI
+    
+    - Original local result retained: `pytest
+    tests/ut/spec_decode/test_gemma4_speculator_v2.py` — **5 passed**. This
+    is the previously reported run, not a new count for the current file,
+    which now contains seven test functions.
+    - Current unit coverage includes Gemma4 routing/EAGLE bypass, MRO and
+    inherited Gemma4 methods, KV-sharing propagation, and prefill metadata
+    copy/state handling. Routing coverage is also updated in
+    `tests/ut/worker/v2/test_spec_decode.py`.
+    - Added TP2 `FULL_DECODE_ONLY` E2E coverage with three speculative
+    tokens, four coding prompts, greedy sampling, and 64 output tokens. It
+    checks nonempty generation and per-position acceptance floors of 0.85 /
+    0.75 / 0.60. It skips if the assistant model is absent from the runner's
+    offline cache; adding the test does not prove it executed.
+    - **CI snapshot checked October 23, 2026, for head
+    `6cbe0edfe3e628600f1e2ebaf61d6144149aec71`:** 33 check runs returned,
+    all completed: **28 success, 5 skipped**, with no failed or pending
+    checks in that snapshot. The [E2E
+    workflow](https://github.com/vllm-project/vllm-ascend/actions/runs/39762616956)
+    and its `ci-gate` are successful. Successful checks include pre-commit,
+    CPU UT on v0.31.0 and the pinned main revision, and selected E2E jobs.
+    The A5 selected-test job is skipped, so this CI snapshot does not
+    establish execution of the new A5-tagged Gemma4 test. The legacy
+    commit-status endpoint returned no statuses. These CI observations were
+    checked independently of the A/B comment.
+    - Previously recorded vLLM main revision:
+    https://github.com/vllm-project/vllm/commit/a98247ab4db686ee03c66d5feb3c761e52a2f8ab
+    
+    ---------
+    
+    Signed-off-by: Wu Meng <791025341@qq.com>
+    Co-authored-by: Wu Meng <791025341@qq.com>
+    Co-authored-by: Claude Code <noreply@anthropic.com>
+    Co-authored-by: XUE TONGYAO <xuetongyao2001@gmail.com>
+
+diff --git a/tests/e2e/pull_request/two_card/test_gemma4.py b/tests/e2e/pull_request/two_card/test_gemma4.py
+index a394118f4..b49299bbe 100644
+--- a/tests/e2e/pull_request/two_card/test_gemma4.py
++++ b/tests/e2e/pull_request/two_card/test_gemma4.py
+@@ -18,8 +18,10 @@ import os
+ from unittest.mock import patch
+ 
+ import pytest
++from vllm.v1.metrics.reader import Counter, Vector
+ 
+ from tests.e2e.conftest import VllmRunner, wait_until_npu_memory_free
++from tests.e2e.pull_request.one_card.spec_decode.utils import calculate_acceptance_per_pos
+ 
+ _GRAPH_ENV = {
+     "HCCL_BUFFSIZE": "1024",
+@@ -27,6 +29,21 @@ _GRAPH_ENV = {
+     "PYTORCH_NPU_ALLOC_CONF": "expandable_segments:True",
+ }
+ 
++_MTP_MODEL = "google/gemma-4-31B-it"
++_MTP_DRAFT_MODEL = "google/gemma-4-31B-it-assistant"
++_MTP_NUM_SPECULATIVE_TOKENS = 3
++# Floors keep ~10-20pp of headroom over the measured profile (TP2,
++# FULL_DECODE_ONLY: 0.96/0.90/0.80) to absorb the small-sample noise of the
++# 4-prompt run and cross-hardware drift, while catching double-digit
++# regressions such as a broken in-graph window path.
++_MTP_MIN_ACCEPTANCE_PER_POS = (0.85, 0.75, 0.60)
++
++
++def _draft_model_cached() -> bool:
++    from huggingface_hub import try_to_load_from_cache
++
++    return try_to_load_from_cache(_MTP_DRAFT_MODEL, "config.json") is not None
++
+ 
+ def _run_full_decode_graph_smoke(model: str, *, enable_expert_parallel: bool) -> None:
+     with VllmRunner(
+@@ -65,3 +82,67 @@ def _run_full_decode_graph_smoke(model: str, *, enable_expert_parallel: bool) ->
+ def test_gemma4_26b_a4b_moe_full_decode_graph() -> None:
+     """Verify Gemma4 MoE startup, graph capture, and short generation."""
+     _run_full_decode_graph_smoke("google/gemma-4-26B-A4B-it", enable_expert_parallel=True)
++
++
++@pytest.mark.e2e_model(_MTP_MODEL)
++@pytest.mark.e2e_coverage(
++    arch="dense",
++    feature="mtp",
++    parallel="TP",
++    deploy="pd_mix",
++    hardware="A5",
++    quantization="BF16",
++    graph_mode="full_decode_only",
++)
++@patch.dict(os.environ, {**_GRAPH_ENV, "VLLM_USE_V2_MODEL_RUNNER": "1"})
++@wait_until_npu_memory_free()
++def test_gemma4_mtp_spec_decode_model_runner_v2() -> None:
++    """Gemma4 MTP keeps its acceptance on Model Runner V2."""
++    if not _draft_model_cached():
++        pytest.skip(
++            f"{_MTP_DRAFT_MODEL} is not in the offline HF cache of this runner; "
++            "add the draft repo to the runner's model cache to enable this test"
++        )
++
++    from vllm import SamplingParams
++
++    sampling_params = SamplingParams(temperature=0, max_tokens=64)
++    prompts = [
++        "def binary_search(arr, target):",
++        "def merge_sort(arr):",
++        "def is_balanced(s):",
++        "def flatten(nested):",
++    ]
++
++    with VllmRunner(
++        _MTP_MODEL,
++        tensor_parallel_size=2,
++        distributed_executor_backend="mp",
++        max_model_len=2048,
++        max_num_batched_tokens=2048,
++        max_num_seqs=8,
++        gpu_memory_utilization=0.8,
++        speculative_config={
++            "method": "mtp",
++            "model": _MTP_DRAFT_MODEL,
++            "num_speculative_tokens": _MTP_NUM_SPECULATIVE_TOKENS,
++        },
++        compilation_config={"cudagraph_mode": "FULL_DECODE_ONLY"},
++    ) as vllm_model:
++        outputs = vllm_model.model.generate(prompts, sampling_params)
++        metrics = vllm_model.model.get_metrics()
++
++    assert outputs
++    assert all(output.outputs[0].token_ids for output in outputs)
++
++    acceptance_per_pos = calculate_acceptance_per_pos(
++        metrics,
++        _MTP_NUM_SPECULATIVE_TOKENS,
++        Counter,
++        Vector,
++    )
++    assert all(rate >= floor for rate, floor in zip(acceptance_per_pos, _MTP_MIN_ACCEPTANCE_PER_POS, strict=True)), (
++        f"per-position acceptance {acceptance_per_pos} fell below the floors "
++        f"{_MTP_MIN_ACCEPTANCE_PER_POS}; the Gemma4 draft may not be sharing "
++        "the target model's KV cache or the in-graph window path regressed"
++    )
+diff --git a/tests/ut/spec_decode/test_gemma4_speculator_v2.py b/tests/ut/spec_decode/test_gemma4_speculator_v2.py
+new file mode 100644
+index 000000000..c0d32cc72
+--- /dev/null
++++ b/tests/ut/spec_decode/test_gemma4_speculator_v2.py
+@@ -0,0 +1,161 @@
++#
++# Copyright (c) 2026 Huawei Technologies Co., Ltd. All Rights Reserved.
++# Copyright 2023 The vLLM team.
++#
++# Licensed under the Apache License, Version 2.0 (the "License");
++# you may not use this file except in compliance with the License.
++# You may obtain a copy of the License at
++#
++#     http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS,
++# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++# See the License for the specific language governing permissions and
++# limitations under the License.
++# This file is a part of the vllm-ascend project.
++#
++from types import SimpleNamespace
++from unittest.mock import MagicMock, patch
++
++import torch
++from vllm.v1.worker.gpu.spec_decode.gemma4.speculator import Gemma4Speculator
++
++from vllm_ascend.utils import vllm_version_is
++
++# vLLM #60335 renamed the AR speculator class/module on main; the release
++# lane (v0.31.0) still ships `autoregressive.speculator.AutoRegressiveSpeculator`.
++if vllm_version_is("0.31.0"):
++    from vllm.v1.worker.gpu.spec_decode.autoregressive.speculator import (  # type: ignore[import-not-found]
++        AutoRegressiveSpeculator,
++    )
++else:
++    from vllm.v1.worker.gpu.spec_decode.target_dependent_ar.speculator import (
++        TargetDependentARSpeculator as AutoRegressiveSpeculator,
++    )
++
++from vllm_ascend.attention.attention_v1 import AscendAttentionState
++from vllm_ascend.worker.v2 import spec_decode as v2_spec_decode
++from vllm_ascend.worker.v2.spec_decode.autoregressive.speculator import (
++    AscendAutoRegressiveSpeculator,
++)
++from vllm_ascend.worker.v2.spec_decode.gemma4.speculator import (
++    AscendGemma4Speculator,
++)
++
++
++def _speculative_config():
++    config = MagicMock()
++    config.method = "mtp"
++    # Falsy: init_speculator's enforce_eager branch copies compilation_config,
++    # which the stub vllm_config does not carry.
++    config.enforce_eager = None
++    config.use_gemma4_mtp.return_value = True
++    config.use_step3p5_mtp.return_value = False
++    config.use_dspark.return_value = False
++    config.use_dflash.return_value = False
++    config.use_eagle.return_value = True
++    return config
++
++
++def test_routes_gemma4_mtp_to_ascend_gemma4_speculator():
++    vllm_config = SimpleNamespace(speculative_config=_speculative_config())
++    expected = object()
++    with patch(
++        "vllm_ascend.worker.v2.spec_decode.gemma4.speculator.AscendGemma4Speculator",
++        return_value=expected,
++    ) as speculator_cls:
++        result = v2_spec_decode.init_speculator(vllm_config, torch.device("cpu"))
++
++    assert result is expected
++    speculator_cls.assert_called_once()
++
++
++def test_eagle_speculator_is_not_reached_for_gemma4():
++    vllm_config = SimpleNamespace(speculative_config=_speculative_config())
++    with patch(
++        "vllm_ascend.worker.v2.spec_decode.gemma4.speculator.AscendGemma4Speculator",
++        return_value=object(),
++    ):
++        v2_spec_decode.init_speculator(vllm_config, torch.device("cpu"))
++
++    vllm_config.speculative_config.use_eagle.assert_not_called()
++
++
++def test_gemma4_speculator_mro():
++    # Order invariants, not a fixed tuple: main may insert extra bases between
++    # ours (e.g. LmheadTPDraftSamplingMixin) without breaking this contract.
++    mro = AscendGemma4Speculator.__mro__
++    order = (
++        AscendGemma4Speculator,
++        AscendAutoRegressiveSpeculator,
++        Gemma4Speculator,
++        AutoRegressiveSpeculator,
++    )
++    indices = [mro.index(cls) for cls in order]
++    assert indices == sorted(indices), f"MRO order broken: {mro}"
++    assert AscendGemma4Speculator.advance_draft_positions is Gemma4Speculator.advance_draft_positions
++    assert AscendGemma4Speculator._share_embeddings is Gemma4Speculator._share_embeddings
++
++
++def test_sync_kv_sharing_target_to_impl():
++    speculator = AscendGemma4Speculator.__new__(AscendGemma4Speculator)
++    synced_impl = SimpleNamespace(kv_sharing_target_layer_name=None)
++    untouched_impl = SimpleNamespace(kv_sharing_target_layer_name=None)
++    draft_model = SimpleNamespace(
++        model=SimpleNamespace(
++            layers=[
++                SimpleNamespace(
++                    self_attn=SimpleNamespace(
++                        attn=SimpleNamespace(
++                            impl=synced_impl,
++                            kv_sharing_target_layer_name="target.attn",
++                        )
++                    )
++                ),
++                SimpleNamespace(
++                    self_attn=SimpleNamespace(
++                        attn=SimpleNamespace(
++                            impl=untouched_impl,
++                            kv_sharing_target_layer_name=None,
++                        )
++                    )
++                ),
++            ]
++        )
++    )
++
++    speculator._sync_kv_sharing_target_to_impl(draft_model)
++
++    assert synced_impl.kv_sharing_target_layer_name == "target.attn"
++    assert untouched_impl.kv_sharing_target_layer_name is None
++
++
++def test_sync_kv_sharing_target_to_impl_without_layers():
++    speculator = AscendGemma4Speculator.__new__(AscendGemma4Speculator)
++    speculator._sync_kv_sharing_target_to_impl(SimpleNamespace(model=SimpleNamespace(layers=[])))
++
++
++def test_prefill_rebinds_prefill_nocache_state():
++    speculator = AscendGemma4Speculator.__new__(AscendGemma4Speculator)
++    original = {
++        "shared": SimpleNamespace(attn_state=AscendAttentionState.PrefillNoCache),
++        "other": SimpleNamespace(attn_state=AscendAttentionState.DecodeOnly),
++    }
++    with patch.object(AscendAutoRegressiveSpeculator, "_prefill") as parent_prefill:
++        speculator._prefill(2, 8, original, None)
++
++    passed = parent_prefill.call_args[0][2]
++    assert passed is not original
++    assert passed["shared"].attn_state is AscendAttentionState.PrefillCacheHit
++    assert passed["other"].attn_state is AscendAttentionState.DecodeOnly
++    assert original["shared"].attn_state is AscendAttentionState.PrefillNoCache
++
++
++def test_prefill_keeps_cache_reading_states():
++    speculator = AscendGemma4Speculator.__new__(AscendGemma4Speculator)
++    original = {"shared": SimpleNamespace(attn_state=AscendAttentionState.DecodeOnly)}
++    with patch.object(AscendAutoRegressiveSpeculator, "_prefill") as parent_prefill:
++        speculator._prefill(2, 8, original, None)
++
++    assert parent_prefill.call_args[0][2] is original
+diff --git a/tests/ut/worker/v2/test_spec_decode.py b/tests/ut/worker/v2/test_spec_decode.py
+index 799e15dff..04b42165d 100644
+--- a/tests/ut/worker/v2/test_spec_decode.py
++++ b/tests/ut/worker/v2/test_spec_decode.py
+@@ -229,23 +229,25 @@ def test_init_speculator_unsupported_method():
+         init_speculator(config, torch.device("cpu"))
+ 
+ 
+-@pytest.mark.parametrize(
+-    "use_gemma4_mtp,use_step3p5_mtp",
+-    [
+-        (True, False),
+-        (False, True),
+-    ],
+-)
+-def test_init_speculator_skips_special_mtp(
+-    use_gemma4_mtp,
+-    use_step3p5_mtp,
+-):
+-    """Test that Gemma4 and Step3.5 MTP bypass the regular MTP speculator."""
+-    config = _make_config(
+-        "mtp",
+-        use_gemma4_mtp=use_gemma4_mtp,
+-        use_step3p5_mtp=use_step3p5_mtp,
++def test_init_speculator_routes_gemma4_mtp(monkeypatch):
++    """Gemma4 MTP routes to AscendGemma4Speculator, not the regular MTP path."""
++    config = _make_config("mtp", use_gemma4_mtp=True)
++    speculator_cls = _mock_speculator_module(
++        monkeypatch,
++        "vllm_ascend.worker.v2.spec_decode.gemma4.speculator",
++        "AscendGemma4Speculator",
+     )
++    device = torch.device("cpu")
++
++    result = init_speculator(config, device)
++
++    assert result is speculator_cls.return_value
++    speculator_cls.assert_called_once_with(config, device)
++
++
++def test_init_speculator_skips_special_mtp():
++    """Step3.5 MTP bypasses the regular MTP speculator and stays unsupported."""
++    config = _make_config("mtp", use_step3p5_mtp=True)
+ 
+     with pytest.raises(
+         NotImplementedError,
+diff --git a/vllm_ascend/worker/v2/spec_decode/__init__.py b/vllm_ascend/worker/v2/spec_decode/__init__.py
+index 7216aa553..d59024c7f 100644
+--- a/vllm_ascend/worker/v2/spec_decode/__init__.py
++++ b/vllm_ascend/worker/v2/spec_decode/__init__.py
+@@ -61,11 +61,13 @@ def init_speculator(
+         )
+ 
+         return AscendDFlashSpeculator(vllm_config, device)
+-    if (
+-        speculative_config.method == "mtp"
+-        and not speculative_config.use_gemma4_mtp()
+-        and not speculative_config.use_step3p5_mtp()
+-    ):
++    if speculative_config.use_gemma4_mtp():
++        from vllm_ascend.worker.v2.spec_decode.gemma4.speculator import (
++            AscendGemma4Speculator,
++        )
++
++        return AscendGemma4Speculator(vllm_config, device)
++    if speculative_config.method == "mtp" and not speculative_config.use_step3p5_mtp():
+         from vllm_ascend.worker.v2.spec_decode.mtp.speculator import (
+             AscendMTPSpeculator,
+         )
+diff --git a/vllm_ascend/worker/v2/spec_decode/autoregressive/speculator.py b/vllm_ascend/worker/v2/spec_decode/autoregressive/speculator.py
+index 3d1926c6a..e30c7ea7d 100644
+--- a/vllm_ascend/worker/v2/spec_decode/autoregressive/speculator.py
++++ b/vllm_ascend/worker/v2/spec_decode/autoregressive/speculator.py
+@@ -839,16 +839,16 @@ class AscendAutoRegressiveSpeculator(LmheadTPDraftSamplingMixin, AutoRegressiveS
+         """Build all draft steps' FIA parameters for a single graph update."""
+         if self.use_dcp:
+             return self.build_fia_params_dcp(num_reqs_padded, draft_attn_metadata, is_draft_model_prefill)
+-        layer_name, metadata = next(iter(draft_attn_metadata.items()))
+-        block_table = metadata.block_tables
++        block_table = next(iter(draft_attn_metadata.values())).block_tables
+         if is_draft_model_prefill:
+             return [
+                 {
+                     "layer_name": layer_name,
+                     "actual_seq_lengths": metadata.actual_seq_lengths_q,
+                     "actual_seq_lengths_kv": metadata.seq_lens_list,
+-                    "block_table": block_table,
++                    "block_table": metadata.block_tables,
+                 }
++                for layer_name, metadata in draft_attn_metadata.items()
+             ]
+         assert self.input_batch is not None
+         num_reqs = self.input_batch.num_reqs
+diff --git a/vllm_ascend/worker/v2/spec_decode/gemma4/__init__.py b/vllm_ascend/worker/v2/spec_decode/gemma4/__init__.py
+new file mode 100644
+index 000000000..d7a0fee65
+--- /dev/null
++++ b/vllm_ascend/worker/v2/spec_decode/gemma4/__init__.py
+@@ -0,0 +1,7 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Ascend project
++#
++# Ascend version of the upstream ``gemma4`` spec_decode module.
++# Hosts ``AscendGemma4Speculator``, the Ascend port of the upstream Q-only
++# Gemma4 MTP draft speculator that reads the KV cache shared with the
++# target model via cross-model KV sharing.
+diff --git a/vllm_ascend/worker/v2/spec_decode/gemma4/speculator.py b/vllm_ascend/worker/v2/spec_decode/gemma4/speculator.py
+new file mode 100644
+index 000000000..deb6d9a3f
+--- /dev/null
++++ b/vllm_ascend/worker/v2/spec_decode/gemma4/speculator.py
+@@ -0,0 +1,106 @@
++# Adapt from https://github.com/vllm-project/vllm/blob/main/vllm/v1/worker/gpu/spec_decode/gemma4/speculator.py
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++# Copyright (c) 2026 Huawei Technologies Co., Ltd. All Rights Reserved.
++#
++# Licensed under the Apache License, Version 2.0 (the "License");
++# you may not use this file except in compliance with the License.
++# You may obtain a copy of the License at
++#
++#     http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS,
++# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++# See the License for the specific language governing permissions and
++# limitations under the License.
++# This file is a part of the vllm-ascend project.
++#
++"""Ascend Gemma4 MTP speculator for Model Runner V2."""
++
++from copy import copy
++
++import torch.nn as nn
++from vllm.config import VllmConfig, replace
++from vllm.config.compilation import CUDAGraphMode
++from vllm.logger import logger
++from vllm.v1.worker.gpu.spec_decode.gemma4.speculator import Gemma4Speculator
++
++from vllm_ascend.attention.attention_v1 import AscendAttentionState
++from vllm_ascend.worker.v2.spec_decode.autoregressive.speculator import (
++    AscendAutoRegressiveSpeculator,
++)
++
++
++class AscendGemma4Speculator(AscendAutoRegressiveSpeculator, Gemma4Speculator):
++    """Recombines the two methods both bases define (draft config, draft load)."""
++
++    def _prefill(
++        self,
++        num_reqs: int,
++        num_tokens: int,
++        attn_metadata,
++        slot_mappings,
++        num_tokens_across_dp=None,
++        cudagraph_runtime_mode: CUDAGraphMode = CUDAGraphMode.NONE,
++        mm_inputs=None,
++    ):
++        if attn_metadata and any(
++            metadata is not None and metadata.attn_state == AscendAttentionState.PrefillNoCache
++            for metadata in attn_metadata.values()
++        ):
++            attn_metadata = {
++                name: copy(metadata) if metadata is not None else None for name, metadata in attn_metadata.items()
++            }
++            for metadata in attn_metadata.values():
++                if metadata is not None and metadata.attn_state == AscendAttentionState.PrefillNoCache:
++                    metadata.attn_state = AscendAttentionState.PrefillCacheHit
++        super()._prefill(
++            num_reqs,
++            num_tokens,
++            attn_metadata,
++            slot_mappings,
++            num_tokens_across_dp,
++            cudagraph_runtime_mode,
++            mm_inputs,
++        )
++
++    def _create_draft_vllm_config(self) -> VllmConfig:
++        draft_vllm_config = super()._create_draft_vllm_config()
++        return replace(
++            draft_vllm_config,
++            parallel_config=replace(
++                draft_vllm_config.parallel_config,
++                prefill_context_parallel_size=1,
++                enable_expert_parallel=False,
++                enable_eplb=False,
++            ),
++        )
++
++    def _setup_gemma4_kv_sharing(
++        self,
++        model: nn.Module,
++        target_attn_layer_names: set[str],
++    ) -> None:
++        super()._setup_gemma4_kv_sharing(model, target_attn_layer_names)
++        self._sync_kv_sharing_target_to_impl(model)
++
++    def _sync_kv_sharing_target_to_impl(self, draft_model: nn.Module) -> None:
++        """Propagate the late-bound KV-sharing target onto the Ascend attention impls."""
++        synced = 0
++        total = 0
++        for layer in getattr(draft_model.model, "layers", []):
++            attn = getattr(getattr(layer, "self_attn", None), "attn", None)
++            if attn is None:
++                continue
++            total += 1
++            target = getattr(attn, "kv_sharing_target_layer_name", None)
++            impl = getattr(attn, "impl", None)
++            if target is not None and impl is not None:
++                impl.kv_sharing_target_layer_name = target
++                synced += 1
++        logger.info(
++            "Gemma4 MTP: propagated KV-sharing target to %d/%d draft layers.",
++            synced,
++            total,
++        )

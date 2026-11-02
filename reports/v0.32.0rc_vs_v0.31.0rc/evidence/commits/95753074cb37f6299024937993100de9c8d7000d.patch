@@ -1,0 +1,291 @@
+commit 95753074cb37f6299024937993100de9c8d7000d
+Author:     drslark <96540755+drslark@users.noreply.github.com>
+AuthorDate: Sat Oct 31 10:20:31 2026 +0800
+Commit:     GitHub <noreply@github.com>
+CommitDate: Sat Oct 31 10:20:31 2026 +0800
+
+    [Feature] Enable prefix caching for GLM KDA RecoverSSM (#20369)
+    
+    ### What this PR does / why we need it?
+    
+    Allow GLM KDA RecoverSSM to use prefix caching with Mamba cache mode
+    `align`. Previously configuration validation rejected prefix caching,
+    and the inherited MRV2 KDA builder required physical state indices that
+    Ascend did not prepare.
+    
+    Prepare those indices with the same device-independent helper used by
+    Ascend GDN before calling the upstream KDA builder. Reuse the existing
+    accepted-state recovery and block-boundary checkpoint kernels. Update
+    the serving guide and extend the four-card regression to check cache
+    hits and identical cold/warm token outputs in eager and graph modes.
+    
+    ### Does this PR introduce _any_ user-facing change?
+    
+    Yes. Experimental GLM KDA RecoverSSM can now run with
+    `--enable-prefix-caching`; vLLM selects Mamba cache mode `align`
+    automatically. Disabling prefix caching continues to use mode `none`.
+    Other execution restrictions remain unchanged.
+    
+    ### How was this patch tested?
+    
+    1. Configuration, metadata, cache-layout, KDA-contract and scheduler CPU
+    regressions: 89 passed. State-index cases cover block boundaries,
+    changing sequence positions, padded graph rows and unchanged source
+    block tables.
+    2. A3 hardware (`80.5.9.129`, Ascend 9392): 12 RecoverSSM align-operator
+    reference tests passed. The four-card W8A8 synthetic Flash regression
+    passed with prefix caching enabled in eager and FULL_DECODE_ONLY graph
+    modes, checking nonzero prefix hits and identical cold/warm output
+    tokens.
+    3. Real GLM-5.3-Flash W8A8 on the same A3, TP8 + EP, BF16 model dtype/KV
+    cache, MTP5, FULL_DECODE_ONLY: 30 GSM8K questions with prefix caching
+    disabled and enabled. Accuracy was 28/30 with caching disabled, 28/30
+    with an empty enabled cache and 28/30 on warm repeats; the same two
+    questions were incorrect in all three runs. All 30 cold/warm token
+    sequences matched exactly; every warm request hit at least 1280 cached
+    tokens (640-token blocks). Generating a different suffix against a
+    shared prefix left the original request's output unchanged.
+    Disabled/enabled cold token sequences matched in only 2/30 cases. One
+    final numeric answer differed between the disabled and enabled runs;
+    both answers were incorrect. These results establish the observed
+    accuracy and cache-reuse behavior on this sample, not token equivalence
+    between cache modes.
+    4. vLLM source was aligned to the repository-verified main commit;
+    effective Triton Ascend was 3.2.2. Ruff, Ruff formatting, Markdownlint,
+    Codespell and `git diff --check` passed. Full `bash format.sh ci` was
+    attempted, but actionlint environment installation failed with a network
+    disconnect.
+    5. A5 align-operator tests passed (12 cases). A5 end-to-end validation
+    remains pending: its first run exited before model initialization
+    because another workload consumed the devices. This draft primarily
+    provides the completed A3 validation; no A5 end-to-end success is
+    claimed.
+    
+    - vLLM main:
+    https://github.com/vllm-project/vllm/commit/544f182d9f0c9bfe8bd7645525951d5e3692a542
+    
+    Signed-off-by: drslark <slarksblood@qq.com>
+    Co-authored-by: GPT-6 Codex <codex@openai.com>
+
+diff --git a/docs/source/user_guide/feature_guide/speculative_decoding.md b/docs/source/user_guide/feature_guide/speculative_decoding.md
+index 5a1749f1f..60c9019ac 100644
+--- a/docs/source/user_guide/feature_guide/speculative_decoding.md
++++ b/docs/source/user_guide/feature_guide/speculative_decoding.md
+@@ -961,15 +961,16 @@ and devices:
+ ```shell
+ --use-replayssm \
+ --speculative-config '{"method": "deepseek_mtp", "num_speculative_tokens": 5}' \
+---no-enable-prefix-caching \
+---mamba-cache-mode none \
++--enable-prefix-caching \
+ --compilation-config '{"cudagraph_mode": "FULL_DECODE_ONLY"}'
+ ```
+ 
+ RecoverSSM requires speculative decoding and does not support pipeline
+ parallelism (PP), prefill context parallelism (PCP), or decode context
+-parallelism (DCP). Prefix caching and stochastic rounding must be disabled,
+-and Mamba cache mode must be `none`.
++parallelism (DCP). Stochastic rounding must be disabled. With prefix caching,
++vLLM selects Mamba cache mode `align` to preserve block-aligned recurrent
++checkpoints. To disable prefix caching, use `--no-enable-prefix-caching`;
++vLLM then selects Mamba cache mode `none`.
+ 
+ For prefill/decode separation, use `MooncakeConnectorV2` or
+ `MooncakePullConnector` with matching model weights, TP size, speculative window,
+diff --git a/release_notes/fragments/20369.yaml b/release_notes/fragments/20369.yaml
+new file mode 100644
+index 000000000..59a45f3f6
+--- /dev/null
++++ b/release_notes/fragments/20369.yaml
+@@ -0,0 +1,5 @@
++pr: 20369
++entries:
++  - category: feature
++    text: Enabled prefix caching for experimental GLM KDA RecoverSSM with block-aligned recurrent checkpoints.
++    model: glm-5.3-flash
+diff --git a/tests/e2e/pull_request/four_card/test_glm5_3_flash.py b/tests/e2e/pull_request/four_card/test_glm5_3_flash.py
+index 1f66e55c7..1c890e15a 100644
+--- a/tests/e2e/pull_request/four_card/test_glm5_3_flash.py
++++ b/tests/e2e/pull_request/four_card/test_glm5_3_flash.py
+@@ -126,7 +126,8 @@ class FlashWorker:
+ 
+ @pytest.mark.parametrize("enforce_eager", [True, False], ids=["eager", "graph"])
+ @pytest.mark.parametrize("use_replayssm", [False, True], ids=["no_recover", "recover"])
+-def test_glm53flash_tp4(tmp_path, monkeypatch, enforce_eager, use_replayssm):
++@pytest.mark.parametrize("prefix_caching", [False, True], ids=["no_prefix", "prefix"])
++def test_glm53flash_tp4(tmp_path, monkeypatch, enforce_eager, use_replayssm, prefix_caching):
+     for name, value in {
+         "VLLM_USE_V2_MODEL_RUNNER": "1",
+         "VLLM_WORKER_MULTIPROC_METHOD": "spawn",
+@@ -157,8 +158,8 @@ def test_glm53flash_tp4(tmp_path, monkeypatch, enforce_eager, use_replayssm):
+         limit_mm_per_prompt={"image": 0, "video": 0},
+         block_size=128,
+         enable_chunked_prefill=True,
+-        enable_prefix_caching=False,
+-        mamba_cache_mode="none",
++        enable_prefix_caching=prefix_caching,
++        mamba_cache_mode="align" if prefix_caching else "none",
+         gpu_memory_utilization=0.8,
+         seed=1024,
+         enforce_eager=enforce_eager,
+@@ -194,3 +195,12 @@ def test_glm53flash_tp4(tmp_path, monkeypatch, enforce_eager, use_replayssm):
+                 tokens = list(output.outputs[0].token_ids)
+                 assert len(tokens) == OUTPUT_TOKENS
+                 assert all(0 <= token < config["text_config"]["vocab_size"] for token in tokens)
++        if prefix_caching:
++            block_size = runner.model.llm_engine.vllm_config.cache_config.block_size
++            prefix_length = 2 * block_size + 17
++            assert prefix_length + OUTPUT_TOKENS < settings["max_model_len"]
++            prompt = [{"prompt_token_ids": [10 + i % 1000 for i in range(prefix_length)]}]
++            cold = runner.model.generate(prompt, params, use_tqdm=False)[0]
++            warm = runner.model.generate(prompt, params, use_tqdm=False)[0]
++            assert warm.num_cached_tokens >= block_size
++            assert warm.outputs[0].token_ids == cold.outputs[0].token_ids
+diff --git a/tests/ut/models/test_glm5next_recoverssm_config.py b/tests/ut/models/test_glm5next_recoverssm_config.py
+index 6256b79d2..103a0981a 100644
+--- a/tests/ut/models/test_glm5next_recoverssm_config.py
++++ b/tests/ut/models/test_glm5next_recoverssm_config.py
+@@ -37,8 +37,11 @@ def test_default_does_not_change_native_cache_contract():
+ 
+ 
+ @pytest.mark.parametrize("connector", [None, "MooncakeConnectorV2", "MooncakePullConnector"])
+-def test_configuration_validation_derives_recoverssm_before_worker_initialization(connector):
++@pytest.mark.parametrize("prefix_caching", [False, True])
++def test_configuration_validation_derives_recoverssm_before_worker_initialization(connector, prefix_caching):
+     config = make_config()
++    config.cache_config.enable_prefix_caching = prefix_caching
++    config.cache_config.mamba_cache_mode = "align" if prefix_caching else "none"
+     if connector is not None:
+         config.kv_transfer_config = SimpleNamespace(kv_connector=connector)
+     assert use_glm_recoverssm(config)
+@@ -59,7 +62,7 @@ def test_initialization_requires_speculative_decoding():
+     "section,field,value,message",
+     [
+         ("cache_config", "mamba_cache_mode", "align", "Mamba cache mode none"),
+-        ("cache_config", "enable_prefix_caching", True, "prefix caching disabled"),
++        ("cache_config", "enable_prefix_caching", True, "Mamba cache mode align"),
+         ("parallel_config", "pipeline_parallel_size", 2, "PP=1 and PCP=1"),
+         ("parallel_config", "prefill_context_parallel_size", 2, "PP=1 and PCP=1"),
+         ("parallel_config", "decode_context_parallel_size", 2, "DCP=1"),
+diff --git a/tests/ut/models/test_glm5next_recoverssm_metadata.py b/tests/ut/models/test_glm5next_recoverssm_metadata.py
+index 9ac3d7ada..a65dcdf02 100644
+--- a/tests/ut/models/test_glm5next_recoverssm_metadata.py
++++ b/tests/ut/models/test_glm5next_recoverssm_metadata.py
+@@ -8,11 +8,54 @@ from unittest.mock import Mock
+ import pytest
+ import torch
+ from vllm.models.kimi_k3.nvidia.kda_metadata import KDARecoverSSMCommitMetadata, KimiK3KDAMetadataBuilder
++from vllm.v1.kv_cache_interface import MambaSpec
+ 
+ from vllm_ascend.models.glm5next.recoverssm_metadata import AscendKDARecoverSSMMetadataBuilder
+ from vllm_ascend.ops.triton.kda.recoverssm import KDARecoverSSMCommitContext
+ 
+ 
++@pytest.mark.parametrize("graph_mode", [False, True])
++def test_align_indices_follow_sequence_position_and_refresh_each_step(monkeypatch, graph_mode):
++    builder = AscendKDARecoverSSMMetadataBuilder.__new__(AscendKDARecoverSSMMetadataBuilder)
++    builder.vllm_config = SimpleNamespace(cache_config=SimpleNamespace(mamba_cache_mode="align"))
++    builder.use_full_cuda_graph = graph_mode
++    builder.kv_cache_spec = MambaSpec(
++        block_size=8,
++        shapes=((3, 4), (2, 2)),
++        dtypes=(torch.bfloat16, torch.float32),
++        mamba_cache_mode="align",
++        num_speculative_blocks=1,
++    )
++    table = torch.tensor([[9, 7, 5, 3], [2, 4, 6, 8], [11, 12, 13, 14], [0, 0, 0, 0]], dtype=torch.int32)
++    original = table.clone()
++    starts = torch.tensor([0, 6, 12, 18, 24], dtype=torch.int32)
++    expected = None
++
++    def parent_build(self, prefix, common, accepted, draft_counts, fast_build):
++        assert not self.use_full_cuda_graph
++        torch.testing.assert_close(self.mamba_aligned_state_indices, expected, atol=0, rtol=0)
++        return SimpleNamespace(num_spec_decodes=0, num_prefills=0, num_decodes=0)
++
++    monkeypatch.setattr(KimiK3KDAMetadataBuilder, "build", parent_build)
++    for lengths, blocks in [
++        ([8, 9, 17, 0, 999], [[9, 7], [4, 6], [13, 14], [0, 0]]),
++        ([9, 17, 8, 0, 999], [[7, 5], [6, 8], [11, 12], [0, 0]]),
++    ]:
++        expected = torch.tensor(blocks, dtype=torch.int32)
++        common = SimpleNamespace(
++            num_reqs=4,
++            num_actual_tokens=24,
++            query_start_loc=starts,
++            query_start_loc_cpu=starts,
++            seq_lens=torch.tensor(lengths, dtype=torch.int32),
++            block_table_tensor=table,
++        )
++        common.replace = lambda common=common, **updates: SimpleNamespace(**(vars(common) | updates))
++        builder.build(0, common, num_actual_reqs=3 if graph_mode else None)
++        assert builder.use_full_cuda_graph is graph_mode
++        torch.testing.assert_close(table, original, atol=0, rtol=0)
++
++
+ def test_upstream_context_creation_uses_ascend_patch_and_caches(monkeypatch):
+     from vllm.models.kimi_k3.nvidia.ops import recoverssm
+ 
+@@ -59,6 +102,7 @@ def test_context_patch_is_limited_to_enabled_glm(monkeypatch, model_type, enable
+ 
+ def test_graph_padding_is_excluded_from_sampler_commit_rows(monkeypatch):
+     builder = AscendKDARecoverSSMMetadataBuilder.__new__(AscendKDARecoverSSMMetadataBuilder)
++    builder.vllm_config = SimpleNamespace(cache_config=SimpleNamespace(mamba_cache_mode="none"))
+     builder.use_full_cuda_graph = True
+     starts = torch.tensor([0, 6, 12, 18, 24], dtype=torch.int32)
+     drafts = torch.full((4,), 5, dtype=torch.int32)
+@@ -161,6 +205,7 @@ def test_eager_fallback_keeps_metadata_when_graph_staging_does_not_fit(batch, co
+ @pytest.mark.parametrize("actual_reqs", [0, 1, 2, 3])
+ def test_padding_offsets_stay_on_device_without_host_copy(monkeypatch, actual_reqs):
+     builder = AscendKDARecoverSSMMetadataBuilder.__new__(AscendKDARecoverSSMMetadataBuilder)
++    builder.vllm_config = SimpleNamespace(cache_config=SimpleNamespace(mamba_cache_mode="none"))
+     builder.use_full_cuda_graph = True
+     cpu_starts = torch.tensor([0, 1, 5, 11, 17], dtype=torch.int32)
+     device_starts = cpu_starts.clone()
+diff --git a/vllm_ascend/models/glm5next/recoverssm_config.py b/vllm_ascend/models/glm5next/recoverssm_config.py
+index ab54aded1..e25158114 100644
+--- a/vllm_ascend/models/glm5next/recoverssm_config.py
++++ b/vllm_ascend/models/glm5next/recoverssm_config.py
+@@ -26,8 +26,11 @@ def validate_glm_recoverssm(vllm_config: VllmConfig) -> None:
+     # TODO: FP16 KV cache with RecoverSSM has not been validated.
+     if vllm_config.mamba_config.enable_stochastic_rounding:
+         raise ValueError("GLM RecoverSSM does not support stochastic rounding")
+-    if cache.mamba_cache_mode != "none" or cache.enable_prefix_caching:
+-        raise ValueError("GLM RecoverSSM currently requires Mamba cache mode none and prefix caching disabled")
++    expected_cache_mode = "align" if cache.enable_prefix_caching else "none"
++    if cache.mamba_cache_mode != expected_cache_mode:
++        raise ValueError(
++            f"GLM RecoverSSM requires Mamba cache mode {expected_cache_mode} with this prefix caching setting"
++        )
+     parallel = vllm_config.parallel_config
+     if parallel.pipeline_parallel_size != 1 or parallel.prefill_context_parallel_size != 1:
+         raise ValueError("GLM RecoverSSM currently requires PP=1 and PCP=1")
+diff --git a/vllm_ascend/models/glm5next/recoverssm_metadata.py b/vllm_ascend/models/glm5next/recoverssm_metadata.py
+index b8a1fc395..206238afc 100644
+--- a/vllm_ascend/models/glm5next/recoverssm_metadata.py
++++ b/vllm_ascend/models/glm5next/recoverssm_metadata.py
+@@ -8,6 +8,7 @@ from dataclasses import replace
+ import torch
+ from vllm.models.kimi_k3.nvidia.kda_metadata import KimiK3KDAMetadataBuilder
+ from vllm.v1.attention.backend import AttentionCGSupport
++from vllm.v1.attention.backends.utils import mamba_get_block_table_tensor
+ 
+ from vllm_ascend.ops.gdn_attn_builder import (
+     GDNCausalConv1dMetadata,
+@@ -48,6 +49,16 @@ class AscendKDARecoverSSMMetadataBuilder(KimiK3KDAMetadataBuilder):
+         m, num_decode_draft_tokens_cpu = self._normalize_graph_padding(
+             common_attn_metadata, num_actual_reqs, num_decode_draft_tokens_cpu
+         )
++        if self.vllm_config.cache_config.mamba_cache_mode == "align":
++            # MRV2's CUDA builder requires precomputed physical state IDs.
++            # Reuse the device-independent path used by Ascend's GDN builder;
++            # the upstream KDA fallback and multi-group helper require CUDA.
++            self.mamba_aligned_state_indices = mamba_get_block_table_tensor(
++                m.block_table_tensor[: m.num_reqs],
++                m.seq_lens[: m.num_reqs],
++                self.kv_cache_spec,
++                "align",
++            )
+         with _disable_upstream_graph_staging(self):
+             metadata = super().build(common_prefix_len, m, num_accepted_tokens, num_decode_draft_tokens_cpu, fast_build)
+         self._build_conv_metadata(m, metadata, num_decode_draft_tokens_cpu)

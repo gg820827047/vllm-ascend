@@ -1,0 +1,178 @@
+commit b2ceaf726e1ff54b4d0f327656609f27b5dba0ae
+Author:     CuixyHW <cuixuanyu1@huawei.com>
+AuthorDate: Sat Oct 24 16:04:05 2026 +0800
+Commit:     GitHub <noreply@github.com>
+CommitDate: Sat Oct 24 16:04:05 2026 +0800
+
+    [CI] start single-node tests in parallel once multi-node pods are ready (#19690)
+    
+    ### What this PR does / why we need it?
+    
+    Currently the A2 nightly single-node and accuracy jobs wait for the
+    entire
+    `multi-node-tests` job (including the long Stream logs phase) to finish
+    before
+    starting, which serializes independent workloads and wastes time. This
+    change
+    adds an A2-only readiness gate so single-node / accuracy tests start as
+    soon as
+    the multi-node pods are launched, while the multi-node test keeps
+    running in the
+    background.
+    
+    ### Does this PR introduce _any_ user-facing change?
+    
+    No
+    
+    ### How was this patch tested?
+    
+    by running test cases
+    
+    ---
+    
+    ### Checklist
+    
+    #### Testing
+    
+    - [ ] **Boundary / edge-case coverage**: I reviewed whether this change
+    involves
+    boundary conditions (e.g. empty input, single/zero element, min/max
+    values,
+    off-by-one, sequence-length limits, integer overflow). Where applicable,
+    I
+    added unit tests covering these edge cases in `tests/ut/` or
+    `tests/e2e/`.
+    - [ ] **Regression test**: If this PR fixes a bug, I added a regression
+    test
+      that would fail without the fix.
+    - [ ] **Error / failure path coverage**: I covered abnormal paths
+    (exceptions,
+    timeouts, out-of-range, division by zero) in addition to the happy path.
+    - [ ] **Meaningful & reliable tests**: New tests assert real behavior
+    and are
+      not written merely to satisfy CI.
+    - [ ] **Performance impact**: If this PR touches a performance-sensitive
+    path,
+      I attached benchmark results and added performance regression tests.
+    
+    - vLLM main:
+    https://github.com/vllm-project/vllm/commit/c0b6f74bee518aeaf5d72b200a0216e72fbb5e7c
+    
+    ---------
+    
+    Signed-off-by: cuixuanyu <c00896198@china.huawei.com>
+    Signed-off-by: CuixyHW <cuixuanyu1@huawei.com>
+    Co-authored-by: cuixuanyu <c00896198@china.huawei.com>
+
+diff --git a/.github/workflows/schedule_nightly_test_a2.yaml b/.github/workflows/schedule_nightly_test_a2.yaml
+index 00a3936f4..eb70ed82b 100644
+--- a/.github/workflows/schedule_nightly_test_a2.yaml
++++ b/.github/workflows/schedule_nightly_test_a2.yaml
+@@ -295,9 +295,88 @@ jobs:
+         run: |
+           kubectl taint nodes ${{ vars.A2_TAINT_NODES }} dedicated- || true
+ 
++  wait-multi-node-pods-ready:
++    name: Wait multi-node pods launched
++    # A2-only gate: does NOT wait for multi-node-tests to finish. It polls the
++    # HK001 cluster until the enabled leader pod(s) are Ready, then releases
++    # single-node / accuracy jobs while multi-node Stream logs keep running.
++    # No shared reusable workflow or jinja2 is modified by this job.
++    needs: [setup-vars, parse-trigger, build-image]
++    if: >-
++      always() &&
++      needs.parse-trigger.outputs.run == 'true' &&
++      (needs.build-image.result == 'success' || needs.build-image.result == 'skipped')
++    runs-on: linux-amd64-cpu-8-hk
++    container:
++      image: swr.cn-southwest-2.myhuaweicloud.com/base_image/ascend-ci/vllm-ascend:nightly-cpu
++      env:
++        KUBECONFIG: /tmp/kubeconfig
++        NAMESPACE: vllm-project
++    steps:
++      - name: Decode kubeconfig
++        run: echo "${{ secrets.KUBECONFIG_HK_001_INTERNAL_B64 }}" | base64 -d > "$KUBECONFIG"
++
++      - name: Count enabled multi-node cases and wait for leader pods ready
++        id: gate
++        env:
++          MATRIX_JSON: ${{ needs.setup-vars.outputs.multi_node }}
++          FILTER: ${{ needs.parse-trigger.outputs.filter }}
++        run: |
++          set -euo pipefail
++
++          MATRIX_JSON="${MATRIX_JSON:-[]}"
++          FILTER="${FILTER:-}"
++
++          # Is any multi-node case enabled by the active filter? Pure shell, no
++          # JSON parser: pull each `name` out of the matrix and match the
++          # comma-wrapped filter.
++          MULTI_HIT=0
++          if [ "$FILTER" = "all" ]; then
++            MULTI_HIT=1
++          else
++            while IFS= read -r name; do
++              [ -z "$name" ] && continue
++              case "$FILTER" in
++                *",${name},"*) MULTI_HIT=1 ;;
++              esac
++            done < <(printf '%s' "$MATRIX_JSON" \
++              | grep -oE '"name"[[:space:]]*:[[:space:]]*"[^"]+"' \
++              | sed -E 's/.*"name"[[:space:]]*:[[:space:]]*"([^"]+)".*/\1/')
++          fi
++
++          # No enabled multi-node case: release single-node immediately.
++          if [ "$MULTI_HIT" -eq 0 ]; then
++            echo "No enabled multi-node case; proceeding to single-node without waiting."
++            exit 0
++          fi
++
++          # Poll role=leader pods until at least one is Ready. Lenient by design:
++          # a failed/slow launch must not block the independent single-node jobs;
++          # worker readiness follows once the leader joins the LWS.
++          TIMEOUT=1200
++          INTERVAL=10
++          ELAPSED=0
++          while [ "$ELAPSED" -lt "$TIMEOUT" ]; do
++            READY_RAW=$(kubectl get pods -n "$NAMESPACE" -l role=leader \
++              -o jsonpath='{.items[*].status.containerStatuses[*].ready}' 2>/dev/null || true)
++            READY=$(printf '%s' "$READY_RAW" | tr ' ' '\n' | grep -c '^true$' || true)
++            READY=${READY:-0}
++            echo "[$(date -u +%FT%TZ)] ready leaders=${READY} (${ELAPSED}s)"
++            if [ "$READY" -ge 1 ]; then
++              echo "Multi-node leader Ready; releasing single-node."
++              exit 0
++            fi
++            sleep "$INTERVAL"
++            ELAPSED=$((ELAPSED + INTERVAL))
++          done
++
++          # Lenient fallback: do not fail the whole pipeline if a multi-node
++          # launch does not become Ready in time; single-node runs independently.
++          echo "::warning::Timed out after ${TIMEOUT}s waiting for a ready leader pod; releasing single-node anyway."
++
+   single-node-tests:
+     name: single-node
+-    needs: [setup-vars, parse-trigger, build-image, multi-node-tests, remove-taints]
++    needs: [setup-vars, parse-trigger, build-image, wait-multi-node-pods-ready]
+     if: >-
+       always() &&
+       needs.parse-trigger.outputs.run == 'true' &&
+@@ -438,7 +517,7 @@ jobs:
+           python3 .github/workflows/scripts/resolve_nightly_tests.py --mode=matrix
+ 
+   single-node-accuracy-tests:
+-    needs: [setup-vars, parse-trigger, build-image, generate-accuracy-matrix, multi-node-tests, remove-taints]
++    needs: [setup-vars, parse-trigger, build-image, generate-accuracy-matrix, wait-multi-node-pods-ready]
+     if: >-
+       always() &&
+       needs.parse-trigger.outputs.run == 'true' &&
+@@ -470,7 +549,7 @@ jobs:
+       upload: false
+ 
+   single-node-accuracy-tests-pr-only:
+-    needs: [setup-vars, parse-trigger, build-image, generate-accuracy-matrix, multi-node-tests, remove-taints]
++    needs: [setup-vars, parse-trigger, build-image, generate-accuracy-matrix, wait-multi-node-pods-ready]
+     if: >-
+       always() &&
+       needs.parse-trigger.outputs.run == 'true' &&

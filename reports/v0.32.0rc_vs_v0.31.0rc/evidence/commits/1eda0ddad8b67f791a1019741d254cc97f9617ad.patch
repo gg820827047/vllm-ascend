@@ -1,0 +1,488 @@
+commit 1eda0ddad8b67f791a1019741d254cc97f9617ad
+Author:     yeyida <32807987+yeyida@users.noreply.github.com>
+AuthorDate: Thu Oct 29 21:58:03 2026 +0800
+Commit:     GitHub <noreply@github.com>
+CommitDate: Thu Oct 29 21:58:03 2026 +0800
+
+    [BugFix] Keep GLM KPool ND and scope NZ handling to A5 vision (#19564)
+    
+    ### What this PR does / why we need it?
+    
+    GLM-5.3-Flash fails on Ascend A5 with Model Runner V2 and
+    `weight_nz_mode=2`:
+    
+    **KPool weight extraction (NZ to FP32):**
+    
+    ```text
+    RuntimeError: The copy_ operator with internal format tensors is not supported on Ascend950, except for device-to-host copies and same-device copies between contiguous, non-view NZ tensors with the same dtype, matching shapes/storage descriptions, zero storage offsets, and tensor metadata matching their storage base metadata
+    ```
+    
+    **Vision projections (batched NZ Linear):**
+    
+    ```text
+    RuntimeError: matmul got not support format in current device: (2, 29)
+    ```
+    
+    Keep KPool's fused `wk_weights_proj` in ND for FP32 extraction and CANN
+    `key_pool`. Apply 2D inputs only to GLM vision projections requiring the
+    A5 workaround: NZ mode 2, unquantized BF16/FP16 weights. Cache this
+    decision at construction. Shared `ops/linear.py` and A2/A3 native
+    projection calls remain unchanged.
+    
+    ### Does this PR introduce _any_ user-facing change?
+    
+    Fixes loading and text/image inference in this configuration; no new
+    public options.
+    
+    ### How was this patch tested?
+    
+    - **CPU: 240 passed; A5: 112 passed.** Covers hardware/mode/dtype
+    selection, shapes/layouts, empty inputs, native bypasses and repeated
+    KPool processing.
+    - **Full-model A5:** TP8/DP1/EP, eager, V2, FP8 KV and CANN 9.2.0.
+    Health/models and four text/image requests returned HTTP 200; all 242
+    generated tokens and logprobs matched the previous implementation.
+    - **18 paired A5 projection cases:** bitwise-identical outputs and equal
+    peak allocation deltas. Median scoped/previous latency ratio: **0.998**;
+    range: **0.948-1.017**. This excludes TP communication.
+    - Ruff lint/format, spelling, syntax and whitespace checks passed. Full
+    local `format.sh ci` encountered Windows hook dependencies; applicable
+    checks were also run directly.
+    
+    A2/A3 hardware, full-model accuracy/performance, long context, graph
+    capture and MTP remain unvalidated.
+    
+    <details>
+    <summary>Reproduction commands and environment</summary>
+    
+    ```bash
+    python -m pytest tests/ut/device/test_hardware_profile.py \
+      tests/ut/device/test_device_config.py \
+      tests/ut/models/test_glm5next_vision_nz.py \
+      tests/ut/models/test_glm5next_kpool_model_backend.py \
+      tests/ut/ops/test_linear.py -q
+    
+    python -m pytest \
+      tests/e2e/nightly/single_node/ops/singlecard_ops/test_glm5next_vision_nz.py -q
+    ```
+    
+    Model: GLM-5.3-Flash W8A8 MXFP8; 8 Ascend 950DT devices. Stack: CANN
+    9.2.0, PyTorch 2.10.0+cpu, torch_npu 2.10.0.post7.dev20261020; vLLM
+    `db9527a46873454610df6dbedf79a36d6bf1a7f6`, vllm-ascend
+    `9df8e7fcb0733e52e7a6b4d37aaf95bd00fd8964` plus this patch.
+    
+    Image:
+    `sha256:f45b0c271730173c4fd9f0d38afae98d5d3a72d3a1cb2a6b93bf97c93b7be713`.
+    
+    </details>
+    
+    
+    - vLLM main:
+    https://github.com/vllm-project/vllm/commit/544f182d9f0c9bfe8bd7645525951d5e3692a542
+    
+    Signed-off-by: yeyida <yeahelec@gmail.com>
+    Co-authored-by: lijiahang226 <216526138+lijiahang226@users.noreply.github.com>
+
+diff --git a/tests/e2e/nightly/single_node/ops/singlecard_ops/test_glm5next_vision_nz.py b/tests/e2e/nightly/single_node/ops/singlecard_ops/test_glm5next_vision_nz.py
+new file mode 100644
+index 000000000..8471b5244
+--- /dev/null
++++ b/tests/e2e/nightly/single_node/ops/singlecard_ops/test_glm5next_vision_nz.py
+@@ -0,0 +1,61 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++
++import pytest
++import torch
++import torch_npu
++from torch import nn
++
++from vllm_ascend.device.device_config import is_950
++from vllm_ascend.models.glm5next.multimodal import _vision_projection
++from vllm_ascend.utils import ACL_FORMAT_FRACTAL_NZ
++
++pytestmark = pytest.mark.e2e_coverage(
++    arch="", feature="", parallel="", deploy="", hardware="A5", quantization="", graph_mode="eager"
++)
++
++
++@pytest.fixture(scope="module", autouse=True)
++def require_a5():
++    if not torch.npu.is_available() or not is_950():
++        pytest.skip("GLM vision NZ regression requires Ascend 950")
++
++
++class VisionProjection(nn.Module):
++    def __init__(self, weight, bias):
++        super().__init__()
++        self.weight = nn.Parameter(weight, requires_grad=False)
++        self.bias = bias
++
++    def forward(self, x):
++        # RowParallelLinear computes the local GEMM without bias, then adds
++        # bias after the TP reduction. Do not fuse it into this reference.
++        output = torch.ops.vllm.unquantized_gemm(x, self.weight, None)
++        return output if self.bias is None else output + self.bias, None
++
++
++@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
++@pytest.mark.parametrize("has_bias", [False, True])
++@pytest.mark.parametrize("noncontiguous", [False, True])
++@pytest.mark.parametrize("use_nz", [False, True])
++@pytest.mark.parametrize("shape", [(32,), (1, 32), (7, 32), (2, 3, 32), (2, 2, 3, 32), (0, 32), (2, 0, 32)])
++@torch.inference_mode()
++def test_glm5next_vision_nz_projection(dtype, has_bias, noncontiguous, use_nz, shape):
++    generator = torch.Generator(device="cpu").manual_seed(42)
++    x = torch.randn(shape, generator=generator, dtype=dtype).npu()
++    if noncontiguous:
++        x = torch.stack((x, x), dim=-1)[..., 0]
++    weight = torch.randn(64, 32, generator=generator, dtype=dtype).npu()
++    bias = torch.randn(64, generator=generator, dtype=dtype).npu() if has_bias else None
++    expected = torch.nn.functional.linear(x, weight)
++    if bias is not None:
++        expected = expected + bias
++    stored_weight = torch_npu.npu_format_cast(weight, ACL_FORMAT_FRACTAL_NZ) if use_nz else weight
++    layer = VisionProjection(stored_weight, bias)
++    actual, _ = _vision_projection(layer, x, use_nz)
++    torch.testing.assert_close(actual, expected, rtol=1e-2, atol=2e-2)
++    assert actual.shape == (*x.shape[:-1], weight.shape[0])
++    if use_nz:
++        assert torch_npu.get_npu_format(layer.weight) == ACL_FORMAT_FRACTAL_NZ
++    else:
++        assert torch.equal(actual, expected)
+diff --git a/tests/ut/models/test_glm5next_kpool_model_backend.py b/tests/ut/models/test_glm5next_kpool_model_backend.py
+index bd9036cee..9a8cb390d 100644
+--- a/tests/ut/models/test_glm5next_kpool_model_backend.py
++++ b/tests/ut/models/test_glm5next_kpool_model_backend.py
+@@ -12,12 +12,16 @@ from torch import nn
+ from vllm.config.compilation import CUDAGraphMode
+ 
+ import vllm_ascend.attention.indexer_kpool as backend_module
++import vllm_ascend.ops.linear as linear_module
++import vllm_ascend.utils as utils_module
+ from vllm_ascend.attention.indexer_kpool import (
+     AscendIndexerKPoolMetadata,
+     AscendIndexerKPoolQueryMetadata,
+     AscendIndexerKPoolTailMetadata,
+     Glm5NextKPoolIndexerBackend,
+ )
++from vllm_ascend.device.hardware import AscendDeviceType
++from vllm_ascend.device.hardware_profile import get_hardware_profile
+ 
+ with patch.dict(
+     "sys.modules",
+@@ -157,6 +161,74 @@ def test_kpool_cache_backends_support_pcp() -> None:
+     assert backend_module.AscendIndexerKPoolTailBackend.supports_pcp()
+ 
+ 
++@pytest.mark.parametrize("weight_nz_mode", [0, 1, 2])
++@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
++def test_kpool_weight_postprocessing_keeps_nd_before_fp32_cast(monkeypatch, weight_nz_mode, dtype):
++    profile = get_hardware_profile(AscendDeviceType.A5)
++    for module in (backend_module, linear_module, utils_module):
++        monkeypatch.setattr(module, "get_current_hardware_profile", lambda: profile)
++    monkeypatch.setattr(utils_module, "get_ascend_config", lambda: SimpleNamespace(weight_nz_mode=weight_nz_mode))
++    monkeypatch.setattr(Glm5NextKPoolIndexerBackend, "_init_cann_ops", lambda self: None)
++
++    source = SimpleNamespace(
++        vllm_config=SimpleNamespace(
++            parallel_config=SimpleNamespace(prefill_context_parallel_size=1, decode_context_parallel_size=1)
++        ),
++        n_head=2,
++        head_dim=4,
++        topk_tokens=8,
++        q_lora_rank=4,
++        index_kpool=4,
++        wq_b=nn.Linear(4, 8, bias=False, dtype=dtype),
++        wk_weights_proj=nn.Linear(8, 6, bias=False, dtype=dtype),
++        k_norm=nn.LayerNorm(4, dtype=dtype),
++        softmax_scale=0.5,
++        index_kpool_compress_ape=nn.Parameter(torch.zeros(4, 4, dtype=dtype)),
++        index_kpool_compress_gate=nn.Parameter(torch.randn(4, 8, dtype=dtype)),
++        k_cache=SimpleNamespace(prefix="indexer.k_cache"),
++        tail_cache=SimpleNamespace(prefix="indexer.tail"),
++        topk_indices_buffer=None,
++    )
++    source.wk_weights_proj.prefix = "model.layers.0.indexer.wk_weights_proj"
++    source.wq_b.prefix = "model.layers.0.indexer.wq_b"
++    backend = Glm5NextKPoolIndexerBackend(source, qk_rope_head_dim=0)
++    original_weight = source.wk_weights_proj.weight.detach().clone()
++    nz_weights = []
++
++    def format_cast(weight, fmt, **kwargs):
++        # Fail at the device boundary if Linear tries to convert the source
++        # before KPool can derive its FP32 head weights (the A5 failure path).
++        if weight.data_ptr() == source.wk_weights_proj.weight.data_ptr():
++            raise AssertionError("KPool source converted to NZ before FP32 head-weight extraction")
++        nz_weights.append(weight.data_ptr())
++        return weight
++
++    monkeypatch.setattr(utils_module.torch_npu, "npu_format_cast", format_cast)
++    method = linear_module.AscendUnquantizedLinearMethod()
++    # Match the loader's ordering: Linear hooks first, then attention hooks.
++    for layer in (source.wk_weights_proj, source.wq_b):
++        method.process_weights_after_loading(layer)
++    expected_nz_weights = [source.wq_b.weight.data_ptr()] if weight_nz_mode == 2 else []
++    assert nz_weights == expected_nz_weights
++
++    # Repeated post-processing must not encounter an NZ source on the next cast.
++    for _ in range(2):
++        backend.process_weights_after_loading()
++        # CANN key weights and FP32 head weights must stay in ND, including
++        # when post-processing is repeated.
++        assert nz_weights == expected_nz_weights
++        assert backend._key_weight.dtype == dtype
++        assert backend._head_weight_f32.dtype == torch.float32
++        assert backend._key_weight.is_contiguous()
++        assert backend._head_weight_f32.is_contiguous()
++        torch.testing.assert_close(backend._key_weight, original_weight[: source.head_dim])
++        torch.testing.assert_close(backend._head_weight_f32, original_weight[source.head_dim :].float())
++        torch.testing.assert_close(backend._gate_weight, source.index_kpool_compress_gate.detach())
++        torch.testing.assert_close(backend._norm_weight_f32, source.k_norm.weight.detach().float())
++        torch.testing.assert_close(backend._norm_bias_f32, source.k_norm.bias.detach().float())
++    torch.testing.assert_close(source.wk_weights_proj.weight, original_weight)
++
++
+ @pytest.mark.parametrize("compute_topk", [False, True])
+ def test_backend_zero_token_batch_does_not_launch_operators(monkeypatch, compute_topk):
+     compress = MagicMock()
+diff --git a/tests/ut/models/test_glm5next_vision_nz.py b/tests/ut/models/test_glm5next_vision_nz.py
+new file mode 100644
+index 000000000..e018a4685
+--- /dev/null
++++ b/tests/ut/models/test_glm5next_vision_nz.py
+@@ -0,0 +1,118 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++
++from types import SimpleNamespace
++from unittest.mock import Mock
++
++import pytest
++import torch
++from torch import nn
++from vllm.model_executor.layers.linear import UnquantizedLinearMethod
++
++from vllm_ascend.device.hardware import AscendDeviceType
++from vllm_ascend.device.hardware_profile import get_hardware_profile
++from vllm_ascend.models.glm5next import multimodal as vision
++from vllm_ascend.ops.linear import unquantized_gemm
++
++
++@pytest.mark.parametrize("device", [AscendDeviceType.A2, AscendDeviceType.A3, AscendDeviceType.A5])
++@pytest.mark.parametrize("mode", [0, 1, 2])
++@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16, torch.float32])
++@pytest.mark.parametrize("unquantized", [False, True])
++def test_vision_nz_policy(monkeypatch, device, mode, dtype, unquantized):
++    monkeypatch.setattr(vision, "get_current_hardware_profile", lambda: get_hardware_profile(device))
++    monkeypatch.setattr(vision, "get_ascend_config", lambda: SimpleNamespace(weight_nz_mode=mode))
++    layer = nn.Linear(32, 64, dtype=dtype)
++    layer.quant_method = UnquantizedLinearMethod() if unquantized else object()
++    expected = device == AscendDeviceType.A5 and mode == 2 and unquantized and dtype != torch.float32
++    assert vision._requires_2d_nz_input(layer) == expected
++
++
++@pytest.mark.parametrize("use_2d", [False, True])
++@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
++@pytest.mark.parametrize("has_bias", [False, True])
++@pytest.mark.parametrize("noncontiguous", [False, True])
++@pytest.mark.parametrize("shape", [(32,), (7, 32), (2, 3, 32), (2, 2, 3, 32), (0, 1, 32)])
++def test_vision_projection_preserves_values_and_scope(use_2d, dtype, has_bias, noncontiguous, shape):
++    generator = torch.Generator().manual_seed(42)
++    x = torch.randn(shape, generator=generator, dtype=dtype)
++    if noncontiguous:
++        x = torch.stack((x, x), dim=-1)[..., 0]
++    weight = nn.Parameter(torch.randn(64, 32, generator=generator, dtype=dtype), requires_grad=False)
++    bias = torch.randn(64, generator=generator, dtype=dtype) if has_bias else None
++    calls = []
++
++    def project(input_):
++        calls.append(input_)
++        return torch.nn.functional.linear(input_, weight, bias), bias
++
++    expected = torch.nn.functional.linear(x.float(), weight.float(), bias.float() if bias is not None else None).to(
++        dtype
++    )
++    actual, returned_bias = vision._vision_projection(project, x, use_2d)
++    torch.testing.assert_close(actual, expected, rtol=1e-2, atol=2e-2)
++    assert returned_bias is bias
++    assert len(calls) == 1
++    if use_2d and x.ndim != 2:
++        assert calls[0].ndim == 2
++        if x.is_contiguous() and x.numel():
++            assert calls[0].data_ptr() == x.data_ptr()
++    else:
++        assert calls[0] is x
++
++
++@pytest.mark.parametrize("use_2d", [False, True])
++def test_vision_mlp_keeps_activation_layout(monkeypatch, use_2d):
++    model = object.__new__(vision.Glm5NextVisionMLP)
++    nn.Module.__init__(model)
++    inputs: list[torch.Tensor] = []
++
++    def project(x: torch.Tensor) -> tuple[torch.Tensor, None]:
++        inputs.append(x)
++        return x, None
++
++    model.gate_up_proj = Mock(side_effect=project)
++    model.down_proj = Mock(side_effect=project)
++    model._gate_up_2d = model._down_2d = use_2d
++    model.act_fn = Mock(side_effect=lambda x: x + 1)
++    x = torch.randn(3, 1, 8)
++    projection = Mock(wraps=vision._vision_projection)
++    monkeypatch.setattr(vision, "_vision_projection", projection)
++    torch.testing.assert_close(model(x), x + 1)
++    assert [v.ndim for v in inputs] == ([2, 2] if use_2d else [3, 3])
++    assert model.act_fn.call_args.args[0].shape == x.shape
++    assert projection.call_count == (2 if use_2d else 0)
++
++
++@pytest.mark.parametrize("use_2d", [False, True])
++def test_vision_attention_scopes_output_projection(monkeypatch, use_2d):
++    model = object.__new__(vision.Glm5NextVisionAttention)
++    nn.Module.__init__(model)
++    model.head_dim = model.hidden_size_per_attention_head = 4
++    model.num_attention_heads_per_partition = 2
++    qkv = torch.randn(3, 1, 24)
++    model.qkv = Mock(return_value=(qkv, None))
++    model.q_norm = model.k_norm = SimpleNamespace(weight=torch.ones(4), variance_epsilon=1e-5)
++    model.attn = Mock(side_effect=lambda **kwargs: kwargs["query"])
++    model.proj = Mock(side_effect=lambda x: (x, None))
++    model._proj_2d = use_2d
++    monkeypatch.setattr(vision, "fused_q_kv_rmsnorm", lambda q, k, *args: (q, k))
++    projection = Mock(wraps=vision._vision_projection)
++    monkeypatch.setattr(vision, "_vision_projection", projection)
++    actual = model(torch.zeros(3, 1, 8), torch.tensor([0, 3]), None, None)
++    torch.testing.assert_close(actual, qkv[..., :8])
++    assert model.proj.call_args.args[0].ndim == (2 if use_2d else 3)
++    assert projection.call_count == (1 if use_2d else 0)
++
++
++def test_shared_linear_keeps_native_dispatch(monkeypatch):
++    x = torch.randn(3, 2, 32).transpose(0, 1)
++    weight = torch.randn(64, 32)
++    bias = torch.randn(64)
++    sentinel = object()
++    linear = Mock(return_value=sentinel)
++    monkeypatch.setattr(torch.nn.functional, "linear", linear)
++    assert unquantized_gemm(x, weight, bias) is sentinel
++    assert linear.call_args.args[0] is x
++    assert linear.call_args.args[1] is weight
++    assert linear.call_args.args[2] is bias
+diff --git a/vllm_ascend/attention/indexer_kpool.py b/vllm_ascend/attention/indexer_kpool.py
+index b8d2329a8..1be2cd16b 100644
+--- a/vllm_ascend/attention/indexer_kpool.py
++++ b/vllm_ascend/attention/indexer_kpool.py
+@@ -591,6 +591,11 @@ class Glm5NextKPoolIndexerBackend(nn.Module):
+         self.index_kpool: int = vllm_indexer.index_kpool
+         self.wq_b = vllm_indexer.wq_b
+         self.wk_weights_proj = vllm_indexer.wk_weights_proj
++        # Linear post-processing runs before the attention backend's hook.
++        # Keep the fused source in ND for slicing and FP32 head-weight casts:
++        # ACLNN-only devices cannot cast NZ weights to FP32. The key slice is
++        # consumed directly by CANN key_pool, rather than the linear method.
++        self.wk_weights_proj.skip_weight_nz_conversion = True
+         self.k_norm = vllm_indexer.k_norm
+         self.softmax_scale = vllm_indexer.softmax_scale
+         self.index_kpool_compress_ape = vllm_indexer.index_kpool_compress_ape
+diff --git a/vllm_ascend/device/hardware_profile.py b/vllm_ascend/device/hardware_profile.py
+index 39b0cb3af..a4227b3ed 100644
+--- a/vllm_ascend/device/hardware_profile.py
++++ b/vllm_ascend/device/hardware_profile.py
+@@ -239,6 +239,9 @@ class HardwareProfile:
+     # Independent, additive contracts queried with ``supports``.
+     capabilities: frozenset[HardwareCapability]
+ 
++    # NZ mm/addmm is supported, but batched matmul rejects NZ weights.
++    requires_2d_nz_linear_input: bool = False
++
+     def supports(self, capability: HardwareCapability) -> bool:
+         """Return whether the exact documented ``capability`` contract is available."""
+ 
+@@ -334,6 +337,7 @@ _HARDWARE_PROFILES: Mapping[AscendDeviceType, HardwareProfile] = MappingProxyTyp
+         ),
+         AscendDeviceType.A5: HardwareProfile(
+             _device_type=AscendDeviceType.A5,
++            requires_2d_nz_linear_input=True,
+             attention_backend_family=AttentionBackendFamily.STANDARD,
+             cpu_binding_mode=CPUBindingMode.TOPO_AFFINITY,
+             default_worker_cls=_DEFAULT_WORKER_CLS,
+diff --git a/vllm_ascend/models/glm5next/multimodal.py b/vllm_ascend/models/glm5next/multimodal.py
+index e5b0bad05..55a834dc3 100644
+--- a/vllm_ascend/models/glm5next/multimodal.py
++++ b/vllm_ascend/models/glm5next/multimodal.py
+@@ -25,6 +25,7 @@ from vllm.model_executor.layers.linear import (
+     MergedColumnParallelLinear,
+     QKVParallelLinear,
+     RowParallelLinear,
++    UnquantizedLinearMethod,
+ )
+ from vllm.model_executor.layers.quantization import QuantizationConfig
+ from vllm.model_executor.layers.rotary_embedding import get_rope
+@@ -47,9 +48,29 @@ from vllm.multimodal.parse import ImageSize, MultiModalDataItems
+ from vllm.multimodal.processing import PromptReplacement, PromptUpdate, PromptUpdateDetails
+ from vllm.v1.attention.backends.registry import AttentionBackendEnum
+ 
++from vllm_ascend.ascend_config import get_ascend_config
++from vllm_ascend.device.hardware_profile import get_current_hardware_profile
+ from vllm_ascend.models.glm5next.processor import Glm5NextProcessorKwargs
+ 
+ 
++def _requires_2d_nz_input(layer: nn.Module) -> bool:
++    return (
++        get_current_hardware_profile().requires_2d_nz_linear_input
++        and get_ascend_config().weight_nz_mode == 2
++        and isinstance(layer.quant_method, UnquantizedLinearMethod)
++        and layer.weight.dtype in (torch.bfloat16, torch.float16)
++    )
++
++
++def _vision_projection(layer: nn.Module, x: torch.Tensor, use_2d: bool) -> tuple[torch.Tensor, torch.Tensor | None]:
++    if not use_2d or x.ndim == 2:
++        return layer(x)
++    # Only GLM vision's NZ projections need the 2D mm/addmm path. Preserve
++    # leading dimensions for the attention/MLP and leave weights untouched.
++    output, bias = layer(x.reshape(-1, x.shape[-1]))
++    return output.view(*x.shape[:-1], output.shape[-1]), bias
++
++
+ class Glm5NextVisionPatchEmbed(nn.Module):
+     def __init__(
+         self,
+@@ -107,13 +128,15 @@ class Glm5NextVisionMLP(nn.Module):
+             prefix=f"{prefix}.down_proj",
+             disable_tp=use_data_parallel,
+         )
++        self._gate_up_2d = _requires_2d_nz_input(self.gate_up_proj)
++        self._down_2d = _requires_2d_nz_input(self.down_proj)
+         # GLM-5.3-Flash clamps the vision SwiGLU gate/up unlike GLM-OCR/GLM-4V.
+         self.act_fn = SiluAndMulWithClamp(swiglu_limit=swiglu_limit)
+ 
+     def forward(self, x: torch.Tensor):
+-        x, _ = self.gate_up_proj(x)
++        x, _ = _vision_projection(self.gate_up_proj, x, True) if self._gate_up_2d else self.gate_up_proj(x)
+         x = self.act_fn(x)
+-        x, _ = self.down_proj(x)
++        x, _ = _vision_projection(self.down_proj, x, True) if self._down_2d else self.down_proj(x)
+         return x
+ 
+ 
+@@ -158,6 +181,8 @@ class Glm5NextVisionAttention(nn.Module):
+             disable_tp=use_data_parallel,
+         )
+ 
++        self._proj_2d = _requires_2d_nz_input(self.proj)
++
+         self.attn = MMEncoderAttention(
+             num_heads=self.num_attention_heads_per_partition,
+             head_size=self.hidden_size_per_attention_head,
+@@ -222,7 +247,7 @@ class Glm5NextVisionAttention(nn.Module):
+         )
+         context_layer = rearrange(context_layer, "b s h d -> s b (h d)").contiguous()
+ 
+-        output, _ = self.proj(context_layer)
++        output, _ = _vision_projection(self.proj, context_layer, True) if self._proj_2d else self.proj(context_layer)
+         return output
+ 
+ 

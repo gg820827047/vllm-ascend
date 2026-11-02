@@ -1,0 +1,485 @@
+commit e131256399c84309c72ad2592b8c211d366f6d25
+Author:     CXY-Katrina <katrina.cxy@gmail.com>
+AuthorDate: Sat Oct 31 09:34:32 2026 +0800
+Commit:     GitHub <noreply@github.com>
+CommitDate: Sat Oct 31 09:34:32 2026 +0800
+
+    [Performance][Model] Fuse MiniMax MXFP8 SwiGLU and enable A5 AscendC index score (#20290)
+    
+    ### What this PR does / why we need it?
+    
+    MiniMax M3 on A5 launches separate clipped SwiGLU and MXFP8 quantization
+    kernels. This PR fuses them with `npu_swiglu_mx_quant` and includes the
+    AscendC index-score decode change from #18963 (credit to @xuchi-0808).
+    
+    - Enable fused activation for `SWIGLUOAI_UNINTERLEAVE` with CEIL
+    scaling; compare the runtime enum directly and cache the scale algorithm
+    privately.
+    - Use `swiglu_mode=2`, per-layer activation parameters, and E4M3 output;
+    preserve other activation and scale-algorithm paths.
+    - This PR does not depend on #20167.
+    
+    ### Does this PR introduce _any_ user-facing change?
+    
+    A5 MiniMax MXFP8 MoE uses fused activation/quantization, and sparse
+    decode uses AscendC index score. No new configuration. Release note:
+    `release_notes/fragments/20290.yaml`.
+    
+    ### How was this patch tested?
+    
+    **Updated CPU UT: 193 passed**, covering all activation enums, both
+    scale algorithms, one-time configuration lookup, instance isolation,
+    operator arguments, and GMM2 scale propagation. The shared quantization
+    fixture now supplies explicit model architecture metadata. CI coverage
+    registration and A5 runner selection also pass validation.
+    
+    ```bash
+    python3 -m pytest -q \
+      tests/ut/quantization/methods/w8a8/test_swiglu_mx_quant.py \
+      tests/ut/quantization/methods/w8a8/test_w8a8_mxfp8.py \
+      tests/ut/ops/test_moe_mlp.py \
+      tests/ut/models/minimax_m3/test_msa_m3.py
+    ```
+    
+    **CI limitation:** The 17 direct fused-operator/graph E2E cases are
+    temporarily marked `pytest.mark.skip` because CI torch_npu
+    `2.10.0.post4` rejects `swiglu_mode=2`. Re-enable them after the CI
+    runtime is upgraded. CPU unit tests remain enabled; this change does not
+    add a runtime fallback.
+    
+    **Previous A5 validation:** 17 operator/graph tests passed. A 3-second
+    decode profile with #20167 confirmed fused sparse preparation,
+    `MsaIndexScore`, and `SwigluMxQuant` on all eight ranks, with eager
+    disabled.
+    
+    **Standalone operator audit (test code not included in this PR):**
+    Ascend950DT, CANN 9.2.0 (`V100R001C25B114`), torch_npu
+    `2.10.0.post7.dev20261020`, image `f45b0c271730`. **46 cases / 161
+    checks passed**, including random inputs, clamp boundaries, zero/tiny
+    values, two activation parameter sets, and both scale algorithms.
+    
+    **Equivalence comparison: both the fused operator and each split
+    reference explicitly use `scale_alg=1`**, with identical BF16 inputs,
+    clamp limits, alpha/bias, and E4M3 output dtype. Across 1,632,512 output
+    values and 51,016 scale blocks:
+    
+    | Reference implementation | FP8 values differing | Scale blocks
+    differing | Maximum FP8 code distance |
+    | --- | --- | --- | --- |
+    | Original BF16 small-op chain + MX quant | 3.095% | 0 | 1 |
+    | FP32 small-op chain + MX quant | 1.965% | 0 | 1 |
+    
+    With `scale_alg=1` on both paths, the fused operator is not bitwise
+    equivalent to the split implementations: some FP8 output values differ,
+    but all observed differences are at most one adjacent representable FP8
+    value, and all scale blocks match.
+    
+    Parameter checks:
+    
+    - **Separate parameter-effect control (not the equivalence baseline):**
+    for an activation of approximately 29.994, alg=0 produced E8M0 scale
+    byte 123, FP8 value 448, and dequantized output 28; alg=1 produced byte
+    124, value 240, and output 30. Both matched independent exponent
+    calculations and split quantization.
+    - **Clamping is effective:** limits 5 and 7 matched manually preclipped
+    inputs bitwise for gate upper-bound and up upper/lower-bound probes,
+    differed from unclamped outputs, and preserved below-threshold inputs.
+    The gate has no lower clamp.
+    - Three graph replays with changing inputs matched eager fused
+    output/scale bitwise. The temporary single-NPU container was removed
+    after testing.
+    
+    **Previous GPQA Diamond validation:** **142/165 correct (86.06%,
+    partial)**.
+    
+    Ruff and `git diff --check` passed. The local aggregate format check
+    remains limited by Windows `/bin/bash` wrappers; ShellCheck was skipped
+    as requested.
+    
+    
+    - vLLM main:
+    https://github.com/vllm-project/vllm/commit/544f182d9f0c9bfe8bd7645525951d5e3692a542
+    
+    ---------
+    
+    Signed-off-by: CXY-Katrina <katrina.cxy@gmail.com>
+    Co-authored-by: xuchi <xuchicolson@163.com>
+
+diff --git a/.github/workflows/scripts/estimated_times.yaml b/.github/workflows/scripts/estimated_times.yaml
+index c2d3f4cdd..618ae702e 100644
+--- a/.github/workflows/scripts/estimated_times.yaml
++++ b/.github/workflows/scripts/estimated_times.yaml
+@@ -11,6 +11,7 @@
+ estimated_times:
+   tests/e2e/pull_request/one_card/test_kv_pool_accuracy.py: 410
+   tests/e2e/pull_request/one_card/test_flash_attn_precision.py: 30
++  tests/e2e/pull_request/one_card/test_swiglu_mx_quant.py: 30
+   tests/e2e/pull_request/four_card/model_runner_v2/test_kvpp_pp.py: 300
+   tests/e2e/pull_request/four_card/test_kvpp_pd.py: 230
+   tests/e2e/pull_request/two_card/test_kvpp.py: 290
+diff --git a/.github/workflows/scripts/test_config.yaml b/.github/workflows/scripts/test_config.yaml
+index d84e409ac..0427a86f4 100644
+--- a/.github/workflows/scripts/test_config.yaml
++++ b/.github/workflows/scripts/test_config.yaml
+@@ -113,6 +113,8 @@ runner_mapping:
+     default: a3-2
+   tests/e2e/pull_request/one_card/test_flash_attn_precision\.py$:
+     default: a5-4
++  tests/e2e/pull_request/one_card/test_swiglu_mx_quant\.py$:
++    default: a5-4
+   tests/e2e/pull_request/one_card:
+     default: a2-1
+     310p: 310p-1
+diff --git a/release_notes/fragments/20290.yaml b/release_notes/fragments/20290.yaml
+new file mode 100644
+index 000000000..289b6bb3d
+--- /dev/null
++++ b/release_notes/fragments/20290.yaml
+@@ -0,0 +1,9 @@
++pr: 20290
++entries:
++  - category: performance
++    text: >-
++      Enabled AscendC sparse decode index scoring on A5 and fused MiniMax M3
++      MXFP8 MoE clipped SwiGLU with CEIL-scale activation quantization.
++      Other activation and quantization paths retain their existing behavior.
++    model: minimax-m3
++    hardware: [A5]
+diff --git a/tests/e2e/pull_request/one_card/test_swiglu_mx_quant.py b/tests/e2e/pull_request/one_card/test_swiglu_mx_quant.py
+new file mode 100644
+index 000000000..5f570ba61
+--- /dev/null
++++ b/tests/e2e/pull_request/one_card/test_swiglu_mx_quant.py
+@@ -0,0 +1,76 @@
++# SPDX-License-Identifier: Apache-2.0
++# Copyright (c) 2026 Huawei Technologies Co., Ltd. All Rights Reserved.
++
++import pytest
++import torch
++import torch_npu
++
++pytestmark = pytest.mark.skip(
++    reason="CI torch_npu 2.10.0.post4 does not support swiglu_mode=2; re-enable after the CI runtime is upgraded"
++)
++
++
++def fused(x, limit, alpha, bias):
++    return torch_npu.npu_swiglu_mx_quant(
++        x,
++        activate_left=True,
++        swiglu_mode=2,
++        clamp_limit=limit,
++        glu_alpha=alpha,
++        glu_bias=bias,
++        dst_type=torch.float8_e4m3fn,
++        scale_alg=1,
++    )
++
++
++def dequantize(q, scale):
++    q = q.cpu().float()
++    if q.numel() == 0:
++        return q
++    exponent = scale.cpu().reshape(q.shape[0], -1).float() - 127
++    return q * torch.exp2(exponent).repeat_interleave(32, dim=-1)[:, : q.shape[-1]]
++
++
++@pytest.mark.parametrize("rows", [0, 1, 16, 128])
++@pytest.mark.parametrize("width", [128, 2048])
++@pytest.mark.parametrize("limit,alpha,bias", [(7.0, 1.702, 1.0), (5.0, 1.5, 0.5)])
++@torch.inference_mode()
++def test_clipped_swiglu_mx_quant_numerics(rows, width, limit, alpha, bias):
++    if not any(tag in torch.npu.get_device_name(0).lower() for tag in ("950", "910_95")):
++        pytest.skip("The CEIL-scale fused activation is an A5 path")
++    torch.manual_seed(19)
++    x = torch.randn(rows, 2 * width, device="npu", dtype=torch.bfloat16) * 4
++    actual, scale = fused(x, limit, alpha, bias)
++    gate, up = x.cpu().float().chunk(2, dim=-1)
++    gate = gate.clamp(max=limit)
++    up = up.clamp(-limit, limit)
++    reference = gate * torch.sigmoid(alpha * gate) * (up + bias)
++    assert actual.shape == reference.shape
++    assert actual.dtype == torch.float8_e4m3fn
++    # E4M3 rounding has at most half an ULP (6.25% for normal values).
++    torch.testing.assert_close(dequantize(actual, scale), reference, rtol=0.07, atol=0.02)
++
++
++@torch.inference_mode()
++def test_clipped_swiglu_mx_quant_graph_replay():
++    if not any(tag in torch.npu.get_device_name(0).lower() for tag in ("950", "910_95")):
++        pytest.skip("The CEIL-scale fused activation is an A5 path")
++    x = torch.randn(128, 4096, device="npu", dtype=torch.bfloat16)
++    stream = torch.npu.Stream()
++    stream.wait_stream(torch.npu.current_stream())
++    with torch.npu.stream(stream):
++        for _ in range(3):
++            fused(x, 7.0, 1.702, 1.0)
++    torch.npu.current_stream().wait_stream(stream)
++    graph = torch.npu.NPUGraph()
++    with torch.npu.graph(graph, stream=stream):
++        actual, scale = fused(x, 7.0, 1.702, 1.0)
++    pointers = (actual.data_ptr(), scale.data_ptr())
++    for _ in range(3):
++        x.copy_(torch.randn_like(x) * 4)
++        expected, expected_scale = fused(x, 7.0, 1.702, 1.0)
++        graph.replay()
++        torch.npu.synchronize()
++        assert (actual.data_ptr(), scale.data_ptr()) == pointers
++        torch.testing.assert_close(actual.cpu().float(), expected.cpu().float(), rtol=0, atol=0)
++        torch.testing.assert_close(scale.cpu(), expected_scale.cpu(), rtol=0, atol=0)
+diff --git a/tests/ut/models/minimax_m3/test_msa_m3.py b/tests/ut/models/minimax_m3/test_msa_m3.py
+index 89c84deca..8c4312f09 100644
+--- a/tests/ut/models/minimax_m3/test_msa_m3.py
++++ b/tests/ut/models/minimax_m3/test_msa_m3.py
+@@ -574,21 +574,19 @@ def test_sparse_prepare_bypasses_fused_qkv_norm_rope_on_a5() -> None:
+     assert "1.0 + self.q_norm.weight" in source
+ 
+ 
+-def test_a5_index_score_uses_ascendc_prefill_and_triton_decode() -> None:
++def test_index_score_uses_ascendc_prefill_and_decode_on_all_devices() -> None:
+     module_source = inspect.getsource(msa_m3_module)
+     a5_branch_start = module_source.index("if get_ascend_device_type() == AscendDeviceType.A5:")
+     a5_branch_end = module_source.index("\n\ndef _active_decode_num_reqs", a5_branch_start)
+     import_branches = module_source[a5_branch_start:a5_branch_end]
+ 
+     assert msa_m3_module._USE_ASCENDC_INDEX_SCORE_PREFILL is True
+-    assert msa_m3_module._USE_ASCENDC_INDEX_SCORE_DECODE is (
+-        msa_m3_module.get_ascend_device_type() != AscendDeviceType.A5
+-    )
++    assert msa_m3_module._USE_ASCENDC_INDEX_SCORE_DECODE is True
+     assert import_branches.count("minimax_m3_index_decode") == 1
+     assert "msa_m3_triton_a5" in import_branches
+     assert "msa_m3_triton" not in import_branches.replace("msa_m3_triton_a5", "")
+     assert "_USE_ASCENDC_INDEX_SCORE_PREFILL = True" in module_source
+-    assert "_USE_ASCENDC_INDEX_SCORE_DECODE = get_ascend_device_type() != AscendDeviceType.A5" in module_source
++    assert "_USE_ASCENDC_INDEX_SCORE_DECODE = True" in module_source
+ 
+ 
+ def _make_mrv2_padding_context(
+@@ -608,7 +606,8 @@ def _make_mrv2_padding_context(
+     )
+ 
+ 
+-def test_a5_indexer_forward_keeps_original_decode_path() -> None:
++def test_a5_indexer_forward_keeps_triton_decode_branch() -> None:
++    """The A5 Triton decode branch stays patched-reachable as a rollback path."""
+     impl = object.__new__(AscendMiniMaxM3IndexerImpl)
+     torch.nn.Module.__init__(impl)
+     impl.num_index_heads = 1
+diff --git a/tests/ut/quantization/conftest_quantization.py b/tests/ut/quantization/conftest_quantization.py
+index ea2ad9fa5..7508e38ec 100644
+--- a/tests/ut/quantization/conftest_quantization.py
++++ b/tests/ut/quantization/conftest_quantization.py
+@@ -93,7 +93,9 @@ def create_mock_vllm_config(
+     mock_config.quant_config = Mock(quant_description=quant_description)
+     mock_config.model_config = Mock(
+         dtype=model_dtype,
++        architectures=[],
+         hf_config=Mock(model_type=None),
++        hf_text_config=Mock(model_type=None),
+         enforce_eager=enforce_eager,
+     )
+ 
+diff --git a/tests/ut/quantization/methods/w8a8/test_swiglu_mx_quant.py b/tests/ut/quantization/methods/w8a8/test_swiglu_mx_quant.py
+new file mode 100644
+index 000000000..e0646507d
+--- /dev/null
++++ b/tests/ut/quantization/methods/w8a8/test_swiglu_mx_quant.py
+@@ -0,0 +1,107 @@
++# SPDX-License-Identifier: Apache-2.0
++# Copyright (c) 2026 Huawei Technologies Co., Ltd. All Rights Reserved.
++
++from types import SimpleNamespace
++from unittest.mock import Mock, patch
++
++import pytest
++import torch
++from vllm.model_executor.layers.fused_moe.activation import MoEActivation
++
++from vllm_ascend.ops.fused_moe.moe_mlp import apply_moe_mlp
++from vllm_ascend.quantization.methods.w8a8 import w8a8_mxfp8 as module
++from vllm_ascend.quantization.utils import DynamicMXQuantScaleAlg
++
++
++def make_method(scale_alg):
++    config = SimpleNamespace(quant_config=SimpleNamespace(), use_v2_model_runner=True)
++    with (
++        patch.object(module, "get_current_vllm_config", return_value=config),
++        patch.object(module, "get_ascend_config"),
++        patch.object(module, "get_dynamic_mx_quant_scale_alg", return_value=scale_alg) as get_scale_alg,
++    ):
++        method = module.AscendW8A8MXFP8DynamicFusedMoEMethod()
++    get_scale_alg.assert_called_once_with(config)
++    return method
++
++
++@pytest.mark.parametrize("scale_alg", list(DynamicMXQuantScaleAlg))
++@pytest.mark.parametrize("activation", list(MoEActivation))
++def test_fused_activation_dispatch(scale_alg, activation):
++    method = make_method(scale_alg)
++    expected = activation == MoEActivation.SILU or (
++        scale_alg == DynamicMXQuantScaleAlg.CEIL and activation == MoEActivation.SWIGLUOAI_UNINTERLEAVE
++    )
++    assert method.supports_fused_activation(activation) == expected
++
++
++def test_enabling_one_model_does_not_change_other_instances():
++    enabled = make_method(1)
++    other_model = make_method(0)
++    assert enabled.supports_fused_activation(MoEActivation.SWIGLUOAI_UNINTERLEAVE)
++    assert not other_model.supports_fused_activation(MoEActivation.SWIGLUOAI_UNINTERLEAVE)
++    assert "fused_activations" not in vars(enabled)
++    assert "fused_activations" not in vars(other_model)
++    assert module.AscendW8A8MXFP8DynamicFusedMoEMethod.fused_activations == frozenset({"silu"})
++
++
++@pytest.mark.parametrize("scale_alg", [0, 1])
++def test_activation_quantization_reuses_cached_scale_algorithm(scale_alg):
++    method = make_method(scale_alg)
++    hidden_states = torch.randn(4, 64, dtype=torch.bfloat16)
++    quantized = torch.zeros(4, 64, dtype=torch.float8_e4m3fn)
++    scales = torch.ones(4, 1, 2, dtype=torch.uint8)
++    with (
++        patch.object(module, "get_dynamic_mx_quant_scale_alg", side_effect=AssertionError("unexpected scale lookup")),
++        patch.object(module.torch_npu, "npu_dynamic_mx_quant", return_value=(quantized, scales)) as quant,
++    ):
++        assert method.supports_fused_activation(MoEActivation.SWIGLUOAI_UNINTERLEAVE) == (scale_alg == 1)
++        result, result_scale = method.apply_act_quant(None, hidden_states)
++    quant.assert_called_once_with(hidden_states, dst_type=torch.float8_e4m3fn, scale_alg=scale_alg)
++    assert result is quantized
++    assert result_scale is scales
++
++
++@pytest.mark.parametrize("scale_alg", [0, 1])
++def test_mlp_dispatch_preserves_fallback_and_gmm2_scales(scale_alg):
++    method = make_method(scale_alg)
++    packed = torch.randn(4, 128, dtype=torch.bfloat16)
++    quantized = torch.zeros(4, 64, dtype=torch.float8_e4m3fn)
++    scales = torch.ones(4, 1, 2, dtype=torch.uint8)
++    method.apply_gmm1 = Mock(return_value=packed)
++    method.apply_act_quant = Mock(return_value=(quantized, scales))
++    method.apply_gmm2 = Mock(return_value="result")
++    inputs = SimpleNamespace(
++        activation=MoEActivation.SWIGLUOAI_UNINTERLEAVE,
++        quant=SimpleNamespace(is_quant=True),
++        lora_context=None,
++        swiglu_limit=5.0,
++        swiglu_alpha=1.5,
++        swiglu_beta=0.5,
++    )
++    with (
++        patch.object(module, "get_dynamic_mx_quant_scale_alg", side_effect=AssertionError("unexpected scale lookup")),
++        patch.object(module.torch_npu, "npu_swiglu_mx_quant", return_value=(quantized, scales), create=True) as fused,
++        patch("vllm_ascend.ops.fused_moe.moe_mlp.DeviceOperator.clipped_swiglu", return_value="activated") as legacy,
++        patch("vllm_ascend.ops.fused_moe.moe_mlp.maybe_record_event", return_value=None),
++    ):
++        assert apply_moe_mlp(inputs, method) == ("result", None)
++    method.apply_gmm1.assert_called_once_with(inputs)
++    method.apply_gmm2.assert_called_once_with(inputs, quantized, scales)
++    if scale_alg == 1:
++        fused.assert_called_once_with(
++            packed,
++            activate_left=True,
++            swiglu_mode=2,
++            clamp_limit=5.0,
++            glu_alpha=1.5,
++            glu_bias=0.5,
++            dst_type=torch.float8_e4m3fn,
++            scale_alg=1,
++        )
++        legacy.assert_not_called()
++        method.apply_act_quant.assert_not_called()
++    else:
++        fused.assert_not_called()
++        legacy.assert_called_once_with(packed, swiglu_limit=5.0, swiglu_alpha=1.5, swiglu_beta=0.5)
++        method.apply_act_quant.assert_called_once_with(inputs, "activated")
+diff --git a/vllm_ascend/models/minimax_m3/msa_m3.py b/vllm_ascend/models/minimax_m3/msa_m3.py
+index a8ac2eaed..9a118667a 100644
+--- a/vllm_ascend/models/minimax_m3/msa_m3.py
++++ b/vllm_ascend/models/minimax_m3/msa_m3.py
+@@ -61,10 +61,11 @@ from vllm_ascend.utils import (
+ # Minimum used by heterogeneous-KV alignment; the final FP8 cache block is 128.
+ _MINIMAX_M3_FP8_KV_CACHE_BLOCK_SIZE = 64
+ 
+-# Use CANN MsaIndexScore for prefill on all devices and decode on A2/A3.
+-# A5 decode keeps its lower-latency Triton path.
++# Use CANN MsaIndexScore for prefill and decode on every device, keeping A5
++# aligned with A3. A5's Triton decode kernel stays importable as a rollback
++# path.
+ _USE_ASCENDC_INDEX_SCORE_PREFILL = True
+-_USE_ASCENDC_INDEX_SCORE_DECODE = get_ascend_device_type() != AscendDeviceType.A5
++_USE_ASCENDC_INDEX_SCORE_DECODE = True
+ 
+ if get_ascend_device_type() == AscendDeviceType.A5:
+     from vllm_ascend.models.minimax_m3.ops.msa_m3_triton_a5 import (
+diff --git a/vllm_ascend/quantization/methods/w8a8/w8a8_mxfp8.py b/vllm_ascend/quantization/methods/w8a8/w8a8_mxfp8.py
+index 06c1c7609..fdd929b68 100644
+--- a/vllm_ascend/quantization/methods/w8a8/w8a8_mxfp8.py
++++ b/vllm_ascend/quantization/methods/w8a8/w8a8_mxfp8.py
+@@ -22,6 +22,7 @@ import torch.nn.functional as F
+ import torch_npu
+ from vllm.config import get_current_vllm_config
+ from vllm.logger import logger
++from vllm.model_executor.layers.fused_moe.activation import MoEActivation
+ from vllm.model_executor.layers.linear import RowParallelLinear
+ from vllm.utils.math_utils import cdiv
+ 
+@@ -31,7 +32,7 @@ from vllm_ascend.ops.fused_moe.dataclass.fused_experts import MoEWeights, build_
+ from vllm_ascend.ops.fused_moe.dataclass.moe_mlp import MoEMlpComputeInput
+ from vllm_ascend.ops.fused_moe.moe_utils import cumsum_group_list, maybe_normalize_mxfp_scale_layout
+ from vllm_ascend.ops.fused_moe.routed_experts import AscendRoutedExperts  # noqa: F401
+-from vllm_ascend.quantization.utils import get_dynamic_mx_quant_scale_alg
++from vllm_ascend.quantization.utils import DynamicMXQuantScaleAlg, get_dynamic_mx_quant_scale_alg
+ from vllm_ascend.utils import FP8_METHOD, dispose_tensor, maybe_trans_nz, maybe_trans_nz_with_scale
+ 
+ from ..base import (
+@@ -291,6 +292,16 @@ class AscendW8A8MXFP8DynamicFusedMoEMethod(AscendMoEScheme):
+         self.group_size = quant_description.get("group_size", 32)
+         ascend_config = get_ascend_config()
+         self.dynamic_eplb = False if vllm_config.use_v2_model_runner else ascend_config.eplb_config.dynamic_eplb
++        self._dynamic_mx_quant_scale_alg = get_dynamic_mx_quant_scale_alg(vllm_config)
++
++    def supports_fused_activation(self, activation: MoEActivation) -> bool:
++        # Only MiniMax's A5 CEIL-scale MXFP8 path has been validated with the
++        # fused clipped activation. Keep the scale and activation requirements
++        # together without changing the supported activations of other models.
++        return super().supports_fused_activation(activation) or (
++            self._dynamic_mx_quant_scale_alg == DynamicMXQuantScaleAlg.CEIL
++            and activation == MoEActivation.SWIGLUOAI_UNINTERLEAVE
++        )
+ 
+     @staticmethod
+     def get_weight(
+@@ -526,6 +537,23 @@ class AscendW8A8MXFP8DynamicFusedMoEMethod(AscendMoEScheme):
+         layer._mxfp8_transformed = False
+ 
+     def apply_gmm1_act_quant(self, mlp_compute_input: MoEMlpComputeInput):
++        if mlp_compute_input.activation == MoEActivation.SWIGLUOAI_UNINTERLEAVE:
++            # GMM produces contiguous [gate | up] BF16 output. Mode 2 applies
++            # the clipped, non-interleaved SwiGLU-OAI before MXFP8 quantization;
++            # mode 1 would instead interpret alternating gate/up elements.
++            hidden_states = self.apply_gmm1(mlp_compute_input)
++            hidden_states, out_scale = torch_npu.npu_swiglu_mx_quant(
++                hidden_states,
++                activate_left=True,
++                swiglu_mode=2,
++                clamp_limit=mlp_compute_input.swiglu_limit,
++                glu_alpha=mlp_compute_input.swiglu_alpha,
++                glu_bias=mlp_compute_input.swiglu_beta,
++                dst_type=self.act_quant_type,
++                scale_alg=self._dynamic_mx_quant_scale_alg,
++            )
++            return hidden_states, maybe_normalize_mxfp_scale_layout(out_scale)
++
+         hidden_states = mlp_compute_input.hidden_states
+         hidden_states, pertoken_scale = self._quant_hidden_states(hidden_states, mlp_compute_input.dynamic_scale)
+         layer = mlp_compute_input.layer
+@@ -573,7 +601,7 @@ class AscendW8A8MXFP8DynamicFusedMoEMethod(AscendMoEScheme):
+ 
+     def apply_act_quant(self, mlp_compute_input: MoEMlpComputeInput, hidden_states: torch.Tensor):
+         hidden_states, dynamic_scale = torch_npu.npu_dynamic_mx_quant(
+-            hidden_states, dst_type=self.act_quant_type, scale_alg=get_dynamic_mx_quant_scale_alg()
++            hidden_states, dst_type=self.act_quant_type, scale_alg=self._dynamic_mx_quant_scale_alg
+         )
+         return hidden_states, maybe_normalize_mxfp_scale_layout(dynamic_scale)
+ 

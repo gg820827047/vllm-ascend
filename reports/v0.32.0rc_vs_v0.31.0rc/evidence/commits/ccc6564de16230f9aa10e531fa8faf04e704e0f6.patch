@@ -1,0 +1,115 @@
+commit ccc6564de16230f9aa10e531fa8faf04e704e0f6
+Author:     spoon1116 <86033972+spoon1116@users.noreply.github.com>
+AuthorDate: Mon Oct 26 15:26:41 2026 +0800
+Commit:     GitHub <noreply@github.com>
+CommitDate: Mon Oct 26 07:26:41 2026 +0000
+
+    [Refactor][310P] Avoid bool-mask IndexPut in GDN prefill state init (#19295)
+    
+    ### What this PR does / why we need it?
+    In the 310P GDN prefill path, `_forward_core` uses two indexed
+    assignments on
+    the recurrent state for every layer. On Ascend both of them lower to the
+    generic IndexPut implementation, which is pure operator overhead in this
+    layer;
+    the boolean-mask form additionally has to convert the mask into an index
+    tensor before writing.
+    
+    This PR replaces both with equivalent dedicated operators:
+    
+    - Clearing the initial state of requests without history:
+      `initial_state[~has_initial_state, ...] = 0` -> `masked_fill_` with a
+    broadcast mask. One element-wise kernel, no mask-to-index
+    materialization,
+      and exactly the same positions are cleared.
+    - Writing the final recurrent state back to the paged cache:
+      `ssm_state[indices] = ...` -> `index_copy_` on a flattened 2D view. A
+    dedicated single-dimension copy instead of the generic multi-dimensional
+      IndexPut template, writing the same rows to the same slots.
+    
+    Both changes are bit-exact: the indices are unique per request, no
+    accumulate
+    path is involved, and the dtype conversion and arithmetic are unchanged.
+    There
+    is no API or behavior change outside this layer.
+    
+    ### Does this PR introduce _any_ user-facing change?
+    No. The change only replaces how the 310P GDN prefill path clears and
+    writes
+    back its recurrent state internally. The results are bit-exact, and
+    there is no
+    change to public APIs, configuration options, kernel signatures, or the
+    behaviour of any non-310P backend.
+    
+    ### How was this patch tested?
+    
+    - Accuracy: served Qwen3.5 on Atlas 300I Duo with both the baseline
+    build and
+    this patch, and compared the generated outputs over the same prompts;
+    the
+      results are identical.
+    
+    - Profiling: collected a MindStudio trace of a prefill step and
+    confirmed the
+      two indexed assignments no longer take the generic IndexPut path.
+    
+    ### Checklist
+    
+    #### Testing
+    
+    - [ ] **Boundary / edge-case coverage**: I reviewed whether this change
+    involves
+    boundary conditions (e.g. empty input, single/zero element, min/max
+    values,
+    off-by-one, sequence-length limits, integer overflow). Where applicable,
+    I
+    added unit tests covering these edge cases in `tests/ut/` or
+    `tests/e2e/`.
+    - [ ] **Regression test**: If this PR fixes a bug, I added a regression
+    test
+      that would fail without the fix.
+    - [ ] **Error / failure path coverage**: I covered abnormal paths
+    (exceptions,
+    timeouts, out-of-range, division by zero) in addition to the happy path.
+    - [ ] **Meaningful & reliable tests**: New tests assert real behavior
+    and are
+      not written merely to satisfy CI.
+    - [ ] **Performance impact**: If this PR touches a performance-sensitive
+    path,
+      I attached benchmark results and added performance regression tests.
+    
+    
+    - vLLM main:
+    https://github.com/vllm-project/vllm/commit/a98247ab4db686ee03c66d5feb3c761e52a2f8ab
+    
+    Signed-off-by: spoon1116 <1522707055@qq.com>
+    Co-authored-by: Shaoxu Cheng <2906339855@qq.com>
+
+diff --git a/vllm_ascend/_310p/ops/fla/gdn_310.py b/vllm_ascend/_310p/ops/fla/gdn_310.py
+index 77a40c870..65a117122 100644
+--- a/vllm_ascend/_310p/ops/fla/gdn_310.py
++++ b/vllm_ascend/_310p/ops/fla/gdn_310.py
+@@ -358,7 +358,7 @@ class AscendGatedDeltaNetAttention310(GatedDeltaNetAttention):
+             # 2.2: Process the remaining part
+             if attn_metadata.num_prefills > 0:
+                 initial_state = ssm_state[non_spec_state_indices_tensor].contiguous()
+-                initial_state[~has_initial_state, ...] = 0
++                initial_state.masked_fill_(~has_initial_state.view(-1, 1, 1, 1), 0)
+                 (
+                     core_attn_out_non_spec,
+                     last_recurrent_state,
+@@ -375,8 +375,12 @@ class AscendGatedDeltaNetAttention310(GatedDeltaNetAttention):
+                     use_qk_l2norm_in_kernel=True,
+                 )
+ 
+-                # Init cache
+-                ssm_state[non_spec_state_indices_tensor] = last_recurrent_state.to(ssm_state.dtype)
++                state_rows = ssm_state.view(ssm_state.shape[0], -1)
++                state_rows.index_copy_(
++                    0,
++                    non_spec_state_indices_tensor,
++                    last_recurrent_state.to(ssm_state.dtype).view(-1, state_rows.shape[1]),
++                )
+             elif attn_metadata.num_decodes > 0:
+                 num_decodes = attn_metadata.num_decodes
+                 core_attn_out_non_spec = npu_recurrent_gated_delta_rule_310(
