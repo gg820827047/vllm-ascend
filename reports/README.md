@@ -1,6 +1,7 @@
 # vLLM Ascend：30 → 31 → 32 演进报告
 
 - [三版本 HTML 总览](index.html)：逐阶段统计、性能机制演进矩阵、关键代码符号追踪。
+- [DeepSeek 优化专题](deepseek_summary/report.html)：37 项直接优化、20 项性能使能、适用条件及代码量；[PR 明细 CSV](deepseek_summary/prs.csv)。
 - [30 → 31 报告说明](v0.31.0rc_vs_v0.30.0rc2/README.md) · [HTML](v0.31.0rc_vs_v0.30.0rc2/report.html)。
 - [31 → 32 报告说明](v0.32.0rc_vs_v0.31.0rc/README.md) · [HTML](v0.32.0rc_vs_v0.31.0rc/report.html)。
 - [演进矩阵 CSV](evolution_matrix.csv) · [总览数据 JSON](overview_data.json)。
