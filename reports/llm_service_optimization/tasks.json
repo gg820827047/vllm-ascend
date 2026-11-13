@@ -1,0 +1,1411 @@
+{
+  "title": "LLM 服务请求全局视图与性能任务台账",
+  "date": "2026-11-13",
+  "scope": "以 A3 / DeepSeek / vLLM-CANN 为主要优化对象；A5用于机制对照。主要工作在模型调用与框架，网关、Mooncake与重型算子保留边界观测和协同接口。",
+  "roles": {
+    "lead": "性能分析 / 项目统筹",
+    "framework": "vLLM / Ascend 框架开发",
+    "model": "模型适配开发",
+    "bench": "部署 / 压测",
+    "infra": "NPU / CPU / 通信运维",
+    "vendor": "CANN / 算子对接"
+  },
+  "categories": {
+    "G": "共同基础",
+    "A": "① A3 同步点与 Host 开销",
+    "B": "② 算子 / 执行路径 / 引擎差异",
+    "C": "③ 快慢卡与并行等待",
+    "D": "④ 切分与配置差异",
+    "R": "回归与资产归档"
+  },
+  "stages": [
+    {
+      "id": "S0",
+      "title": "请求进入",
+      "subtitle": "API 接入、分词、路由",
+      "meaning": "记录请求 ID、输入/输出 token、流式时间；Agent 的一次任务可能产生多个 LLM 请求。",
+      "code": "网关 / API server / tokenizer；只做必要边界观测。",
+      "observe": "客户端与 API 时间戳、到达率、队列与错误率"
+    },
+    {
+      "id": "S1",
+      "title": "引擎调度与缓存判定",
+      "subtitle": "请求排队 → 本轮 token / KV block",
+      "meaning": "本地 prefix cache 与外部 Store 是不同缓存域；先确定命中来源、实际未计算 token 与本轮预算。",
+      "code": "vLLM EngineCore / Scheduler / KVCacheManager / connector scheduler",
+      "observe": "排队、命中率、调度 token、抢占、等待外部加载"
+    },
+    {
+      "id": "S2",
+      "title": "P 端 Host 输入准备",
+      "subtitle": "execute_model 入口 → 首层",
+      "meaning": "请求状态、positions、slot mapping、SWA / DSA 元数据、H2D、DP 元数据协商。",
+      "code": "Ascend Model Runner V1/V2 / attention metadata builder",
+      "observe": "Python scope、Torch op、CANN API、Gloo 与首层关联"
+    },
+    {
+      "id": "S3",
+      "title": "P 端模型计算",
+      "subtitle": "Prefill 的目标模型层",
+      "meaning": "Norm / QKV / DSA-MLA / SWA / MoE；TP、EP 通信与多流依赖贯穿其中，不能把累计算子时间当成关键路径。",
+      "code": "DeepSeek 模型 → attention / MoE → torch_npu / CANN",
+      "observe": "同 shape 算子、AI Core / Vector / AICPU、通信、空洞、依赖关系"
+    },
+    {
+      "id": "S4",
+      "title": "采样与结果回传",
+      "subtitle": "logits → sampling → D2H",
+      "meaning": "P 端可能为交接生成首 token；P/D 首 token 的归属和返回顺序以实际代理协议为准。D2H 也出现在 D 端每轮结果处理中。",
+      "code": "sampler / async output / executor 输出线程",
+      "observe": "D2H 方向与字节数、完成事件、消费线程、输出处理"
+    },
+    {
+      "id": "S5",
+      "title": "KV 交接与外部缓存",
+      "subtitle": "P/D 传输；Store 读写旁路",
+      "meaning": "P2P connector 负责 P/D 交接；Store 提供共享外部缓存。MultiConnector 按策略组合子 connector，不等于必须开启池化；不是每个请求都串行经过两者。",
+      "code": "MooncakeConnector / Hybrid / MultiConnector / AscendStore",
+      "observe": "KV 就绪、发送、接收、加载完成、缓存组、命中/失败/重算"
+    },
+    {
+      "id": "S6",
+      "title": "D 端调度与准备",
+      "subtitle": "接收 KV → 本轮 decode 输入",
+      "meaning": "等待 KV 可用、调度合批、准备位置与 block table；必要的尾 token / 窗口恢复工作取决于模型与 connector，不能直接假定为零。",
+      "code": "D 端 Scheduler / connector / Model Runner",
+      "observe": "加载等待、输入准备、异步调度、有效/无效工作"
+    },
+    {
+      "id": "S7",
+      "title": "D 端重复生成",
+      "subtitle": "目标模型 / draft / verify 循环",
+      "meaning": "重复执行模型与采样，直到停止条件。投机接受率影响每轮有效输出数，step 不等于单个 token。",
+      "code": "D 端模型 / Attention / MoE / MTP / 图重放",
+      "observe": "有效 tokens / step、step 延迟、接受率、KV 读取与通信"
+    },
+    {
+      "id": "S8",
+      "title": "流式返回",
+      "subtitle": "输出线程 → API / proxy → 客户端",
+      "meaning": "反分词、流式合包、网络发送；客户端 ITL 是输出事件间隔，不能无条件当作设备单 token 时间。",
+      "code": "detokenizer / API streaming / proxy",
+      "observe": "客户端 TTFT / ITL / TPOT、服务端完成时间、取消/超时"
+    }
+  ],
+  "evidence": [
+    {
+      "id": "E01",
+      "title": "已提交的 A3/A5 主报告",
+      "source": "../dsv41_a3_a5_prefill/report.html",
+      "detail": "P.rar=A3，DP4×TP4/EP16；bs12.zip=A5，DP8×TP1/EP8。另有历史 A3 ZIP，不能把两份 A3 当成 A3/A5。"
+    },
+    {
+      "id": "E02",
+      "title": "A3/A5 的输入准备与融合证据",
+      "source": "../dsv41_a3_a5_prefill/report.html",
+      "detail": "代表有效前向：准备硬件任务 1641 vs 221；A3 42 次 RepeatInterleave、Index/IndexCheck 各176次。A5 40 次 RMSNorm+MX 动态量化融合。两组还有 Runner、CANN、量化与负载差异。"
+    },
+    {
+      "id": "E03",
+      "title": "D2H / 同步 / 重叠补充核对，2026-11-13",
+      "source": "../dsv41_a3_a5_prefill/README.md",
+      "detail": "基于同批 SQLite/trace 的后续查询：A3 DP0/TP0 的两条明确 D2H 来自 sample_tokens→async_copy_to_np；约7.3ms Event wait 在后台输出线程。A5 DP0/TP0 两条 D2H 也来自采样输出。代表 A3 execute_model 内未见阻塞式 Synchronize；这不覆盖所有请求/所有隐式等待。"
+    },
+    {
+      "id": "E04",
+      "title": "跨 rank 的 MegaMoE 原始索引",
+      "source": "../dsv41_a3_a5_prefill/data/mega_cross_rank.csv",
+      "detail": "A3 共同轮0/层0：DP0TP0 dummy 44.239ms，DP1TP0 prefill 0.491ms，结束差约5µs。A5 共同轮2/层0：DP1 dummy 104.821ms，DP2 prefill 5.581ms，结束差约0.464ms。指向内部等待，不能把最长 Mega 当成最慢计算卡。"
+    },
+    {
+      "id": "E05",
+      "title": "同 shape 卡间补充核对，2026-11-13",
+      "source": "../dsv41_a3_a5_prefill/README.md",
+      "detail": "相同 kernel/完整输入shape、有效目标模型层内统计：A3 HcPre[1848]，12 rank 中位数352.648–357.117µs，差1.27%；A5 HcPre[128]，7 rank为17.022–17.566µs，差3.20%。A3某MatMul[1848,5120;512,5120]为51.571–78.362µs。尚未控制所有stride/tiling/并发资源因素，不能据此确认物理慢卡。"
+    },
+    {
+      "id": "E06",
+      "title": "DeepSeek 30→31→32 优化清单",
+      "source": "../deepseek_summary/report.html",
+      "detail": "已有 PR、代码依据、适用条件与代码量梳理；上游作者收益、当前代码已集成、trace出现、当前服务端到端收益是四种不同证据。"
+    },
+    {
+      "id": "E07",
+      "title": "CANN 升级代码与验证反馈",
+      "source": "https://github.com/vllm-project/vllm-ascend/pull/21521",
+      "detail": "本地升级分支核对到9a6a156fccccb7ad55c5d534c8948d3ec4efc3f8。用户反馈 DeepSeek 1P1D 功能通过；缺少本次可审计的完整原始性能对照，不能据此量化单项收益或覆盖 GLM 2P2D。"
+    },
+    {
+      "id": "E08",
+      "title": "0.32 调度开关的固定源码",
+      "source": "https://github.com/vllm-project/vllm/blob/5df63a7203cdb9328d824a27b682e77c7b9928be/vllm/config/vllm.py#L1585",
+      "detail": "async_scheduling=None 时按兼容条件解析；未在命令中显式传入不代表关闭。采集镜像的实际 core SHA 和最终解析值仍需补齐。"
+    },
+    {
+      "id": "E09",
+      "title": "CANN 流依赖与 Host 同步语义",
+      "source": "https://www.hiascend.com/doc_center/source/zh/canncommercial/850/appdevg/acldevg/aclcppdevg_000013.html",
+      "detail": "StreamWaitEvent 建立设备流依赖；SynchronizeEvent/Stream/Device 阻塞调用线程。接口耗时不等于设备等待量，后台线程 wait 不一定挡住模型下发。"
+    },
+    {
+      "id": "E10",
+      "title": "学习地图与实验模板",
+      "source": "../npu_inference_learning/index.html",
+      "detail": "已有请求生命周期、代码入口、性能指标、Roofline、profiling 方法和实验模板，可复用为本台账的学习与复现入口。"
+    }
+  ],
+  "history": [
+    {
+      "id": "H01",
+      "title": "版本与优化 PR 梳理",
+      "stage": "S1 / S2 / S3 / S7",
+      "status": "分析已完成",
+      "conclusion": "已形成30→31→32与DeepSeek优化清单；不是当前服务加速证明。",
+      "evidence": "E06",
+      "followup": "B01 / D07"
+    },
+    {
+      "id": "H02",
+      "title": "CANN 基线升级到0.32",
+      "stage": "贯穿引擎、模型、connector",
+      "status": "代码已集成；用户功能反馈",
+      "conclusion": "DeepSeek 1P1D 用户反馈通过；单项收益及全拓扑回归待补。",
+      "evidence": "E07",
+      "followup": "G01 / R01"
+    },
+    {
+      "id": "H03",
+      "title": "SWA replay 与后段尾窗机制",
+      "stage": "S1 / S2 / S3 / S5 / S6",
+      "status": "已有集成；trace观察到后段缩小",
+      "conclusion": "A3代表前向1848→1024，A5为11791→768；不能等同纯开关A/B，也不能取消SP等布局限制。",
+      "evidence": "E01",
+      "followup": "A05 / D05"
+    },
+    {
+      "id": "H04",
+      "title": "A5 RMSNorm + MX 动态量化融合",
+      "stage": "S3 / S7",
+      "status": "trace + 调用栈已观察到",
+      "conclusion": "代表前向40次；属于A5实际路径。A3 INT8消费格式、双输出和算子支持需单独确认。",
+      "evidence": "E02",
+      "followup": "B02"
+    },
+    {
+      "id": "H05",
+      "title": "A3输入准备热点定位",
+      "stage": "S2",
+      "status": "部分分析完成；尚未实施优化",
+      "conclusion": "visible_lens重复展开与索引链是候选；不能声称1641→221全部可在A3消除。",
+      "evidence": "E02",
+      "followup": "A05 / B03"
+    },
+    {
+      "id": "H06",
+      "title": "D2H、流依赖、Host重叠分类",
+      "stage": "S2 / S4 / S6 / S8",
+      "status": "代表窗口已核对；待全量归档",
+      "conclusion": "已区分输出线程wait、采集结束同步和模型热路径；A5存在跨有效prefill的部分准备重叠。",
+      "evidence": "E03",
+      "followup": "A01 / A02 / A03"
+    },
+    {
+      "id": "H07",
+      "title": "EP轮次与等待分析",
+      "stage": "S3 / S7 / X",
+      "status": "部分分析完成",
+      "conclusion": "已对齐共同轮次并发现dummy等待；未证明固定物理慢卡。",
+      "evidence": "E04",
+      "followup": "C01 / C02 / C03"
+    }
+  ],
+  "tasks": [
+    {
+      "id": "G01",
+      "category": "G",
+      "stages": [
+        "X"
+      ],
+      "title": "冻结真实基线与生效配置",
+      "kind": "分析",
+      "priority": "P0",
+      "status": "待补齐",
+      "owner": "待认领",
+      "owner_role": "bench",
+      "collaborators": [
+        "framework",
+        "infra"
+      ],
+      "depends": [],
+      "current": "A3/A5的DP/TP、Runner、CANN和量化路径均不同；采集时完整脚本与最终core SHA不齐。",
+      "actions": [
+        "记录镜像digest、两个仓库SHA、模型/量化版本、torch_npu/CANN、芯片及rank映射。",
+        "保存P/D完整命令、最终解析配置、实际加载路径；列清async、SWA、SP、图、MTP、connector。",
+        "输入/输出长度、并发、到达率、缓存状态和采集边界与trace一一对应。"
+      ],
+      "deliverable": "可复用的基线清单、配置diff和采集manifest。",
+      "expected_benefit": "直接性能收益0；使后续结果可归因。",
+      "metric": "环境/配置字段完整率；不同实验仅保留计划变量。",
+      "acceptance": "第三人能用同一清单复现实验，未知字段明确标记而非猜测。",
+      "evidence": [
+        "E01",
+        "E08"
+      ]
+    },
+    {
+      "id": "G02",
+      "category": "G",
+      "stages": [
+        "S0",
+        "S8"
+      ],
+      "title": "建立请求级指标与固定压测集",
+      "kind": "分析",
+      "priority": "P0",
+      "status": "待补齐",
+      "owner": "待认领",
+      "owner_role": "bench",
+      "collaborators": [
+        "lead"
+      ],
+      "depends": [
+        "G01"
+      ],
+      "current": "已有单机SWA bench与profiling；当前缺少匹配每批trace的完整端到端结果。",
+      "actions": [
+        "区分长短prompt、输出长度、单/多并发、饱和负载和Agent多轮；固定tokenizer与实际token数。",
+        "将冷缓存、相同前缀命中、热身分开；随机输入seed可复现且不意外复用前缀。",
+        "至少多次交错A/B；保留原始流式时间戳、错误、取消、超时与完成量。"
+      ],
+      "deliverable": "统一压测数据集与TTFT/ITL/TPOT分位数、吞吐、goodput基线。",
+      "expected_benefit": "直接性能收益0；避免把超时丢请求或缓存命中变化当成加速。",
+      "metric": "TTFT/TPOT p50/p95/p99；客户端ITL；tokens/s；SLO内完成量。",
+      "acceptance": "负载、完成量和缓存口径相同；结论附自然波动与样本数。",
+      "evidence": [
+        "E10"
+      ]
+    },
+    {
+      "id": "G03",
+      "category": "G",
+      "stages": [
+        "X"
+      ],
+      "title": "建立请求→step→rank→kernel关联与关键路径",
+      "kind": "分析",
+      "priority": "P0",
+      "status": "部分分析",
+      "owner": "待认领",
+      "owner_role": "lead",
+      "collaborators": [
+        "framework",
+        "bench"
+      ],
+      "depends": [
+        "G01",
+        "G02"
+      ],
+      "current": "已有本地forward、目标40层/draft及EP轮次识别；不等于完整请求链路。",
+      "actions": [
+        "关联request_id、scheduled_tokens、step、进程/rank、Python scope和launch连接。",
+        "标出有效prefill、dummy、draft/verify、采集首尾；跨机先核对时钟，勿用本地step序号硬对齐。",
+        "分别计算阶段墙钟与多流区间并集，找客户端延迟的关键依赖。"
+      ],
+      "deliverable": "一张带时间边界的请求关键路径图和可复查事件索引。",
+      "expected_benefit": "直接性能收益0；定位哪个阶段具有可释放时间。",
+      "metric": "未覆盖设备空洞；CPU阻塞；通信/计算重叠；请求阶段等待。",
+      "acceptance": "不重复累计嵌套scope、多流任务和HCCL子任务；不把Free等同Host耗时。",
+      "evidence": [
+        "E01",
+        "E04"
+      ]
+    },
+    {
+      "id": "A01",
+      "category": "A",
+      "stages": [
+        "S1",
+        "S2",
+        "S6"
+      ],
+      "title": "确认异步调度和Runner实际路径",
+      "kind": "分析",
+      "priority": "P0",
+      "status": "部分分析",
+      "owner": "待认领",
+      "owner_role": "framework",
+      "collaborators": [
+        "bench"
+      ],
+      "depends": [
+        "G01"
+      ],
+      "current": "不传async参数不能判定关闭；A3样本为MRV2，A5为MRV1。",
+      "actions": [
+        "核对最终async_scheduling值、兼容性降级日志、executor与Runner类。",
+        "用execute_model、输入准备、输出消费与上一轮设备任务识别真正重叠。",
+        "把Host等待区间与有用CPU准备分开，不用scope重叠反推开关。"
+      ],
+      "deliverable": "每份capture的执行路径卡片与开关真值表。",
+      "expected_benefit": "直接性能收益0；为异步调度A/B提供前提。",
+      "metric": "可用Host准备重叠量；未隐藏的调度时间。",
+      "acceptance": "实际配置和调用栈相符；采集时未知配置保持未知。",
+      "evidence": [
+        "E03",
+        "E08"
+      ]
+    },
+    {
+      "id": "A02",
+      "category": "A",
+      "stages": [
+        "S2",
+        "S3",
+        "S4",
+        "S6",
+        "S7"
+      ],
+      "title": "分类并追踪同步点的关键依赖",
+      "kind": "分析",
+      "priority": "P0",
+      "status": "部分分析",
+      "owner": "待认领",
+      "owner_role": "lead",
+      "collaborators": [
+        "framework",
+        "model"
+      ],
+      "depends": [
+        "G03",
+        "A01"
+      ],
+      "current": "A3代表execute窗口有较多StreamWaitEvent，但未见阻塞式Synchronize；不能概括所有step。",
+      "actions": [
+        "逐处分类Host阻塞同步、设备流依赖、collective等待和采集器同步。",
+        "记录线程、调用栈、被等待事件、是否阻塞下一次有效下发。",
+        "统计未被计算覆盖的等待与实际device空洞，排除后台输出wait和profiler stop误归因。"
+      ],
+      "deliverable": "同步点台账：位置/原因/正确性约束/关键路径贡献/能否优化。",
+      "expected_benefit": "直接性能收益0；只筛出值得修改的同步点。",
+      "metric": "每类等待次数、墙钟、暴露时间；有因果关联的设备空洞。",
+      "acceptance": "至少复现多个有效step；每个删除或后移建议有数据依赖证明。",
+      "evidence": [
+        "E03",
+        "E09"
+      ]
+    },
+    {
+      "id": "A03",
+      "category": "A",
+      "stages": [
+        "S4",
+        "S8"
+      ],
+      "title": "核对D2H与异步输出是否挡住流水",
+      "kind": "分析",
+      "priority": "P0",
+      "status": "部分分析",
+      "owner": "待认领",
+      "owner_role": "framework",
+      "collaborators": [
+        "model"
+      ],
+      "depends": [
+        "A02"
+      ],
+      "current": "A3/A5都观察到采样输出D2H；长Event同步可能在后台get_output。",
+      "actions": [
+        "记录D2H方向/字节数/同步方式/Host消费者，不把所有copy_或item都当D2H。",
+        "区分采样结果、序列长度/接受token统计、调试输出与KV搬运。",
+        "仅对关键路径候选评估批量回传、延后消费或保留设备状态；保留完成事件和buffer寿命。"
+      ],
+      "deliverable": "D2H依赖图与可后移/必须等待列表。",
+      "expected_benefit": "分析阶段直接收益0；若有暴露等待，优化上限由可隐藏的ΔT决定。",
+      "metric": "D2H实际传输、消费等待、下一轮启动及客户端输出延迟。",
+      "acceptance": "不读未完成结果；端到端p95和完成量共同验证，不能只报API耗时。",
+      "evidence": [
+        "E03",
+        "E09"
+      ]
+    },
+    {
+      "id": "A04",
+      "category": "A",
+      "stages": [
+        "S2",
+        "S6"
+      ],
+      "title": "拆解DP元数据同步和Gloo等待",
+      "kind": "分析",
+      "priority": "P0",
+      "status": "部分分析",
+      "owner": "待认领",
+      "owner_role": "framework",
+      "collaborators": [
+        "infra",
+        "model"
+      ],
+      "depends": [
+        "G03",
+        "C01"
+      ],
+      "current": "A3代表准备段Gloo约88.8ms，其中约69.2ms与上轮设备任务重叠。",
+      "actions": [
+        "比较所有DP进入同步的时间、有效/dummy状态和各自输入准备。",
+        "拆为已隐藏等待、上游晚到、通信本身与Host处理；不要把88.8ms全部算收益空间。",
+        "先查晚到原因；仅在依赖允许时评估同步时机或元数据粒度。"
+      ],
+      "deliverable": "跨DP到达/完成对齐图和暴露等待预算。",
+      "expected_benefit": "分析阶段直接收益0；后续只能回收关键路径上可消除的等待。",
+      "metric": "最后到达者；到达离散度；未覆盖等待；首层启动时间。",
+      "acceptance": "同一共同轮次、完整参与rank；改动不破坏EP参与和token padding一致性。",
+      "evidence": [
+        "E01",
+        "E04"
+      ]
+    },
+    {
+      "id": "A05",
+      "category": "A",
+      "stages": [
+        "S2"
+      ],
+      "title": "复用step内SWA/DSA元数据与visible_lens",
+      "kind": "优化候选",
+      "priority": "P1",
+      "status": "待实验",
+      "owner": "待认领",
+      "owner_role": "model",
+      "collaborators": [
+        "framework",
+        "bench"
+      ],
+      "depends": [
+        "G02",
+        "A02",
+        "B01"
+      ],
+      "current": "A3已有重复展开与索引链证据，尚未提交此项性能修改。",
+      "actions": [
+        "确认各层输入、缓存组与窗口参数是否等价，先做同step安全复用。",
+        "测RepeatInterleave、Index/Check等调用是否真实减少，检查分配与Python处理。",
+        "复用缓存在step/请求状态改变时失效，覆盖chunk、抢占、prefix命中与窗口边界。"
+      ],
+      "deliverable": "小范围patch、元数据微基准、正确性用例与端到端A/B。",
+      "expected_benefit": "预期减少重复元数据生成和准备开销；幅度待实测，不能套用A5的1641→221比例。",
+      "metric": "准备关键路径Δms、launch/分配次数、TTFT、内存峰值。",
+      "acceptance": "元数据逐项等价；多轮无陈旧状态；端到端收益超过自然波动。",
+      "evidence": [
+        "E02"
+      ]
+    },
+    {
+      "id": "A06",
+      "category": "A",
+      "stages": [
+        "S2",
+        "S6"
+      ],
+      "title": "优化Host下发与准备热路径",
+      "kind": "优化候选",
+      "priority": "P1",
+      "status": "待分析",
+      "owner": "待认领",
+      "owner_role": "framework",
+      "collaborators": [
+        "model",
+        "infra"
+      ],
+      "depends": [
+        "G03",
+        "A02"
+      ],
+      "current": "可从Python循环、小tensor构造、重复cast/copy及元数据下发入手；尚未量化各自self time。",
+      "actions": [
+        "按未覆盖Host时间排序，区分Python计算、runtime下发与等待。",
+        "评估持久buffer、批量构造、移除无效转换和小操作复用；区分CPU张量与设备张量。",
+        "核对NUMA/绑核和线程竞争，避免把运行环境问题改成复杂代码。"
+      ],
+      "deliverable": "Host热点清单及每次只改一个因素的patch/实验。",
+      "expected_benefit": "减少暴露的准备/下发时间；若已被设备覆盖，时延收益可能为0。",
+      "metric": "Host self time、launch速率、分配数、设备空洞、TTFT/TPOT。",
+      "acceptance": "有明确关键路径收益；输出、请求隔离和异步buffer寿命正确。",
+      "evidence": [
+        "E02",
+        "E10"
+      ]
+    },
+    {
+      "id": "A07",
+      "category": "A",
+      "stages": [
+        "S1",
+        "S2",
+        "S6",
+        "S7"
+      ],
+      "title": "做异步调度受控A/B",
+      "kind": "验证",
+      "priority": "P1",
+      "status": "待实验",
+      "owner": "待认领",
+      "owner_role": "framework",
+      "collaborators": [
+        "bench",
+        "model"
+      ],
+      "depends": [
+        "A01",
+        "A02",
+        "G02"
+      ],
+      "current": "已看到部分跨step重叠，但尚无相同环境下的开关收益实验。",
+      "actions": [
+        "在版本支持的组合中显式ON/OFF，核对实际生效；禁止借切换Runner同时改变多个变量。",
+        "覆盖长prefill、混合负载、decode与MTP；检查有用准备提前量。",
+        "观察排队/吞吐、尾延迟与CPU占用，区分Host空档减少和collective等待转移。"
+      ],
+      "deliverable": "异步调度兼容矩阵、前后时间线与服务级收益表。",
+      "expected_benefit": "有机会隐藏调度/输出处理开销；设备持续满载时收益可能有限。",
+      "metric": "TTFT/TPOT p95、goodput、Host/device有效重叠、CPU占用。",
+      "acceptance": "同工作量多次复测；无错误、输出状态错配和饥饿；给出无收益场景。",
+      "evidence": [
+        "E03",
+        "E08"
+      ]
+    },
+    {
+      "id": "A08",
+      "category": "A",
+      "stages": [
+        "S2",
+        "S3",
+        "S6",
+        "S7"
+      ],
+      "title": "模型多流与可切分计算的重叠评估",
+      "kind": "优化候选",
+      "priority": "P2",
+      "status": "待分析",
+      "owner": "待认领",
+      "owner_role": "model",
+      "collaborators": [
+        "framework",
+        "bench"
+      ],
+      "depends": [
+        "B01",
+        "A02",
+        "G02"
+      ],
+      "current": "这是模型/框架可控制的方向；当前没有证明具体子图可并行。",
+      "actions": [
+        "画出输入准备、独立投影、量化、通信与消费子图的数据依赖，选独立分支。",
+        "评估torch_npu stream/event与生命周期；仅对允许的子图切分、流水，检查共享内存与核资源竞争。",
+        "记录收益是否来自计算通信重叠，检查新增同步、HBM峰值与图捕获限制。"
+      ],
+      "deliverable": "依赖图、最小多流/切分实验和正反例。",
+      "expected_benefit": "可能隐藏独立计算/通信；竞争或切分过细可能变慢，不预设加速。",
+      "metric": "关键路径、重叠量、launch数、HBM峰值、TTFT/TPOT。",
+      "acceptance": "数值等价、无数据竞争；支持配置边界明确，保留必要event。",
+      "evidence": [
+        "E09",
+        "E10"
+      ]
+    },
+    {
+      "id": "B01",
+      "category": "B",
+      "stages": [
+        "S2",
+        "S3",
+        "S7"
+      ],
+      "title": "建立同口径算子与执行引擎清单",
+      "kind": "分析",
+      "priority": "P0",
+      "status": "部分分析",
+      "owner": "待认领",
+      "owner_role": "lead",
+      "collaborators": [
+        "model",
+        "vendor"
+      ],
+      "depends": [
+        "G01",
+        "G03"
+      ],
+      "current": "已有代表窗口算子对比；A3/A5含Runner、CANN、量化和负载混杂。",
+      "actions": [
+        "按阶段、目标/draft、真实kernel、完整shape、dtype、layout/stride和调用栈归档。",
+        "标出AI Core/Cube、Vector、AICPU、SDMA与通信；区分API、CPU op和硬件任务。",
+        "比较每次耗时、次数、并集关键路径及融合前后功能范围，避免同名不同工作量。"
+      ],
+      "deliverable": "可筛选算子目录与公平比较的可比/不可比矩阵。",
+      "expected_benefit": "直接性能收益0；定位能由模型替换、元数据或配置解决的部分。",
+      "metric": "同shape单次分布、调用数、关键路径占比、实际执行引擎。",
+      "acceptance": "明确已融合功能，不能以算子减少数量直接证明端到端收益。",
+      "evidence": [
+        "E01",
+        "E02"
+      ]
+    },
+    {
+      "id": "B02",
+      "category": "B",
+      "stages": [
+        "S3",
+        "S7"
+      ],
+      "title": "核对并替换可用Norm/量化融合路径",
+      "kind": "优化候选",
+      "priority": "P1",
+      "status": "待分析",
+      "owner": "待认领",
+      "owner_role": "model",
+      "collaborators": [
+        "vendor",
+        "bench"
+      ],
+      "depends": [
+        "B01",
+        "G02"
+      ],
+      "current": "A5的RMSNorm+MX动态量化已观察到；A3为不同量化消费路径。",
+      "actions": [
+        "核对A3可用融合算子及硬件支持，确认BF16归一化结果是否还有其他消费者。",
+        "检查INT8/MXFP等格式、scale布局、双输出、精度与shape支持；不直接搬A5专用内核。",
+        "先做等价替换微基准再测目标层和服务，缺少可用接口时转B06。"
+      ],
+      "deliverable": "兼容性表、可用接口替换方案或明确不可复用的理由。",
+      "expected_benefit": "可能减少中间读写、kernel下发和临时buffer；实际收益待实验。",
+      "metric": "Norm+quant组合墙钟、HBM读写、launch数、TTFT/TPOT。",
+      "acceptance": "消费者语义和量化精度一致；关注整体子图而非单个算子。",
+      "evidence": [
+        "E02"
+      ]
+    },
+    {
+      "id": "B03",
+      "category": "B",
+      "stages": [
+        "S2",
+        "S6"
+      ],
+      "title": "融合准备阶段的小算子链",
+      "kind": "优化候选",
+      "priority": "P1",
+      "status": "待分析",
+      "owner": "待认领",
+      "owner_role": "model",
+      "collaborators": [
+        "framework",
+        "vendor"
+      ],
+      "depends": [
+        "A05",
+        "B01"
+      ],
+      "current": "优先完成复用后，再判断剩余visible_lens/索引/边界计算是否值得融合。",
+      "actions": [
+        "将热点输入输出与依赖固定，列出现有aclnn或可维护的小Triton融合实现。",
+        "比较单kernel与Torch组合；同时测Host下发和设备任务，不承诺实现重型Attention/MoE内核。",
+        "覆盖变长、空batch、小shape、不同缓存组和边界；复用与融合分开测贡献。"
+      ],
+      "deliverable": "准备子图规格、融合实验和可复用微基准。",
+      "expected_benefit": "可能降低launch数与暴露的准备时间；小任务累加时间不是收益上限。",
+      "metric": "launch数、准备墙钟、buffer分配、TTFT p95。",
+      "acceptance": "输入输出逐项一致；新增路径有稳定端到端收益才保留。",
+      "evidence": [
+        "E02"
+      ]
+    },
+    {
+      "id": "B04",
+      "category": "B",
+      "stages": [
+        "S3",
+        "S7"
+      ],
+      "title": "定位Attention/Indexer/MLA的瓶颈与调用条件",
+      "kind": "分析",
+      "priority": "P1",
+      "status": "待分析",
+      "owner": "待认领",
+      "owner_role": "model",
+      "collaborators": [
+        "vendor",
+        "lead"
+      ],
+      "depends": [
+        "B01"
+      ],
+      "current": "算子本体暂不作为团队主要开发范围，但调用方式和输入条件可控。",
+      "actions": [
+        "同shape同上下文比较，区分计算、HBM读写、元数据与稀疏选择工作量。",
+        "核对布局/连续性、额外转置、量化转换和已有融合接口，确认实际走预期backend。",
+        "结合PMU/内存指标与关键路径证据判断bound；单看耗时占比不能判断算力不足。"
+      ],
+      "deliverable": "Attention子图瓶颈结论、可在调用侧处理的项及CANN问题单材料。",
+      "expected_benefit": "分析直接收益0；可能通过布局、接口或batch条件消除额外开销。",
+      "metric": "同shape延迟、有效工作量、内存/计算指标、关键路径。",
+      "acceptance": "不能优化时给出证据和边界，不把A3/A5原始耗时比当硬件倍率。",
+      "evidence": [
+        "E01",
+        "E10"
+      ]
+    },
+    {
+      "id": "B05",
+      "category": "B",
+      "stages": [
+        "S3",
+        "S7"
+      ],
+      "title": "拆解MegaMoE的计算、搬运、通信与等待",
+      "kind": "分析",
+      "priority": "P0",
+      "status": "部分分析",
+      "owner": "待认领",
+      "owner_role": "lead",
+      "collaborators": [
+        "model",
+        "infra",
+        "vendor"
+      ],
+      "depends": [
+        "B01",
+        "C01"
+      ],
+      "current": "Mega占比高且含跨rank交互；最长事件不一定承担最多计算。",
+      "actions": [
+        "同一共同轮/层对齐所有EP rank，记录到达/结束、tokens和专家负载。",
+        "结合MAC/向量/内存/通信数据拆分可计算部分和等待；内部不可见部分明确为未知。",
+        "从调用侧评估输入格式、token分布、已有通信策略和粒度；核内瓶颈交B06。"
+      ],
+      "deliverable": "MegaMoE归因图和模型/框架/算子方各自可行动清单。",
+      "expected_benefit": "分析直接收益0；优先减少输入晚到与不均衡，不能把Mega总占比全算可优化。",
+      "metric": "到达离散、有效计算/等待、专家负载、层关键路径。",
+      "acceptance": "包含完整EP组并排除采集边界；不能仅凭低MAC证明全部时间都在等。",
+      "evidence": [
+        "E04"
+      ]
+    },
+    {
+      "id": "B06",
+      "category": "B",
+      "stages": [
+        "S3",
+        "S7"
+      ],
+      "title": "整理重型算子最小复现并交接算子团队",
+      "kind": "分析",
+      "priority": "P2",
+      "status": "待分析",
+      "owner": "待认领",
+      "owner_role": "vendor",
+      "collaborators": [
+        "model",
+        "bench"
+      ],
+      "depends": [
+        "B04",
+        "B05"
+      ],
+      "current": "若公平对照后确认核内瓶颈，团队不默认自行重写Attention或MegaMoE。",
+      "actions": [
+        "导出shape/dtype/stride/layout、tiling条件、并发流、版本与可复现输入。",
+        "提供带设备完成等待的微基准、预热、分位数、精度基线和原始trace。",
+        "跟踪可用版本、融合接口、fallback或形状适配方案，回到服务验收。"
+      ],
+      "deliverable": "可交接的算子性能问题包与责任接口。",
+      "expected_benefit": "分析直接收益0；解锁外部算子修复或已有实现替换，收益待返回版本验证。",
+      "metric": "可复现率、核内延迟、服务回归收益与精度。",
+      "acceptance": "复现能在对应硬件运行；无数据时不指定compute/memory bound结论。",
+      "evidence": [
+        "E10"
+      ]
+    },
+    {
+      "id": "B07",
+      "category": "B",
+      "stages": [
+        "S2",
+        "S3",
+        "S6",
+        "S7"
+      ],
+      "title": "区分Eager、图重放和static kernel实际命中",
+      "kind": "分析",
+      "priority": "P1",
+      "status": "待分析",
+      "owner": "待认领",
+      "owner_role": "framework",
+      "collaborators": [
+        "model",
+        "bench"
+      ],
+      "depends": [
+        "G01",
+        "B01"
+      ],
+      "current": "FULL_DECODE_ONLY不等于prefill走图；static kernel开关也不保证所有shape命中。",
+      "actions": [
+        "标记prefill/decode/draft各路径的图捕获范围、回退原因和shape档位。",
+        "比较图重放减少的Host下发与padding额外工作，区分SWA replay和graph replay。",
+        "核对Runner、版本与算子支持后才做受控开关实验。"
+      ],
+      "deliverable": "执行模式覆盖表与可实验的shape/配置集合。",
+      "expected_benefit": "分析直接收益0；图命中后可能降低decode下发成本，不能泛化到prefill。",
+      "metric": "每step launch/Host时间、padding、图命中、TPOT p95。",
+      "acceptance": "相同工作负载和精度；记录未命中场景与显存代价。",
+      "evidence": [
+        "E01",
+        "E06"
+      ]
+    },
+    {
+      "id": "C01",
+      "category": "C",
+      "stages": [
+        "X"
+      ],
+      "title": "对齐通信组、共同轮次与物理卡映射",
+      "kind": "分析",
+      "priority": "P0",
+      "status": "部分分析",
+      "owner": "待认领",
+      "owner_role": "lead",
+      "collaborators": [
+        "infra",
+        "bench"
+      ],
+      "depends": [
+        "G01",
+        "G03"
+      ],
+      "current": "已有EP共同轮次对齐；仍需完整物理NPU、CPU、NUMA与链路映射。",
+      "actions": [
+        "建立DP/TP/EP/PCP/PP到进程、host、物理device映射。",
+        "同轮同层比较有效/dummy与到达/结束；不要用各rank本地step编号直接对齐。",
+        "标注不完整首尾采集，跨机时间先校准。"
+      ],
+      "deliverable": "拓扑图、rank映射和共同轮次索引。",
+      "expected_benefit": "直接性能收益0；避免把工作量不同或边界等待识别为慢卡。",
+      "metric": "参与rank覆盖、事件对齐误差、缺失窗口。",
+      "acceptance": "全参与组可复查；未知映射明确标记。",
+      "evidence": [
+        "E04"
+      ]
+    },
+    {
+      "id": "C02",
+      "category": "C",
+      "stages": [
+        "S3",
+        "S7"
+      ],
+      "title": "做同工作量的计算卡间一致性分析",
+      "kind": "分析",
+      "priority": "P0",
+      "status": "部分分析",
+      "owner": "待认领",
+      "owner_role": "lead",
+      "collaborators": [
+        "infra",
+        "vendor"
+      ],
+      "depends": [
+        "C01",
+        "B01"
+      ],
+      "current": "HcPre离散较小；A3某同shape MatMul可差约52%，原因未定。",
+      "actions": [
+        "按kernel、shape、dtype、layout/stride、tiling、层位置与并发条件配对。",
+        "跨多轮比较各卡分位数，覆盖MatMul、Norm等多类纯计算，独立于collective耗时。",
+        "确认是否始终同一物理卡偏慢；记录局部异常而不武断判卡故障。"
+      ],
+      "deliverable": "按物理卡的稳定性矩阵、异常样本与待排除因素。",
+      "expected_benefit": "直接性能收益0；识别持续退化、资源争用或调用条件差异。",
+      "metric": "同条件中位数/p95比例、跨轮重复性、关键路径贡献。",
+      "acceptance": "单一算子异常不作为固定慢卡结论；对异常用独立微基准复核。",
+      "evidence": [
+        "E05"
+      ]
+    },
+    {
+      "id": "C03",
+      "category": "C",
+      "stages": [
+        "S2",
+        "S3",
+        "S6",
+        "S7"
+      ],
+      "title": "查明晚到rank和EP拖尾的来源",
+      "kind": "分析",
+      "priority": "P0",
+      "status": "部分分析",
+      "owner": "待认领",
+      "owner_role": "framework",
+      "collaborators": [
+        "model",
+        "infra"
+      ],
+      "depends": [
+        "C01",
+        "G03"
+      ],
+      "current": "A3/A5均有dummy先到后等待；慢到与算得慢是不同问题。",
+      "actions": [
+        "从每层collective/Mega反向追到Host准备、不同token量、KV加载和CPU调度。",
+        "区分DP请求不均、专家token不均、通信慢和单卡计算慢。",
+        "将等待归到实际晚到路径，评估均衡与调度方案而非删除dummy参与。"
+      ],
+      "deliverable": "晚到根因排序和每类等待的可回收预算。",
+      "expected_benefit": "分析直接收益0；为减少全组拖尾提供依据。",
+      "metric": "最后到达rank、跨rank到达差、暴露等待、层墙钟。",
+      "acceptance": "同组共同轮次、输入工作量可解释；不破坏MoE collective一致性。",
+      "evidence": [
+        "E04"
+      ]
+    },
+    {
+      "id": "C04",
+      "category": "C",
+      "stages": [
+        "X"
+      ],
+      "title": "核对频率、温度、CPU/NUMA与资源争用",
+      "kind": "分析",
+      "priority": "P1",
+      "status": "待采集",
+      "owner": "待认领",
+      "owner_role": "infra",
+      "collaborators": [
+        "bench",
+        "lead"
+      ],
+      "depends": [
+        "C01",
+        "C02"
+      ],
+      "current": "当前静态NPU配置不足以证明运行时没有降频、带宽或CPU争用。",
+      "actions": [
+        "同步采集运行频率/温度/功耗、HBM和链路状态，保留时间戳。",
+        "核对CPU绑核、NUMA、进程负载、共享设备与后台任务，关联异常step。",
+        "区分硬件限制、环境部署和模型实现，不只比较型号标称频率。"
+      ],
+      "deliverable": "资源遥测与异常step对齐证据。",
+      "expected_benefit": "直接性能收益0；若确认降频/争用，修复部署可恢复损失性能。",
+      "metric": "同条件算子分布、运行频率、CPU等待与内存/链路指标。",
+      "acceptance": "与异常同一时段采集；保留正常对照，不用事后快照下结论。",
+      "evidence": [
+        "E05"
+      ]
+    },
+    {
+      "id": "C05",
+      "category": "C",
+      "stages": [
+        "S3",
+        "S5",
+        "S7"
+      ],
+      "title": "分析HCCL与P/D、Store链路差异",
+      "kind": "分析",
+      "priority": "P1",
+      "status": "待分析",
+      "owner": "待认领",
+      "owner_role": "infra",
+      "collaborators": [
+        "framework",
+        "bench"
+      ],
+      "depends": [
+        "C01",
+        "G01"
+      ],
+      "current": "全局服务还包括P/D与Store，不能用单P trace覆盖网络交接问题。",
+      "actions": [
+        "区分TP/EP的集合通信、P/D点到点和Store读写，分别核对协议、接口与路由。",
+        "记录KV字节、并发、延迟、带宽、建链、超时和失败回退；冷/热连接分开。",
+        "比较同样数据量下的链路差异和与计算重叠，不把通信任务重复累加。"
+      ],
+      "deliverable": "三类通信的拓扑、基线与瓶颈归属。",
+      "expected_benefit": "分析直接收益0；可能恢复传输吞吐、降低KV就绪等待和失败率。",
+      "metric": "KV交接p95、有效GB/s、建链时间、失败/重算率。",
+      "acceptance": "P/D两端与Store证据齐全；通信失败不能靠吞掉错误当成优化。",
+      "evidence": [
+        "E04",
+        "E07"
+      ]
+    },
+    {
+      "id": "C06",
+      "category": "C",
+      "stages": [
+        "X"
+      ],
+      "title": "通过绑核/换卡与独立微基准验证慢卡假设",
+      "kind": "验证",
+      "priority": "P2",
+      "status": "待实验",
+      "owner": "待认领",
+      "owner_role": "infra",
+      "collaborators": [
+        "vendor",
+        "bench"
+      ],
+      "depends": [
+        "C02",
+        "C04"
+      ],
+      "current": "尚未确认固定物理慢卡，不应先按硬件故障处理。",
+      "actions": [
+        "隔离其他负载，固定shape/dtype，做多种算子的逐卡独立基准。",
+        "在验证环境交换rank/物理卡或CPU绑定，观察异常跟卡还是跟任务。",
+        "对通信异常使用相应链路测试，不拿计算微基准替代网络诊断。"
+      ],
+      "deliverable": "慢卡假设的确认/排除报告及可复现步骤。",
+      "expected_benefit": "直接性能收益0；确认硬件/部署问题后可定向恢复损失。",
+      "metric": "异常随卡/随rank迁移；跨轮稳定性；正常对照。",
+      "acceptance": "没有稳定复现就保留未确认，不能以一次极值判坏卡。",
+      "evidence": [
+        "E05"
+      ]
+    },
+    {
+      "id": "D01",
+      "category": "D",
+      "stages": [
+        "S1",
+        "S3",
+        "S6",
+        "S7"
+      ],
+      "title": "建立固定资源预算的DP/TP/EP切分矩阵",
+      "kind": "验证",
+      "priority": "P1",
+      "status": "待实验",
+      "owner": "待认领",
+      "owner_role": "bench",
+      "collaborators": [
+        "model",
+        "framework"
+      ],
+      "depends": [
+        "G01",
+        "G02",
+        "C01"
+      ],
+      "current": "A3 DP4TP4/EP16与A5 DP8TP1/EP8并非同拓扑/卡数对照。",
+      "actions": [
+        "在同型号、固定物理卡预算内选择能装下模型的DP/TP/EP组合；先核对支持和HBM。",
+        "保持模型/量化、数据集、到达率与缓存条件一致；每组记录本地token量和通信域。",
+        "若评估PCP/PP/SP等，另开单变量实验并核对SWA、图与Runner限制。"
+      ],
+      "deliverable": "各切分的容量/延迟/吞吐曲线与适用负载。",
+      "expected_benefit": "可能改善利用率与通信比例；更小TP不一定更快，也可能装不下。",
+      "metric": "TTFT/TPOT p95、goodput、HBM峰值、通信、每卡有效tokens/s。",
+      "acceptance": "同资源可比；同时报告精度、失败、显存和每请求代价。",
+      "evidence": [
+        "E01"
+      ]
+    },
+    {
+      "id": "D02",
+      "category": "D",
+      "stages": [
+        "S1",
+        "S2",
+        "S3",
+        "S6",
+        "S7"
+      ],
+      "title": "扫描合批、token预算与prefill切块",
+      "kind": "验证",
+      "priority": "P1",
+      "status": "待实验",
+      "owner": "待认领",
+      "owner_role": "bench",
+      "collaborators": [
+        "framework",
+        "model"
+      ],
+      "depends": [
+        "G02",
+        "D01"
+      ],
+      "current": "batch/shape决定下发、算子效率和排队；压缩包文件名不是完整配置。",
+      "actions": [
+        "分别扫描max_num_seqs、max_num_batched_tokens和chunk策略，区分P与D预算。",
+        "固定输入长度分布和发送方式，测低负载与接近饱和场景。",
+        "解释shape变化与准备/主干/通信成本，观察长prefill对交互尾延迟影响。"
+      ],
+      "deliverable": "配置扫描表、SLO可承载点与推荐范围。",
+      "expected_benefit": "可能降低排队或摊薄下发成本；大batch也可能增加单请求延迟。",
+      "metric": "队列时间、TTFT/TPOT、goodput、实际batch、抢占和OOM。",
+      "acceptance": "相同SLO和完成量；不只选吞吐最大的点。",
+      "evidence": [
+        "E10"
+      ]
+    },
+    {
+      "id": "D03",
+      "category": "D",
+      "stages": [
+        "S1",
+        "S5",
+        "S6",
+        "S7"
+      ],
+      "title": "匹配P/D能力与KV交接容量",
+      "kind": "分析",
+      "priority": "P1",
+      "status": "待采集",
+      "owner": "待认领",
+      "owner_role": "bench",
+      "collaborators": [
+        "framework",
+        "infra"
+      ],
+      "depends": [
+        "G02",
+        "C05"
+      ],
+      "current": "当前主证据偏P侧；缺少同一请求全链路P/D与代理时间。",
+      "actions": [
+        "补采P/D和客户端，记录P计算完成、KV就绪、D可运行和首输出的关系。",
+        "按输入/输出长度及到达率估计两侧服务能力，识别P排队、D排队或传输瓶颈。",
+        "再比较P/D实例与卡数配比；不得只按日活数推算容量。"
+      ],
+      "deliverable": "P/D负载与容量模型、交接关键路径和配比实验计划。",
+      "expected_benefit": "分析直接收益0；合理配比后可能减少排队、提升SLO内完成量。",
+      "metric": "两侧利用率/排队、KV交接、TTFT/TPOT、goodput/卡。",
+      "acceptance": "同一请求ID与可靠时钟；重叠路径不简单相加。",
+      "evidence": [
+        "E10"
+      ]
+    },
+    {
+      "id": "D04",
+      "category": "D",
+      "stages": [
+        "S1",
+        "S5",
+        "S6"
+      ],
+      "title": "拆开本地prefix cache与Store收益",
+      "kind": "验证",
+      "priority": "P1",
+      "status": "待实验",
+      "owner": "待认领",
+      "owner_role": "framework",
+      "collaborators": [
+        "model",
+        "bench"
+      ],
+      "depends": [
+        "G01",
+        "G02",
+        "C05"
+      ],
+      "current": "MultiConnector不等于Store；本地APC与外部池化需要分别归因。",
+      "actions": [
+        "固定connector选择策略、consumer加载设置与命中来源，明确冷/本地热/Store热三个状态。",
+        "比较实际跳过的token、KV字节、命中查询/加载/保存成本；SWA按缓存组确认窗口状态。",
+        "覆盖加载失败、抢占重调度和recompute，检查异步完成后才消费。"
+      ],
+      "deliverable": "缓存来源真值表与收益/代价、恢复正确性报告。",
+      "expected_benefit": "可能减少重复prefill并提高跨实例命中；冷请求可能多出查找/传输开销。",
+      "metric": "分来源命中率、跳过token、TTFT、加载/保存时间、失败/重算。",
+      "acceptance": "命中token数不等于SWA窗口已恢复；不能用100%外部命中率单独证明正确。",
+      "evidence": [
+        "E07",
+        "E10"
+      ]
+    },
+    {
+      "id": "D05",
+      "category": "D",
+      "stages": [
+        "S1",
+        "S2",
+        "S3",
+        "S5",
+        "S6"
+      ],
+      "title": "验证SWA replay相关机制的条件与净收益",
+      "kind": "验证",
+      "priority": "P1",
+      "status": "待实验",
+      "owner": "待认领",
+      "owner_role": "model",
+      "collaborators": [
+        "framework",
+        "bench"
+      ],
+      "depends": [
+        "G02",
+        "A05",
+        "D04"
+      ],
+      "current": "已有反合与tail shape证据；当前需要单机和P/D分别做受控开关实验。",
+      "actions": [
+        "沿此前SWA/CED专题逐项确认实际代码路径，不将专题名当成一个独立开关或PR。",
+        "保持Runner、SP/并行、量化、输入和缓存条件一致；检查后段每请求窗口对应的batch shape。",
+        "分别核对前向计算、窗口恢复、额外元数据与传输代价；不为开启而删除布局正确性限制。"
+      ],
+      "deliverable": "支持矩阵、精度结果、ON/OFF原始数据及净收益归因。",
+      "expected_benefit": "长prefill可能减少后段工作量；元数据/恢复可能抵消收益，TPOT需单独测。",
+      "metric": "TTFT、TPOT/ITL、目标层shape、准备时间、HBM、恢复/传输。",
+      "acceptance": "功能与精度通过；P/D/Store分别验证，不以开关或启动日志代表必然生效。",
+      "evidence": [
+        "E01",
+        "E07"
+      ]
+    },
+    {
+      "id": "D06",
+      "category": "D",
+      "stages": [
+        "S4",
+        "S7"
+      ],
+      "title": "扫描MTP / draft配置与有效输出效率",
+      "kind": "验证",
+      "priority": "P1",
+      "status": "待实验",
+      "owner": "待认领",
+      "owner_role": "model",
+      "collaborators": [
+        "framework",
+        "bench"
+      ],
+      "depends": [
+        "G02",
+        "B07"
+      ],
+      "current": "P侧也可能有draft调用；draft块次数不等于用户请求数。",
+      "actions": [
+        "确认P和D上的MTP角色、num_speculative_tokens、draft/verify执行方式。",
+        "固定负载与sampling参数，比较关闭及支持的draft长度，记录接受率与实际输出token数。",
+        "计算每个有效输出token的目标/draft/准备成本，观察图命中与KV开销。"
+      ],
+      "deliverable": "投机配置的接受率、代价和服务收益表。",
+      "expected_benefit": "接受率与开销合适时可降低TPOT；多draft也可能更慢。",
+      "metric": "accepted tokens/step、draft耗时、TPOT、goodput、HBM。",
+      "acceptance": "以有效输出token归一，控制输出长度/EOS；不得只以接受率高低判断收益。",
+      "evidence": [
+        "E01",
+        "E06"
+      ]
+    },
+    {
+      "id": "D07",
+      "category": "D",
+      "stages": [
+        "S2",
+        "S3",
+        "S6",
+        "S7"
+      ],
+      "title": "分离Runner、量化、KV布局和通信开关影响",
+      "kind": "验证",
+      "priority": "P2",
+      "status": "待实验",
+      "owner": "待认领",
+      "owner_role": "model",
+      "collaborators": [
+        "framework",
+        "vendor",
+        "bench"
+      ],
+      "depends": [
+        "G01",
+        "G02",
+        "B01"
+      ],
+      "current": "A3/A5当前多因素同时不同，不能将差异都归给融合或硬件。",
+      "actions": [
+        "优先在同硬件固定一个可运行基线，分别检查MRV1/V2、支持的权重量化/KV dtype和布局。",
+        "对FlashComm/MC2等按代码支持范围做单变量对照，检查实际backend与SP语义。",
+        "跨硬件不可统一的格式或算子列为固有限制，不勉强声称纯硬件公平比。"
+      ],
+      "deliverable": "受控差异矩阵、单项收益与组合兼容范围。",
+      "expected_benefit": "可能选择更适合的执行路径/精度/通信组合；收益与精度代价待测。",
+      "metric": "TTFT/TPOT、goodput、HBM、精度、实际kernel/backend。",
+      "acceptance": "每条结论注明硬件/版本/模型/量化；组合收益不可把单项百分比相加。",
+      "evidence": [
+        "E01",
+        "E06"
+      ]
+    },
+    {
+      "id": "R01",
+      "category": "R",
+      "stages": [
+        "X"
+      ],
+      "title": "做功能、精度、恢复与混合负载回归",
+      "kind": "验证",
+      "priority": "P0",
+      "status": "待实验",
+      "owner": "待认领",
+      "owner_role": "bench",
+      "collaborators": [
+        "framework",
+        "model"
+      ],
+      "depends": [
+        "G02"
+      ],
+      "current": "用户已有部分功能验证；后续每项优化仍需对应场景验收。",
+      "actions": [
+        "覆盖单机/P/D、冷/热缓存、长短输入、并发、MTP和支持的并行组合。",
+        "除精度外测取消、超时、加载失败、抢占、请求状态与多流buffer复用。",
+        "用固定baseline做交错回归；记录稳态、首次请求、显存峰值和长稳情况。"
+      ],
+      "deliverable": "每项patch/配置的验收记录、回滚点和支持范围。",
+      "expected_benefit": "直接性能收益0；防止局部加速换来精度、尾延迟或稳定性退化。",
+      "metric": "精度、错误/超时、p95/p99、goodput、HBM与长稳。",
+      "acceptance": "所有待发布优化先通过本项；基线与变更原始数据可追溯。",
+      "evidence": [
+        "E07",
+        "E10"
+      ]
+    },
+    {
+      "id": "R02",
+      "category": "R",
+      "stages": [
+        "X"
+      ],
+      "title": "持续更新任务状态与可复现资产",
+      "kind": "归档",
+      "priority": "P0",
+      "status": "持续归档",
+      "owner": "待认领",
+      "owner_role": "lead",
+      "collaborators": [
+        "bench"
+      ],
+      "depends": [],
+      "current": "已有学习地图、版本报告与profiling报告；本台账连接全局位置和责任。",
+      "actions": [
+        "每项任务补具体责任人、实验ID、版本、支持配置、关键证据和结论。",
+        "分开标注分析完成、实现完成、功能通过、性能通过；无收益/否定结果也归档。",
+        "将确认的分工和实测收益回写JSON，重建HTML/Markdown/CSV并提交。"
+      ],
+      "deliverable": "团队性能案例库、版本化台账和面向新人的复现教程。",
+      "expected_benefit": "直接性能收益0；减少重复试验，沉淀可交接知识。",
+      "metric": "可复现案例、结论证据完整率、完成任务/待验证任务。",
+      "acceptance": "不把上游PR、trace出现或功能通过自动升级为当前服务性能已验证。",
+      "evidence": [
+        "E06",
+        "E10"
+      ]
+    }
+  ]
+}
