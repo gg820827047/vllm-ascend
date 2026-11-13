@@ -3,6 +3,7 @@
 - [三版本 HTML 总览](index.html)：逐阶段统计、性能机制演进矩阵、关键代码符号追踪。
 - [DeepSeek 优化专题](deepseek_summary/report.html)：37 项直接优化、20 项性能使能、适用条件及代码量；[PR 明细 CSV](deepseek_summary/prs.csv)。
 - [DeepSeek-V4.1 Profiling 实战](dsv41_profiling_30_32/report.html)：0.30/0.32 执行机制验证、交互时间线、60 项 PR 证据状态和系统教学；[复现说明](dsv41_profiling_30_32/README.md)。
+- [DeepSeek-V4.1 A3/A5 Prefill 对比](dsv41_a3_a5_prefill/report.html)：实际硬件与拓扑核对、融合算子证据、输入准备、全 EP 卡间对比和 A3 优化路线；[复现说明](dsv41_a3_a5_prefill/README.md) · [离线包](dsv41_a3_a5_prefill.zip)。
 - [NPU 推理学习地图与性能实践](npu_inference_learning/index.html)：部署、模型、vLLM/Ascend 源码、容量、profiling 与优化闭环；含交互知识地图、Roofline 教学图和实验模板；[Markdown 手册](npu_inference_learning/guide.md)。
 - [30 → 31 报告说明](v0.31.0rc_vs_v0.30.0rc2/README.md) · [HTML](v0.31.0rc_vs_v0.30.0rc2/report.html)。
 - [31 → 32 报告说明](v0.32.0rc_vs_v0.31.0rc/README.md) · [HTML](v0.32.0rc_vs_v0.31.0rc/report.html)。
