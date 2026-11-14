@@ -61,6 +61,44 @@ def enrich(data):
 
     for task_id in by_id:
         visit(task_id, set())
+    for row in data["observability"]["rows"]:
+        assert set(row["tasks"]) <= ids, row["title"]
+
+
+def observability_html(data):
+    section = data["observability"]
+    rows = []
+    for row in section["rows"]:
+        links = " / ".join(f'<a href="#task-{task_id}">{task_id}</a>' for task_id in row["tasks"])
+        cells = "".join(f"<td>{escape(row[field])}</td>" for field in ["profiling", "collect", "measure"])
+        rows.append(f"<tr><th scope='row'>{escape(row['title'])}</th>{cells}<td>{links}</td></tr>")
+    notes = "".join(f"<li>{escape(note)}</li>" for note in section["notes"])
+    return (
+        f"<h2>{escape(section['title'])}</h2><p>{escape(section['intro'])}</p>"
+        f"<p class='note warn'>{escape(section['priority'])}</p>"
+        '<div class="table-wrap"><table id="observability-table"><thead><tr>'
+        "<th>位置</th><th>单独看 worker profiling</th><th>需要补采</th><th>计时口径</th><th>任务</th>"
+        f"</tr></thead><tbody>{''.join(rows)}</tbody></table></div><ul>{notes}</ul>"
+    )
+
+
+def observability_markdown(data):
+    section = data["observability"]
+    lines = [
+        f"## {section['title']}",
+        "",
+        section["intro"],
+        "",
+        section["priority"],
+        "",
+        "| 位置 | 单独看worker profiling | 需要补采 | 计时口径 | 任务 |",
+        "| --- | --- | --- | --- | --- |",
+    ]
+    for row in section["rows"]:
+        cells = [row[k] for k in ["title", "profiling", "collect", "measure"]] + [" / ".join(row["tasks"])]
+        lines.append("| " + " | ".join(map(markdown_cell, cells)) + " |")
+    lines.extend([""] + [f"- {note}" for note in section["notes"]] + [""])
+    return lines
 
 
 def task_row(task):
@@ -107,7 +145,7 @@ def render_html(data):
     category_cards = "".join(
         f'<button type="button" class="theme" data-category="{key}"><b>{escape(data["categories"][key])}</b>'
         f"<span>{sum(t['category'] == key for t in data['tasks'])} 项 · 点击筛选</span></button>"
-        for key in ["A", "B", "C", "D"]
+        for key in ["A", "B", "C", "D", "F"]
     )
     substitutions = {
         "TITLE": escape(data["title"]),
@@ -117,6 +155,7 @@ def render_html(data):
         "FOUNDATION": str(sum(t["category"] in ["G", "R"] for t in data["tasks"])),
         "CANDIDATES": str(sum(t["kind"] == "优化候选" for t in data["tasks"])),
         "THEMES": category_cards,
+        "OBSERVABILITY": observability_html(data),
         "HISTORY": history,
         "EVIDENCE": evidence,
         "ROLES": roles,
@@ -147,10 +186,10 @@ def render_markdown(data):
         "",
         f"更新：{data['date']}。{data['scope']}",
         "",
-        "## 全局位置与四类工作",
+        "## 全局位置、四类主线与边界观测",
         "",
         "```text",
-        "S0 请求/API/分词 → S1 调度、排队、本地/外部缓存判定",
+        "S0 网关/API接入、排队、分词 → S1 引擎入队/等待、调度、缓存判定",
         "                         ↓",
         "P: S2 Host准备 → S3 Prefill模型层 → S4 采样/输出回传",
         "                         ↓",
@@ -173,6 +212,8 @@ def render_markdown(data):
         "| ③ 快慢卡 | X，落到S2/S3/S5/S7 | 分开同工作量计算速度、晚到rank、通信链路与真实硬件异常 |",
         "| ④ 切分配置 | S1/S2/S3/S5/S6/S7 | 固定资源预算与负载，"
         "比较DP/TP/EP、batch/chunk、P/D配比、缓存、MTP和执行路径 |",
+        "| ⑤ 网关排队/KV传输（P2） | S0/S1/S5/S6/S8 | "
+        "F01分开网关真队列、API前处理和引擎等待；F02分开P/D交接与Store读写，联合请求级观测 |",
         "",
         "## 各阶段看什么",
         "",
@@ -188,6 +229,7 @@ def render_markdown(data):
                 "",
             ]
         )
+    lines.extend(observability_markdown(data))
     lines.extend(
         [
             "## 已有工作和证据等级",
@@ -216,7 +258,8 @@ def render_markdown(data):
             "",
             "## 子事项总表",
             "",
-            "P0先形成证据与回归基础；P1做受控实验和低风险候选；P2涉及复杂依赖、额外资源或外部协同。优先级不是效果保证；点击HTML中的任务可展开实施步骤。",
+            "P0先形成证据与回归基础；P1做受控实验和低风险候选；P2为后置专题、跨组件依赖或外部协同。"
+            "F01/F02初始列P2，若成为TTFT主因则提升；点击HTML中的任务可展开实施步骤。",
             "",
             "| ID/优先级 | 位置/类型 | 子事项 | 责任人（建议角色） | 状态与已有证据 | 预期收益 / 指标 | 前置 |",
             "| --- | --- | --- | --- | --- | --- | --- |",
@@ -265,6 +308,8 @@ def render_markdown(data):
             "A07异步开关只在支持组合中受控对照。",
             "3. B02/B03/A08 + D01/D02/D03：再推进可用融合、多流/切分与拓扑/预算；每次只改变计划变量。",
             "4. D04/D05/D06/D07 + R01/R02：缓存、SWA、MTP和执行路径分项验收；逐项回写实测与负结果，再评估组合。",
+            "5. F01/F02作为P2补充专题，与主线复用request_id与时间戳采集；"
+            "进入P/D容量或Store收益结论前，先补齐所依赖的排队与KV交接数据。",
             "",
             "## 证据索引与适用范围",
             "",

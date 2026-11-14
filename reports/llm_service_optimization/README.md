@@ -7,6 +7,8 @@
 - [tasks.json](tasks.json)：阶段、证据、已有工作与任务的维护源。
 - [validation.json](validation.json)：文档与浏览器交互检查结果。
 
+新增“网关排队 / KV传输”专题：F01/F02初始优先级为P2，分别挂到S0/S1与S5/S6。HTML和Markdown均列出四类观测边界：网关/API排队、引擎等待、P/D KV交接、Store读写；注明worker profiling能看到的范围、需要补采的数据和计时口径。当前共35项任务。
+
 责任人暂按角色建议分工，具体人名均为“待认领”；这不是已确认的人员安排。分析任务的直接性能收益为零，收益体现在形成证据与决策。优化候选不承诺未经实验的加速百分比。
 
 维护 `tasks.json`、`page_template.html` 或 `interactions.js` 后，在仓库根目录重建：
