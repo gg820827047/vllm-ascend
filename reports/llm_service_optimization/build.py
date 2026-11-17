@@ -66,6 +66,9 @@ def enrich(data):
     for finding in data["recent"]["findings"]:
         assert set(finding["tasks"]) <= ids, finding["id"]
         assert set(finding["evidence"]) <= evidence_ids, finding["id"]
+    for project in data["peer_review"]["projects"]:
+        assert set(project["tasks"]) <= ids, project["id"]
+        assert set(project["evidence"]) <= evidence_ids, project["id"]
 
 
 def recent_html(data):
@@ -123,6 +126,64 @@ def recent_markdown(data):
             ]
         )
     return lines + [""]
+
+
+def peer_html(data):
+    section = data["peer_review"]
+    takeaways = "".join(f"<li>{escape(item)}</li>" for item in section["takeaways"])
+    rules = "".join(f"<li>{escape(item)}</li>" for item in section["measurement_rules"])
+    experiments = "".join(f"<li>{escape(item)}</li>" for item in section["first_experiments"])
+    summary = "".join(f"<p>{escape(item)}</p>" for item in section["daily_summary"])
+    rows = []
+    for project in section["projects"]:
+        tasks = " / ".join(f'<a href="#task-{task}">{task}</a>' for task in project["tasks"])
+        evidence = " / ".join(f'<a href="#evidence-{item}">{item}</a>' for item in project["evidence"])
+        rows.append(
+            f'<tr id="peer-{project["id"]}"><th scope="row">{project["id"]} {escape(project["title"])}'
+            f'<p class="muted">对方报告：{escape(project["reported"])}</p></th>'
+            f"<td><b>{escape(project['priority'])}</b><p>{escape(project['placement'])}</p>"
+            f"<p>{escape(project['verdict'])}</p></td><td>{escape(project['match'])}<p>{evidence}</p></td>"
+            f"<td>{escape(project['next'])}<p>跟进：{tasks}</p></td></tr>"
+        )
+    return (
+        f"<h2>{escape(section['title'])}</h2><p>{escape(section['scope'])}</p>"
+        f"<p class='note warn'>{escape(section['provenance'])}</p>"
+        f"<h3>对我们最有价值的启发</h3><ul>{takeaways}</ul>"
+        '<div class="table-wrap"><table id="peer-table"><thead><tr>'
+        "<th>对方项目与原文结果</th><th>位置与优先级</th><th>我们的profiling / 代码证据</th><th>下一步</th>"
+        f"</tr></thead><tbody>{''.join(rows)}</tbody></table></div>"
+        f"<h3>收益如何比较</h3><ul>{rules}</ul><h3>首批实验顺序</h3><ol>{experiments}</ol>"
+        f'<div class="note"><h3>今天的进展 · 可直接用于简报</h3>{summary}</div>'
+    )
+
+
+def peer_markdown(data):
+    section = data["peer_review"]
+    lines = [f"## {section['title']}", "", section["scope"], "", section["provenance"], ""]
+    lines.extend(f"- {item}" for item in section["takeaways"])
+    lines.extend(
+        [
+            "",
+            "| 对方项目与原文结果 | 位置与优先级 | 我们的证据 | 下一步与任务 |",
+            "| --- | --- | --- | --- |",
+        ]
+    )
+    for project in section["projects"]:
+        cells = [
+            f"{project['id']} {project['title']}；对方报告：{project['reported']}",
+            f"{project['placement']}；{project['priority']}；{project['verdict']}",
+            f"{project['match']}；证据 {' / '.join(project['evidence'])}",
+            f"{project['next']}；跟进 {' / '.join(project['tasks'])}",
+        ]
+        lines.append("| " + " | ".join(map(markdown_cell, cells)) + " |")
+    lines.extend(["", "### 收益比较口径", ""])
+    lines.extend(f"- {item}" for item in section["measurement_rules"])
+    lines.extend(["", "### 首批实验顺序", ""])
+    lines.extend(f"{i}. {item}" for i, item in enumerate(section["first_experiments"], 1))
+    lines.extend(["", "### 今天的进展", ""])
+    for item in section["daily_summary"]:
+        lines.extend([item, ""])
+    return lines
 
 
 def observability_html(data):
@@ -217,6 +278,7 @@ def render_html(data):
         "THEMES": category_cards,
         "OBSERVABILITY": observability_html(data),
         "RECENT": recent_html(data),
+        "PEER_REVIEW": peer_html(data),
         "HISTORY": history,
         "EVIDENCE": evidence,
         "ROLES": roles,
@@ -291,6 +353,7 @@ def render_markdown(data):
             ]
         )
     lines.extend(recent_markdown(data))
+    lines.extend(peer_markdown(data))
     lines.extend(observability_markdown(data))
     lines.extend(
         [

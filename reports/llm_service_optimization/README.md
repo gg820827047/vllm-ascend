@@ -7,11 +7,15 @@
 - [tasks.json](tasks.json)：阶段、证据、已有工作与任务的维护源。
 - [validation.json](validation.json)：文档与浏览器交互检查结果。
 
-“网关排队 / KV传输”专题：F01/F02初始优先级为P2，分别挂到S0/S1与S5/S6。HTML和Markdown均列出四类观测边界：网关/API排队、引擎等待、P/D KV交接、Store读写；注明worker profiling能看到的范围、需要补采的数据和计时口径。当前共37项任务。
+“网关排队 / KV传输”专题：F01/F02初始优先级为P2，分别挂到S0/S1与S5/S6。HTML和Markdown均列出四类观测边界：网关/API排队、引擎等待、P/D KV交接、Store读写；注明worker profiling能看到的范围、需要补采的数据和计时口径。当前共42项任务。
 
 2026-11-17新增“近期核对”入口，归档五项结论：A3目标层461.233ms与首层前Host准备的拆分、异步调度实际生效证据、官方0.32/CANN共有的共享专家多流互斥、A5 Prefill不能证明D侧static kernel配置，以及启动时静态二进制编译/FX图编译/ACLGraph capture的区别。新增B08共享专家多流验证、D08启动缓存排查，保留责任人、预期收益和验收口径。
 
 附[交互时序图](../dsv41_a3_a5_prefill/host_device_timing/report.html)和[数值/事件索引](../dsv41_a3_a5_prefill/host_device_timing/audit.json)。它们是对既有`P.rar`的后续复核，非新采集或开关收益实验；D侧“约50项”与`.run`缺失的现场原因仍待日志和版本确认。
+
+“对方项目借鉴”入口逐项分析用户提供的21项结果，映射到生命周期、现有trace、代码条件和跟进任务。优先验证batch/chunk、P/D供给与DP分发、元数据复用/异步规划；明确当前MegaMoE的DP同步限制、DSV4.1 Gate精度合同，以及Attention布局/写回和DSL的硬件量化前提。新增A09、B09、B10、D09、R03，原文结果保存在`tasks.json`的`peer_review.projects`，附首批实验顺序和可直接用于简报的三句话总结。
+
+外部数字均标为“对方报告”，没有冒充本服务实测。Motor具体组件、Interactivity定义、模型/硬件/框架和chip分母待补；2P1D负收益与EP32卡效率反例同样保留。NPU性能实验尚未执行。
 
 责任人暂按角色建议分工，具体人名均为“待认领”；这不是已确认的人员安排。分析任务的直接性能收益为零，收益体现在形成证据与决策。优化候选不承诺未经实验的加速百分比。
 
