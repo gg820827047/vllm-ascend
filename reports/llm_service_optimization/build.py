@@ -63,6 +63,66 @@ def enrich(data):
         visit(task_id, set())
     for row in data["observability"]["rows"]:
         assert set(row["tasks"]) <= ids, row["title"]
+    for finding in data["recent"]["findings"]:
+        assert set(finding["tasks"]) <= ids, finding["id"]
+        assert set(finding["evidence"]) <= evidence_ids, finding["id"]
+
+
+def recent_html(data):
+    section = data["recent"]
+    timing = section["timing"]
+    rows = "".join(
+        "<tr>" + "".join(f"<td>{escape(row[key])}</td>" for key in ["boundary", "time", "meaning"]) + "</tr>"
+        for row in timing["rows"]
+    )
+    cards = []
+    for finding in section["findings"]:
+        facts = "".join(f"<li>{escape(fact)}</li>" for fact in finding["facts"])
+        tasks = " / ".join(f'<a href="#task-{task}">{task}</a>' for task in finding["tasks"])
+        evidence = " / ".join(f'<a href="#evidence-{item}">{item}</a>' for item in finding["evidence"])
+        cards.append(
+            f'<article id="finding-{finding["id"]}"><h3>{escape(finding["title"])}</h3>'
+            f"<p><b>{escape(finding['level'])}</b> · {escape(finding['stage'])}</p>"
+            f"<ul>{facts}</ul><p class='note warn'>{escape(finding['limit'])}</p>"
+            f"<p>跟进：{tasks}<br>证据：{evidence}</p></article>"
+        )
+    return (
+        f"<h2>{escape(section['title'])}</h2><p>{escape(section['scope'])}</p>"
+        f"<h3>{escape(timing['title'])}</h3><p>{escape(timing['reference'])}</p>"
+        '<div class="table-wrap"><table><thead><tr><th>边界</th><th>时间</th><th>解读</th></tr></thead>'
+        f"<tbody>{rows}</tbody></table></div><div class='evidence-grid recent-cards'>{''.join(cards)}</div>"
+    )
+
+
+def recent_markdown(data):
+    section = data["recent"]
+    timing = section["timing"]
+    lines = [
+        f"## {section['title']}",
+        "",
+        section["scope"],
+        "",
+        f"### {timing['title']}",
+        "",
+        timing["reference"],
+        "",
+        "| 边界 | 时间 | 解读 |",
+        "| --- | --- | --- |",
+    ]
+    for row in timing["rows"]:
+        lines.append("| " + " | ".join(markdown_cell(row[key]) for key in ["boundary", "time", "meaning"]) + " |")
+    for finding in section["findings"]:
+        lines.extend(["", f"### {finding['title']}", "", f"{finding['level']}。位置：{finding['stage']}。", ""])
+        lines.extend(f"- {fact}" for fact in finding["facts"])
+        lines.extend(
+            [
+                "",
+                f"边界：{finding['limit']}",
+                "",
+                f"跟进：{' / '.join(finding['tasks'])}。证据：{' / '.join(finding['evidence'])}。",
+            ]
+        )
+    return lines + [""]
 
 
 def observability_html(data):
@@ -156,6 +216,7 @@ def render_html(data):
         "CANDIDATES": str(sum(t["kind"] == "优化候选" for t in data["tasks"])),
         "THEMES": category_cards,
         "OBSERVABILITY": observability_html(data),
+        "RECENT": recent_html(data),
         "HISTORY": history,
         "EVIDENCE": evidence,
         "ROLES": roles,
@@ -229,6 +290,7 @@ def render_markdown(data):
                 "",
             ]
         )
+    lines.extend(recent_markdown(data))
     lines.extend(observability_markdown(data))
     lines.extend(
         [
@@ -308,7 +370,9 @@ def render_markdown(data):
             "A07异步开关只在支持组合中受控对照。",
             "3. B02/B03/A08 + D01/D02/D03：再推进可用融合、多流/切分与拓扑/预算；每次只改变计划变量。",
             "4. D04/D05/D06/D07 + R01/R02：缓存、SWA、MTP和执行路径分项验收；逐项回写实测与负结果，再评估组合。",
-            "5. F01/F02作为P2补充专题，与主线复用request_id与时间戳采集；"
+            "5. B08核对共享专家多流互斥后再做支持路径对照；"
+            "D08独立记录冷启动、缓存重启与实例就绪时间，和热服务时延分开。",
+            "6. F01/F02作为P2补充专题，与主线复用request_id与时间戳采集；"
             "进入P/D容量或Store收益结论前，先补齐所依赖的排队与KV交接数据。",
             "",
             "## 证据索引与适用范围",

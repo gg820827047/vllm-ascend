@@ -39,3 +39,9 @@ python build_report.py
 原始 trace/DB 和全量中间 JSON 没有重复提交或打入交付 ZIP。执行脚本会重新生成这些中间结果。硬件时间取整数纳秒后再转换为相对微秒；Host 优先通过 PyTorch connection ID 关联，绕过 PyTorch op 记录的 C++ kernel 则通过同一主线程的 CANN launch 关联。HCCL 子任务不与大算子重复累计。
 
 报告主干区间含前 40 层，后面 3 次 draft 调用单独保留。主对照均有 execute_model Python scope；只有历史 A3 ZIP 缺该范围，使用重建锚点。不要把异步重叠的窗口相加当作 TTFT。A5 首尾共同轮次覆盖不完整，不能拿边界长等待推断稳态慢卡。
+
+## Host / Device 时序补充
+
+2026-11-17归档对既有`P.rar`的后续复核：[交互时间线](host_device_timing/report.html)、[数值与事件索引](host_device_timing/audit.json)。它们独立于原主报告的生成流程；交互页可离线打开，包含Host准备、真实launch、目标层与draft结束边界、设备区间互斥归账及EP首层到达差异。
+
+该补充仅针对A3 DP0TP0本地step1：目标层归属设备活动包络为461.233ms，首个主流HcPre到目标层结束为455.757ms；二者不能混用。`audit.json`保留原始DB/rank目录、CSV行号和launch关联，核对时需先提取同一份原始压缩包。它不是新增采集、完整请求TTFT或异步调度ON/OFF实验。后续任务与结论边界见[全局优化台账](../llm_service_optimization/index.html#recent)。
