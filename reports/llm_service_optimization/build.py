@@ -74,6 +74,10 @@ def enrich(data):
 def recent_html(data):
     section = data["recent"]
     timing = section["timing"]
+    report_links = "".join(
+        f'<p><a href="{escape(report["source"])}">{escape(report["title"])}</a> · {escape(report["detail"])}</p>'
+        for report in section.get("reports", [])
+    )
     rows = "".join(
         "<tr>" + "".join(f"<td>{escape(row[key])}</td>" for key in ["boundary", "time", "meaning"]) + "</tr>"
         for row in timing["rows"]
@@ -91,6 +95,7 @@ def recent_html(data):
         )
     return (
         f"<h2>{escape(section['title'])}</h2><p>{escape(section['scope'])}</p>"
+        f"{report_links}"
         f"<h3>{escape(timing['title'])}</h3><p>{escape(timing['reference'])}</p>"
         '<div class="table-wrap"><table><thead><tr><th>边界</th><th>时间</th><th>解读</th></tr></thead>'
         f"<tbody>{rows}</tbody></table></div><div class='evidence-grid recent-cards'>{''.join(cards)}</div>"
@@ -104,6 +109,8 @@ def recent_markdown(data):
         f"## {section['title']}",
         "",
         section["scope"],
+        "",
+        *[f"[{report['title']}]({report['source']})：{report['detail']}" for report in section.get("reports", [])],
         "",
         f"### {timing['title']}",
         "",

@@ -13,6 +13,8 @@
 
 附[交互时序图](../dsv41_a3_a5_prefill/host_device_timing/report.html)和[数值/事件索引](../dsv41_a3_a5_prefill/host_device_timing/audit.json)。它们是对既有`P.rar`的后续复核，非新采集或开关收益实验；D侧“约50项”与`.run`缺失的现场原因仍待日志和版本确认。
 
+2026-11-18新增[DP2/TP2主线程与多流时序报告](../dsv41_a3_a5_prefill/host_issue_dp2tp2/report.html)。总览顶部导航、“近期核对”和E29均可进入，报告内可返回总览。包括metadata/实际launch对照、Task15092与15140的同名任务复核、时间坐标校准，以及DecoderLayer与Prefill/Decode的区别；对应A06/A08/C03，未新增性能收益实测。
+
 “对方项目借鉴”入口逐项分析用户提供的21项结果，映射到生命周期、现有trace、代码条件和跟进任务。优先验证batch/chunk、P/D供给与DP分发、元数据复用/异步规划；明确当前MegaMoE的DP同步限制、DSV4.1 Gate精度合同，以及Attention布局/写回和DSL的硬件量化前提。新增A09、B09、B10、D09、R03，原文结果保存在`tasks.json`的`peer_review.projects`，附首批实验顺序和可直接用于简报的三句话总结。
 
 外部数字均标为“对方报告”，没有冒充本服务实测。Motor具体组件、Interactivity定义、模型/硬件/框架和chip分母待补；2P1D负收益与EP32卡效率反例同样保留。NPU性能实验尚未执行。
