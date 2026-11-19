@@ -87,5 +87,11 @@
     reset();
     row.querySelector("details").open = true;
   });
+  function openMechanismFromHash() {
+    const target = document.getElementById(location.hash.slice(1));
+    if (target && target.matches("details.mechanism-note")) target.open = true;
+  }
+  window.addEventListener("hashchange", openMechanismFromHash);
+  openMechanismFromHash();
   applyFilters();
 })();

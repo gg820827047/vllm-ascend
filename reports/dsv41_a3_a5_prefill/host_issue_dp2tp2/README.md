@@ -8,6 +8,10 @@
 - [inspection_points.csv](inspection_points.csv)：精确定位表。
 - [summary.json](summary.json)：阶段耗时、原始零点与局限。
 - [kernel_connections.json](kernel_connections.json)：42条CPU → runtime → device关联。
+- [qkv_first_layer_walkthrough.csv](qkv_first_layer_walkthrough.csv)：首层13个任务的作用、shape、dtype与共同坐标时间。
+- [attention_mechanism_evidence.json](attention_mechanism_evidence.json)：原始CSV校验摘要、TP输出AllReduce及20个A3有效rank-step的多流统计。
+
+2026-11-19的[多流阶段结论与原理笔记](../../llm_service_optimization/index.html#multistream-review)归档于总览；机制和局部时序分析完成，Host抖动及端到端收益仍待验证。
 
 SESSION相对时间与多卡共同坐标分别标注。先按Stream/Task/Connection ID确认同一个任务，再校准显示时间；单锚点平移只适用于各泳道使用相同显示偏移的情况。
 

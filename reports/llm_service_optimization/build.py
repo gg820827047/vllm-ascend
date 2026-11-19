@@ -69,6 +69,104 @@ def enrich(data):
     for project in data["peer_review"]["projects"]:
         assert set(project["tasks"]) <= ids, project["id"]
         assert set(project["evidence"]) <= evidence_ids, project["id"]
+    for item in data["multistream_review"]["conclusions"]:
+        assert set(item["tasks"]) <= ids, item["topic"]
+    note_ids = [note["id"] for note in data["multistream_review"]["notes"]]
+    assert len(note_ids) == len(set(note_ids)), "Duplicate mechanism note ID"
+
+
+def review_table_html(table):
+    header = "".join(f"<th>{escape(value)}</th>" for value in table["headers"])
+    rows = "".join("<tr>" + "".join(f"<td>{escape(value)}</td>" for value in row) + "</tr>" for row in table["rows"])
+    return (
+        f'<h3>{escape(table["title"])}</h3><div class="table-wrap">'
+        f"<table><thead><tr>{header}</tr></thead><tbody>{rows}</tbody></table></div>"
+    )
+
+
+def review_note_html(note):
+    paragraphs = "".join(f"<p>{escape(value)}</p>" for value in note["paragraphs"])
+    tables = "".join(review_table_html(table) for table in note.get("tables", []))
+    code = f"<pre><code>{escape(note['code'])}</code></pre>" if note.get("code") else ""
+    links = " · ".join(f'<a href="{escape(link["source"])}">{escape(link["title"])}</a>' for link in note["links"])
+    return (
+        f'<details id="mechanism-{escape(note["id"])}" class="mechanism-note">'
+        f'<summary>{escape(note["title"])}</summary><p class="muted">{escape(note["scope"])}</p>'
+        f"{paragraphs}{code}{tables}<p>{links}</p></details>"
+    )
+
+
+def multistream_review_html(data):
+    section = data["multistream_review"]
+    conclusions = {
+        "title": "阶段结论与后续归属",
+        "headers": ["事项", "当前状态", "已知证据与边界", "下一步 / 台账"],
+        "rows": [
+            [item["topic"], item["status"], item["finding"], item["next"] + " / " + "、".join(item["tasks"])]
+            for item in section["conclusions"]
+        ],
+    }
+    handoff = " / ".join(f'<a href="#task-{task}">{task}</a>' for task in ["A05", "A06", "C03", "A08", "B08"])
+    steps = "".join(f"<li>{escape(step)}</li>" for step in section["next_steps"])
+    notes = "".join(review_note_html(note) for note in section["notes"])
+    return (
+        f"<h2>{escape(section['title'])}</h2><p>{escape(section['scope'])}</p>"
+        f'<p class="note"><b>{escape(section["verdict"])}</b></p>'
+        f'<p class="note warn">{escape(section["hypothesis_limit"])}</p>'
+        f"{review_table_html(conclusions)}<p>跟进任务：{handoff}</p>"
+        f"<h3>下一轮只验证这些问题</h3><ol>{steps}</ol>"
+        f"<h3>今天的原理与profiling对照笔记</h3><p>展开查看，表中时间口径分别标注。</p>{notes}"
+    )
+
+
+def review_table_markdown(table):
+    headers = table["headers"]
+    lines = [
+        f"### {table['title']}",
+        "",
+        "| " + " | ".join(map(markdown_cell, headers)) + " |",
+        "| " + " | ".join("---" for _ in headers) + " |",
+    ]
+    lines.extend("| " + " | ".join(map(markdown_cell, row)) + " |" for row in table["rows"])
+    return lines + [""]
+
+
+def multistream_review_markdown(data):
+    section = data["multistream_review"]
+    lines = [
+        f"## {section['title']}",
+        "",
+        section["scope"],
+        "",
+        section["verdict"],
+        "",
+        section["hypothesis_limit"],
+        "",
+    ]
+    for item in section["conclusions"]:
+        lines.extend(
+            [
+                f"### {item['topic']}：{item['status']}",
+                "",
+                item["finding"],
+                "",
+                f"后续：{item['next']}。台账：{' / '.join(item['tasks'])}。",
+                "",
+            ]
+        )
+    lines.extend(["### 下一轮验证", ""])
+    lines.extend(f"{index}. {step}" for index, step in enumerate(section["next_steps"], 1))
+    lines.append("")
+    for note in section["notes"]:
+        lines.extend([f"### {note['title']}", "", note["scope"], ""])
+        for paragraph in note["paragraphs"]:
+            lines.extend([paragraph, ""])
+        if note.get("code"):
+            lines.extend(["```text", note["code"], "```", ""])
+        for table in note.get("tables", []):
+            lines.extend(review_table_markdown(table))
+        lines.extend([" · ".join(f"[{link['title']}]({link['source']})" for link in note["links"]), ""])
+    return lines
 
 
 def recent_html(data):
@@ -285,6 +383,7 @@ def render_html(data):
         "THEMES": category_cards,
         "OBSERVABILITY": observability_html(data),
         "RECENT": recent_html(data),
+        "MULTISTREAM_REVIEW": multistream_review_html(data),
         "PEER_REVIEW": peer_html(data),
         "HISTORY": history,
         "EVIDENCE": evidence,
@@ -360,6 +459,7 @@ def render_markdown(data):
             ]
         )
     lines.extend(recent_markdown(data))
+    lines.extend(multistream_review_markdown(data))
     lines.extend(peer_markdown(data))
     lines.extend(observability_markdown(data))
     lines.extend(
@@ -440,7 +540,7 @@ def render_markdown(data):
             "A07异步开关只在支持组合中受控对照。",
             "3. B02/B03/A08 + D01/D02/D03：再推进可用融合、多流/切分与拓扑/预算；每次只改变计划变量。",
             "4. D04/D05/D06/D07 + R01/R02：缓存、SWA、MTP和执行路径分项验收；逐项回写实测与负结果，再评估组合。",
-            "5. B08核对共享专家多流互斥后再做支持路径对照；"
+            "5. 多流阶段分析已归档，A05/A06/C03先跟进Host与元数据；B08共享专家辅助流兼容扩展实验后置；"
             "D08独立记录冷启动、缓存重启与实例就绪时间，和热服务时延分开。",
             "6. F01/F02作为P2补充专题，与主线复用request_id与时间戳采集；"
             "进入P/D容量或Store收益结论前，先补齐所依赖的排队与KV交接数据。",

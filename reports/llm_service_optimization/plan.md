@@ -1,6 +1,6 @@
 # LLM 服务请求全局视图与性能任务台账
 
-更新：2026-11-18。以 A3 / DeepSeek / vLLM-CANN 为主要优化对象，A5用于机制对照。结合既有profiling、固定源码和用户提供的对方项目清单，整理可验证方向、版本差异、责任分工与收益口径；对方报告数字不作为本服务实测收益。
+更新：2026-11-19。以 A3 / DeepSeek / vLLM-CANN 为主要优化对象，A5用于机制对照。结合既有profiling、固定源码和用户提供的对方项目清单，整理可验证方向、版本差异、责任分工与收益口径；对方报告数字不作为本服务实测收益。
 
 ## 全局位置、四类主线与边界观测
 
@@ -85,9 +85,10 @@ P2P connector 负责 P/D 交接；Store 提供共享外部缓存。MultiConnecto
 
 ## 近期讨论：时序、多流与静态kernel缓存
 
-2026-11-17归档。源码结论固定到官方0.32快照b12b6f7和CANN升级快照9a6a156；trace结论来自既有P.rar，不是新增性能实验。D侧启动日志、镜像中的npugraph_ex版本与约50个进度项的原文仍待补充。 2026-11-18补充DP2/TP2主线程/元数据/实际launch追踪，以及同名任务与时间零点复核；仍使用既有P.rar数据。
+2026-11-17归档。源码结论固定到官方0.32快照b12b6f7和CANN升级快照9a6a156；trace结论来自既有P.rar，不是新增性能实验。D侧启动日志、镜像中的npugraph_ex版本与约50个进度项的原文仍待补充。 2026-11-18补充DP2/TP2主线程/元数据/实际launch追踪，以及同名任务与时间零点复核；仍使用既有P.rar数据。 2026-11-19的多流阶段收尾与机制笔记见下方独立章节。
 
 [打开A3 DP2/TP2主线程与多流时序报告](../dsv41_a3_a5_prefill/host_issue_dp2tp2/report.html)：包含Task15092/15140对照、SESSION/共同坐标切换，以及DecoderLayer为何出现在Prefill调用栈。
+[多流阶段结论与原理笔记](index.html#multistream-review)：展开metadata、Q/KV、通信、CSA2/CED、量化和并行切分对照；Host抖动保留为假设。
 
 ### A3一个有效prefill：先统一时间零点与结束边界
 
@@ -179,6 +180,220 @@ A3 DP0TP0，本地step1；以下均为相对worker execute_model进入的毫秒�
 边界：Python self wall包含可能的CPU调度和采集开销，Event还被profiler包装；现有数据没有CPU调度/亲和/频率遥测，未确认物理慢卡或可回收收益。
 
 跟进：A06 / A08 / C03。证据：E29 / E14。
+
+## 多流专项：阶段收尾、证据边界与原理笔记
+
+2026-11-19归档。涵盖metadata搜索、Q/KV原理与实际算子、TP通信、CSA2/CED、量化及DP/TP/PP/CP。仅复核既有P.rar、固定代码与官方模型资料，未修改推理功能，未新增性能收益实测。
+
+多流机制与局部时序分析阶段完成；优化实施及端到端收益验证仍未完成。
+
+Host准备/下发影响重叠是已观测机制；Host抖动是待验证假设。当前没有证据给抖动分配“大概率”，也未确认固定物理NPU慢卡。
+
+### MegaMoE＋共享专家辅助流：限制已确认；兼容扩展后置
+
+范围是特定共享专家框架辅助流与fused MC2互斥；原始历史说明涉及收益与通信顺序/资源风险，不等于所有MoE多流都不支持。
+
+后续：保留互斥，跟踪可支持组合；需要独立兼容性设计与实验时再推进。。台账：B08。
+
+### DSA Q/KV预处理多流：机制与局部低重叠定位完成
+
+已有真实重叠实例。DP2/TP2的38/40层未观察到预处理交集，直接机制是Host没有及时使分支同时就绪。
+
+后续：后续问题转入Host/metadata专项；A08保留收益验证，不标记性能优化完成。。台账：A08 / A05 / A06。
+
+### Host抖动或固定开销：根因待验证
+
+尚不能区分固定构造/包装成本、采集扰动和CPU运行态波动。
+
+后续：先无profiler对照，再补CPU遥测；稳定复现后逐项验证环境或代码因素。。台账：A06 / C03。
+
+### 服务性能收益：尚未验证
+
+0.088/7.421ms重叠差和63.670ms Host差不是可直接回收的预算。
+
+后续：固定负载做单变量精度、稳定性与TTFT/吞吐验收，记录无收益结果。。台账：A08 / A06。
+
+### 下一轮验证
+
+1. 先在同负载下比较无profiler压测与轻量采集，确认低重叠和晚到rank是否稳定复现。
+2. 若复现，补CPU调度/绑核/NUMA/频率等观测，区分运行环境差异、随机抖动与固定Host构造开销。
+3. A05/A06优先尝试同step/缓存组的合法元数据复用及下发开销消减；每次只改变一个因素。
+4. B08的MegaMoE＋共享专家辅助流兼容扩展后置，不与Host实验混合；所有收益最终用无profiler服务指标确认。
+
+### Metadata：搜哪些名称，哪些耗时不能相加
+
+DP2/TP2主线程1601；表内时间统一使用DP0/TP0 SESSION共同零点。
+
+在原始trace中查name字段，在Insight按节点名称搜索；metadata不是一个统一耗时字段。CPU/Python scope与设备算子需要分别查。
+
+Metadata包含query边界、序列长度、block table、slot mapping、SWA可见窗口和Indexer/Attention执行计划。构造它不等于计算QK或生成KV内容。
+
+Engram外层prepare_attn包含普通Attention与Replay元数据阶段。父子scope不能相加，Python持续时间也不是CPU实际运行时间。
+
+### 可搜索名称与定位
+
+| 位置 | 名称/路径 | 作用或时间 |
+| --- | --- | --- |
+| Python主线程 | model_states/default.py: prepare_attn | 2004.967920–2073.992690ms；69.024770ms |
+| Python主线程 | decoder_replay_state.py: _build_metadata | 2076.023680–2143.750350ms；67.726670ms |
+| Python主线程 | engram/model_state.py: prepare_attn | 外层2004.485700–2143.785850ms；139.300150ms |
+| Python主线程 | build_replay_swa_visible_lens | 本窗口42次；每个query可见的SWA历史长度 |
+| Ascend Hardware | SparseFlashMlaMetadata / IndexerV2Metadata | 设备侧执行计划/元数据；不等于Attention主计算 |
+
+[原始主线程时序报告](../dsv41_a3_a5_prefill/host_issue_dp2tp2/report.html) · [元数据构造源码](https://github.com/gg820827047/vllm-ascend/blob/9a6a156fccccb7ad55c5d534c8948d3ec4efc3f8/vllm_ascend/models/deepseek_v41/decoder_replay_state.py#L346)
+
+### Q/KV：生成向量、读取缓存与主Attention算子
+
+首层1848-token示例；下面列的是Device共同坐标，先按Stream/Task/Connection ID匹配。
+
+Q用于查询，K用于匹配打分，V提供加权汇总的信息。简化公式：P=softmax(QKᵀ/sqrt(d)+mask)，O=PV；这里省略了sinks和位置编码细节。不是只选最高分K再取一个V，而是按权重汇总多个可见位置的V。
+
+当前模型这条算子路径使用共享KV：同一缓存向量承担K和V的角色，并由多个Q头读取。Q和KV使用不同模型权重生成。
+
+首层H为[1848,5120]。Q_a投影得到[1848,1280]，经过RMSNorm/量化后，Q_b输出[1848,8192]，reshape为本rank的[1848,16,512]。KV投影输出[1848,512]，经归一化、RoPE后写入缓存。
+
+前面的MatMulV3、MatMulV2和QuantBatchMatmulV3是在乘模型权重，不是在计算QKᵀ。QK打分、Softmax及PV汇总在SparseFlashMla内部以分块流水方式完成，因此不一定出现单独Softmax任务。
+
+本例第0层没有压缩KV输入；后续带长程分支的层还会读取选中的全局KV。SparseFlashMla之后的逆RoPE与输出投影仍属于Attention模块。
+
+```text
+本层H ─┬→ Q_a投影 → Q归一化/量化 → Q_b投影 → Q RoPE ─┐
+       └→ KV投影 → KV归一化/RoPE → KV缓存写入 ────────┤
+                                                   └→ SparseFlashMla → 逆RoPE → wo_a/wo_b
+这是数据依赖图，不是实际下发时间线。
+```
+
+### 原始CSV核对的13个计算/写缓存任务
+
+| 算子 | Stream / Task | 开始ms | 作用 |
+| --- | --- | --- | --- |
+| MatMulV3 | 47 / 5905 | 2153.053187 | 生成Q_a；输入H乘模型权重Wq_a |
+| MatMulV2 | 37 / 15140 | 2154.143529 | 生成共享KV；输入H乘模型权重Wkv |
+| RmsNorm | 47 / 5907 | 2154.512096 | Q_a的RMSNorm |
+| DynamicQuant | 47 / 5908 | 2154.716100 | Q中间表示动态量化，供Q_b投影 |
+| RmsNorm | 37 / 15143 | 2155.344973 | KV的RMSNorm |
+| InplacePartialRotaryMul | 37 / 15144 | 2155.561417 | KV位置编码RoPE |
+| ScatterNdUpdateSk | 37 / 15145 | 2155.824862 | 按slot_mapping写SWA KV缓存 |
+| QuantBatchMatmulV3 | 47 / 5911 | 2156.332692 | Q_b投影，得到本rank多头Q |
+| InplacePartialRotaryMul | 47 / 5913 | 2156.819802 | Q位置编码RoPE |
+| SparseFlashMla | 47 / 5914 | 2157.278271 | 融合Attention：QK打分、Softmax、加权V |
+| InplacePartialRotaryMul | 47 / 5915 | 2157.427154 | Attention输出逆RoPE |
+| TransposeBatchMatMul | 47 / 5916 | 2157.973205 | wo_a输出投影 |
+| MatMulV3 | 47 / 5917 | 2158.347613 | wo_b输出投影 |
+
+[完整shape、dtype和时刻CSV](../dsv41_a3_a5_prefill/host_issue_dp2tp2/qkv_first_layer_walkthrough.csv) · [投影层定义](https://github.com/gg820827047/vllm-ascend/blob/9a6a156fccccb7ad55c5d534c8948d3ec4efc3f8/vllm_ascend/models/deepseek_v41/model.py#L392) · [SparseFlashMla调用](https://github.com/gg820827047/vllm-ascend/blob/9a6a156fccccb7ad55c5d534c8948d3ec4efc3f8/vllm_ascend/attention/dsa_v41.py#L722)
+
+### 多流：数学可并行、任务及时就绪、硬件资源允许是三个条件
+
+DSA预处理子图；与共享专家多流分别判断。低重叠并非所有TP2或所有窗口共有。
+
+当前代码先提交Q_a，再将KV矩阵乘提交到辅助流，然后向主流提交Q归一化/量化。CPU调用顺序串行，设备任务仍可异步重叠。Q Norm不需要KV投影结果；最终Attention消费缓存前才必须满足相关就绪条件。
+
+实现通过event错开主要Cube矩阵乘，尝试让Q归一化/量化与KV矩阵乘重叠，再让Q_b矩阵乘与KV归一化/RoPE/写缓存重叠。算子也可能占用多种资源，不保证分流后净收益为正。
+
+DP2/TP2第0层KV在2154.196610ms结束，Q Norm到2154.512096ms才在设备开始，已错过重叠窗口。TP0同层KV为2151.912405–2151.986627ms，Q Norm为2151.911425–2151.942366ms，实际交集约29.961µs。
+
+DP2/TP2的40层中38层未观察到该预处理重叠，仅第5、18层有少量重叠。DP0/TP2、DP3/TP2有明显重叠；DP1/TP0另一有效窗口也出现低重叠。不能把现象绑定到TP2编号或固定物理设备。
+
+日报7.420534ms是TP0目标层内全部计算流重叠；下面6.563496ms只统计DSA预处理子图，两者口径不同。A3/A5拓扑、Runner和量化路径不同，不能直接外推硬件优劣。
+
+### 同DP2窗口的DSA预处理交集（40层）
+
+| Rank | 重叠ms | 零重叠层数 |
+| --- | --- | --- |
+| dp2-tp0 | 6.563496 | 0/40 |
+| dp2-tp1 | 6.605075 | 0/40 |
+| dp2-tp2 | 0.088462 | 38/40 |
+| dp2-tp3 | 6.515915 | 0/40 |
+
+### 已确认的框架限制范围
+
+| 路径 | 已确认 | 仍需验证 |
+| --- | --- | --- |
+| MegaMoE＋共享专家辅助流 | 官方0.32与当前CANN均有框架互斥；不等于所有MoE多流都不可能 | 已知跨rank/跨流通信顺序和资源竞争风险；扩展兼容性实验后置 |
+| DSA Q/KV预处理 | 代码允许部分并行，TP0等rank已观察到真实交集 | 生产稳态是否复现TP2差异，以及改善下发能否带来服务收益 |
+
+[DSA多流代码](https://github.com/gg820827047/vllm-ascend/blob/9a6a156fccccb7ad55c5d534c8948d3ec4efc3f8/vllm_ascend/attention/dsa_v41.py#L491) · [共享专家互斥历史提交](https://github.com/vllm-project/vllm-ascend/commit/2044419f8f3dec6288eb1b1b1f54245d4c2b0904) · [全部A3窗口统计来源](../dsv41_a3_a5_prefill/host_issue_dp2tp2/attention_mechanism_evidence.json)
+
+### DP / TP / PP / CP / EP分别切什么，Attention何时通信
+
+先区分纯并行概念，再看本例DP4×TP4 / EP16的组合；不能把所有集体通信都归给MoE。
+
+切分通常以rank/设备为单位，不一定以服务器为单位。DP分不同请求；TP分每层的大矩阵/Attention头；PP分模型层；CP分同一请求的token位置和上下文。
+
+Attention按TP组协作：每个DP分组的4个TP rank各算部分头和输出投影，再合并结果。MoE切换到EP组做专家分发/归并；同一进程同时有DP、TP和EP编号。开启EP后，不能认为每个DP分组都独立持有全部专家权重。
+
+SparseFlashMla这次调用执行本卡Q/KV计算，但整个Attention模块有TP通信。原始CSV的wo_b之后出现AllReduce，CPU栈也有AscendRowParallelLinear_0 → tensor_model_parallel_all_reduce。
+
+DP之间通常不为同一请求交换Attention的Q/KV，但框架仍可同步批量/调度信息；EP组也可能跨DP分组。受支持的PCP等上下文切分还会增加上下文数据组织通信。P→D的Mooncake KV传输属于connector层，应另计。
+
+### 并行维度与权重/数据划分
+
+| 方式 | 切分对象 | 权重布局及示例 |
+| --- | --- | --- |
+| DP | 不同请求/批次 | 纯DP复制模型；一份逻辑副本也可由TP/PP承载 |
+| TP | 同一层内张量/头 | 每层部分权重分片，部分参数仍复制；通常有层内collective |
+| PP | 不同层/模块 | 假设40层分四段，每段持有对应层；阶段间传激活 |
+| CP | 同一请求的token/上下文 | 分摊上下文计算/KV负担；通常不以切权重为主要目标，具体结合TP/PP实现 |
+| EP | MoE专家 | 按专家分权重，并按路由分发/归并token；不是EPLB自动开启 |
+
+### 首层Attention与TP通信的实际记录
+
+| 设备任务 | 开始ms | 持续µs | 含义 |
+| --- | --- | --- | --- |
+| SparseFlashMla / Task5914 | 2157.278271 | 98.382 | 本卡Attention主计算 |
+| MatMulV3 / Task5917 | 2158.347613 | 157.803 | wo_b输出投影 |
+| hcom_allReduce_ | 2158.655699 | 525.650 | TP输出合并；通信区间仍可能包含等待，不能当作可回收预算 |
+
+[RowParallelLinear的TP合并](https://github.com/vllm-project/vllm/blob/5df63a7203cdb9328d824a27b682e77c7b9928be/vllm/model_executor/layers/linear.py#L1762) · [当前PCP实现与支持条件](https://github.com/gg820827047/vllm-ascend/blob/9a6a156fccccb7ad55c5d534c8948d3ec4efc3f8/vllm_ascend/attention/context_parallel/dsa_v41_cp.py#L135) · [原始事件与dtype摘要](../dsv41_a3_a5_prefill/host_issue_dp2tp2/attention_mechanism_evidence.json)
+
+### CSA2 / CED / 量化 / QuantMatmul不是同一个维度
+
+V4.1官方模型设计与这份A3实际精度路径分别记录；架构术语不能仅由算子名推断。
+
+CSA2是Compressed Sparse Attention 2，组织全局KV、Indexer与稀疏位置复用。其名称中的2与配置compress_ratio=2的二合一倍率不是同一概念。源码处理0/2/1等路径，具体层配置以checkpoint为准。
+
+序列压缩改变KV条目数；稀疏选择改变本次关注哪些条目；跨层复用减少重复计算/存储；数值量化改变每个数的位宽。SparseFlashMla是执行Attention数学计算的算子接口。
+
+Full生成全局KV并做索引；Reindex复用全局KV/Indexer K、重新选Top-K；Reuse复用全局KV及Top-K。每层仍保留自己的主Q和SWA KV，Reuse不代表整层Attention结果直接复用。
+
+量化将数据表示为较低位宽格式及scale等辅助信息；QuantMatmul使用量化数据做矩阵乘。权重、激活、KV缓存均可有各自量化路径，不都对应QuantMatmul。
+
+V4.1官方为CED：20层因果Encoder加20层Decoder。两段可使用同一DecoderLayer代码类；类名不能判定当前运行阶段。模型分段与部署P/D不是一一对应，bounded replay路径还需按实际开关/支持布局确认。此处修正此前仅用通用Decoder结构概括V4.1的不足。
+
+### 这份A3采集的实际dtype
+
+| 算子 / Task | 输入与输出 | 说明 |
+| --- | --- | --- |
+| DynamicQuant / 5908 | BF16 → INT8＋FLOAT scale | 量化转换 |
+| QuantBatchMatmulV3 / 5911 | INT8激活/权重及scale等 → BF16 | 量化矩阵乘，生成Q_b |
+| SparseFlashMla / 5914 | 主要数值输入Q/KV为BF16，输出BF16 | 旁边出现QuantMatmul不代表此Attention的QK/PV都是INT8 |
+
+[官方模型说明（CED / CSA2 / FP4 KV）](https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash) · [官方技术报告§2.3](https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash/blob/main/DeepSeek_V41_Tech_Report.pdf) · [当前V4.1层复用规划](https://github.com/gg820827047/vllm-ascend/blob/9a6a156fccccb7ad55c5d534c8948d3ec4efc3f8/vllm_ascend/models/deepseek_v41/model.py#L522)
+
+### 慢rank、物理慢设备与Host抖动：证据能支持到哪里
+
+当前只完成带profiler的局部机制定位；没有新增NPU性能A/B。
+
+已观察到DP2/TP2的Host准备和下发偏慢，并导致独立Q/KV分支错过重叠窗口。这可以称为本次采集中的慢rank/Host慢路径。
+
+Host抖动尚未证实，更不能赋予“大概率”判断。现有数据无法区分重复构造/包装的固定成本、profiler额外开销，以及CPU调度、绑核、NUMA、频率或其他运行态争用。
+
+当前CPU/NPU采集启用了大量Python记录，Event.record/wait还存在profiler包装。Python self wall不是CPU实际运行时间；_host_sys为空，缺少调度、亲和与频率轨迹。
+
+称为固定物理NPU慢设备，还需在等工作量/精度/布局下重复观察设备计算差异，并用rank↔设备及CPU绑定对照判断异常跟随谁。collective内等待与逻辑晚到不能直接当作芯片计算慢。
+
+### 证据等级与验证顺序
+
+| 判断 | 当前状态 | 需要的下一步 |
+| --- | --- | --- |
+| DSA存在可重叠分支 | 已确认 | 保留数学依赖与正确性event |
+| 本次TP2 Host影响设备重叠 | 已确认局部机制 | 无profiler重复压测及轻量采集确认稳态复现 |
+| Host随机抖动为主因 | 待验证假设 | CPU调度/亲和/频率遥测；区分固定开销与随机波动 |
+| 固定物理NPU慢卡 | 未确认 | 等工作量设备对照、rank与设备映射互换 |
+| 多流优化已带来服务收益 | 未验证 | 单变量、精度/稳定性与无profiler TTFT/吞吐验收 |
+
+[主线程记录与方法限制](../dsv41_a3_a5_prefill/host_issue_dp2tp2/summary.json) · [官方TorchNPU Event采集包装](https://github.com/Ascend/pytorch/blob/v2.10.0/torch_npu/profiler/profiler_interface.py#L43-L60)
 
 ## 对方21项优化：对A3 / vLLM-CANN的启发与适用边界
 
@@ -277,6 +492,7 @@ F01/F02初始列P2；若排队或KV加载等待主导TTFT、使D侧长期空等�
 | H08 A3 Host/Device时序与异步路径复核 | S2 / S3 / S4 / S7 | 既有trace补充核对 | 已归档目标包络461.233ms拆分、首层前准备及launch关联；存在跨step重叠，仍无异步调度ON/OFF性能实验。；E13；后续 A01 / A06 / A07 / B05 / C03 |
 | H09 共享专家多流互斥与静态缓存机制核对 | S3 / S7及启动前 | 源码机制确认；现场验证待补 | 官方0.32和CANN均有fused MC2互斥；启动编译、缓存检查和图捕获分开记录，不从50项进度或.run缺失推断重编译。；E15；后续 B07 / B08 / D08 |
 | H10 对方优化项目适用性与实验计划 | S0–S8 / X | 21项对照已归档；NPU实验未执行 | 优先batch/chunk、DP供给与元数据；明确MegaMoE DP绕过及DSV4.1 Gate的适配差异，外部收益仅作线索。；E21；后续 A05 / A06 / A09 / B09 / B10 / D02 / D09 / R03 |
+| H11 多流分析阶段收尾与机制学习笔记 | S2 / S3 / S7 / X | 阶段分析完成；收益未验证 | 确认共享专家辅助流互斥范围和DSA局部Host供给问题；Host抖动/物理慢设备待证实，后续移交Host与环境验证。；E30；后续 A05 / A06 / C03 / A08 / B08 |
 
 ## 责任与预期收益口径
 
@@ -299,10 +515,10 @@ P0先形成证据与回归基础；P1做受控实验和低风险候选；P2为�
 | A02 / P0 | S2/S3/S4/S6/S7 / 分析 | 分类并追踪同步点的关键依赖 | 待认领（性能分析 / 项目统筹） | 部分分析；A3代表execute窗口有较多StreamWaitEvent，但未见阻塞式Synchronize；不能概括所有step。 | 直接性能收益0；只筛出值得修改的同步点。 指标：每类等待次数、墙钟、暴露时间；有因果关联的设备空洞。 | G03 / A01 |
 | A03 / P0 | S4/S8 / 分析 | 核对D2H与异步输出是否挡住流水 | 待认领（vLLM / Ascend 框架开发） | 部分分析；A3/A5都观察到采样输出D2H；长Event同步可能在后台get_output。 | 分析阶段直接收益0；若有暴露等待，优化上限由可隐藏的ΔT决定。 指标：D2H实际传输、消费等待、下一轮启动及客户端输出延迟。 | A02 |
 | A04 / P0 | S2/S6 / 分析 | 拆解DP元数据同步和Gloo等待 | 待认领（vLLM / Ascend 框架开发） | 部分分析；A3代表准备段Gloo约88.8ms，其中约69.2ms与上轮设备任务重叠。 | 分析阶段直接收益0；后续只能回收关键路径上可消除的等待。 指标：最后到达者；到达离散度；未覆盖等待；首层启动时间。 | G03 / C01 |
-| A05 / P1 | S2 / 优化候选 | 复用step内SWA/DSA元数据与visible_lens | 待认领（模型适配开发） | 待实验；A3已有重复展开与索引链证据，尚未提交此项性能修改。 | 预期减少重复元数据生成和准备开销；幅度待实测，不能套用A5的1641→221比例。 指标：准备关键路径Δms、launch/分配次数、TTFT、内存峰值。 | G02 / A02 / B01 |
-| A06 / P1 | S2/S6 / 优化候选 | 优化Host下发与准备热路径 | 待认领（vLLM / Ascend 框架开发） | 部分分析；A3代表窗口首层前约223.6ms：prepare_attn 59.887ms、replay metadata 54.277ms；DP同步约88.347ms中部分已被前轮设备覆盖，尚需拆self time。 补充DP2/TP2对照：metadata139.300ms、目标40层Host447.453ms，比同DP TP0分别多25.567ms和63.670ms；先核对profiler扰动与CPU调度，再评估重复准备/stream-event包装。 | 减少暴露的准备/下发时间；若已被设备覆盖，时延收益可能为0。 指标：Host self time、launch速率、分配数、设备空洞、TTFT/TPOT。 | G03 / A02 |
+| A05 / P1 | S2 / 优化候选 | 复用step内SWA/DSA元数据与visible_lens | 待认领（模型适配开发） | 待实验；A3已有重复展开与索引链证据，尚未提交此项性能修改。 已定位两个metadata构造scope及42次visible_lens调用；每组输入是否等价仍须校验，不能直接假设42次可合并为一次。 | 预期减少重复元数据生成和准备开销；幅度待实测，不能套用A5的1641→221比例。 指标：准备关键路径Δms、launch/分配次数、TTFT、内存峰值。 | G02 / A02 / B01 |
+| A06 / P1 | S2/S6 / 优化候选 | 优化Host下发与准备热路径 | 待认领（vLLM / Ascend 框架开发） | 部分分析；A3代表窗口首层前约223.6ms：prepare_attn 59.887ms、replay metadata 54.277ms；DP同步约88.347ms中部分已被前轮设备覆盖，尚需拆self time。 补充DP2/TP2对照：metadata139.300ms、目标40层Host447.453ms，比同DP TP0分别多25.567ms和63.670ms；先核对profiler扰动与CPU调度，再评估重复准备/stream-event包装。 Host抖动尚待证实；现有数据未能区分固定包装/重复构造成本、采集扰动与运行态CPU差异。 | 减少暴露的准备/下发时间；若已被设备覆盖，时延收益可能为0。 指标：Host self time、launch速率、分配数、设备空洞、TTFT/TPOT。 | G03 / A02 |
 | A07 / P1 | S1/S2/S6/S7 / 验证 | 做异步调度受控A/B | 待认领（vLLM / Ascend 框架开发） | 待实验；A3样本已有异步输出运行栈及部分跨step重叠，不能用未写CLI参数当OFF基线；尚无同环境显式ON/OFF收益实验。 | 有机会隐藏调度/输出处理开销；设备持续满载时收益可能有限。 指标：TTFT/TPOT p95、goodput、Host/device有效重叠、CPU占用。 | A01 / A02 / G02 |
-| A08 / P2 | S2/S3/S6/S7 / 优化候选 | 模型多流与可切分计算的重叠评估 | 待认领（模型适配开发） | 部分分析；A3已观察到DSA辅助流与主流任务重叠；共享专家框架多流被fused MC2互斥关闭。独立子图可否扩展及净收益仍待验证。 全目标窗口计算流重叠：DP2/TP2为0.088462ms、TP0为7.420534ms；第0/10/21层证实独立分支未同时就绪，重叠少不能直接当作物理卡慢或加速预算。 | 可能隐藏独立计算/通信；竞争或切分过细可能变慢，不预设加速。 指标：关键路径、重叠量、launch数、HBM峰值、TTFT/TPOT。 | B01 / A02 / G02 |
+| A08 / P2 | S2/S3/S6/S7 / 优化候选 | 模型多流与可切分计算的重叠评估 | 待认领（模型适配开发） | 阶段分析完成；收益待验证；A3已观察到DSA辅助流与主流任务重叠；共享专家框架多流被fused MC2互斥关闭。独立子图可否扩展及净收益仍待验证。 全目标窗口计算流重叠：DP2/TP2为0.088462ms、TP0为7.420534ms；第0/10/21层证实独立分支未同时就绪，重叠少不能直接当作物理卡慢或加速预算。 2026-11-19完成机制/局部时序阶段归档；Host根因转A06/C03，优先元数据/下发专项，不把提高重叠本身当作验收。 | 可能隐藏独立计算/通信；竞争或切分过细可能变慢，不预设加速。 指标：关键路径、重叠量、launch数、HBM峰值、TTFT/TPOT。 | B01 / A02 / G02 |
 | A09 / P1 | S6/S7 / 分析 | 核对Decode DP同步绕过的版本、算子与一致性条件 | 待认领（vLLM / Ascend 框架开发） | 部分分析；对方称MegaMoE+重算调度下绕过DP AllReduce收益4.45%；当前CANN快照明确在MegaMoE/FUSED_MC2等路径保留协调，现有P侧88ms同步也不能套用D侧策略。 | 分析直接收益0；确认可安全绕过时才有机会减少每步暴露同步与padding，外部4.45%不作为本环境预算。 指标：D侧同步暴露ms、有效/填充tokens、TPOT/ITL、吞吐、collective一致性。 | G01 / A02 / B05 |
 | B01 / P0 | S2/S3/S7 / 分析 | 建立同口径算子与执行引擎清单 | 待认领（性能分析 / 项目统筹） | 部分分析；已有代表窗口算子对比；A3/A5含Runner、CANN、量化和负载混杂。 | 直接性能收益0；定位能由模型替换、元数据或配置解决的部分。 指标：同shape单次分布、调用数、关键路径占比、实际执行引擎。 | G01 / G03 |
 | B02 / P1 | S3/S7 / 优化候选 | 核对并替换可用Norm/量化融合路径 | 待认领（模型适配开发） | 待分析；A5的RMSNorm+MX动态量化已观察到；A3为不同量化消费路径。 | 可能减少中间读写、kernel下发和临时buffer；实际收益待实验。 指标：Norm+quant组合墙钟、HBM读写、launch数、TTFT/TPOT。 | B01 / G02 |
@@ -311,12 +527,12 @@ P0先形成证据与回归基础；P1做受控实验和低风险候选；P2为�
 | B05 / P0 | S3/S7 / 分析 | 拆解MegaMoE的计算、搬运、通信与等待 | 待认领（性能分析 / 项目统筹） | 部分分析；代表目标层Mega驻留299.701/461.233ms；首层完整16个EP rank到达差35.763ms、结束差0.031ms，优先追踪晚到路径和内部等待。 | 分析直接收益0；优先减少输入晚到与不均衡，不能把Mega总占比全算可优化。 指标：到达离散、有效计算/等待、专家负载、层关键路径。 | B01 / C01 |
 | B06 / P2 | S3/S7 / 分析 | 整理重型算子最小复现并交接算子团队 | 待认领（CANN / 算子对接） | 待分析；若公平对照后确认核内瓶颈，团队不默认自行重写Attention或MegaMoE。 | 分析直接收益0；解锁外部算子修复或已有实现替换，收益待返回版本验证。 指标：可复现率、核内延迟、服务回归收益与精度。 | B04 / B05 |
 | B07 / P1 | S2/S3/S6/S7 / 分析 | 区分Eager、图重放和static kernel实际命中 | 待认领（vLLM / Ascend 框架开发） | 部分分析；A5 Prefill样本不能确定D侧static开关；已核对三层启动工作与缓存，实际D镜像版本和“约50项”日志仍缺。 | 分析直接收益0；图命中后可能降低decode下发成本，不能泛化到prefill。 指标：每step launch/Host时间、padding、图命中、TPOT p95。 | G01 / B01 |
-| B08 / P1 | S3/S7 / 验证 | 核对共享专家多流互斥并验证支持路径的重叠收益 | 待认领（模型适配开发） | 部分分析；官方0.32和CANN均在内部fused_mc2=1时关闭共享专家overlap；A3观察到的其他多流不能用来证明共享专家并行。 | 验证本身直接收益0；支持路径有机会隐藏共享专家计算，收益受路由专家关键路径和资源竞争约束。 指标：共享/路由重叠ms、MoE层墙钟、TTFT/TPOT/ITL、吞吐及精度。 | G01 / G02 / B01 / A02 |
+| B08 / P2 | S3/S7 / 验证 | 核对共享专家多流互斥并验证支持路径的重叠收益 | 待认领（模型适配开发） | 限制已确认；实验后置；官方0.32和CANN均在内部fused_mc2=1时关闭共享专家overlap；A3观察到的其他多流不能用来证明共享专家并行。 互斥历史与风险范围已核对；不是普遍的MoE多流禁令。兼容扩展需另行设计，暂后置于Host验证。 | 验证本身直接收益0；支持路径有机会隐藏共享专家计算，收益受路由专家关键路径和资源竞争约束。 指标：共享/路由重叠ms、MoE层墙钟、TTFT/TPOT/ITL、吞吐及精度。 | G01 / G02 / B01 / A02 |
 | B09 / P2 | S3/S7 / 优化候选 | 确认MoE Gate实际dtype路径并评估保精度的转换消减 | 待认领（模型适配开发） | 部分分析；AscendGateLinear已有BF16×BF16到FP32输出分支；DeepSeek-V4.1 gate却显式要求precast_fp32_weight，内部router还可能复用FP32 hidden。不能以类存在认定目标模型已走BF16路径。 | 候选收益取决于目标路由热路径的暴露cast/投影时间；不能从BF16输出声明推断精度等价或复制对方收益。 指标：Gate+cast时间/内存、专家选择一致性、TTFT/TPOT及端到端精度。 | G01 / B01 / G02 |
 | B10 / P2 | S3/S7 / 优化候选 | 评估Attention尾部融合、投影布局与直接写回 | 待认领（模型适配开发） | 待采集；对方的逆RoPE/量化/o_proj融合、ND权重和MXFP8写回有方向价值；我们主证据是A3 Prefill INT8路径，D侧小batch与MXFP8收益尚无对应trace。DSV4.1 wo_a本身已要求ND。 | 有机会减少尾部launch、临时结果和内存搬运；外部SLO吞吐大幅改善不等于同幅kernel加速。 指标：epilogue墙钟、copy/format_cast字节数、launch数、HBM、TPOT/ITL与精度。 | G01 / B01 / B04 / G02 |
 | C01 / P0 | X / 分析 | 对齐通信组、共同轮次与物理卡映射 | 待认领（性能分析 / 项目统筹） | 部分分析；已有EP共同轮次对齐；仍需完整物理NPU、CPU、NUMA与链路映射。 | 直接性能收益0；避免把工作量不同或边界等待识别为慢卡。 指标：参与rank覆盖、事件对齐误差、缺失窗口。 | G01 / G03 |
 | C02 / P0 | S3/S7 / 分析 | 做同工作量的计算卡间一致性分析 | 待认领（性能分析 / 项目统筹） | 部分分析；HcPre离散较小；A3某同shape MatMul可差约52%，原因未定。 | 直接性能收益0；识别持续退化、资源争用或调用条件差异。 指标：同条件中位数/p95比例、跨轮重复性、关键路径贡献。 | C01 / B01 |
-| C03 / P0 | S2/S3/S6/S7 / 分析 | 查明晚到rank和EP拖尾的来源 | 待认领（vLLM / Ascend 框架开发） | 部分分析；A3代表首层到达差35.763ms而结束差0.031ms，结合dummy先到等待进一步查Host准备；该证据不足以确认物理慢卡。 补充DP2/TP2主线程的元数据与下发差异，尚缺CPU调度/绑核/频率证据；区分同名小shape dummy与真实Prefill，以及单rank/共同时间坐标。 | 分析直接收益0；为减少全组拖尾提供依据。 指标：最后到达rank、跨rank到达差、暴露等待、层墙钟。 | C01 / G03 |
+| C03 / P0 | S2/S3/S6/S7 / 分析 | 查明晚到rank和EP拖尾的来源 | 待认领（vLLM / Ascend 框架开发） | 部分分析；A3代表首层到达差35.763ms而结束差0.031ms，结合dummy先到等待进一步查Host准备；该证据不足以确认物理慢卡。 补充DP2/TP2主线程的元数据与下发差异，尚缺CPU调度/绑核/频率证据；区分同名小shape dummy与真实Prefill，以及单rank/共同时间坐标。 阶段结论是慢rank/Host慢路径；需要固定负载复现、CPU遥测与rank↔设备映射对照，才能区分CPU侧问题和固定物理慢设备。 | 分析直接收益0；为减少全组拖尾提供依据。 指标：最后到达rank、跨rank到达差、暴露等待、层墙钟。 | C01 / G03 |
 | C04 / P1 | X / 分析 | 核对频率、温度、CPU/NUMA与资源争用 | 待认领（NPU / CPU / 通信运维） | 待采集；当前静态NPU配置不足以证明运行时没有降频、带宽或CPU争用。 | 直接性能收益0；若确认降频/争用，修复部署可恢复损失性能。 指标：同条件算子分布、运行频率、CPU等待与内存/链路指标。 | C01 / C02 |
 | C05 / P1 | S3/S7 / 分析 | 分析模型内HCCL集合通信与链路差异 | 待认领（NPU / CPU / 通信运维） | 待分析；本项聚焦TP/EP等模型内集合通信；P/D点到点与Store KV交接单独列F02（P2），避免混用口径。 | 分析直接收益0；若确认暴露的集合通信瓶颈，可评估通信配置或模型调用侧改进。 指标：collective p95、有效GB/s、到达差、计算通信重叠、失败率。 | C01 / G01 |
 | C06 / P2 | X / 验证 | 通过绑核/换卡与独立微基准验证慢卡假设 | 待认领（NPU / CPU / 通信运维） | 待实验；尚未确认固定物理慢卡，不应先按硬件故障处理。 | 直接性能收益0；确认硬件/部署问题后可定向恢复损失。 指标：异常随卡/随rank迁移；跨轮稳定性；正常对照。 | C02 / C04 |
@@ -448,21 +664,22 @@ P0先形成证据与回归基础；P1做受控实验和低风险候选；P2为�
 
 验收：元数据逐项等价；多轮无陈旧状态；端到端收益超过自然波动。
 
-前置：G02 / A02 / B01。证据：E02 / E21。
+前置：G02 / A02 / B01。证据：E02 / E21 / E30。
 
 ### A06 优化Host下发与准备热路径
 
 位置：S2 P 端 Host 输入准备 / S6 D 端调度与准备。责任人：待认领；建议角色：vLLM / Ascend 框架开发；协同：模型适配开发 / NPU / CPU / 通信运维。
 
-1. 以首层前准备为起点，按未覆盖Host时间排序；结合真实launch、前序设备任务和event依赖，区分Python计算、runtime下发与等待。
-2. 评估持久buffer、批量构造、移除无效转换和小操作复用；区分CPU张量与设备张量。
-3. 核对NUMA/绑核和线程竞争，避免把运行环境问题改成复杂代码。
+1. 先做无profiler与轻量采集对照，再补CPU调度/频率/亲和观测；稳定复现后才决定环境调整或代码实验，不预设Host抖动为主因。
+2. 以首层前准备为起点，按未覆盖Host时间排序；结合真实launch、前序设备任务和event依赖，区分Python计算、runtime下发与等待。
+3. 评估持久buffer、批量构造、移除无效转换和小操作复用；区分CPU张量与设备张量。
+4. 核对NUMA/绑核和线程竞争，避免把运行环境问题改成复杂代码。
 
 交付物：Host热点清单及每次只改一个因素的patch/实验。
 
 验收：有明确关键路径收益；输出、请求隔离和异步buffer寿命正确。
 
-前置：G03 / A02。证据：E02 / E10 / E13 / E14 / E29。
+前置：G03 / A02。证据：E02 / E10 / E13 / E14 / E29 / E30。
 
 ### A07 做异步调度受控A/B
 
@@ -491,7 +708,7 @@ P0先形成证据与回归基础；P1做受控实验和低风险候选；P2为�
 
 验收：数值等价、无数据竞争；支持配置边界明确，保留必要event。
 
-前置：B01 / A02 / G02。证据：E09 / E13 / E14 / E15 / E16 / E29。
+前置：B01 / A02 / G02。证据：E09 / E13 / E14 / E15 / E16 / E29 / E30 / E31。
 
 ### A09 核对Decode DP同步绕过的版本、算子与一致性条件
 
@@ -622,7 +839,7 @@ P0先形成证据与回归基础；P1做受控实验和低风险候选；P2为�
 
 验收：区分单项与组合变量；证明实际后端和流已生效，端到端收益经重复压测且无数值或通信退化。
 
-前置：G01 / G02 / B01 / A02。证据：E13 / E14 / E15 / E16。
+前置：G01 / G02 / B01 / A02。证据：E13 / E14 / E15 / E16 / E32。
 
 ### B09 确认MoE Gate实际dtype路径并评估保精度的转换消减
 
@@ -694,7 +911,7 @@ P0先形成证据与回归基础；P1做受控实验和低风险候选；P2为�
 
 验收：同组共同轮次、输入工作量可解释；不破坏MoE collective一致性。
 
-前置：C01 / G03。证据：E04 / E13 / E14 / E21 / E29。
+前置：C01 / G03。证据：E04 / E13 / E14 / E21 / E29 / E30。
 
 ### C04 核对频率、温度、CPU/NUMA与资源争用
 
@@ -948,7 +1165,7 @@ P0先形成证据与回归基础；P1做受控实验和低风险候选；P2为�
 2. A05/A06 + C02/C03/B05：优先验证元数据复用与Host热点，同时查Mega等待和异常MatMul；A07异步开关只在支持组合中受控对照。
 3. B02/B03/A08 + D01/D02/D03：再推进可用融合、多流/切分与拓扑/预算；每次只改变计划变量。
 4. D04/D05/D06/D07 + R01/R02：缓存、SWA、MTP和执行路径分项验收；逐项回写实测与负结果，再评估组合。
-5. B08核对共享专家多流互斥后再做支持路径对照；D08独立记录冷启动、缓存重启与实例就绪时间，和热服务时延分开。
+5. 多流阶段分析已归档，A05/A06/C03先跟进Host与元数据；B08共享专家辅助流兼容扩展实验后置；D08独立记录冷启动、缓存重启与实例就绪时间，和热服务时延分开。
 6. F01/F02作为P2补充专题，与主线复用request_id与时间戳采集；进入P/D容量或Store收益结论前，先补齐所依赖的排队与KV交接数据。
 
 ## 证据索引与适用范围
@@ -1128,3 +1345,27 @@ BF16输入/权重、FP32输出且无bias时，已有torch.mm(...,out_dtype=torch
 既有P.rar，同DP的TP0/TP2对照。TP2初始metadata139.300ms vs113.733ms，目标40层Host447.453ms vs383.783ms；多流计算重叠0.088462ms vs7.420534ms。原始connection关联确认Task15140第0层1848 token的Host准备/提交晚于KV完成；用户看到的Task15092属于前一轮_dummy_run第37层6 token。报告区分SESSION和共同坐标、profiler包装墙钟与CPU实际运行，未新增NPU收益实测或确认物理慢卡。
 
 [对应资料](../dsv41_a3_a5_prefill/host_issue_dp2tp2/report.html)
+
+### E30 首层Q/KV、Attention、TP通信和dtype的原始CSV复核
+
+重新从P.rar提取同一DP2/TP2原始kernel_details.csv，核对13条Q/KV至输出投影任务，附2158.655699ms的TP AllReduce、dtype和原始CSV SHA256。另保存20个A3有效rank-step的多流统计，区分DSA预处理与全部计算流交集；未新增上板实验。
+
+[对应资料](../dsv41_a3_a5_prefill/host_issue_dp2tp2/attention_mechanism_evidence.json)
+
+### E31 DeepSeek官方V4.1模型说明与CSA2/CED架构
+
+2026-11-19核对官方说明：CED为20层因果Encoder＋20层Decoder；CSA2有Full/Reindex/Reuse与分层Indexer；FP4 KV是配套精度设计。算法层与具体A3算子dtype分别归档，不把官方精度方案默认套到本次采集。
+
+[对应资料](https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash)
+
+### E32 共享专家多流互斥的历史来源
+
+历史提交在0.32之前已引入相关互斥；说明涉及当时重叠收益与特定共享专家TP通信/主流MoE的跨rank跨流风险。它解释当前限制的来源，不证明所有后端/所有MoE多流都不可能，也不直接构成删除guard的依据。
+
+[对应资料](https://github.com/vllm-project/vllm-ascend/commit/2044419f8f3dec6288eb1b1b1f54245d4c2b0904)
+
+### E33 Attention输出投影为何有TP AllReduce
+
+RowParallelLinear在reduce_results且TP>1时合并output_parallel。与原始CPU AscendRowParallelLinear_0 → tensor_model_parallel_all_reduce及设备hcom_allReduce记录相互印证；与MoE EP分发、DP批量同步、connector KV传输分开分析。
+
+[对应资料](https://github.com/vllm-project/vllm/blob/5df63a7203cdb9328d824a27b682e77c7b9928be/vllm/model_executor/layers/linear.py#L1762)

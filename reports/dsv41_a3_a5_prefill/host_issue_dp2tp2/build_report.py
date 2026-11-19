@@ -246,11 +246,11 @@ def timing_cell(value):
 MODEL_PHASE_HTML = """<section id="model-phases"><h2>为什么Prefill调用DecoderLayer？</h2>
 <p>trace中的nn.Module是PyTorch模块。DeepseekV41DecoderLayer描述模型层的结构，Prefill和增量生成都会调用它；模块名不能用来判断当前请求阶段。</p>
 <div class="table"><table><tr><th>服务阶段</th><th>这次送入模型什么</th><th>经过哪些模型层</th></tr>
-<tr><td>Prefill</td><td>批量处理prompt或其中一个chunk，构建所需KV并计算后续token预测</td><td>同一组DecoderLayer，Attention按因果关系关注允许的历史token</td></tr>
+<tr><td>Prefill</td><td>批量处理prompt或其中一个chunk，构建所需KV并计算后续token预测</td><td>使用模型层的因果Attention；bounded replay生效时，后段可只处理尾窗，不能把它理解成所有token必经所有层</td></tr>
 <tr><td>Decode</td><td>增量处理新token并读取历史KV；MTP等路径可一次处理多个候选token</td><td>继续调用同一组DecoderLayer</td></tr></table></div>
-<p>架构中的Encoder通常将输入编码成上下文表示；在Encoder–Decoder模型中，Decoder再结合这些表示生成输出。本次DeepSeek文本主干采用因果Decoder结构，P侧Prefill不等于单独的Encoder阶段。</p>
+<p>V4.1官方架构为CED：20层因果Encoder接20层Decoder，Decoder的全局KV来源于Encoder的最终隐藏状态。两段均可使用DecoderLayer这一代码类，不能仅由类名推断执行阶段。模型的Encoder/Decoder分段与部署P/D实例不是一一对应，bounded replay是否生效仍须核对实际开关和布局。</p>
 <p>Tokenizer.encode/decode又是另一层含义：文本与token ID之间的转换。识别本trace的真实Prefill、dummy和生成前向，需结合execute_model/_dummy_run上下文、Attention元数据、输入shape与任务关联。</p>
-<p><a href="https://github.com/gg820827047/vllm-ascend/blob/9a6a156fccccb7ad55c5d534c8948d3ec4efc3f8/vllm_ascend/models/deepseek_v41/model.py#L780">固定源码：DeepseekV41DecoderLayer</a></p></section>"""
+<p><a href="https://github.com/gg820827047/vllm-ascend/blob/9a6a156fccccb7ad55c5d534c8948d3ec4efc3f8/vllm_ascend/models/deepseek_v41/model.py#L780">固定源码：DeepseekV41DecoderLayer</a> · <a href="https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash">官方CED / CSA2说明</a> · <a href="../../llm_service_optimization/index.html#mechanism-qkv">Q/KV原理与13个任务对照</a> · <a href="../../llm_service_optimization/index.html#multistream-review">多流阶段结论</a></p></section>"""
 
 # Static scientific timeline; x axis uses the bad rank SESSION clock.
 svg = [
