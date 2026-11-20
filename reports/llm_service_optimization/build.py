@@ -115,7 +115,7 @@ def multistream_review_html(data):
         f'<p class="note warn">{escape(section["hypothesis_limit"])}</p>'
         f"{review_table_html(conclusions)}<p>跟进任务：{handoff}</p>"
         f"<h3>下一轮只验证这些问题</h3><ol>{steps}</ol>"
-        f"<h3>今天的原理与profiling对照笔记</h3><p>展开查看，表中时间口径分别标注。</p>{notes}"
+        f"<h3>原理与profiling对照笔记（持续更新）</h3><p>展开查看，表中时间口径分别标注。</p>{notes}"
     )
 
 

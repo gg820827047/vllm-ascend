@@ -19,6 +19,12 @@
 
 多流目前标记为“机制与局部时序分析阶段完成”，不是性能优化完成。Host准备/下发影响重叠已有局部证据，Host抖动保留为待验证假设。A05/A06/C03继续验证Host、元数据与运行环境；A08保留端到端收益验证；B08仅将MegaMoE＋共享专家辅助流兼容扩展实验后置。任务总数仍为42。
 
+2026-11-20补充三组笔记：[异步调度与DP同步](index.html#mechanism-async-dp)、[逐轮类型与跨step遮盖](index.html#mechanism-step-overlap)、[AG/A2A与MoE分块通信](index.html#mechanism-moe-communication)。同时扩充[CPU绑核与Host抖动验证](index.html#mechanism-host-cause)，给出线程亲和、pidstat和perf sched的检查方法。
+
+新增[运行态复核证据](runtime_coordination_evidence.json)：保存A3原始异步输出线程事件，以及16个rank的60个主干前向窗口。DP2/TP2的4个主干窗口不等于全部6次外层execute_model调用；其中只有编号1是真实Prefill。记录跨step准备与前轮设备包络的交集，并说明等待、有效CPU工作和收益的区别。参考core默认自动解析异步调度，未写参数不能判关闭；采集镜像准确core SHA和最终配置仍待补齐。
+
+[MoE方案原文与口径](moe_plan_evidence.json)保留用户提供的48k/EP16/N256/K8、分段GMM、通信量化以及500～700us/无OOM表述。参数和分段规则按假设解释，外部结果不作为本服务实测。新增内容仍仅为文档与既有数据复核，未实施新优化或运行上板性能实验。
+
 “对方项目借鉴”入口逐项分析用户提供的21项结果，映射到生命周期、现有trace、代码条件和跟进任务。优先验证batch/chunk、P/D供给与DP分发、元数据复用/异步规划；明确当前MegaMoE的DP同步限制、DSV4.1 Gate精度合同，以及Attention布局/写回和DSL的硬件量化前提。新增A09、B09、B10、D09、R03，原文结果保存在`tasks.json`的`peer_review.projects`，附首批实验顺序和可直接用于简报的三句话总结。
 
 外部数字均标为“对方报告”，没有冒充本服务实测。Motor具体组件、Interactivity定义、模型/硬件/框架和chip分母待补；2P1D负收益与EP32卡效率反例同样保留。NPU性能实验尚未执行。

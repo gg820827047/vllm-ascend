@@ -1,6 +1,6 @@
 # LLM 服务请求全局视图与性能任务台账
 
-更新：2026-11-19。以 A3 / DeepSeek / vLLM-CANN 为主要优化对象，A5用于机制对照。结合既有profiling、固定源码和用户提供的对方项目清单，整理可验证方向、版本差异、责任分工与收益口径；对方报告数字不作为本服务实测收益。
+更新：2026-11-20。以 A3 / DeepSeek / vLLM-CANN 为主要优化对象，A5用于机制对照。结合既有profiling、固定源码和用户提供的对方项目清单，整理可验证方向、版本差异、责任分工与收益口径；对方报告数字不作为本服务实测收益。
 
 ## 全局位置、四类主线与边界观测
 
@@ -85,7 +85,7 @@ P2P connector 负责 P/D 交接；Store 提供共享外部缓存。MultiConnecto
 
 ## 近期讨论：时序、多流与静态kernel缓存
 
-2026-11-17归档。源码结论固定到官方0.32快照b12b6f7和CANN升级快照9a6a156；trace结论来自既有P.rar，不是新增性能实验。D侧启动日志、镜像中的npugraph_ex版本与约50个进度项的原文仍待补充。 2026-11-18补充DP2/TP2主线程/元数据/实际launch追踪，以及同名任务与时间零点复核；仍使用既有P.rar数据。 2026-11-19的多流阶段收尾与机制笔记见下方独立章节。
+2026-11-17归档。源码结论固定到官方0.32快照b12b6f7和CANN升级快照9a6a156；trace结论来自既有P.rar，不是新增性能实验。D侧启动日志、镜像中的npugraph_ex版本与约50个进度项的原文仍待补充。 2026-11-18补充DP2/TP2主线程/元数据/实际launch追踪，以及同名任务与时间零点复核；仍使用既有P.rar数据。 2026-11-19的多流阶段收尾与机制笔记见下方独立章节。 2026-11-20补充CPU验证方法、异步默认值/线程证据、真实与dummy逐轮区分，以及AG/A2A和MoE分块机制。
 
 [打开A3 DP2/TP2主线程与多流时序报告](../dsv41_a3_a5_prefill/host_issue_dp2tp2/report.html)：包含Task15092/15140对照、SESSION/共同坐标切换，以及DecoderLayer为何出现在Prefill调用栈。
 [多流阶段结论与原理笔记](index.html#multistream-review)：展开metadata、Q/KV、通信、CSA2/CED、量化和并行切分对照；Host抖动保留为假设。
@@ -181,9 +181,22 @@ A3 DP0TP0，本地step1；以下均为相对worker execute_model进入的毫秒�
 
 跟进：A06 / A08 / C03。证据：E29 / E14。
 
+### 异步默认值与MoE通信术语补齐
+
+原始线程证据/固定代码复核；MoE外部收益未验证。位置：S2准备 / S3 MoE / X跨step。
+
+- 未显式写async选项不能判关闭；A3原始TID4151已出现async_output_busy_loop/get_output。
+- DP2/TP2有4个主干窗口、6次外层execute_model scope；只有编号1为真实Prefill。DP1有两个连续真实Prefill。
+- 跨step存在部分准备/设备包络交集，但其中可能是Gloo等待；不能把区间交集直接当有效准备或收益。
+- AG/A2A区别与Routing/GMM分块方案已归档；500~700us和无OOM是对方摘要，尚非本服务结果。
+
+边界：采集镜像core SHA/最终配置与CPU调度轨迹仍缺；MoE分块规则、量化合同和收益范围待补，未新增上板实验。
+
+跟进：A02 / A06 / A07 / B05 / C03。证据：E34 / E35。
+
 ## 多流专项：阶段收尾、证据边界与原理笔记
 
-2026-11-19归档。涵盖metadata搜索、Q/KV原理与实际算子、TP通信、CSA2/CED、量化及DP/TP/PP/CP。仅复核既有P.rar、固定代码与官方模型资料，未修改推理功能，未新增性能收益实测。
+2026-11-19归档、2026-11-20补充。涵盖metadata、Q/KV、TP通信、CSA2/CED、并行切分，以及CPU绑核/抖动验证、异步默认值、逐轮遮盖和MoE通信分块。仅复核既有P.rar、固定代码与官方资料；MoE外部方案作为待验证线索，未修改推理功能或新增性能收益实测。
 
 多流机制与局部时序分析阶段完成；优化实施及端到端收益验证仍未完成。
 
@@ -219,6 +232,7 @@ Host准备/下发影响重叠是已观测机制；Host抖动是待验证假设�
 2. 若复现，补CPU调度/绑核/NUMA/频率等观测，区分运行环境差异、随机抖动与固定Host构造开销。
 3. A05/A06优先尝试同step/缓存组的合法元数据复用及下发开销消减；每次只改变一个因素。
 4. B08的MegaMoE＋共享专家辅助流兼容扩展后置，不与Host实验混合；所有收益最终用无profiler服务指标确认。
+5. 异步调度实验必须显式使用--async-scheduling / --no-async-scheduling，并保存镜像core SHA、最终值和线程证据；MoE分块先补实现与工作量口径，不套用外部500~700us。
 
 ### Metadata：搜哪些名称，哪些耗时不能相加
 
@@ -383,6 +397,24 @@ Host抖动尚未证实，更不能赋予“大概率”判断。现有数据无�
 
 称为固定物理NPU慢设备，还需在等工作量/精度/布局下重复观察设备计算差异，并用rank↔设备及CPU绑定对照判断异常跟随谁。collective内等待与逻辑晚到不能直接当作芯片计算慢。
 
+enable_cpu_binding=true只表达绑核请求，仍需核对main/ACL/release实际线程亲和；绑核不会自动独占CPU，也不排除cgroup限额、NUMA/频率和其他线程竞争。当前A3路径先绑定worker线程，再对ACL/release线程分配对应CPU池，失败会warning后继续。
+
+相同TP主路径/shape通常有相同的共同Host工作量，但实际CPU运行机会、依赖就绪时间和Device队列积压可能不同；整轮还有rank分支和EP专家负载差异。因而共同开销不能单独解释TP2额外变慢，等待最多的rank也不一定最先变慢。
+
+区分固定Host开销与抖动：在相同输入、batch、缓存状态下重复观察；秒级pidstat先筛查，再用线程级perf sched将Host空洞分解为实际运行、就绪等待CPU和阻塞。只有调度等待与慢step关联，并随单变量环境调整一起变化，才形成较强归因。
+
+```text
+# 在代表性压测期间采集，替换为当前worker PID；perf在宿主机使用宿主机PID
+WORKER_PID=12345
+taskset -apc "$WORKER_PID"
+ps -L -p "$WORKER_PID" -o pid,tid,psr,pcpu,comm
+# 以下采集在独立终端运行
+pidstat -u -w -t -p "$WORKER_PID" 1 30
+mpstat -P ALL 1 30
+sudo perf sched record -a -o host-sched.data -- sleep 15
+sudo perf sched timehist -i host-sched.data -p "$WORKER_PID" > worker-sched.txt
+```
+
 ### 证据等级与验证顺序
 
 | 判断 | 当前状态 | 需要的下一步 |
@@ -393,7 +425,131 @@ Host抖动尚未证实，更不能赋予“大概率”判断。现有数据无�
 | 固定物理NPU慢卡 | 未确认 | 等工作量设备对照、rank与设备映射互换 |
 | 多流优化已带来服务收益 | 未验证 | 单变量、精度/稳定性与无profiler TTFT/吞吐验收 |
 
-[主线程记录与方法限制](../dsv41_a3_a5_prefill/host_issue_dp2tp2/summary.json) · [官方TorchNPU Event采集包装](https://github.com/Ascend/pytorch/blob/v2.10.0/torch_npu/profiler/profiler_interface.py#L43-L60)
+### 如何读CPU观测，避免把所有Host慢都叫抖动
+
+| 观测 | 能支持的判断 | 边界 |
+| --- | --- | --- |
+| pidstat线程%wait升高；perf sch delay增加 | 线程已就绪却等待CPU | 需与目标step对齐；不等于磁盘iowait |
+| 线程实际运行时间长，调度等待少 | 检查Host代码、内存访问、频率与采集成本 | CPU满核也不能单独证明根因或随机抖动 |
+| CPU利用率和就绪等待都低，但函数墙钟长 | 检查锁、事件、I/O或设备依赖 | perf wait time包含阻塞，不全是CPU争用 |
+| 相同负载重复时固定某rank慢 | 检查固定绑核/NUMA/竞争及rank特有路径 | 不自动认定物理NPU慢卡 |
+| 上下文切换多或整机CPU低 | 辅助线索 | 切换次数不是抖动证明，平均值可能掩盖单核繁忙 |
+
+[主线程记录与方法限制](../dsv41_a3_a5_prefill/host_issue_dp2tp2/summary.json) · [官方TorchNPU Event采集包装](https://github.com/Ascend/pytorch/blob/v2.10.0/torch_npu/profiler/profiler_interface.py#L43-L60) · [CPU绑核实现（固定CANN快照）](https://github.com/gg820827047/vllm-ascend/blob/9a6a156fccccb7ad55c5d534c8948d3ec4efc3f8/vllm_ascend/cpu_binding.py#L679) · [pidstat字段说明](https://www.man7.org/linux/man-pages/man1/pidstat.1.html) · [Linux perf sched调度延迟定义](https://github.com/torvalds/linux/blob/v6.12/tools/perf/Documentation/perf-sched.txt)
+
+### 异步调度、Runner V2与DP的Gloo同步
+
+参考core 5df63a7；原始trace的异步线程证据与镜像配置的缺口分别标注。
+
+必须撤回“启动脚本没写--async-scheduling，所以本次一定关闭”的前提。该core默认async_scheduling=None，经兼容性检查可自动设为True；显式--async-scheduling开启，--no-async-scheduling关闭。V2与该选项是两个维度，V1也可支持异步调度。
+
+原始P.rar的DP2/TP2主线程TID1601执行execute_model；独立TID4151记录async_output_busy_loop及AsyncOutput.get_output。参考core只在use_async_scheduling=True时创建对应线程，因此强烈支持该采集已走异步调度对应输出路径；准确镜像core SHA与最终解析值仍待补，不能把参考代码当成镜像配置快照。
+
+底层算子异步下发、模型内部Q/KV多流、异步输出拷贝和跨step调度流水需分开。V2会构造AsyncOutput；最终get_output需要copy_event.synchronize。关闭调度异步仍可能有底层异步；开启后把输出交给后台线程，并允许更多batch在途，但不会自动消除metadata成本或数学依赖。
+
+NCCL是NVIDIA设备集合通信库，Ascend设备通信通常为HCCL；这里沿用上游字段名。disable_nccl_for_dp_synchronization=True表示相关DP元数据协调改走CPU Gloo，不是全局关闭设备通信，也不关闭TP/EP或P/D KV传输。
+
+DP协调交换token数、图模式和microbatch等少量执行信息。通过设备AllReduce后CPU取值可能引入设备同步，Gloo让这类信息留在CPU处理；Gloo仍需等待其他rank，长区间可能来自晚到或CPU调度，不能直接当网络带宽差。
+
+特别注意V2的sync_cudagraph_and_dp_padding直接构造CPU tensor并使用cpu_group，其Gloo调用不能独立证明async_scheduling开启；独立异步输出线程证据更直接。
+
+### 四种异步及选项的作用范围
+
+| 机制 | 作用 | 关闭async_scheduling后 |
+| --- | --- | --- |
+| 算子异步下发 | Host将工作提交到Device流 | 仍可能存在 |
+| Q/KV等模型多流 | 独立分支通过stream/event执行 | 由对应模型多流逻辑控制 |
+| V2异步输出拷贝 | 输出在copy stream搬回Host，取结果时等待事件 | 仍可异步发起，但输出等待可能在worker主线程 |
+| 跨step调度/输出流水 | 后台处理输出，允许下一批在前一批输出收尾前推进 | 相关流水能力受限；PP=1参考实现的在途batch从2变1 |
+
+### 采集中的异步输出定位（共同时间坐标）
+
+| 线程TID | 调用 | 时间/含义 |
+| --- | --- | --- |
+| 1601 | execute_model | worker主执行线程，历史采集TID |
+| 4151 | async_output_busy_loop | 独立输出线程；函数存续区间不等于一直占用CPU |
+| 4151 | AsyncOutput.get_output | 2651.263660–2651.748230ms；使用E34的共同零点 |
+
+[原始线程证据与逐轮数据 E34](runtime_coordination_evidence.json) · [async默认值及兼容性解析](https://github.com/vllm-project/vllm/blob/5df63a7203cdb9328d824a27b682e77c7b9928be/vllm/config/vllm.py#L1585) · [输出线程创建条件](https://github.com/vllm-project/vllm/blob/5df63a7203cdb9328d824a27b682e77c7b9928be/vllm/v1/executor/multiproc_executor.py#L689) · [V2 CPU侧DP协调](https://github.com/vllm-project/vllm/blob/5df63a7203cdb9328d824a27b682e77c7b9928be/vllm/v1/worker/gpu/dp_utils.py#L69)
+
+### 采集有几轮：真实Prefill、dummy与跨step遮盖
+
+P.rar共16个A3 rank，60个主模型前向窗口，其中20个为有效rank-step；TP副本不作为独立请求数。编号从0开始。
+
+DP0/DP2/DP3每rank有4个主干窗口：dummy、真实Prefill、dummy、dummy；DP1每rank有3个：真实Prefill、真实Prefill、dummy。我们细看的DP2/TP2真实窗口是编号1，即采集中的第2个主干窗口，后面没有同rank的第二次真实Prefill可复验。dummy是空跑/协调参与，不能仅凭小shape就称为启动warmup。
+
+4个主干窗口不等于所有execute_model函数调用数。原始DP2/TP2 Ascend外层scope共6次，其中2次短调用未匹配主干前向；上游与Ascend嵌套scope也不能重复计数。调用次数、主干前向、有效Prefill、请求数量是不同口径。
+
+后续dummy也观察到TP2 Host推进偏慢：step2为359.576ms vsTP0的304.186ms；step3为363.293ms vs309.874ms。它支持差异并非只出现在那一次Prefill，但不能替代等负载、多次真实请求的稳态验证。
+
+DP2/TP2 step0设备完整forward包络结束于1987.054670ms，step1准备为1906.859750–2151.831790ms；244.972040ms准备中有80.194920ms与上一轮设备包络相交，余164.777120ms未被上一轮覆盖。交集内约70.083694ms为Gloo区间；不能说80ms都是有效metadata计算。Attention metadata从2004.967920ms开始，已晚于上一轮结束。
+
+DP1的两个连续真实Prefill也有部分rank跨轮交叠，见下表。交集使用上一轮包含target和draft的设备包络；包络交集不是CPU实际运行时间、精确有效遮盖或服务收益。无profiler基准、更多连续真实step与显式开关A/B仍是验收前提。
+
+### DP2/TP2的主干前向窗口
+
+| 编号 | 类型 | 主要token shape |
+| --- | --- | --- |
+| 0 | dummy | 6 |
+| 1 | 真实Prefill | 1848；后段1024 |
+| 2 | dummy | 6 |
+| 3 | dummy | 6 |
+
+### DP1真实Prefill step0→1的准备区间交集
+
+| rank | 下一轮准备ms | 与上一轮设备包络交集ms |
+| --- | --- | --- |
+| TP0 | 123.367200 | 0 |
+| TP1 | 145.282200 | 25.972077 |
+| TP2 | 156.356190 | 39.065169 |
+| TP3 | 122.215340 | 0 |
+
+[全部16个rank的窗口、时间戳及口径 E34](runtime_coordination_evidence.json) · [原始逐轮统计](../dsv41_a3_a5_prefill/data/rank_steps.csv) · [时钟与同名任务校准](../dsv41_a3_a5_prefill/host_issue_dp2tp2/report.html)
+
+### MoE术语入门：AG/RS、A2A、Init Routing与分段GMM
+
+解释用户提供的48k/EP16/N256/K8方案；外部摘要与本服务已验证事实分开。
+
+MoE一层可简化为：Gate/Top-K选择专家与权重 → 按专家整理并跨卡分发 → 专家FFN/GMM → 结果回传、恢复token顺序并加权合并。传输的是token隐藏向量等数据，专家权重仍在原卡。
+
+AG（AllGather）把组内各卡数据收齐，让每张卡都有完整输入。A2A（All-to-All）让各卡分别交换不同数据，在MoE中按专家归属把token送到需要它的卡；Top-K下一个token仍可能发给多卡。RS（ReduceScatter）将部分结果归约并按分片返回。具体通信组取决于TP/EP/DP布局，不能只凭名称推定拓扑。
+
+两卡例子：初始卡0有A/B、卡1有C/D。AG后两卡都拿A/B/C/D；若A/C属于卡0专家、B/D属于卡1专家，按需A2A后卡0拿A/C、卡1拿B/D。不是交换模型权重。
+
+Init Routing是每次MoE计算前按专家对token展开/排序/搬运、统计数量并保存恢复映射的操作，不是服务启动初始化。它通常消费Gate/Top-K结果，有的接口能融合量化。GMM是Grouped MatMul，将多个专家各自的矩阵乘组织在一起，group_list描述各专家token分段，不是把所有专家合成一套权重。
+
+48k暂按token规模理解，单卡/通信组总量、单请求/整batch口径缺失。N=256和K=8暂按总路由专家数与Top-8理解，均须原方案确认。若均匀EP16且无冗余专家，每rank为16个专家；48k×8约384k份token—专家任务，不代表生成384k个token。
+
+AG/RS全量路径可能等整批AG后才做Routing，并同时保留大输入、重排输出与GMM中间结果，放大耗时和峰值显存。动态A2A常需把Device产生的收发计数交给Host，形成D2H/提交依赖；即使计数很小，等待也会留下空泡。当前CANN A2A _preprocess确有input_splits/output_splits转CPU的路径，但不能据此断言本次MegaMoE内部使用相同实现或已有同样瓶颈。
+
+“GMM前优化500~700us”按摘要暂理解为计算启动前关键路径缩短0.5–0.7ms，未说明单层/单轮/整模型，不能乘层数推TTFT。无OOM也只对原作者测试条件成立。我们尚未对该组合做实现、精度或性能验证。
+
+```text
+初始：卡0 [A, B]；卡1 [C, D]
+AG后：卡0 [A, B, C, D]；卡1 [A, B, C, D]
+
+假设A/C需要卡0专家，B/D需要卡1专家：
+A2A后：卡0 [A, C]；卡1 [B, D]
+```
+
+### 四项方案的可能机制与待确认点
+
+| 方案原文 | 可理解的方向 | 不能直接下的结论 |
+| --- | --- | --- |
+| 前AG，后A2A | 可能是AG分发、A2A回收；也可能是前后token段切换 | 缺实现，不能确定作者是哪一种 |
+| Init Routing与AG重叠 | 收到一块先整理一块，与后续通信形成流水 | 必须有就绪协议；不能读取尚未收齐的同块数据 |
+| 分段GMM：固定＋可变 | 先算可提前确定的固定块，后算依赖实际路由的剩余块 | 分块规则未知；不是权重一部分固定、一部分变化 |
+| A2A分两段，量化 | 分段通信隐藏准备等待；低精度激活减少字节数 | 量化对象/scale/精度未知；需要成本与精度验收 |
+
+### 映射到本项目的验证事项
+
+| 位置 | 需补证据 | 台账 |
+| --- | --- | --- |
+| Routing前准备与通信 | 真实后端、D2H计数等待、AG与Routing依赖、暴露时间 | A02 / B05 |
+| GMM与中间缓冲 | 每专家token数、分块就绪、峰值显存、buffer复用 | B05 / A08 |
+| 收益验收 | 补齐48k口径与对方实现，控制拓扑/精度/工作量，验证TTFT/吞吐和峰值显存 | G02 / B05 |
+
+[用户方案原文与未确定口径 E35](moe_plan_evidence.json) · [官方Init Routing定义](https://github.com/Ascend/op-plugin/blob/master/docs/zh/custom_APIs/torch_npu/torch_npu-npu_moe_init_routing_v2.md) · [官方GMM定义](https://github.com/Ascend/op-plugin/blob/master/docs/zh/custom_APIs/torch_npu/torch_npu-npu_grouped_matmul.md) · [当前CANN A2A计数预处理](https://github.com/gg820827047/vllm-ascend/blob/9a6a156fccccb7ad55c5d534c8948d3ec4efc3f8/vllm_ascend/ops/fused_moe/token_dispatcher.py#L645)
 
 ## 对方21项优化：对A3 / vLLM-CANN的启发与适用边界
 
@@ -493,6 +649,7 @@ F01/F02初始列P2；若排队或KV加载等待主导TTFT、使D侧长期空等�
 | H09 共享专家多流互斥与静态缓存机制核对 | S3 / S7及启动前 | 源码机制确认；现场验证待补 | 官方0.32和CANN均有fused MC2互斥；启动编译、缓存检查和图捕获分开记录，不从50项进度或.run缺失推断重编译。；E15；后续 B07 / B08 / D08 |
 | H10 对方优化项目适用性与实验计划 | S0–S8 / X | 21项对照已归档；NPU实验未执行 | 优先batch/chunk、DP供给与元数据；明确MegaMoE DP绕过及DSV4.1 Gate的适配差异，外部收益仅作线索。；E21；后续 A05 / A06 / A09 / B09 / B10 / D02 / D09 / R03 |
 | H11 多流分析阶段收尾与机制学习笔记 | S2 / S3 / S7 / X | 阶段分析完成；收益未验证 | 确认共享专家辅助流互斥范围和DSA局部Host供给问题；Host抖动/物理慢设备待证实，后续移交Host与环境验证。；E30；后续 A05 / A06 / C03 / A08 / B08 |
+| H12 CPU验证、异步与MoE通信机制补充 | S2 / S3 / X | 学习与证据归档；性能实验未执行 | 补齐A3异步线程和逐轮遮盖口径；AG/A2A/Init Routing/分段GMM说明保留外部方案歧义与收益边界。；E34；后续 A02 / A05 / A06 / A07 / B05 / C03 |
 
 ## 责任与预期收益口径
 
@@ -517,14 +674,14 @@ P0先形成证据与回归基础；P1做受控实验和低风险候选；P2为�
 | A04 / P0 | S2/S6 / 分析 | 拆解DP元数据同步和Gloo等待 | 待认领（vLLM / Ascend 框架开发） | 部分分析；A3代表准备段Gloo约88.8ms，其中约69.2ms与上轮设备任务重叠。 | 分析阶段直接收益0；后续只能回收关键路径上可消除的等待。 指标：最后到达者；到达离散度；未覆盖等待；首层启动时间。 | G03 / C01 |
 | A05 / P1 | S2 / 优化候选 | 复用step内SWA/DSA元数据与visible_lens | 待认领（模型适配开发） | 待实验；A3已有重复展开与索引链证据，尚未提交此项性能修改。 已定位两个metadata构造scope及42次visible_lens调用；每组输入是否等价仍须校验，不能直接假设42次可合并为一次。 | 预期减少重复元数据生成和准备开销；幅度待实测，不能套用A5的1641→221比例。 指标：准备关键路径Δms、launch/分配次数、TTFT、内存峰值。 | G02 / A02 / B01 |
 | A06 / P1 | S2/S6 / 优化候选 | 优化Host下发与准备热路径 | 待认领（vLLM / Ascend 框架开发） | 部分分析；A3代表窗口首层前约223.6ms：prepare_attn 59.887ms、replay metadata 54.277ms；DP同步约88.347ms中部分已被前轮设备覆盖，尚需拆self time。 补充DP2/TP2对照：metadata139.300ms、目标40层Host447.453ms，比同DP TP0分别多25.567ms和63.670ms；先核对profiler扰动与CPU调度，再评估重复准备/stream-event包装。 Host抖动尚待证实；现有数据未能区分固定包装/重复构造成本、采集扰动与运行态CPU差异。 | 减少暴露的准备/下发时间；若已被设备覆盖，时延收益可能为0。 指标：Host self time、launch速率、分配数、设备空洞、TTFT/TPOT。 | G03 / A02 |
-| A07 / P1 | S1/S2/S6/S7 / 验证 | 做异步调度受控A/B | 待认领（vLLM / Ascend 框架开发） | 待实验；A3样本已有异步输出运行栈及部分跨step重叠，不能用未写CLI参数当OFF基线；尚无同环境显式ON/OFF收益实验。 | 有机会隐藏调度/输出处理开销；设备持续满载时收益可能有限。 指标：TTFT/TPOT p95、goodput、Host/device有效重叠、CPU占用。 | A01 / A02 / G02 |
+| A07 / P1 | S1/S2/S6/S7 / 验证 | 做异步调度受控A/B | 待认领（vLLM / Ascend 框架开发） | 待实验；参考core默认async_scheduling=None按兼容性自动启用；A3原始TID4151有async_output_busy_loop/get_output，与异步输出路径一致。脚本未写参数不能作为OFF基线；准确镜像core SHA和最终解析值待补。DP2/TP2真实窗口准备与前轮设备包络部分相交，DP1连续真实Prefill的交集因rank不同而异，尚无ON/OFF服务收益实验。 | 有机会隐藏调度/输出处理开销；设备持续满载时收益可能有限。 指标：TTFT/TPOT p95、goodput、Host/device有效重叠、CPU占用。 | A01 / A02 / G02 |
 | A08 / P2 | S2/S3/S6/S7 / 优化候选 | 模型多流与可切分计算的重叠评估 | 待认领（模型适配开发） | 阶段分析完成；收益待验证；A3已观察到DSA辅助流与主流任务重叠；共享专家框架多流被fused MC2互斥关闭。独立子图可否扩展及净收益仍待验证。 全目标窗口计算流重叠：DP2/TP2为0.088462ms、TP0为7.420534ms；第0/10/21层证实独立分支未同时就绪，重叠少不能直接当作物理卡慢或加速预算。 2026-11-19完成机制/局部时序阶段归档；Host根因转A06/C03，优先元数据/下发专项，不把提高重叠本身当作验收。 | 可能隐藏独立计算/通信；竞争或切分过细可能变慢，不预设加速。 指标：关键路径、重叠量、launch数、HBM峰值、TTFT/TPOT。 | B01 / A02 / G02 |
 | A09 / P1 | S6/S7 / 分析 | 核对Decode DP同步绕过的版本、算子与一致性条件 | 待认领（vLLM / Ascend 框架开发） | 部分分析；对方称MegaMoE+重算调度下绕过DP AllReduce收益4.45%；当前CANN快照明确在MegaMoE/FUSED_MC2等路径保留协调，现有P侧88ms同步也不能套用D侧策略。 | 分析直接收益0；确认可安全绕过时才有机会减少每步暴露同步与padding，外部4.45%不作为本环境预算。 指标：D侧同步暴露ms、有效/填充tokens、TPOT/ITL、吞吐、collective一致性。 | G01 / A02 / B05 |
 | B01 / P0 | S2/S3/S7 / 分析 | 建立同口径算子与执行引擎清单 | 待认领（性能分析 / 项目统筹） | 部分分析；已有代表窗口算子对比；A3/A5含Runner、CANN、量化和负载混杂。 | 直接性能收益0；定位能由模型替换、元数据或配置解决的部分。 指标：同shape单次分布、调用数、关键路径占比、实际执行引擎。 | G01 / G03 |
 | B02 / P1 | S3/S7 / 优化候选 | 核对并替换可用Norm/量化融合路径 | 待认领（模型适配开发） | 待分析；A5的RMSNorm+MX动态量化已观察到；A3为不同量化消费路径。 | 可能减少中间读写、kernel下发和临时buffer；实际收益待实验。 指标：Norm+quant组合墙钟、HBM读写、launch数、TTFT/TPOT。 | B01 / G02 |
 | B03 / P1 | S2/S6 / 优化候选 | 融合准备阶段的小算子链 | 待认领（模型适配开发） | 待分析；优先完成复用后，再判断剩余visible_lens/索引/边界计算是否值得融合。 | 可能降低launch数与暴露的准备时间；小任务累加时间不是收益上限。 指标：launch数、准备墙钟、buffer分配、TTFT p95。 | A05 / B01 |
 | B04 / P1 | S3/S7 / 分析 | 定位Attention/Indexer/MLA的瓶颈与调用条件 | 待认领（模型适配开发） | 待分析；算子本体暂不作为团队主要开发范围，但调用方式和输入条件可控。 | 分析直接收益0；可能通过布局、接口或batch条件消除额外开销。 指标：同shape延迟、有效工作量、内存/计算指标、关键路径。 | B01 |
-| B05 / P0 | S3/S7 / 分析 | 拆解MegaMoE的计算、搬运、通信与等待 | 待认领（性能分析 / 项目统筹） | 部分分析；代表目标层Mega驻留299.701/461.233ms；首层完整16个EP rank到达差35.763ms、结束差0.031ms，优先追踪晚到路径和内部等待。 | 分析直接收益0；优先减少输入晚到与不均衡，不能把Mega总占比全算可优化。 指标：到达离散、有效计算/等待、专家负载、层关键路径。 | B01 / C01 |
+| B05 / P0 | S3/S7 / 分析 | 拆解MegaMoE的计算、搬运、通信与等待 | 待认领（性能分析 / 项目统筹） | 部分分析；代表目标层Mega驻留299.701/461.233ms；首层完整16个EP rank到达差35.763ms、结束差0.031ms，优先追踪晚到路径和内部等待。 新增用户48k/EP16/N256/K8分块方案作为线索：AG/RS全量Routing和A2A计数D2H分别排查；GMM前500~700us及无OOM尚非本服务实测。 | 分析直接收益0；优先减少输入晚到与不均衡，不能把Mega总占比全算可优化。 指标：到达离散、有效计算/等待、专家负载、层关键路径。 | B01 / C01 |
 | B06 / P2 | S3/S7 / 分析 | 整理重型算子最小复现并交接算子团队 | 待认领（CANN / 算子对接） | 待分析；若公平对照后确认核内瓶颈，团队不默认自行重写Attention或MegaMoE。 | 分析直接收益0；解锁外部算子修复或已有实现替换，收益待返回版本验证。 指标：可复现率、核内延迟、服务回归收益与精度。 | B04 / B05 |
 | B07 / P1 | S2/S3/S6/S7 / 分析 | 区分Eager、图重放和static kernel实际命中 | 待认领（vLLM / Ascend 框架开发） | 部分分析；A5 Prefill样本不能确定D侧static开关；已核对三层启动工作与缓存，实际D镜像版本和“约50项”日志仍缺。 | 分析直接收益0；图命中后可能降低decode下发成本，不能泛化到prefill。 指标：每step launch/Host时间、padding、图命中、TPOT p95。 | G01 / B01 |
 | B08 / P2 | S3/S7 / 验证 | 核对共享专家多流互斥并验证支持路径的重叠收益 | 待认领（模型适配开发） | 限制已确认；实验后置；官方0.32和CANN均在内部fused_mc2=1时关闭共享专家overlap；A3观察到的其他多流不能用来证明共享专家并行。 互斥历史与风险范围已核对；不是普遍的MoE多流禁令。兼容扩展需另行设计，暂后置于Host验证。 | 验证本身直接收益0；支持路径有机会隐藏共享专家计算，收益受路由专家关键路径和资源竞争约束。 指标：共享/路由重叠ms、MoE层墙钟、TTFT/TPOT/ITL、吞吐及精度。 | G01 / G02 / B01 / A02 |
@@ -532,7 +689,7 @@ P0先形成证据与回归基础；P1做受控实验和低风险候选；P2为�
 | B10 / P2 | S3/S7 / 优化候选 | 评估Attention尾部融合、投影布局与直接写回 | 待认领（模型适配开发） | 待采集；对方的逆RoPE/量化/o_proj融合、ND权重和MXFP8写回有方向价值；我们主证据是A3 Prefill INT8路径，D侧小batch与MXFP8收益尚无对应trace。DSV4.1 wo_a本身已要求ND。 | 有机会减少尾部launch、临时结果和内存搬运；外部SLO吞吐大幅改善不等于同幅kernel加速。 指标：epilogue墙钟、copy/format_cast字节数、launch数、HBM、TPOT/ITL与精度。 | G01 / B01 / B04 / G02 |
 | C01 / P0 | X / 分析 | 对齐通信组、共同轮次与物理卡映射 | 待认领（性能分析 / 项目统筹） | 部分分析；已有EP共同轮次对齐；仍需完整物理NPU、CPU、NUMA与链路映射。 | 直接性能收益0；避免把工作量不同或边界等待识别为慢卡。 指标：参与rank覆盖、事件对齐误差、缺失窗口。 | G01 / G03 |
 | C02 / P0 | S3/S7 / 分析 | 做同工作量的计算卡间一致性分析 | 待认领（性能分析 / 项目统筹） | 部分分析；HcPre离散较小；A3某同shape MatMul可差约52%，原因未定。 | 直接性能收益0；识别持续退化、资源争用或调用条件差异。 指标：同条件中位数/p95比例、跨轮重复性、关键路径贡献。 | C01 / B01 |
-| C03 / P0 | S2/S3/S6/S7 / 分析 | 查明晚到rank和EP拖尾的来源 | 待认领（vLLM / Ascend 框架开发） | 部分分析；A3代表首层到达差35.763ms而结束差0.031ms，结合dummy先到等待进一步查Host准备；该证据不足以确认物理慢卡。 补充DP2/TP2主线程的元数据与下发差异，尚缺CPU调度/绑核/频率证据；区分同名小shape dummy与真实Prefill，以及单rank/共同时间坐标。 阶段结论是慢rank/Host慢路径；需要固定负载复现、CPU遥测与rank↔设备映射对照，才能区分CPU侧问题和固定物理慢设备。 | 分析直接收益0；为减少全组拖尾提供依据。 指标：最后到达rank、跨rank到达差、暴露等待、层墙钟。 | C01 / G03 |
+| C03 / P0 | S2/S3/S6/S7 / 分析 | 查明晚到rank和EP拖尾的来源 | 待认领（vLLM / Ascend 框架开发） | 部分分析；A3代表首层到达差35.763ms而结束差0.031ms，结合dummy先到等待进一步查Host准备；该证据不足以确认物理慢卡。 补充DP2/TP2主线程的元数据与下发差异，尚缺CPU调度/绑核/频率证据；区分同名小shape dummy与真实Prefill，以及单rank/共同时间坐标。 阶段结论是慢rank/Host慢路径；需要固定负载复现、CPU遥测与rank↔设备映射对照，才能区分CPU侧问题和固定物理慢设备。 同一TP主路径相同不保证运行条件与就绪时刻相同；后续dummy中TP2也偏慢，需检查固定环境条件及连续真实负载，不能直接归随机抖动。 | 分析直接收益0；为减少全组拖尾提供依据。 指标：最后到达rank、跨rank到达差、暴露等待、层墙钟。 | C01 / G03 |
 | C04 / P1 | X / 分析 | 核对频率、温度、CPU/NUMA与资源争用 | 待认领（NPU / CPU / 通信运维） | 待采集；当前静态NPU配置不足以证明运行时没有降频、带宽或CPU争用。 | 直接性能收益0；若确认降频/争用，修复部署可恢复损失性能。 指标：同条件算子分布、运行频率、CPU等待与内存/链路指标。 | C01 / C02 |
 | C05 / P1 | S3/S7 / 分析 | 分析模型内HCCL集合通信与链路差异 | 待认领（NPU / CPU / 通信运维） | 待分析；本项聚焦TP/EP等模型内集合通信；P/D点到点与Store KV交接单独列F02（P2），避免混用口径。 | 分析直接收益0；若确认暴露的集合通信瓶颈，可评估通信配置或模型调用侧改进。 指标：collective p95、有效GB/s、到达差、计算通信重叠、失败率。 | C01 / G01 |
 | C06 / P2 | X / 验证 | 通过绑核/换卡与独立微基准验证慢卡假设 | 待认领（NPU / CPU / 通信运维） | 待实验；尚未确认固定物理慢卡，不应先按硬件故障处理。 | 直接性能收益0；确认硬件/部署问题后可定向恢复损失。 指标：异常随卡/随rank迁移；跨轮稳定性；正常对照。 | C02 / C04 |
@@ -588,12 +745,13 @@ P0先形成证据与回归基础；P1做受控实验和低风险候选；P2为�
 1. 关联客户端/网关/API/P/D的request_id与attempt，再关联scheduled_tokens、step、进程/rank、Python scope和launch连接；网关排队和KV交接分别见F01/F02。
 2. 标出有效prefill、dummy、draft/verify、采集首尾；跨机先核对时钟，勿用本地step序号硬对齐。
 3. 分别计算阶段墙钟与多流区间并集，找客户端延迟的关键依赖。
+4. 分别统计外层execute_model调用、嵌套scope、主干前向窗口、有效Prefill和请求数；将dummy与连续真实轮次分开，交叠量标明包络/任务并集/CPU运行口径。
 
 交付物：一张带时间边界的请求关键路径图和可复查事件索引。
 
 验收：不重复累计嵌套scope、多流任务和HCCL子任务；不把Free等同Host耗时。
 
-前置：G01 / G02。证据：E01 / E04 / E13 / E14。
+前置：G01 / G02。证据：E01 / E04 / E13 / E14 / E34。
 
 ### A01 确认异步调度和Runner实际路径
 
@@ -621,7 +779,7 @@ P0先形成证据与回归基础；P1做受控实验和低风险候选；P2为�
 
 验收：至少复现多个有效step；每个删除或后移建议有数据依赖证明。
 
-前置：G03 / A01。证据：E03 / E09。
+前置：G03 / A01。证据：E03 / E09 / E34。
 
 ### A03 核对D2H与异步输出是否挡住流水
 
@@ -674,26 +832,28 @@ P0先形成证据与回归基础；P1做受控实验和低风险候选；P2为�
 2. 以首层前准备为起点，按未覆盖Host时间排序；结合真实launch、前序设备任务和event依赖，区分Python计算、runtime下发与等待。
 3. 评估持久buffer、批量构造、移除无效转换和小操作复用；区分CPU张量与设备张量。
 4. 核对NUMA/绑核和线程竞争，避免把运行环境问题改成复杂代码。
+5. CPU绑核开启后核对各TID实际affinity，结合pidstat/perf sched区分CPU运行、就绪等待和阻塞；Host函数墙钟不能直接作为CPU运行时间。
 
 交付物：Host热点清单及每次只改一个因素的patch/实验。
 
 验收：有明确关键路径收益；输出、请求隔离和异步buffer寿命正确。
 
-前置：G03 / A02。证据：E02 / E10 / E13 / E14 / E29 / E30。
+前置：G03 / A02。证据：E02 / E10 / E13 / E14 / E29 / E30 / E34。
 
 ### A07 做异步调度受控A/B
 
 位置：S1 引擎调度与缓存判定 / S2 P 端 Host 输入准备 / S6 D 端调度与准备 / S7 D 端重复生成。责任人：待认领；建议角色：vLLM / Ascend 框架开发；协同：部署 / 压测 / 模型适配开发。
 
-1. 在版本支持的组合中显式ON/OFF，核对实际生效；禁止借切换Runner同时改变多个变量。
-2. 覆盖长prefill、混合负载、decode与MTP；检查有用准备提前量。
-3. 观察排队/吞吐、尾延迟与CPU占用，区分Host空档减少和collective等待转移。
+1. 两组分别显式传--async-scheduling与--no-async-scheduling，保存镜像/core SHA、最终配置和输出线程路径；区分底层异步、内部多流、D2H与调度异步。
+2. 在版本支持的组合中显式ON/OFF，核对实际生效；禁止借切换Runner同时改变多个变量。
+3. 覆盖长prefill、混合负载、decode与MTP；检查有用准备提前量。
+4. 观察排队/吞吐、尾延迟与CPU占用，区分Host空档减少和collective等待转移。
 
 交付物：异步调度兼容矩阵、前后时间线与服务级收益表。
 
 验收：同工作量多次复测；无错误、输出状态错配和饥饿；给出无收益场景。
 
-前置：A01 / A02 / G02。证据：E03 / E08 / E13 / E20。
+前置：A01 / A02 / G02。证据：E03 / E08 / E13 / E20 / E34。
 
 ### A08 模型多流与可切分计算的重叠评估
 
@@ -790,12 +950,13 @@ P0先形成证据与回归基础；P1做受控实验和低风险候选；P2为�
 2. 结合MAC/向量/内存/通信数据拆分可计算部分和等待；内部不可见部分明确为未知。
 3. 从调用侧评估输入格式、token分布、已有通信策略和粒度；核内瓶颈交B06。
 4. 对方MegaMoE+cannbotdsl结果仅作融合方向；先交出shape、dtype、专家token分布、通信组与等待拆分，确认现有Mega已融合哪些阶段及对方依赖后再做调用替换。
+5. 核对AG分发/A2A回收或token段切换的真实含义；分解Routing、计数D2H、GMM和回收，补齐固定/可变分块协议、量化精度及峰值显存，再设计单变量验证。
 
 交付物：MegaMoE归因图和模型/框架/算子方各自可行动清单。
 
 验收：包含完整EP组并排除采集边界；不能仅凭低MAC证明全部时间都在等。
 
-前置：B01 / C01。证据：E04 / E13 / E14 / E15 / E21 / E22。
+前置：B01 / C01。证据：E04 / E13 / E14 / E15 / E21 / E22 / E35。
 
 ### B06 整理重型算子最小复现并交接算子团队
 
@@ -911,7 +1072,7 @@ P0先形成证据与回归基础；P1做受控实验和低风险候选；P2为�
 
 验收：同组共同轮次、输入工作量可解释；不破坏MoE collective一致性。
 
-前置：C01 / G03。证据：E04 / E13 / E14 / E21 / E29 / E30。
+前置：C01 / G03。证据：E04 / E13 / E14 / E21 / E29 / E30 / E34。
 
 ### C04 核对频率、温度、CPU/NUMA与资源争用
 
@@ -1369,3 +1530,15 @@ BF16输入/权重、FP32输出且无bias时，已有torch.mm(...,out_dtype=torch
 RowParallelLinear在reduce_results且TP>1时合并output_parallel。与原始CPU AscendRowParallelLinear_0 → tensor_model_parallel_all_reduce及设备hcom_allReduce记录相互印证；与MoE EP分发、DP批量同步、connector KV传输分开分析。
 
 [对应资料](https://github.com/vllm-project/vllm/blob/5df63a7203cdb9328d824a27b682e77c7b9928be/vllm/model_executor/layers/linear.py#L1762)
+
+### E34 异步输出线程、逐轮类型与跨step准备交集复核
+
+从P.rar原始DP2/TP2数据库复核TID4151的async_output_busy_loop/get_output，并保存16个A3 rank的60个前向窗口类型及跨轮包络交集。DP2/TP2有4个主干窗口但6次外层execute_model scope，只有1个真实Prefill窗口；DP1有两个连续真实Prefill。参考core的默认值None按兼容性自动启用；采集镜像准确SHA和解析值仍待补。未做ON/OFF收益实验。
+
+[对应资料](runtime_coordination_evidence.json)
+
+### E35 用户MoE分块通信方案、术语与收益口径
+
+保留48k/EP16/N256/K8及AGRS、A2A、Init Routing、分段GMM、通信量化原文。N/K含义及前后分段规则按假设解释；500~700us和无OOM是对方摘要中的结论，未验证为本服务收益。
+
+[对应资料](moe_plan_evidence.json)
