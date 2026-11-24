@@ -161,6 +161,7 @@ class BalanceScheduler(Scheduler):
         dist.all_gather(self.balance_queue, running_tensor, group=self.dp_group)
 
     def schedule(self, throttle_prefills: bool = False) -> SchedulerOutput:
+        _admission_debug = getattr(self, "_ascend_admission_diagnostics", None)
         if not self._balance_enabled:
             return super().schedule(throttle_prefills)
         self.current_step += 1
@@ -397,6 +398,10 @@ class BalanceScheduler(Scheduler):
             assert len(scheduled_loras) <= self.lora_config.max_loras
 
         # Next, schedule the WAITING requests.
+        if _admission_debug is not None:
+            _admission_debug.enter_schedule_source(
+                "vllm_ascend.patch.platform.patch_balance_schedule.BalanceScheduler.schedule",
+            )
         if not preempted_reqs and self._pause_state == PauseState.UNPAUSED:
             # Both supported versions prioritize waiting requests holding KV blocks.
             step_skipped_waiting: deque[Request] = deque()
@@ -414,14 +419,20 @@ class BalanceScheduler(Scheduler):
                 # Requests holding KV blocks are always drained first.
                 request_queue = self.kv_holding_waiting or self.waiting
                 if not request_queue:
+                    if _admission_debug is not None:
+                        _admission_debug.record_branch("no_eligible_waiting_queue", None, "break", token_budget)
                     break
                 if len(self.running) == self.max_num_active_reqs:
+                    if _admission_debug is not None:
+                        _admission_debug.record_branch("active_request_limit", None, "break", token_budget)
                     break
 
                 # Keep admission balanced across DP ranks: if any rank was at
                 # the running cap after the previous step, stop admitting new
                 # waiting requests on every rank.
                 if max(t.item() for t in self.balance_queue) == self.max_num_running_reqs:
+                    if _admission_debug is not None:
+                        _admission_debug.record_branch("dp_balance_running_limit", None, "break", token_budget)
                     break
 
                 request = request_queue.peek_request()
@@ -430,6 +441,13 @@ class BalanceScheduler(Scheduler):
                 # try to promote blocked statuses while traversing skipped queue.
                 if not self._handle_blocked_waiting_request(request):
                     _skip_request(request_queue)
+                    if _admission_debug is not None:
+                        _admission_debug.record_branch(
+                            "request_state_not_ready",
+                            request,
+                            "continue",
+                            token_budget,
+                        )
                     continue
 
                 # Check that adding the request still respects the max_loras
@@ -444,6 +462,8 @@ class BalanceScheduler(Scheduler):
                 ):
                     # Scheduling would exceed max_loras, skip.
                     _skip_request(request_queue)
+                    if _admission_debug is not None:
+                        _admission_debug.record_branch("lora_limit", request, "continue", token_budget)
                     continue
 
                 num_external_computed_tokens = 0
@@ -501,6 +521,13 @@ class BalanceScheduler(Scheduler):
                             # the KVConnector couldn't determine
                             # the number of matched tokens.
                             _skip_request(request_queue)
+                            if _admission_debug is not None:
+                                _admission_debug.record_branch(
+                                    "cache_lookup_pending",
+                                    request,
+                                    "continue",
+                                    token_budget,
+                                )
                             continue
 
                         num_external_computed_tokens = ext_tokens
@@ -519,6 +546,13 @@ class BalanceScheduler(Scheduler):
                         and not self.ec_connector.ensure_cache_available(request, num_computed_tokens)
                     ):
                         _skip_request(request_queue)
+                        if _admission_debug is not None:
+                            _admission_debug.record_branch(
+                                "encoder_cache_pending",
+                                request,
+                                "continue",
+                                token_budget,
+                            )
                         continue
 
                     # Track first scheduled prefill, not post-preemption repeat prefills
@@ -548,6 +582,8 @@ class BalanceScheduler(Scheduler):
                     # DP prefill balancing: async KV loads (the branch above) are
                     # allowed to start even on throttled steps, but committing new
                     # prefill compute is deferred to a cadence-aligned step.
+                    if _admission_debug is not None:
+                        _admission_debug.record_branch("prefill_cadence_gate", request, "break", token_budget)
                     break
                 else:
                     # Number of tokens to be scheduled.
@@ -568,6 +604,13 @@ class BalanceScheduler(Scheduler):
                     ):
                         # If chunked_prefill is disabled,
                         # we can stop the scheduling here.
+                        if _admission_debug is not None:
+                            _admission_debug.record_branch(
+                                "unchunked_prefill_budget",
+                                request,
+                                "break",
+                                token_budget,
+                            )
                         break
 
                     num_new_tokens = min(num_new_tokens, token_budget)
@@ -589,6 +632,13 @@ class BalanceScheduler(Scheduler):
                         )
                         if num_new_tokens == 0:
                             # The request cannot be scheduled.
+                            if _admission_debug is not None:
+                                _admission_debug.record_branch(
+                                    "encoder_budget_exhausted",
+                                    request,
+                                    "break",
+                                    token_budget,
+                                )
                             break
 
                 # Skip block alignment when setting up async receive (no local work).
@@ -600,6 +650,13 @@ class BalanceScheduler(Scheduler):
                         num_external_computed_tokens,
                     )
                     if num_new_tokens == 0:
+                        if _admission_debug is not None:
+                            _admission_debug.record_branch(
+                                "mamba_alignment_no_tokens",
+                                request,
+                                "break",
+                                token_budget,
+                            )
                         break
 
                 # Handles an edge case when P/D Disaggregation
@@ -644,6 +701,8 @@ class BalanceScheduler(Scheduler):
                     # manager
                     if request.has_encoder_inputs:
                         self.encoder_cache_manager.free(request)
+                    if _admission_debug is not None:
+                        _admission_debug.record_branch("kv_allocation_failed", request, "break", token_budget)
                     break
 
                 # KVTransfer: the connector uses this info to determine
@@ -683,6 +742,13 @@ class BalanceScheduler(Scheduler):
                     request.num_computed_tokens = num_computed_tokens
                     self._inflight_prefills.add(request)
                     _skip_request(request_queue)
+                    if _admission_debug is not None:
+                        _admission_debug.record_branch(
+                            "remote_kv_load_in_progress",
+                            request,
+                            "continue",
+                            token_budget,
+                        )
                     continue
 
                 request = request_queue.pop_request()
@@ -722,6 +788,9 @@ class BalanceScheduler(Scheduler):
                         self.encoder_cache_manager.allocate(request, i)
                         if self.ec_connector is not None:
                             self.ec_connector.update_state_after_alloc(request, i)
+            else:
+                if _admission_debug is not None and token_budget <= 0:
+                    _admission_debug.record_branch("token_budget_exhausted", None, "loop_condition", token_budget)
 
             # re-queue requests skipped in this pass ahead of older skipped items.
             if step_skipped_kv_holding:
@@ -734,6 +803,14 @@ class BalanceScheduler(Scheduler):
             if not defer_prefills:
                 _, num_waiting = self.get_request_counts()
                 self.prefill_capacity_bound = num_waiting > len(self.deferred_waiting)
+        else:
+            if _admission_debug is not None:
+                _admission_debug.record_branch(
+                    "preemption_in_step" if preempted_reqs else "scheduler_paused",
+                    None,
+                    "skip_waiting",
+                    token_budget,
+                )
 
         # Check if the scheduling constraints are satisfied.
         total_num_scheduled_tokens = sum(num_scheduled_tokens.values())

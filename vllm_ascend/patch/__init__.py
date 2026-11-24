@@ -1971,6 +1971,9 @@
 #       rate-limited summaries. Confirmed helper outcomes and step constraints
 #       are separate. Disabled by default; no copied scheduling implementation.
 #       Tracker state belongs to each EngineCore and is bounded per log window.
+#       Waiting-path probes in Ascend overrides and the paired vLLM core source
+#       patch report the actual break/continue site. The core application tool
+#       checks schedule compatibility and preserves an original-file backup.
 #    Related PR (if no, explain why):
 #       No; diagnostic-only instrumentation for the CANN deployment.
 #    Future Plan:

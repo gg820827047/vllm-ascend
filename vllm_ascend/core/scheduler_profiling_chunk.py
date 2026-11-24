@@ -268,6 +268,7 @@ class ProfilingChunkScheduler(Scheduler):
     # ------------------------------------------------------------------
 
     def schedule(self, throttle_prefills: bool = False) -> SchedulerOutput:  # noqa: C901
+        _admission_debug = getattr(self, "_ascend_admission_diagnostics", None)
         self.current_step += 1
         # NOTE(woosuk) on the scheduling algorithm:
         # There's no "decoding phase" nor "prefill phase" in the scheduler.
@@ -588,6 +589,10 @@ class ProfilingChunkScheduler(Scheduler):
             assert len(scheduled_loras) <= self.lora_config.max_loras
 
         # Next, schedule the WAITING requests.
+        if _admission_debug is not None:
+            _admission_debug.enter_schedule_source(
+                "vllm_ascend.core.scheduler_profiling_chunk.ProfilingChunkScheduler.schedule",
+            )
         if not preempted_reqs and self._pause_state == PauseState.UNPAUSED:
             step_skipped_waiting: deque[Request] = deque()
             step_skipped_kv_holding: deque[Request] = deque()
@@ -604,11 +609,15 @@ class ProfilingChunkScheduler(Scheduler):
             while (self.waiting or self.kv_holding_waiting) and token_budget > 0:
                 # <<< PROFILING CHUNK <<<
                 if input_budget <= draft_slots:
+                    if _admission_debug is not None:
+                        _admission_debug.record_branch("input_budget_exhausted", None, "break", token_budget)
                     break
                 # Paused streaming sessions (WAITING_FOR_STREAMING_REQ) are not
                 # in `running` but still hold a model-runner request slot.
                 num_running = len(self.running) + self.num_waiting_for_streaming_input
                 if num_running >= self.max_num_active_reqs:
+                    if _admission_debug is not None:
+                        _admission_debug.record_branch("active_request_limit", None, "break", token_budget)
                     break
 
                 request_queue = self.kv_holding_waiting or self.waiting
@@ -625,6 +634,13 @@ class ProfilingChunkScheduler(Scheduler):
                             request_id,
                         )
                     skip_request(request_queue)
+                    if _admission_debug is not None:
+                        _admission_debug.record_branch(
+                            "request_state_not_ready",
+                            request,
+                            "continue",
+                            token_budget,
+                        )
                     continue
 
                 if request.num_stale_output_tokens > 0 and not request.drop_stale_output:
@@ -632,6 +648,8 @@ class ProfilingChunkScheduler(Scheduler):
                     # could resample a position that output later delivers.
                     # It drains within the pipeline depth.
                     skip_request(request_queue)
+                    if _admission_debug is not None:
+                        _admission_debug.record_branch("pending_output_tokens", request, "continue", token_budget)
                     continue
 
                 # Check that adding the request still respects the max_loras
@@ -646,6 +664,8 @@ class ProfilingChunkScheduler(Scheduler):
                 ):
                     # Scheduling would exceed max_loras, skip.
                     skip_request(request_queue)
+                    if _admission_debug is not None:
+                        _admission_debug.record_branch("lora_limit", request, "continue", token_budget)
                     continue
 
                 num_external_computed_tokens = 0
@@ -679,6 +699,13 @@ class ProfilingChunkScheduler(Scheduler):
                             # the KVConnector couldn't determine
                             # the number of matched tokens.
                             skip_request(request_queue)
+                            if _admission_debug is not None:
+                                _admission_debug.record_branch(
+                                    "cache_lookup_pending",
+                                    request,
+                                    "continue",
+                                    token_budget,
+                                )
                             continue
 
                         if partial_tail and ext_tokens > partial_tail:
@@ -721,6 +748,13 @@ class ProfilingChunkScheduler(Scheduler):
                     # Skip request with pending mm encoding prefetches
                     if self._ec_transfer_pending(request, num_computed_tokens):
                         skip_request(request_queue)
+                        if _admission_debug is not None:
+                            _admission_debug.record_branch(
+                                "encoder_cache_pending",
+                                request,
+                                "continue",
+                                token_budget,
+                            )
                         continue
 
                     # Track first scheduled prefill, not post-preemption repeat prefills
@@ -740,6 +774,13 @@ class ProfilingChunkScheduler(Scheduler):
 
                     if self._ec_transfer_pending(request, num_computed_tokens):
                         skip_request(request_queue)
+                        if _admission_debug is not None:
+                            _admission_debug.record_branch(
+                                "encoder_cache_pending",
+                                request,
+                                "continue",
+                                token_budget,
+                            )
                         continue
 
                 encoder_inputs_to_schedule = None
@@ -754,6 +795,8 @@ class ProfilingChunkScheduler(Scheduler):
                 elif defer_prefills and num_computed_tokens < request.num_tokens - 1:
                     # DP prefill balancing: defer this step's local prefill
                     # compute to a cadence-aligned step.
+                    if _admission_debug is not None:
+                        _admission_debug.record_branch("prefill_cadence_gate", request, "break", token_budget)
                     break
                 else:
                     request_token_budget = min(token_budget, input_budget - draft_slots)
@@ -781,6 +824,13 @@ class ProfilingChunkScheduler(Scheduler):
                         ):
                             if padded_num_tokens > request_token_budget:
                                 # Prefer to not schedule than schedule un-padded.
+                                if _admission_debug is not None:
+                                    _admission_debug.record_branch(
+                                        "speculative_padding_budget",
+                                        request,
+                                        "break",
+                                        token_budget,
+                                    )
                                 break
                             num_new_tokens = padded_num_tokens
                             pad_spec_decode = True
@@ -810,6 +860,13 @@ class ProfilingChunkScheduler(Scheduler):
                                 "Please increase the `max_fit_chunk` to profile more data"
                             )
                         else:
+                            if _admission_debug is not None:
+                                _admission_debug.record_branch(
+                                    "other_admission_condition",
+                                    request,
+                                    "break",
+                                    token_budget,
+                                )
                             break
                     # <<< PROFILING CHUNK <<<
 
@@ -822,6 +879,13 @@ class ProfilingChunkScheduler(Scheduler):
                     ):
                         # If chunked_prefill is disabled,
                         # we can stop the scheduling here.
+                        if _admission_debug is not None:
+                            _admission_debug.record_branch(
+                                "unchunked_prefill_budget",
+                                request,
+                                "break",
+                                token_budget,
+                            )
                         break
 
                     num_new_tokens = min(num_new_tokens, request_token_budget)
@@ -836,6 +900,13 @@ class ProfilingChunkScheduler(Scheduler):
                             num_external_computed_tokens,
                         )
                         if num_new_tokens == 0:
+                            if _admission_debug is not None:
+                                _admission_debug.record_branch(
+                                    "mamba_alignment_no_tokens",
+                                    request,
+                                    "break",
+                                    token_budget,
+                                )
                             break
                         if pad_spec_decode and num_new_tokens != 1 + self.num_spec_tokens:
                             # Alignment clipped the placeholder rows. The split
@@ -868,6 +939,13 @@ class ProfilingChunkScheduler(Scheduler):
 
                     if num_new_tokens == 0:
                         # The request cannot be scheduled.
+                        if _admission_debug is not None:
+                            _admission_debug.record_branch(
+                                "no_schedulable_tokens",
+                                request,
+                                "break",
+                                token_budget,
+                            )
                         break
 
                 # During async KV load, no forward pass is run yet.
@@ -915,6 +993,8 @@ class ProfilingChunkScheduler(Scheduler):
                     # manager
                     if request.has_encoder_inputs:
                         self.encoder_cache_manager.free(request)
+                    if _admission_debug is not None:
+                        _admission_debug.record_branch("kv_allocation_failed", request, "break", token_budget)
                     break
 
                 # KVTransfer: the connector uses this info to determine
@@ -958,6 +1038,13 @@ class ProfilingChunkScheduler(Scheduler):
                     request.num_computed_tokens = num_computed_tokens
                     self._inflight_prefills.add(request)
                     skip_request(request_queue)
+                    if _admission_debug is not None:
+                        _admission_debug.record_branch(
+                            "remote_kv_load_in_progress",
+                            request,
+                            "continue",
+                            token_budget,
+                        )
                     continue
 
                 request = request_queue.pop_request()
@@ -1005,6 +1092,9 @@ class ProfilingChunkScheduler(Scheduler):
                         self.encoder_cache_manager.allocate(request, i)
                         if self.ec_connector is not None:
                             self.ec_connector.update_state_after_alloc(request, i)
+            else:
+                if _admission_debug is not None and token_budget <= 0:
+                    _admission_debug.record_branch("token_budget_exhausted", None, "loop_condition", token_budget)
 
             # re-queue requests skipped in this pass ahead of older skipped items.
             if step_skipped_kv_holding:
@@ -1017,6 +1107,14 @@ class ProfilingChunkScheduler(Scheduler):
             if not defer_prefills:
                 _, num_waiting = self.get_request_counts()
                 self.prefill_capacity_bound = num_waiting > len(self.deferred_waiting)
+        else:
+            if _admission_debug is not None:
+                _admission_debug.record_branch(
+                    "preemption_in_step" if preempted_reqs else "scheduler_paused",
+                    None,
+                    "skip_waiting",
+                    token_budget,
+                )
 
         # Check if the scheduling constraints are satisfied.
         total_num_scheduled_tokens = sum(num_scheduled_tokens.values())

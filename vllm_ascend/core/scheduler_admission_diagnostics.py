@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright (c) 2026 Huawei Technologies Co., Ltd. All Rights Reserved.
-"""Opt-in, bounded scheduler observations; never infer a per-request denial.
+"""Opt-in, bounded scheduler observations and actual waiting-branch events.
 
 The tracker belongs to one EngineCore scheduler. schedule() and its synchronous
 helpers run on that EngineCore thread; there is no cross-process/global request
@@ -12,6 +12,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import sys
 import time
 from collections import Counter
 from collections.abc import Callable
@@ -36,7 +37,7 @@ def _request(args: tuple, kwargs: dict) -> Any:
 
 
 class SchedulerAdmissionDiagnostics:
-    """Record real helper outcomes, separately from step-level constraints."""
+    """Keep actual branch stops, helper outcomes and return constraints separate."""
 
     def __init__(self, scheduler: Any, interval_s: float, clock: Callable[[], float] = time.perf_counter):
         if interval_s <= 0:
@@ -54,6 +55,10 @@ class SchedulerAdmissionDiagnostics:
         self.schedule_max_ms = 0.0
         self.observations: Counter[str] = Counter()
         self.step_limits: Counter[str] = Counter()
+        self.branch_reasons: Counter[str] = Counter()
+        self.branch_sources: set[str] = set()
+        self.branch_samples: list[dict] = []
+        self.omitted_branch_samples = 0
         self.timings: dict[str, list[float]] = {}
         self.samples: list[dict] = []
         self.omitted_samples = 0
@@ -81,6 +86,57 @@ class SchedulerAdmissionDiagnostics:
                 "request_id": str(getattr(request, "request_id", "unknown"))[:_MAX_REQUEST_ID_LENGTH],
                 "status": status,
                 "phase": "running" if status == "RUNNING" else "waiting",
+            }
+        )
+
+    def enter_schedule_source(self, source: str) -> None:
+        """Called inside an instrumented schedule body before its waiting loop."""
+        if self.active:
+            self.branch_sources.add(source)
+
+    def record_branch(
+        self,
+        reason: str,
+        request: Any,
+        action: str,
+        token_budget: int,
+    ) -> None:
+        """Called immediately before the real waiting-path break/continue."""
+        if self.active:
+            location = None
+            if len(self.branch_samples) < _MAX_SAMPLES:
+                # Resolve only bounded samples, without walking a Python stack
+                # or retaining frame objects in the diagnostic window.
+                try:
+                    frame = sys._getframe(1)
+                    location = f"{frame.f_code.co_filename}:{frame.f_lineno}"
+                    del frame
+                except Exception:
+                    # A restricted frame-introspection policy must not affect
+                    # the scheduler's decision or suppress the event counter.
+                    pass
+            self._safe(self._record_branch, reason, request, action, location, token_budget)
+
+    def _record_branch(self, reason, request, action, location, token_budget) -> None:
+        # A natural end of an empty queue is not an admission failure. This is
+        # O(1); do not scan or peek queues solely for logging a RequestID.
+        if request is None and not (self.scheduler.waiting or getattr(self.scheduler, "kv_holding_waiting", ())):
+            return
+        self.branch_reasons[reason] += 1
+        if len(self.branch_samples) >= _MAX_SAMPLES:
+            self.omitted_branch_samples += 1
+            return
+        self.branch_samples.append(
+            {
+                "reason": reason,
+                "scope": "request" if request is not None else "waiting_queue",
+                "request_id": (str(request.request_id)[:_MAX_REQUEST_ID_LENGTH] if request is not None else None),
+                "status": _name(request.status) if request is not None else None,
+                "phase": "waiting",
+                "action": action,
+                "location": location,
+                "token_budget": token_budget,
+                "timestamp": time.time(),
             }
         )
 
@@ -199,6 +255,10 @@ class SchedulerAdmissionDiagnostics:
             "latest": state,
             "observations": dict(self.observations),
             "step_limits": dict(self.step_limits),
+            "branch_reasons": dict(self.branch_reasons),
+            "branch_sources": sorted(self.branch_sources),
+            "branch_samples": self.branch_samples,
+            "omitted_branch_samples": self.omitted_branch_samples,
             "helper_timings": {
                 name: {"calls": values[0], "total_ms": values[1], "max_ms": values[2]}
                 for name, values in self.timings.items()
@@ -217,6 +277,10 @@ class SchedulerAdmissionDiagnostics:
             self.schedule_max_ms = 0.0
             self.observations.clear()
             self.step_limits.clear()
+            self.branch_reasons.clear()
+            self.branch_sources.clear()
+            self.branch_samples.clear()
+            self.omitted_branch_samples = 0
             self.timings.clear()
             self.samples.clear()
             self.omitted_samples = 0

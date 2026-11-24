@@ -24,6 +24,12 @@ _BASE_SCHEDULER = next(
 if _BASE_SCHEDULER is None:
     logger.warning("SchedulerAdmission diagnostics NOT installed: upstream Scheduler base was not found.")
 else:
+    if "enter_schedule_source" not in _BASE_SCHEDULER.schedule.__code__.co_names:
+        logger.warning(
+            "SchedulerAdmission core branch hooks are absent. Apply the paired core patch with "
+            "tools/diagnostics/apply_scheduler_admission_core_patch.py before restarting; "
+            "ordinary P-side branch reasons will otherwise be incomplete."
+        )
     install_scheduler_admission_diagnostics(
         _BASE_SCHEDULER,
         envs.VLLM_ASCEND_SCHEDULER_ADMISSION_LOG_INTERVAL_MS / 1000.0,

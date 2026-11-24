@@ -369,8 +369,18 @@ def _schedule_body_ast(source: str) -> str:
     assert func is not None, "no schedule() in source"
 
     class _BalanceDeltaStripper(ast.NodeTransformer):
+        def visit_Assign(self, node: ast.Assign):  # noqa: N802
+            if any(isinstance(target, ast.Name) and target.id == "_admission_debug" for target in node.targets):
+                return None
+            return self.generic_visit(node)
+
         def visit_If(self, node: ast.If):  # noqa: N802
             test = ast.dump(node.test)
+            # Optional branch probes are observational, including their pure
+            # while-else / admission-else bodies. Separate tests lock the full
+            # pre-instrumentation AST so this does not hide algorithm drift.
+            if "_admission_debug" in test:
+                return None
             # delta 1: disabled-path early return.
             if "_balance_enabled" in test:
                 return None

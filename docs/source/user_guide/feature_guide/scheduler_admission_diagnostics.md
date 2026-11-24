@@ -16,8 +16,51 @@ export VLLM_ASCEND_SCHEDULER_ADMISSION_LOG_INTERVAL_MS=1000
 # Keep your existing vllm serve command and DP/TP configuration.
 ```
 
+## Apply the paired vLLM core patch
+
+Ordinary P-side scheduling delegates to `Scheduler.schedule()` in the separate
+**vLLM core** package. Updating only vllm-ascend covers the Ascend overrides,
+but does not add branch probes to that upstream method.
+
+Stop the service and use the same Python environment as `vllm serve`:
+
+```bash
+# Run from the updated vllm-ascend repository, on both P and D nodes.
+python3 tools/diagnostics/apply_scheduler_admission_core_patch.py \
+    --vllm-root /vllm-workspace/vllm --check
+python3 tools/diagnostics/apply_scheduler_admission_core_patch.py \
+    --vllm-root /vllm-workspace/vllm --apply
+```
+
+`--vllm-root` accepts a repository root, package directory, or site-packages
+root. Omit it to locate the installed top-level vLLM package without importing
+vLLM or torch. The default action is a read-only check.
+
+The bundled patch targets the v0.32 scheduler at core commit
+`5df63a7203cdb9328d824a27b682e77c7b9928be`. The tool compares the schedule AST,
+checks the patch, preserves an original-file backup, and verifies that only
+that method changed. A different scheduling implementation is rejected without
+editing it; provide that runtime core SHA/source to adapt the patch. Unrelated
+changes elsewhere in the file are allowed when the method and patch contexts
+are compatible. This edits Python source and requires a service restart, not
+custom-kernel recompilation.
+
+If the core hooks are missing, startup emits `core branch hooks are absent`.
+Apply the paired patch before interpreting ordinary P-side branch reasons.
+To restore the saved core file after stopping the service:
+
+```bash
+python3 tools/diagnostics/apply_scheduler_admission_core_patch.py \
+    --vllm-root /vllm-workspace/vllm --restore
+```
+
+Restoration refuses to overwrite edits made after patch application. The backup
+and its checksum record remain alongside `scheduler.py`.
+
+## Log frequency
+
 The interval is a positive integer in milliseconds, measured independently per
-EngineCore. The default is 1000 ms. Each summary includes at most four event
+EngineCore. The default is 1000 ms. Each summary includes at most four helper event samples and four branch
 samples; additional observations remain in the counters. Logs use INFO level.
 
 Search the normal service log:
@@ -42,11 +85,50 @@ Each line contains a JSON object with the following fields:
 | `window_ms`, `steps` | Measurement window and number of completed `schedule()` calls. |
 | `schedule_total_ms`, `schedule_max_ms` | Total and maximum scheduler wall time in this window. Includes diagnostic helper recording, but excludes snapshot collection and summary log output. |
 | `latest` | Resource snapshot at the latest schedule return, rather than the window maximum. |
+| `branch_reasons` | Counts from actual waiting-path stops, described below. |
+| `branch_sources` | Schedule implementations that entered an instrumented waiting-admission region in this window. |
+| `branch_samples` | Up to four actual branch events, with file/line location, action, remaining token budget, timestamp, and RequestID when one was already selected. |
+| `omitted_branch_samples` | Branch events omitted from samples, still included in counters. |
 | `observations` | Counts of actual helper outcomes. These are call/event counts, not unique denied requests. |
 | `step_limits` | Counts of steps with backlog and an observed capacity or policy limit at return. These are not attributed to individual requests. |
 | `helper_timings` | Call count, total and maximum duration of each observed helper. |
 | `samples` | Up to four observed events with internal RequestID, status and waiting/running phase. |
 | `omitted_samples` | Events omitted from the bounded sample list; still included in counters. |
+
+### Actual waiting-path branches
+
+The following calls are directly inside each supported `schedule()` body,
+immediately before its actual `break` or `continue`. The log collector remains
+shared and rate-limited; it no longer needs to guess these reasons from return
+snapshots.
+
+| Branch reason | Meaning |
+| --- | --- |
+| `active_request_limit` | The actual active-request-cap branch stopped admission. |
+| `token_budget_exhausted` | The waiting loop naturally ended with no token budget; a different `break` does not trigger this event. |
+| `input_budget_exhausted` | Remaining input budget cannot accommodate drafting slots. |
+| `dp_balance_running_limit`, `dp_admission_filter` | The corresponding balance/admission policy branch blocked progress. |
+| `request_state_not_ready`, `pending_output_tokens` | The selected request's state or outstanding output prevented admission. |
+| `cache_lookup_pending`, `encoder_cache_pending` | Cache matching or encoder cache availability is unresolved. |
+| `kv_allocation_failed` | KV allocation failed and the actual waiting-path stop was taken. |
+| `remote_kv_load_in_progress` | Async KV loading was initiated; the request stayed out of RUNNING. |
+| `lora_limit`, `prefill_cadence_gate`, `unchunked_prefill_budget` | The corresponding LoRA, prefill cadence or unchunked budget guard was taken. |
+| `speculative_padding_budget`, `mamba_alignment_no_tokens`, `no_schedulable_tokens`, `recompute_budget_or_context_limit` | The associated shape/alignment/budget guard stopped this request. |
+| `preemption_in_step`, `recompute_in_step`, `scheduler_paused` | The scheduler skipped its entire waiting-admission region for this step. |
+| `no_eligible_waiting_queue` | No queue was eligible, despite remaining backlog; ordinary empty-queue completion is suppressed. |
+
+These are per-step events, not permanent request rejections or unique request
+counts. Stops before `peek_request()` have `scope=waiting_queue` and a null
+RequestID; the logger does not peek or scan solely to invent an ID. Once a
+request is selected, the sample has `scope=request` and its actual internal
+RequestID. `location` is the actual runtime Python filename and line number.
+The phase is `waiting`: running-request retry/skip branches are not exhaustively
+instrumented.
+
+`branch_sources` should show `vllm.v1.core.sched.scheduler.Scheduler.schedule`
+for ordinary core scheduling, or the concrete Ascend override. A healthy step
+can have sources and no blocking branch. Missing core coverage is also reported
+by the startup warning above.
 
 ### Confirmed helper observations
 
@@ -70,10 +152,10 @@ exist. A connector lookup duration is **not** the complete KV transfer duration.
 | `dp_balance_running_limit_reached` | Balance scheduling was enabled and its CPU running-count snapshot contained a DP at the running cap. |
 
 Multiple constraints can coexist. They are evidence for the next investigation,
-not proof of which branch prevented every waiting request from running. Other
-reasons, such as LoRA limits, encoder limits, long-prefill policies and request
-ordering, are not exhaustively identified by this diagnostic. An empty reason
-counter therefore does not mean there was no scheduling constraint.
+not proof of which branch prevented every waiting request from running. Use `branch_reasons` to identify actual executed waiting-path stops. The
+return-time constraints alone cannot attribute a stop to an individual request.
+An empty branch counter does not explain delays outside these waiting paths,
+such as Worker preparation or running-prefill chunk intervals.
 
 `latest` includes ordinary and KV-holding waiting counts, active and running
 limits, token budget and scheduled tokens, new-request count, free KV blocks,
@@ -101,8 +183,10 @@ engine-step duration and per-request queue time.
 
 ## Validation scope
 
-The wrappers call the existing scheduler implementation and owned helpers;
-they do not copy or replace scheduling decisions. Original arguments, results
+Inline probes record actual branch decisions; the outer wrappers still collect
+timing and resource snapshots. Removing the diagnostic probes restores the
+original scheduling ASTs, checked by regression tests. Neither layer changes
+request selection or scheduling decisions. Original arguments, results
 and exceptions are preserved. Counters are owned by one EngineCore scheduler
 and reset per log window. The observation path avoids scanning waiting requests
 and avoids reading device tensors for diagnostics; optional balance counts are
@@ -119,7 +203,7 @@ state reporting, rate limiting, bounded samples, subclass installation,
 exception propagation and diagnostic output failures:
 
 ```bash
-python3 tests/ut/core/test_scheduler_admission_diagnostics.py
+python3 -m unittest discover -s tests/ut/core -p 'test_scheduler_admission*.py' -v
 ```
 
 NPU validation should run the existing P=4DP×4TP / D=8DP×2TP service with the
