@@ -50,6 +50,9 @@ CHECK_IMPORTS = {
         tip="Replace 'import re' with 'import regex as re' or 'import regex'.",
         allowed_pattern=re.compile(r"^\s*import\s+regex(\s*|\s+as\s+re\s*)$"),
         allowed_files={
+            # The standalone affinity script runs with system Python, without
+            # project or third-party packages on the validation host.
+            "reports/dsv41_a3_a5_prefill/bindcore_review/bind_threads_v3.py",
             # Profiling indexes run in minimal CPU jobs without third-party dependencies.
             "tools/profiling/artifacts.py",
             # Cache key preparation and native build wrappers must work before

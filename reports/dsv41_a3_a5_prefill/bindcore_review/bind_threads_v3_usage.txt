@@ -1,0 +1,136 @@
+A3 P/D 线程绑核脚本 v3
+======================
+
+文件与依赖
+  bind_threads_v3.sh 是可直接复制到验证机运行的单文件脚本。
+  只需要 Linux + Python 3.7 或更新版本（标准库），不需要安装第三方包，
+  不需要重新构建 vLLM 或 vllm-ascend，也不修改推理代码。
+  bind_threads_v3.py 是内嵌 Python 的可编辑源文件。
+
+使用前提
+  本方案针对你目前的 A3：192 个在线逻辑 CPU、8 个非空 NUMA 节点、
+  每节点 24 个 CPU、SMT 关闭；P=4DP×4TP，D=8DP×2TP。
+  先启动服务并完成 warmup，再执行脚本。需要能查看服务 /proc 并设置其亲和；
+  修改 numa_balancing、IRQ 等主机设置时通常需要 root。
+  脚本在实际运行服务的 PID 命名空间执行；容器 /proc 与 /sys 需能反映对应布局。
+  不满足拓扑、进程缺失或 PID 多命中会报错，不会随便挑第一个进程。
+
+推荐使用
+  # 1. P 侧：只看计划，无任何设置修改，也不写状态文件。
+  bash bind_threads_v3.sh --role P --dry-run --verbose
+
+  # 2. P 侧：应用线程绑核，并关闭主机 NUMA 自动平衡。
+  #    状态文件必须不存在；重新实验请换文件名，或先恢复上一次设置。
+  bash bind_threads_v3.sh --role P --disable-numa-balancing --state-file /workspace/bind-state-P-v3.json
+
+  # 3. 逐个核对当前所有目标线程，而非只看进程第一行或 ps 的当前 CPU。
+  bash bind_threads_v3.sh --role P --verify-only
+
+  # 4. D 侧在 D 机器上执行：
+  bash bind_threads_v3.sh --role D --dry-run --verbose
+  bash bind_threads_v3.sh --role D --disable-numa-balancing --state-file /workspace/bind-state-D-v3.json
+  bash bind_threads_v3.sh --role D --verify-only
+
+  # 5. 恢复（在创建相应备份的同一台机器、同一次系统启动中执行）：
+  bash bind_threads_v3.sh --restore /workspace/bind-state-P-v3.json --dry-run
+  bash bind_threads_v3.sh --restore /workspace/bind-state-P-v3.json
+  # D 侧同理，指定 D 的状态文件。
+
+NUMA 开关说明
+  正确名称是 kernel.numa_balancing，对应 /proc/sys/kernel/numa_balancing。
+  --disable-numa-balancing 把它设为 0，保存实际原值，恢复时不是一律写回 1。
+  不加此参数就保留原值。它影响整台主机，不只是某个 worker/容器；
+  设置仅在运行时生效，不写 /etc/sysctl.conf，主机重启后按系统配置恢复。
+  关闭自动平衡不会把已有内存页搬回某个 NUMA 节点，也不等于配置了内存亲和。
+  该开关有无收益需要实测，不能直接认定会降低 TTFT。
+
+如何做单变量对照
+  建议先只改线程亲和：去掉 --disable-numa-balancing 和 --irq。
+  再在相同绑核、代码、输入、并发下，单独对照 NUMA 自动平衡开/关。
+  若只想先验证 worker，可在 dry-run、应用和 verify 时都加 --workers-only，
+  这样不修改 EngineCore / API / DPCoordinator。
+  不要一轮同时改变线程亲和、NUMA、IRQ 后就把收益归因于某一项。
+
+CPU 分配（示例以实际 NUMA CPU 列表为 0-23、24-47……为前提）
+  CPU 编号不连续时，脚本使用 sysfs 的真实 CPU 列表切片，不做 CPU ID 算术。
+  NUMA 节点按节点编号排序；分配仍是你原设计的布局，
+  没有声称已自动确认这些 CPU 与 NPU 的亲近关系或内存放置位置。
+
+  P / DP0（其余 DP 按各自两个 NUMA 节点分配）
+    Worker TP0: 2-10   main 2-6 / aux 7-8 / ACL 9 / release 10
+    Worker TP1: 11-19  main 11-15 / aux 16-17 / ACL 18 / release 19
+    Worker TP2: 26-34  main 26-30 / aux 31-32 / ACL 33 / release 34
+    Worker TP3: 35-43  main 35-39 / aux 40-41 / ACL 42 / release 43
+    EngineCore: 主线程20；其他线程21-23
+    API: 46-47；全局 DPCoordinator: 44-45
+    IRQ 预留: 0-1、24-25（默认不修改 IRQ 设置）
+
+  D / DP0（其余 DP 各用一个 NUMA 节点）
+    Worker TP0: 2-9   main 2-6 / aux 7 / ACL 8 / release 9
+    Worker TP1: 10-17 main 10-14 / aux 15 / ACL 16 / release 17
+    EngineCore: 主线程18；其他线程19-21
+    API: 23；全局 DPCoordinator: 22
+    IRQ 预留: 0-1（默认不修改 IRQ 设置）
+
+  main 是一个 CPU 池，主线程可在其中迁移，不是固定某一个 CPU。
+  acl_thread* -> ACL；release_thread* -> release；其他 worker 线程
+  （含 RT_RECYCLE_0）-> aux。多个同类线程共享该池，不保证每线程独占核。
+  EngineCore 与 v2 不同：其主线程和其他线程也分池，减少相互抢占。
+
+进程发现与歧义处理
+  使用完整 /proc/PID/cmdline 发现 DP/TP，避免 TP1 匹配到 TP10。
+  用 TID=PID 识别主线程，不依赖可能截断为 VLLM::Worker_DP 的 comm。
+  API 默认按 7100+DP 端口发现 launcher、监听者及 launcher 下的 API 子进程；
+  实际端口不同可加 --port-base 你的起始端口。
+  同机多套服务可重复加 --root-pid PID，以各服务 launcher 的 PID 限定范围。
+
+  共享一个 API 端口、多套服务仍歧义、进程名不同等情况，
+  可用 --pid-map bind_threads_v3_pid_map.example.json。
+  模板中的 null 必须换为真实正整数 PID；未填的角色仍自动发现。
+  完整多 API 布局可用 {"apis":{"0":[PID1,PID2],"1":[PID3],...}} 明确归属。
+  不允许把同一进程分配给不同 DP 的 CPU 池；没有可区分的多 API 进程时，
+  先用 --workers-only 测试，不猜测共享 API 属于哪个 DP。
+
+IRQ / workqueue 为独立可选实验
+  默认不动 IRQ / workqueue / irqbalance。
+  v2 的 CQ=SQ+1、logical NPU 到 card/chip 的推断已删除。
+  需要根据验证机实际信息填写 bind_threads_v3_irq_map.example.json，
+  明确每个 DP/TP 对应的 PCI BDF、SQ IRQ、CQ IRQ，可选填 workqueue。
+  IRQ 必须属于指定 PCI 设备的 msi_irqs；脚本核对此归属，但无法判断
+  你填的 SQ/CQ 业务含义和 DP/TP 到 NPU 的对应关系是否正确。
+  模板不可原样执行，支持只填需要测试的设备。
+
+    bash bind_threads_v3.sh --role P --irq --irq-map actual_irq_map.json --dry-run
+    bash bind_threads_v3.sh --role P --irq --irq-map actual_irq_map.json --state-file /workspace/bind-state-P-irq.json
+
+  开启 --irq 后才会按需停 irqbalance，并在恢复时按记录重新启动。
+  IRQ 不支持设置或有效亲和不符合计划时会报错，并尝试回滚本次修改。
+
+验证、回滚与局限
+  SUCCESS 的前提是逐个回读所有现存目标 TID 的 affinity，与计划完全一致。
+  错误返回非零，不再使用“遍历了多少线程”冒充成功绑定数。
+  状态 JSON 以 0600 创建，不覆盖已有文件，保存原 CPU masks 和主机设置。
+  应用异常时尝试自动回滚；权限不足、CPU 下线等情况仍可能使恢复不完整，
+  会明确输出 FAIL 并保留状态文件，需按错误处理后再次 --restore。
+  恢复校验 boot_id 与 PID/TID 的 starttime，避免误操作复用的线程号。
+  若另一个操作已改了同一设置，恢复会报告冲突，不强行覆盖。
+  不要手工改动状态 JSON。被 SIGKILL 等强制终止时不能自动回滚，可用备份恢复。
+
+  这是一次性脚本，不是后台绑核代理：后创建的线程继承创建者的亲和，
+  不会自动按名称重新分类。因此应在 warmup 后执行，并在采集前跑 --verify-only。
+  恢复只针对已记录且仍存活的线程，无法推测执行后新线程本来应该用哪些 CPU。
+  若必须恢复到服务最初的完整线程布局，可恢复主机设置后重启服务。
+  vLLM 自带的 enable_cpu_binding 与此脚本如同时修改亲和，最后执行的设置生效。
+  本脚本不改变 vLLM 的开关值，最终当前亲和以 --verify-only 的回读结果为准。
+
+本地验证
+  python3 test_bind_threads_v3.py
+  bash -n bind_threads_v3.sh
+  覆盖拓扑、范围、截断线程名、进程歧义、dry-run、原值恢复、
+  cpuset 截断后的回滚、PID/TID 复用，以及一个隔离子进程的真实逐 TID 绑核/恢复。
+  没有在你的 NPU 验证机上跑性能实验，不承诺这份 CPU 池划分优于其他划分。
+
+参考
+  https://docs.kernel.org/admin-guide/sysctl/kernel.html#numa-balancing
+  https://man7.org/linux/man-pages/man1/taskset.1.html
+  https://man7.org/linux/man-pages/man5/proc_pid_comm.5.html
