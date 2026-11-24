@@ -1960,6 +1960,22 @@
 #       Contribute LoPT upstream once the renderer API exposes a hook for
 #       parallel tokenization.
 #
+# ** File: platform/patch_scheduler_admission_diagnostics.py **
+# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+#   1. `vllm.v1.core.sched.scheduler.Scheduler.__init__`
+#    Why:
+#       Request queue latency does not identify capacity limits versus pending
+#       cache lookups, failed KV allocations, or blocked request states.
+#    How:
+#       Opt-in instance wrappers observe original schedule/helper calls and emit
+#       rate-limited summaries. Confirmed helper outcomes and step constraints
+#       are separate. Disabled by default; no copied scheduling implementation.
+#       Tracker state belongs to each EngineCore and is bounded per log window.
+#    Related PR (if no, explain why):
+#       No; diagnostic-only instrumentation for the CANN deployment.
+#    Future Plan:
+#       Remove once upstream exposes stable structured admission diagnostics.
+#
 # ** File: platform/patch_trace.py ** and ** worker/patch_trace.py **
 # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 #   1. `vllm_ascend.patch.platform.patch_trace`

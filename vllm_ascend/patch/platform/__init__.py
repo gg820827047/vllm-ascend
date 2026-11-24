@@ -73,6 +73,9 @@ import vllm_ascend.patch.platform.patch_example_connector  # noqa
 if os.getenv("VLLM_ASCEND_TRACE", "0") == "1":
     import vllm_ascend.patch.platform.patch_trace  # noqa
 
+if envs.VLLM_ASCEND_SCHEDULER_ADMISSION_DEBUG:
+    import vllm_ascend.patch.platform.patch_scheduler_admission_diagnostics  # noqa: F401
+
 # ** File: platform/patch_example_connector.py **
 # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 #   1. `vllm.distributed.ec_transfer.ec_connector.example_connector.ECExampleConnector.start_load_caches`

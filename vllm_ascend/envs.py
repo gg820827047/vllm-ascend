@@ -35,6 +35,13 @@ def _strict_binary_env(name: str, default: str = "0") -> bool:
     return value == "1"
 
 
+def _positive_int_env(name: str, default: str) -> int:
+    value = int(os.getenv(name, default))
+    if value <= 0:
+        raise ValueError(f"{name} must be a positive integer, got {value!r}")
+    return value
+
+
 env_variables: dict[str, Callable[[], Any]] = {
     # max compile thread number for package building. Usually, it is set to
     # the number of CPU cores. If not set, the default value is None, which
@@ -82,6 +89,15 @@ env_variables: dict[str, Callable[[], Any]] = {
     # Emit per-layer KVPool ranged transfer audit events. Default: 0 (disabled).
     # Valid values: 0 or 1. This configuration is not sensitive.
     "VLLM_ASCEND_KVPOOL_RANGE_DEBUG": lambda: _strict_binary_env("VLLM_ASCEND_KVPOOL_RANGE_DEBUG"),
+    # Log scheduler helper failures and per-step capacity snapshots for diagnosis.
+    # Default: 0 (disabled). Valid: 0 or 1. Not sensitive; logs include request IDs
+    # but never prompt text or token IDs. Does not require VLLM_ASCEND_TRACE.
+    "VLLM_ASCEND_SCHEDULER_ADMISSION_DEBUG": lambda: _strict_binary_env("VLLM_ASCEND_SCHEDULER_ADMISSION_DEBUG"),
+    # Minimum interval between diagnostic summary lines per EngineCore, in ms.
+    # Default: 1000. Positive integers only. Not sensitive; used only when enabled.
+    "VLLM_ASCEND_SCHEDULER_ADMISSION_LOG_INTERVAL_MS": lambda: _positive_int_env(
+        "VLLM_ASCEND_SCHEDULER_ADMISSION_LOG_INTERVAL_MS", "1000"
+    ),
     # Override the Unified Buffer (UB) size in KB for Triton kernel tile sizing.
     # 0 (default): auto-detect from device properties, falling back to 192 KB
     # (safe for Ascend 910B/A3). Set to a positive value to override when
