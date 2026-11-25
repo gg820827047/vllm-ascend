@@ -1,6 +1,6 @@
 # LLM 服务请求全局视图与性能任务台账
 
-更新：2026-11-20。以 A3 / DeepSeek / vLLM-CANN 为主要优化对象，A5用于机制对照。结合既有profiling、固定源码和用户提供的对方项目清单，整理可验证方向、版本差异、责任分工与收益口径；对方报告数字不作为本服务实测收益。
+更新：2026-11-25。以 A3 / DeepSeek / vLLM-CANN 为主要优化对象，A5用于机制对照。结合既有profiling、固定源码和用户提供的对方项目清单，整理可验证方向、版本差异、责任分工与收益口径；对方报告数字不作为本服务实测收益。 11月25日补充128k/64并发调度日志、预算门限与受控实验，以及MRV2/Prefill/Decode/DSpark和客户端TTFT边界；仍未新增性能收益实测。
 
 ## 全局位置、四类主线与边界观测
 
@@ -87,6 +87,7 @@ P2P connector 负责 P/D 交接；Store 提供共享外部缓存。MultiConnecto
 
 2026-11-17归档。源码结论固定到官方0.32快照b12b6f7和CANN升级快照9a6a156；trace结论来自既有P.rar，不是新增性能实验。D侧启动日志、镜像中的npugraph_ex版本与约50个进度项的原文仍待补充。 2026-11-18补充DP2/TP2主线程/元数据/实际launch追踪，以及同名任务与时间零点复核；仍使用既有P.rar数据。 2026-11-19的多流阶段收尾与机制笔记见下方独立章节。 2026-11-20补充CPU验证方法、异步默认值/线程证据、真实与dummy逐轮区分，以及AG/A2A和MoE分块机制。
 
+[11月25日：128k / 64并发准入诊断与字段说明](index.html#mechanism-scheduler-admission)：包含四DP日志、0.8秒口径、两份预算、running=2与两组受控实验；未把估算写成TTFT实测。
 [打开A3 DP2/TP2主线程与多流时序报告](../dsv41_a3_a5_prefill/host_issue_dp2tp2/report.html)：包含Task15092/15140对照、SESSION/共同坐标切换，以及DecoderLayer为何出现在Prefill调用栈。
 [多流阶段结论与原理笔记](index.html#multistream-review)：展开metadata、Q/KV、通信、CSA2/CED、量化和并行切分对照；Host抖动保留为假设。
 
@@ -194,9 +195,22 @@ A3 DP0TP0，本地step1；以下均为相对worker execute_model进入的毫秒�
 
 跟进：A02 / A06 / A07 / B05 / C03。证据：E34 / E35。
 
+### 128k / 64并发的直接准入门限与实验计划
+
+远端日志摘录和固定源码；端到端归因/A-B仍待完成。位置：S1调度 / S3 Prefill / S5交接 / S6 D准备。
+
+- 四个P侧DP的相邻窗口各有13次schedule和13次input_budget_exhausted，末轮均running=1、waiting=14。
+- 函数均值6.6–8.1ms；约0.8秒是window_ms/steps，不是单次模型或Device耗时。
+- 预算8192、DSpark K=5时，每请求额外记4个输入槽位；尾块和下一请求首块可拼成running=2、scheduled_tokens=8184。
+- 分开做并发64→4诊断和固定64并发预算8192→16384的吞吐/TTFT实验，保持其他因素一致。
+
+边界：仅有窗口日志，尚无每请求queue/TTFT闭环；不认定Host-bound、排除慢卡或宣称性能收益。P首组候选是否交D仍需在线connector证据。
+
+跟进：G03 / A01 / D02 / F01 / F02。证据：E36 / E37 / E38。
+
 ## 多流专项：阶段收尾、证据边界与原理笔记
 
-2026-11-19归档、2026-11-20补充。涵盖metadata、Q/KV、TP通信、CSA2/CED、并行切分，以及CPU绑核/抖动验证、异步默认值、逐轮遮盖和MoE通信分块。仅复核既有P.rar、固定代码与官方资料；MoE外部方案作为待验证线索，未修改推理功能或新增性能收益实测。
+2026-11-19归档、2026-11-20补充。涵盖metadata、Q/KV、TP通信、CSA2/CED、并行切分，以及CPU绑核/抖动验证、异步默认值、逐轮遮盖和MoE通信分块。仅复核既有P.rar、固定代码与官方资料；MoE外部方案作为待验证线索，未修改推理功能或新增性能收益实测。 2026-11-25新增调度准入与请求阶段笔记，区分窗口级日志、机制示意与端到端测量。
 
 多流机制与局部时序分析阶段完成；优化实施及端到端收益验证仍未完成。
 
@@ -551,6 +565,177 @@ A2A后：卡0 [A, C]；卡1 [B, D]
 
 [用户方案原文与未确定口径 E35](moe_plan_evidence.json) · [官方Init Routing定义](https://github.com/Ascend/op-plugin/blob/master/docs/zh/custom_APIs/torch_npu/torch_npu-npu_moe_init_routing_v2.md) · [官方GMM定义](https://github.com/Ascend/op-plugin/blob/master/docs/zh/custom_APIs/torch_npu/torch_npu-npu_grouped_matmul.md) · [当前CANN A2A计数预处理](https://github.com/gg820827047/vllm-ascend/blob/9a6a156fccccb7ad55c5d534c8948d3ec4efc3f8/vllm_ascend/ops/fused_moe/token_dispatcher.py#L645)
 
+### 11月25日：128k / 64并发准入诊断、全部日志字段与0.8秒口径
+
+新证据是用户提供的远端日志摘录；不是本机全量日志或新profiling。P配置明确为4DP×4TP、预算8192；先前误贴400已撤回。
+
+直接证据：03:55:44–45附近四个DP窗口各有13次schedule和13次input_budget_exhausted；末轮running=1、waiting=14、scheduled_tokens=8188。长输入与高并发使输入预算连续无法满足新的准入，这是当前定位到的直接门限；每个请求几十秒的完整因果分解仍需request_id和入队/首调度时间。
+
+0.8秒来自window_ms / steps / 1000；例如DP1是10437.648955 / 13 / 1000≈0.803秒。它是窗口摊到调度调用的墙钟时间，不是测得的单次execute_model、NPU计算或单请求服务时间。DP1函数自身均值86.106842 / 13≈6.624毫秒；其他工作可能发生在窗口剩余时间，但不能仅凭这个差值分配到Host/Device/通信。
+
+8192限制的是一个DP在一轮中为所有请求新安排处理的token总量，不是max_model_len，也不是只允许Attention看最近8k。已有历史KV仍按模型注意力规则参与本轮计算；长上下文会影响同样8k新token的实际执行成本。
+
+128k按128000/131072两种口径，无缓存时约需16/17个8188-token分块。64并发均匀分配到4个DP约16个请求/DP，4TP共同算同一DP批次，不能把8192再乘4。按当前窗口节奏粗算，前面少数完整长请求就有几十秒工作量；这不是测出的TTFT/排队值，也不证明前后窗口是同14个RequestID。
+
+源码先安排RUNNING，再尝试WAITING。存在计算token_budget和输入input_budget两份预算；DSpark K=5按当前规则每个被调度请求额外扣4个输入槽位。8188计算token使剩余计算预算为4、输入容量为0，故waiting不能准入。即使step_limits为空，实际input_budget分支仍可触发；该快照检测没有覆盖所有输入预算条件。
+
+running=2并不要求一轮算完两个128k请求。假设A恰有131072 token且前16轮各算8188，尾部剩64；下一轮可以算A的64与B的8120，再各预留4，输入总计8192、计算总计8184。这是与日志数字吻合的可行例子，不是已恢复出的实际逐请求分配。异步结果尚未回收时，请求也可能继续留在running。
+
+两组实验分开做：①预算8192不变，并发64→4，诊断排队与低排队处理能力；②并发64不变，预算8192→16384，核对实际调度上限同步生效。固定实际输入、缓存命中、代码、Runner、拓扑、输出长度和总请求数，并记录实际到达过程与完成量。降低并发是换负载的诊断，不是64并发优化收益；扩大预算若同样放大轮次时间，也未必提高吞吐。
+
+验收实际未命中Prompt tokens/s、请求queue、P侧Prefill和客户端TTFT分位数、goodput/错误以及抢占/OOM。仅把waiting等待转移到running内的Prefill，或把等待搬到网关，不算端到端改善。若业务必须承载64并发，需验证更高P吞吐、资源/切分调整或有效缓存，而非只降并发。
+
+```text
+计算预算 token_budget = 8192
+输入预算 input_budget = 8192
+草稿额外槽位 draft_slots = 5 - 1 = 4
+
+给一个请求计算8188个token后：
+token_budget -= 8188          # 剩4；branch样本打印这一项
+input_budget -= 8188 + 4     # 剩0；这一项未直接打印
+
+等待队列有请求，且 input_budget <= draft_slots：
+    记录 input_budget_exhausted
+    break  # 停止本轮新准入，后续轮次再尝试
+```
+
+### 相邻忙碌窗口的转录与计算（非严格同一时刻）
+
+| DP | 窗口ms / 调用数 | 函数均值ms | 窗口秒/调用 | 末轮running/waiting | 实际分支次数 |
+| --- | --- | --- | --- | --- | --- |
+| 0 | 10418.299 / 13 | 7.483 | 0.801 | 1 / 14 | input_budget_exhausted: 13 |
+| 1 | 10437.649 / 13 | 6.624 | 0.803 | 1 / 14 | input_budget_exhausted: 13 |
+| 2 | 10426.520 / 13 | 7.332 | 0.802 | 1 / 14 | input_budget_exhausted: 13 |
+| 3 | 10425.384 / 13 | 8.061 | 0.802 | 1 / 14 | input_budget_exhausted: 13 |
+
+### 外层字段
+
+| 字段 | 解释 |
+| --- | --- |
+| pid / dp_rank / scheduler | EngineCore PID、DP编号和实际调度器类；AsyncScheduler不证明Runner版本。 |
+| timestamp | 本条汇总的Unix墙钟秒；branch_samples内timestamp则是事件发生时间。 |
+| window_ms | 统计窗口墙钟毫秒；首窗包含初始化或空闲，后续也可能包含没有调度的间隔。 |
+| steps | 窗口内完成的schedule调用次数，包含可能无token的调用；不等于请求数或有效execute_model次数。 |
+| schedule_total_ms / schedule_max_ms | 函数调用累计/最大墙钟耗时；包括被测helper，不包括Worker/NPU执行与汇总快照/日志输出。不是CPU on-core时间。 |
+| latest | 最后一次schedule返回的快照，不是窗口平均、最大值或所有请求的汇总时序。 |
+| observations / samples / omitted_samples | 实际helper失败/未就绪结果计数、最多4条样本、未展开样本数；空对象只说明这些探针未记录相应结果。 |
+| step_limits | 根据返回快照推导的限制计数，仅作提示；不等于实际触发的退出分支。 |
+| branch_reasons / branch_sources | 实际等待路径停止/跳过的原因次数，以及执行这些分支的方法来源。次数不是不同请求数。 |
+| branch_samples / omitted_branch_samples | 最多4条分支详情与未展开数；完整事件数仍在branch_reasons中。 |
+| helper_timings | 辅助函数的calls、total_ms、max_ms；已包含在schedule耗时中，不能再与总量相加。 |
+
+### latest快照字段
+
+| 字段 | 解释 |
+| --- | --- |
+| running | 已准入且未结束/未完成结果回收的请求；可以仍在分块Prefill，不等于同时在NPU执行的请求数。 |
+| waiting | 普通等待队列的请求数量。 |
+| kv_holding_waiting | 持有KV block但仍等待的请求，例如某些异步加载路径。 |
+| streaming_input_waiting | 等待后续流式输入并保留槽位的请求；不是普通流式输出数。 |
+| active_limit / running_limit | 准入活跃请求上限 / running上限；本例均16，不要求必须达到16才会触发其他门限。 |
+| token_budget | latest中是本轮配置的计算token上限8192；branch样本的同名字段则是当时剩余计算预算。二者口径不同。 |
+| scheduled_tokens / scheduled_new_requests | 最后一轮分配的实际计算token总数 / 首次准入新请求数；running请求继续计算不算新准入。 |
+| free_kv_blocks | 本地KV池空闲块数；不是token数或外部Store容量，也不单独证明所有缓存组都能分配。 |
+| pause_state | UNPAUSED表示未暂停。 |
+| balance_enabled / balance_running_counts | CANN特定调度均衡门限是否生效及其计数；不是所有请求分发均衡机制的总开关。 |
+
+### helper与分支样本字段
+
+| 字段 | 解释 |
+| --- | --- |
+| blocked_state | 等待请求就绪状态处理函数。 |
+| local_cache_lookup | 本地前缀KV命中查询。 |
+| cache_match | connector可匹配token数查询；不是KV数据搬运时间。 |
+| allocate_slots | 本地KV空间分配；返回None会记录kv_allocation_failed。 |
+| branch样本的reason / action / location | 实际原因、break/continue等动作与探针源文件行号；标签为诊断新增，原有准入条件未改。 |
+| branch样本的scope / request_id / status / phase | 取出具体请求前scope为waiting_queue，ID/status可为null；phase为waiting。不是漏记了一个已识别请求。 |
+
+[E36：日志选定字段、假设和两组实验](scheduler_admission_evidence.json) · [诊断字段与配套核心探针说明](https://github.com/gg820827047/vllm-ascend/blob/36b73a9c431d12e7b462f34c89de1da9b18b278d/docs/source/user_guide/feature_guide/scheduler_admission_diagnostics.md) · [诊断字段生成源码](https://github.com/gg820827047/vllm-ascend/blob/36b73a9c431d12e7b462f34c89de1da9b18b278d/vllm_ascend/core/scheduler_admission_diagnostics.py) · [固定核心schedule源码（运行日志行号含配套探针）](https://github.com/vllm-project/vllm/blob/5df63a7203cdb9328d824a27b682e77c7b9928be/vllm/v1/core/sched/scheduler.py)
+
+### 11月25日：AsyncScheduler、MRV2、分块与DSpark的token时序
+
+按本次讨论的MRV2解释机制；SchedulerAdmission仅能确认AsyncScheduler，镜像Runner需独立核对。阶段按主模型输入/任务区分，不按节点名或是否看见草稿算子区分。
+
+async_scheduling=True且没有自定义scheduler时选择AsyncScheduler；executor负责派发Worker任务，其类型并非由该参数切换。Runner V1/V2是Worker准备输入/执行模型的实现选择，与异步调度分属两层，两种Runner都可能使用异步调度。V2路径中sample_tokens同样调用speculator.propose。目录vllm/v1是引擎命名空间，不能据此判为Model Runner V1。
+
+异步调度可在已有批次执行时准备/提交后续批次。调度器利用位置计数和占位信息提前规划，Worker使用实际token，结果返回后修正接受数/结束状态；真实自回归和KV依赖仍须满足。未写参数不代表关闭；选择异步也不证明所有Host准备已经被掩盖。
+
+一个request可以跨很多step；一个step可以拼入不同request的片段，也可以只有一个request。chunk是单个请求的一段Prompt，batch才是一次调度组织的多请求集合。running既可能处于分块Prefill，也可能处于Decode或等待结果回收。
+
+自回归模型在输入位置pN给出下一token的概率，因此完整Prompt的最后一次前向结束即可采样y1；下一次输入y1才计算它自己的KV并预测后续token。Prefill按处理Prompt定义，Decode按处理新生成token定义，首回答通常从最终Prefill结果产生。该模型计算边界不等于客户端TTFT结束。
+
+DSpark默认anchor路径输入[y1,MASK,MASK,MASK,MASK]，5个query位置可以预测5个候选y2*–y6*，anchor本身也预测后继token。当前预算将一个基础query槽位计入已有容量，因此额外记K-1=4；不是首token已输出所以只剩4个候选，也不是所有投机算法都用相同规则。
+
+后续验证时主模型可输入[y1,y2*,…,y6*]；假设5个候选全接受，可确认y2–y6并采样额外y7，再以y7为anchor起草y8*–y12*。候选并非必然接受，实际输出数可变。草稿query的5个输入位置与主模型验证的6个输入位置是两组计算，预留4不能用于推断forward或execute_model接口调用次数。
+
+中间Prefill同一请求也会准备DSpark上下文：取主模型辅助hidden states，投影/写入草稿模型自身上下文KV；按分块维护，供后续草稿查询使用。统一propose路径还可能执行query块。当前输入kernel在num_sampled=0时显式用下一个已知Prompt token作anchor，而非把未读Prompt当作用户答案继续生成；不需要第二个请求来解释草稿网络出现。
+
+因此，第一次实际草稿调用、第一次有效回答草稿、第一次主模型验证和客户端首输出是不同边界。中间分块的上下文准备有用途；其中固定query计算是否有可省部分，需要单独测量与检查状态/collective依赖，不能把整个草稿路径当无效工作。
+
+```text
+Prompt：p1 … pN；回答：y1, y2 …；*表示候选尚未确认。
+
+Prefill中间：主模型处理Prompt分块 → DSpark上下文KV准备/统一query路径
+Prefill末尾：主模型处理到pN → 采样得到y1
+生成准备： DSpark输入[y1,MASK×4] → 候选y2*…y6*
+Decode轮1：主模型验证[y1,y2*…y6*] → 假设全接受，确认到y7
+轮1收尾： DSpark以y7为anchor → 候选y8*…y12*
+Decode轮2：主模型验证[y7,y8*…y12*] → 假设全接受，确认到y13
+
+本图是逻辑token依赖；P/D交接、缓存恢复与草稿状态传递另见下一笔记。
+```
+
+### 模型阶段、token与作用
+
+| 阶段 | 主模型/草稿输入 | 有效结果 |
+| --- | --- | --- |
+| Prefill中间分块 | 主模型：本请求的Prompt子区间 | 积累上下文；中间分块的用户输出数为0 |
+| Prefill最后分块 | 主模型：Prompt尾部至pN | 采样y1；已算出的y1还未作为主模型输入完成其自身KV |
+| 第一组回答草稿准备 | DSpark：[y1,MASK×4] | 候选y2*–y6*；生成位置在P还是D、是否交接须核对协议 |
+| Decode主模型验证 | 主模型：[已确定anchor,候选×5] | 接受/拒绝并采样；不重算整个128k Prompt |
+| Decode后续起草 | DSpark：最新确定token及MASK位置 | 产生下一组候选，交由后续主模型验证 |
+
+[异步调度器选择](https://github.com/vllm-project/vllm/blob/5df63a7203cdb9328d824a27b682e77c7b9928be/vllm/config/scheduler.py) · [AsyncScheduler占位状态](https://github.com/vllm-project/vllm/blob/5df63a7203cdb9328d824a27b682e77c7b9928be/vllm/v1/core/sched/async_scheduler.py) · [V2主模型采样与起草调用](https://github.com/vllm-project/vllm/blob/5df63a7203cdb9328d824a27b682e77c7b9928be/vllm/v1/worker/gpu/model_runner.py) · [Ascend V2 DSpark入口](https://github.com/gg820827047/vllm-ascend/blob/36b73a9c431d12e7b462f34c89de1da9b18b278d/vllm_ascend/worker/v2/spec_decode/dspark/speculator.py) · [分块上下文KV与next_prefill_tokens](https://github.com/vllm-project/vllm/blob/5df63a7203cdb9328d824a27b682e77c7b9928be/vllm/v1/worker/gpu/spec_decode/dflash/speculator.py) · [K-1草稿槽位预算](https://github.com/vllm-project/vllm/blob/5df63a7203cdb9328d824a27b682e77c7b9928be/vllm/config/speculative.py)
+
+### 11月25日：P算出首token、D首次处理与客户端TTFT的边界
+
+固定源码中的示例代理只用于说明一种已查到的协议；未获得验证机在线proxy的完整版本和请求链路，不能断言所有P/D部署返回首token的方式相同。
+
+客户端TTFT=收到首个有效输出token的时刻−发出请求的时刻；P主模型能够预测首token，不代表代理已把它交给客户端。以所查拉取式示例为例：P端stream=False且max_tokens/min_tokens为1，P响应用于提取kv_transfer_params；随后向D请求并把D响应流转发给客户端。
+
+因此，该协议中的P排队/Prefill、交接、D排队/KV恢复/首次必要计算以及代理/网络返回都可能处于TTFT关键路径。D首次计算可能是Prompt尾token的重算或窗口恢复，不能将D节点上所有工作都叫持续Decode。后续第2、3…个客户端token当然不计入已经结束的TTFT。分层传输/并行准备有重叠时不能机械相加。
+
+P/D没有改变模型next-token逻辑，但改变了物理资源、队列与KV位置，允许独立配置P/D算力并降低长Prefill对持续Decode的干扰，同时增加交接成本。不能从首token由Prefill结果产生推导出P/D分不分无关，或TTFT只看P。
+
+必须区分主模型KV、草稿上下文KV与候选token列表。P端运行过DSpark不证明D将直接消费P的候选。所查示例代理没有显式转发独立候选列表；实际connector仍需检查隐藏状态/草稿KV/候选字段及D是否重建。当前没有在线协议证据支持“P的第一组候选必定移交D”。
+
+逻辑上首组有效候选可以由P末尾准备并在支持的协议中交给D；也可由D恢复上下文、取得其首个确定token后自行起草。第二种情况下D得到该token的首次前向可能属于尾部Prefill，不应仅凭位于D就标成Decode。之后在D持续执行草稿→验证循环。
+
+后续按request_id/attempt记录客户端发送、代理/API接收、P入队/首次调度/各chunk完成、KV就绪与加载完成、D入队/首次执行、首有效输出和客户端收到时间；跨机校时后定位暴露的关键路径。SchedulerAdmission是窗口级门限诊断，不替代这条请求级链路。
+
+```text
+所查示例（简化依赖，不表示所有活动都串行）：
+客户端 → P排队/分块Prefill → P返回KV交接信息
+       → D排队/恢复KV/必要尾部计算 → D响应流 → 客户端首token
+                                                  ↑ TTFT结束
+
+P或D上的草稿上下文准备 ≠ 用户有效输出
+P生成过候选 ≠ connector已传递该候选列表
+D节点的首次工作 ≠ 必然已是持续Decode
+```
+
+### 三类数据和两种首组候选路径
+
+| 对象/路径 | 含义 | 本次证据边界 |
+| --- | --- | --- |
+| 主模型KV | 主模型复用上下文的缓存 | P/D需要恢复所需缓存；不是仅凭token计数就证明所有窗口均恢复 |
+| 草稿上下文KV | DSpark按主模型辅助特征准备的上下文状态 | 与主模型KV和候选token列表区分 |
+| 候选token列表 | 草稿模型预测、待主模型验证的token ID | 不能从P草稿kernel出现推定已传给D |
+| P生成首组候选并交D | 需交接候选及必要状态并对齐验证位置 | 一种可实现协议；本次在线路径未确认 |
+| D首次处理后生成首组候选 | D恢复状态，得到确定token再起草 | 不代表D重算整个Prompt；首次计算可能是尾部Prefill |
+
+[示例P请求参数](https://github.com/gg820827047/vllm-ascend/blob/36b73a9c431d12e7b462f34c89de1da9b18b278d/examples/disaggregated_prefill_v1/load_balance_proxy_server_example.py#L933) · [示例P交接后选择D](https://github.com/gg820827047/vllm-ascend/blob/36b73a9c431d12e7b462f34c89de1da9b18b278d/examples/disaggregated_prefill_v1/load_balance_proxy_server_example.py#L1077) · [返回D侧输出流](https://github.com/gg820827047/vllm-ascend/blob/36b73a9c431d12e7b462f34c89de1da9b18b278d/examples/disaggregated_prefill_v1/load_balance_proxy_server_example.py#L1204) · [D接收KV后的尾部处理](https://github.com/vllm-project/vllm/blob/5df63a7203cdb9328d824a27b682e77c7b9928be/vllm/v1/core/sched/scheduler.py) · [官方P/D设计](https://docs.vllm.ai/projects/ascend/en/main/developer_guide/Design_Documents/disaggregated_prefill.html)
+
 ## 对方21项优化：对A3 / vLLM-CANN的启发与适用边界
 
 逐项映射到请求生命周期、现有profiling和固定代码快照。重点是模型调用/框架可控的实验；算子核内、外部调度组件和硬件引擎需要明确配套后协作。
@@ -650,6 +835,7 @@ F01/F02初始列P2；若排队或KV加载等待主导TTFT、使D侧长期空等�
 | H10 对方优化项目适用性与实验计划 | S0–S8 / X | 21项对照已归档；NPU实验未执行 | 优先batch/chunk、DP供给与元数据；明确MegaMoE DP绕过及DSV4.1 Gate的适配差异，外部收益仅作线索。；E21；后续 A05 / A06 / A09 / B09 / B10 / D02 / D09 / R03 |
 | H11 多流分析阶段收尾与机制学习笔记 | S2 / S3 / S7 / X | 阶段分析完成；收益未验证 | 确认共享专家辅助流互斥范围和DSA局部Host供给问题；Host抖动/物理慢设备待证实，后续移交Host与环境验证。；E30；后续 A05 / A06 / C03 / A08 / B08 |
 | H12 CPU验证、异步与MoE通信机制补充 | S2 / S3 / X | 学习与证据归档；性能实验未执行 | 补齐A3异步线程和逐轮遮盖口径；AG/A2A/Init Routing/分段GMM说明保留外部方案歧义与收益边界。；E34；后续 A02 / A05 / A06 / A07 / B05 / C03 |
+| H13 128k/64并发准入诊断与Prefill/Decode/DSpark学习归档 | S1 / S3 / S4 / S5 / S6 / S7 / S8 | 直接门限已定位；请求级闭环及受控性能实验待完成 | 四DP重复输入预算不足与长Prefill积压吻合；函数时间、窗口推进量级、用户TTFT分开。补充异步/Runner、首token和草稿交接边界。；E36；后续 G03 / A01 / D02 / F01 / F02 |
 
 ## 责任与预期收益口径
 
@@ -667,14 +853,14 @@ P0先形成证据与回归基础；P1做受控实验和低风险候选；P2为�
 | --- | --- | --- | --- | --- | --- | --- |
 | G01 / P0 | X / 分析 | 冻结真实基线与生效配置 | 待认领（部署 / 压测） | 待补齐；A3/A5的DP/TP、Runner、CANN和量化路径均不同；采集时完整脚本与最终core SHA不齐。 | 直接性能收益0；使后续结果可归因。 指标：环境/配置字段完整率；不同实验仅保留计划变量。 | — |
 | G02 / P0 | S0/S8 / 分析 | 建立请求级指标与固定压测集 | 待认领（部署 / 压测） | 待补齐；已有单机SWA bench与profiling；当前缺少匹配每批trace的完整端到端结果。 | 直接性能收益0；避免把超时丢请求或缓存命中变化当成加速。 指标：TTFT/TPOT p50/p95/p99；客户端ITL；tokens/s；SLO内完成量。 | G01 |
-| G03 / P0 | X / 分析 | 建立请求→step→rank→kernel关联与关键路径 | 待认领（性能分析 / 项目统筹） | 部分分析；已复核A3 DP0TP0 step1的Host/launch/device边界、目标461.233ms包络与draft尾部；仍不是完整请求链路。 | 直接性能收益0；定位哪个阶段具有可释放时间。 指标：未覆盖设备空洞；CPU阻塞；通信/计算重叠；请求阶段等待。 | G01 / G02 |
-| A01 / P0 | S1/S2/S6 / 分析 | 确认异步调度和Runner实际路径 | 待认领（vLLM / Ascend 框架开发） | 部分分析；A3 MRV2 trace出现async_output_busy_loop及跨step重叠；与参考core的异步已开启条件一致。A5为MRV1；准确镜像core SHA与解析值待补。 | 直接性能收益0；为异步调度A/B提供前提。 指标：可用Host准备重叠量；未隐藏的调度时间。 | G01 |
+| G03 / P0 | X / 分析 | 建立请求→step→rank→kernel关联与关键路径 | 待认领（性能分析 / 项目统筹） | 部分分析；已复核A3 DP0TP0 step1的Host/launch/device边界、目标461.233ms包络与draft尾部；仍不是完整请求链路。 已有11月25日窗口级准入证据，但缺少逐RequestID入队/首次调度与P/D首输出闭环，0.8秒不作为模型时长。 | 直接性能收益0；定位哪个阶段具有可释放时间。 指标：未覆盖设备空洞；CPU阻塞；通信/计算重叠；请求阶段等待。 | G01 / G02 |
+| A01 / P0 | S1/S2/S6 / 分析 | 确认异步调度和Runner实际路径 | 待认领（vLLM / Ascend 框架开发） | 部分分析；A3 MRV2 trace出现async_output_busy_loop及跨step重叠；与参考core的异步已开启条件一致。A5为MRV1；准确镜像core SHA与解析值待补。 11月25日日志实际类为AsyncScheduler；此字段不能单独确认MRV2或有用Host准备已重叠，需核对Worker Runner最终类。 | 直接性能收益0；为异步调度A/B提供前提。 指标：可用Host准备重叠量；未隐藏的调度时间。 | G01 |
 | A02 / P0 | S2/S3/S4/S6/S7 / 分析 | 分类并追踪同步点的关键依赖 | 待认领（性能分析 / 项目统筹） | 部分分析；A3代表execute窗口有较多StreamWaitEvent，但未见阻塞式Synchronize；不能概括所有step。 | 直接性能收益0；只筛出值得修改的同步点。 指标：每类等待次数、墙钟、暴露时间；有因果关联的设备空洞。 | G03 / A01 |
 | A03 / P0 | S4/S8 / 分析 | 核对D2H与异步输出是否挡住流水 | 待认领（vLLM / Ascend 框架开发） | 部分分析；A3/A5都观察到采样输出D2H；长Event同步可能在后台get_output。 | 分析阶段直接收益0；若有暴露等待，优化上限由可隐藏的ΔT决定。 指标：D2H实际传输、消费等待、下一轮启动及客户端输出延迟。 | A02 |
 | A04 / P0 | S2/S6 / 分析 | 拆解DP元数据同步和Gloo等待 | 待认领（vLLM / Ascend 框架开发） | 部分分析；A3代表准备段Gloo约88.8ms，其中约69.2ms与上轮设备任务重叠。 | 分析阶段直接收益0；后续只能回收关键路径上可消除的等待。 指标：最后到达者；到达离散度；未覆盖等待；首层启动时间。 | G03 / C01 |
 | A05 / P1 | S2 / 优化候选 | 复用step内SWA/DSA元数据与visible_lens | 待认领（模型适配开发） | 待实验；A3已有重复展开与索引链证据，尚未提交此项性能修改。 已定位两个metadata构造scope及42次visible_lens调用；每组输入是否等价仍须校验，不能直接假设42次可合并为一次。 | 预期减少重复元数据生成和准备开销；幅度待实测，不能套用A5的1641→221比例。 指标：准备关键路径Δms、launch/分配次数、TTFT、内存峰值。 | G02 / A02 / B01 |
 | A06 / P1 | S2/S6 / 优化候选 | 优化Host下发与准备热路径 | 待认领（vLLM / Ascend 框架开发） | 部分分析；A3代表窗口首层前约223.6ms：prepare_attn 59.887ms、replay metadata 54.277ms；DP同步约88.347ms中部分已被前轮设备覆盖，尚需拆self time。 补充DP2/TP2对照：metadata139.300ms、目标40层Host447.453ms，比同DP TP0分别多25.567ms和63.670ms；先核对profiler扰动与CPU调度，再评估重复准备/stream-event包装。 Host抖动尚待证实；现有数据未能区分固定包装/重复构造成本、采集扰动与运行态CPU差异。 | 减少暴露的准备/下发时间；若已被设备覆盖，时延收益可能为0。 指标：Host self time、launch速率、分配数、设备空洞、TTFT/TPOT。 | G03 / A02 |
-| A07 / P1 | S1/S2/S6/S7 / 验证 | 做异步调度受控A/B | 待认领（vLLM / Ascend 框架开发） | 待实验；参考core默认async_scheduling=None按兼容性自动启用；A3原始TID4151有async_output_busy_loop/get_output，与异步输出路径一致。脚本未写参数不能作为OFF基线；准确镜像core SHA和最终解析值待补。DP2/TP2真实窗口准备与前轮设备包络部分相交，DP1连续真实Prefill的交集因rank不同而异，尚无ON/OFF服务收益实验。 | 有机会隐藏调度/输出处理开销；设备持续满载时收益可能有限。 指标：TTFT/TPOT p95、goodput、Host/device有效重叠、CPU占用。 | A01 / A02 / G02 |
+| A07 / P1 | S1/S2/S6/S7 / 验证 | 做异步调度受控A/B | 待认领（vLLM / Ascend 框架开发） | 待实验；参考core默认async_scheduling=None按兼容性自动启用；A3原始TID4151有async_output_busy_loop/get_output，与异步输出路径一致。脚本未写参数不能作为OFF基线；准确镜像core SHA和最终解析值待补。DP2/TP2真实窗口准备与前轮设备包络部分相交，DP1连续真实Prefill的交集因rank不同而异，尚无ON/OFF服务收益实验。 新日志已确认本次使用异步调度器，不能再将未传参数当OFF；没有相同负载ON/OFF收益结果。 | 有机会隐藏调度/输出处理开销；设备持续满载时收益可能有限。 指标：TTFT/TPOT p95、goodput、Host/device有效重叠、CPU占用。 | A01 / A02 / G02 |
 | A08 / P2 | S2/S3/S6/S7 / 优化候选 | 模型多流与可切分计算的重叠评估 | 待认领（模型适配开发） | 阶段分析完成；收益待验证；A3已观察到DSA辅助流与主流任务重叠；共享专家框架多流被fused MC2互斥关闭。独立子图可否扩展及净收益仍待验证。 全目标窗口计算流重叠：DP2/TP2为0.088462ms、TP0为7.420534ms；第0/10/21层证实独立分支未同时就绪，重叠少不能直接当作物理卡慢或加速预算。 2026-11-19完成机制/局部时序阶段归档；Host根因转A06/C03，优先元数据/下发专项，不把提高重叠本身当作验收。 | 可能隐藏独立计算/通信；竞争或切分过细可能变慢，不预设加速。 指标：关键路径、重叠量、launch数、HBM峰值、TTFT/TPOT。 | B01 / A02 / G02 |
 | A09 / P1 | S6/S7 / 分析 | 核对Decode DP同步绕过的版本、算子与一致性条件 | 待认领（vLLM / Ascend 框架开发） | 部分分析；对方称MegaMoE+重算调度下绕过DP AllReduce收益4.45%；当前CANN快照明确在MegaMoE/FUSED_MC2等路径保留协调，现有P侧88ms同步也不能套用D侧策略。 | 分析直接收益0；确认可安全绕过时才有机会减少每步暴露同步与padding，外部4.45%不作为本环境预算。 指标：D侧同步暴露ms、有效/填充tokens、TPOT/ITL、吞吐、collective一致性。 | G01 / A02 / B05 |
 | B01 / P0 | S2/S3/S7 / 分析 | 建立同口径算子与执行引擎清单 | 待认领（性能分析 / 项目统筹） | 部分分析；已有代表窗口算子对比；A3/A5含Runner、CANN、量化和负载混杂。 | 直接性能收益0；定位能由模型替换、元数据或配置解决的部分。 指标：同shape单次分布、调用数、关键路径占比、实际执行引擎。 | G01 / G03 |
@@ -694,16 +880,16 @@ P0先形成证据与回归基础；P1做受控实验和低风险候选；P2为�
 | C05 / P1 | S3/S7 / 分析 | 分析模型内HCCL集合通信与链路差异 | 待认领（NPU / CPU / 通信运维） | 待分析；本项聚焦TP/EP等模型内集合通信；P/D点到点与Store KV交接单独列F02（P2），避免混用口径。 | 分析直接收益0；若确认暴露的集合通信瓶颈，可评估通信配置或模型调用侧改进。 指标：collective p95、有效GB/s、到达差、计算通信重叠、失败率。 | C01 / G01 |
 | C06 / P2 | X / 验证 | 通过绑核/换卡与独立微基准验证慢卡假设 | 待认领（NPU / CPU / 通信运维） | 待实验；尚未确认固定物理慢卡，不应先按硬件故障处理。 | 直接性能收益0；确认硬件/部署问题后可定向恢复损失。 指标：异常随卡/随rank迁移；跨轮稳定性；正常对照。 | C02 / C04 |
 | D01 / P1 | S1/S3/S6/S7 / 验证 | 建立固定资源预算的DP/TP/EP切分矩阵 | 待认领（部署 / 压测） | 待实验；A3 DP4TP4/EP16与A5 DP8TP1/EP8并非同拓扑/卡数对照。 | 可能改善利用率与通信比例；更小TP不一定更快，也可能装不下。 指标：TTFT/TPOT p95、goodput、HBM峰值、通信、每卡有效tokens/s。 | G01 / G02 / C01 |
-| D02 / P1 | S1/S2/S3/S6/S7 / 验证 | 扫描合批、token预算与prefill切块 | 待认领（部署 / 压测） | 待实验；batch/shape决定下发、算子效率和排队；压缩包文件名不是完整配置。 | 可能降低排队或摊薄下发成本；大batch也可能增加单请求延迟。 指标：队列时间、TTFT/TPOT、goodput、实际batch、抢占和OOM。 | G02 / D01 |
+| D02 / P1 | S1/S2/S3/S6/S7 / 验证 | 扫描合批、token预算与prefill切块 | 待认领（部署 / 压测） | 部分分析；batch/shape决定下发、算子效率和排队；压缩包文件名不是完整配置。 128k/64并发、P预算8192的四DP窗口连续命中input_budget_exhausted，说明直接准入门限；完整请求排队归因与预算A/B尚未完成。 | 可能降低排队或摊薄下发成本；大batch也可能增加单请求延迟。 指标：队列时间、TTFT/TPOT、goodput、实际batch、抢占和OOM。 | G02 / D01 |
 | D03 / P1 | S1/S5/S6/S7 / 分析 | 匹配P/D能力与KV交接容量 | 待认领（部署 / 压测） | 待采集；当前主证据偏P侧；排队归因由F01补采，KV交接分段由F02补采，再拼同一请求的P/D容量链路。 | 分析直接收益0；合理配比后可能减少排队、提升SLO内完成量。 指标：两侧利用率/排队、KV交接、TTFT/TPOT、goodput/卡。 | G02 / F01 / F02 |
 | D04 / P1 | S1/S5/S6 / 验证 | 拆开本地prefix cache与Store收益 | 待认领（vLLM / Ascend 框架开发） | 待实验；MultiConnector不等于Store；本地APC与外部池化需要分别归因。 | 可能减少重复prefill并提高跨实例命中；冷请求可能多出查找/传输开销。 指标：分来源命中率、跳过token、TTFT、加载/保存时间、失败/重算。 | G01 / G02 / F02 |
 | D05 / P1 | S1/S2/S3/S5/S6 / 验证 | 验证SWA replay相关机制的条件与净收益 | 待认领（模型适配开发） | 待实验；已有反合与tail shape证据；当前需要单机和P/D分别做受控开关实验。 | 长prefill可能减少后段工作量；元数据/恢复可能抵消收益，TPOT需单独测。 指标：TTFT、TPOT/ITL、目标层shape、准备时间、HBM、恢复/传输。 | G02 / A05 / D04 |
 | D06 / P1 | S4/S7 / 验证 | 扫描MTP / draft配置与有效输出效率 | 待认领（模型适配开发） | 待实验；P侧也可能有draft调用；draft块次数不等于用户请求数。 | 接受率与开销合适时可降低TPOT；多draft也可能更慢。 指标：accepted tokens/step、draft耗时、TPOT、goodput、HBM。 | G02 / B07 |
-| D07 / P2 | S2/S3/S6/S7 / 验证 | 分离Runner、量化、KV布局和通信开关影响 | 待认领（模型适配开发） | 待实验；A3/A5当前多因素同时不同，不能将差异都归给融合或硬件。 | 可能选择更适合的执行路径/精度/通信组合；收益与精度代价待测。 指标：TTFT/TPOT、goodput、HBM、精度、实际kernel/backend。 | G01 / G02 / B01 |
+| D07 / P2 | S2/S3/S6/S7 / 验证 | 分离Runner、量化、KV布局和通信开关影响 | 待认领（模型适配开发） | 待实验；A3/A5当前多因素同时不同，不能将差异都归给融合或硬件。 本次token时序按MRV2讨论，AsyncScheduler不等于Runner版本；草稿query、主模型验证与接口调用次数分开统计。 | 可能选择更适合的执行路径/精度/通信组合；收益与精度代价待测。 指标：TTFT/TPOT、goodput、HBM、精度、实际kernel/backend。 | G01 / G02 / B01 |
 | D08 / P1 | X / 验证 | 拆分D侧冷启动与缓存复用，定位静态kernel重复编译 | 待认领（vLLM / Ascend 框架开发） | 待采集；用户反馈启动约50项、耗时长且没搜到.run；尚缺日志原文和运行时npugraph_ex版本，不能确认是二进制重编译还是图捕获。 | 若确有重复二进制编译，可缩短重启/扩容的实例就绪时间；不承诺消除图捕获，也不直接等价为热服务TTFT/TPOT改善。 指标：实例就绪秒数、各启动阶段耗时、真实编译次数/缓存命中、capture档位、稳态TPOT/ITL和HBM。 | G01 / B07 |
 | D09 / P1 | S0/S1/S5/S6 / 验证 | 验证会话亲和与DP负载均衡的收益和冲突 | 待认领（vLLM / Ascend 框架开发） | 待采集；对方Motor+DP4×PCP2、Session Affinity有组合收益；本地只有P侧rank时序，尚未采到真实分发、会话命中或D缺粮链路。Motor组件含义待确认。 | 可能减少P组最后到达和D缺粮，并提高重复前缀复用；强亲和也可能加重热点，净收益待测。 指标：DP未处理token离散、缓存命中、P/D有效忙率、KV等待、TTFT/TPOT分位数和goodput。 | G01 / G02 / C03 / F01 / F02 |
-| F01 / P2 | S0/S1/S6/S8 / 分析 | 分析网关/API排队与引擎等待时长 | 待认领（网关 / API 服务对接） | 待采集；现有worker NPU profiling缺少网关队列和完整入口时间戳；暂不能量化这部分TTFT，也不能把设备空档归因于网关排队。 | 分析直接性能收益0；若网关/API/引擎排队是TTFT主因，后续可定向降低暴露等待。P2为初始排期，确认主导时提升优先级。 指标：网关queue时间/长度、API前处理、引擎等待、到达率、客户端TTFT、SLO内完成量、错误/超时。 | G01 / G02 |
-| F02 / P2 | S1/S5/S6 / 分析 | 分段分析P/D KV传输与Store读写 | 待认领（NPU / CPU / 通信运维） | 待采集；worker trace可能含connector线程、拷贝/通信和Hixl事件，但现有采集缺少请求级P/D两端与加载完成关联；不能用一次kernel或API时长代表完整KV交接。 | 分析直接性能收益0；后续可减少KV就绪/加载的暴露等待、优化传输并发或布局。纯传输加速未必等比例降低TTFT，幅度待实测。 指标：KV请求到D侧可用p50/p95/p99、各段等待、实际传输字节/完成时间、有效GB/s、D空闲、TTFT、失败/重算率。 | G01 / G02 / G03 |
+| F01 / P2 | S0/S1/S6/S8 / 分析 | 分析网关/API排队与引擎等待时长 | 待认领（网关 / API 服务对接） | 待采集；现有worker NPU profiling缺少网关队列和完整入口时间戳；暂不能量化这部分TTFT，也不能把设备空档归因于网关排队。 11月25日已有引擎窗口级门限日志，尚无逐请求queue时长；不能将schedule函数6–8ms与请求几十秒等待混为一谈。 | 分析直接性能收益0；若网关/API/引擎排队是TTFT主因，后续可定向降低暴露等待。P2为初始排期，确认主导时提升优先级。 指标：网关queue时间/长度、API前处理、引擎等待、到达率、客户端TTFT、SLO内完成量、错误/超时。 | G01 / G02 |
+| F02 / P2 | S1/S5/S6 / 分析 | 分段分析P/D KV传输与Store读写 | 待认领（NPU / CPU / 通信运维） | 待采集；worker trace可能含connector线程、拷贝/通信和Hixl事件，但现有采集缺少请求级P/D两端与加载完成关联；不能用一次kernel或API时长代表完整KV交接。 需记录客户端首输出来自P还是D、候选列表/草稿上下文是否实际交接；示例代理回传D流不能替代在线协议核对。 | 分析直接性能收益0；后续可减少KV就绪/加载的暴露等待、优化传输并发或布局。纯传输加速未必等比例降低TTFT，幅度待实测。 指标：KV请求到D侧可用p50/p95/p99、各段等待、实际传输字节/完成时间、有效GB/s、D空闲、TTFT、失败/重算率。 | G01 / G02 / G03 |
 | R01 / P0 | X / 验证 | 做功能、精度、恢复与混合负载回归 | 待认领（部署 / 压测） | 待实验；用户已有部分功能验证；后续每项优化仍需对应场景验收。 | 直接性能收益0；防止局部加速换来精度、尾延迟或稳定性退化。 指标：精度、错误/超时、p95/p99、goodput、HBM与长稳。 | G02 |
 | R02 / P0 | X / 归档 | 持续更新任务状态与可复现资产 | 待认领（性能分析 / 项目统筹） | 持续归档；已有学习地图、版本报告与profiling报告；本台账连接全局位置和责任。 | 直接性能收益0；减少重复试验，沉淀可交接知识。 指标：可复现案例、结论证据完整率、完成任务/待验证任务。 | — |
 | R03 / P1 | S3/S7 / 验证 | 为EPLB收益实验补齐稳定性与路由精度准入 | 待认领（模型适配开发） | 待采集；对方记录Decode EPLB算子core和Prefill多batch精度异常；这只是风险线索，不能认定本服务存在同一故障或已从均衡获益。 | 验证直接性能收益0；通过准入后才评估减少EP热点的收益，不以错误请求减少伪造吞吐。 指标：异常/超时率、路由/输出精度、专家token分布、迁移开销和稳态goodput。 | G01 / B05 / C03 / R01 |
@@ -751,7 +937,7 @@ P0先形成证据与回归基础；P1做受控实验和低风险候选；P2为�
 
 验收：不重复累计嵌套scope、多流任务和HCCL子任务；不把Free等同Host耗时。
 
-前置：G01 / G02。证据：E01 / E04 / E13 / E14 / E34。
+前置：G01 / G02。证据：E01 / E04 / E13 / E14 / E34 / E36 / E38。
 
 ### A01 确认异步调度和Runner实际路径
 
@@ -765,7 +951,7 @@ P0先形成证据与回归基础；P1做受控实验和低风险候选；P2为�
 
 验收：实际配置和调用栈相符；采集时未知配置保持未知。
 
-前置：G01。证据：E03 / E08 / E13 / E20。
+前置：G01。证据：E03 / E08 / E13 / E20 / E36 / E37。
 
 ### A02 分类并追踪同步点的关键依赖
 
@@ -853,7 +1039,7 @@ P0先形成证据与回归基础；P1做受控实验和低风险候选；P2为�
 
 验收：同工作量多次复测；无错误、输出状态错配和饥饿；给出无收益场景。
 
-前置：A01 / A02 / G02。证据：E03 / E08 / E13 / E20 / E34。
+前置：A01 / A02 / G02。证据：E03 / E08 / E13 / E20 / E34 / E36 / E37。
 
 ### A08 模型多流与可切分计算的重叠评估
 
@@ -1140,12 +1326,15 @@ P0先形成证据与回归基础；P1做受控实验和低风险候选；P2为�
 2. 固定输入长度分布和发送方式，测低负载与接近饱和场景。
 3. 解释shape变化与准备/主干/通信成本，观察长prefill对交互尾延迟影响。
 4. 结合对方batch与长Prefill阈值经验，在同一A3配置分别扫描max_num_batched_tokens、long_prefill_token_threshold和max_num_seqs；记录真实chunk、实际batch及尾窗重建次数。核对实际scheduler与参数归一化，不能把配置上限当有效batch。
+5. 诊断组固定8192预算，并发64→4，核对每DP分发；保持128k实际输入与缓存条件，验证排队变化。该组负载变化不能当作64并发优化收益。
+6. 性能组固定64并发，预算8192→16384，确认max_num_scheduled_tokens/实际scheduled_tokens生效；记录真实Prompt吞吐、queue、P Prefill、客户端TTFT及显存/抢占，多次交错对照。
+7. 若线上要求64并发，容量不足时评估P侧算力/DP-TP-PCP配比与有效缓存；降低首调度等待但延长Prefill或把等待转移到网关均不算TTFT改进。
 
 交付物：配置扫描表、SLO可承载点与推荐范围。
 
 验收：相同SLO和完成量；不只选吞吐最大的点。
 
-前置：G02 / D01。证据：E10 / E21 / E25 / E26。
+前置：G02 / D01。证据：E10 / E21 / E25 / E26 / E36 / E37。
 
 ### D03 匹配P/D能力与KV交接容量
 
@@ -1217,7 +1406,7 @@ P0先形成证据与回归基础；P1做受控实验和低风险候选；P2为�
 
 验收：每条结论注明硬件/版本/模型/量化；组合收益不可把单项百分比相加。
 
-前置：G01 / G02 / B01。证据：E01 / E06。
+前置：G01 / G02 / B01。证据：E01 / E06 / E38。
 
 ### D08 拆分D侧冷启动与缓存复用，定位静态kernel重复编译
 
@@ -1257,12 +1446,13 @@ P0先形成证据与回归基础；P1做受控实验和低风险候选；P2为�
 1. 按request_id/attempt记录网关接收、队列入/出、上游转发、API接收、引擎入队、首次调度和首输出；若网关没有队列也记录实际路径，缺少边界先补埋点。
 2. 分别算网关真队列等待、API前处理/交接、引擎入队到首调度；分词、路由、重试和外部KV等待单独归档，不把API到引擎的整段都叫排队。
 3. 结合发送率、队列长度、P/D利用率、取消/超时、错误和客户端TTFT分位数；先识别限流、调度/CPU处理还是实例服务能力不足，再设计配置实验。
+4. 区分P输出token已在服务内部产生与客户端首次收到；按在线代理的D响应流与跨机KV交接补齐首输出边界。
 
 交付物：请求入口分段时间表、queue p50/p95/p99与TTFT关键路径图，含各边界的采集字段和缺失项。
 
 验收：真实队列入/出有证据；同一请求与attempt可关联；同发送率/完成量比较，不能把等待从网关搬到引擎或丢弃请求当收益；未测到时不填0。
 
-前置：G01 / G02。证据：E10 / E11。
+前置：G01 / G02。证据：E10 / E11 / E36 / E38。
 
 ### F02 分段分析P/D KV传输与Store读写
 
@@ -1276,7 +1466,7 @@ P0先形成证据与回归基础；P1做受控实验和低风险候选；P2为�
 
 验收：异步提交不等于传输完成；kernel/拷贝事件不直接等同网传时长；跨机时间有校准/误差，缺失时只报局部区间；分层传输与P计算重叠不简单相加；P2P/Store结果分开。
 
-前置：G01 / G02 / G03。证据：E01 / E12。
+前置：G01 / G02 / G03。证据：E01 / E12 / E38。
 
 ### R01 做功能、精度、恢复与混合负载回归
 
@@ -1542,3 +1732,21 @@ RowParallelLinear在reduce_results且TP>1时合并output_parallel。与原始CPU
 保留48k/EP16/N256/K8及AGRS、A2A、Init Routing、分段GMM、通信量化原文。N/K含义及前后分段规则按假设解释；500~700us和无OOM是对方摘要中的结论，未验证为本服务收益。
 
 [对应资料](moe_plan_evidence.json)
+
+### E36 11月25日远端调度日志选定字段、配置确认与实验计划
+
+P侧4DP×4TP、128k/64并发、预算8192；保留四DP相邻窗口与计算公式。全文日志不在本机；0.8秒为窗口摊到调用，不是Device耗时。两组A/B未执行。
+
+[对应资料](scheduler_admission_evidence.json)
+
+### E37 调度探针、预算门限、AsyncScheduler与MRV2机制笔记
+
+逐项解释诊断字段、两份预算、DSpark K-1、分支标签与快照差别；注明固定core/Ascend源码链接及Runner核对边界。
+
+[对应资料](index.html#mechanism-scheduler-admission)
+
+### E38 Prefill/Decode/DSpark token时序与P/D客户端首输出
+
+区分P可预测首token、D首次处理与客户端TTFT。中间chunk使用next_prefill_tokens并准备草稿上下文，不等于两个请求或有效输出；P候选是否交D未确认。
+
+[对应资料](index.html#mechanism-pd-ttft-handoff)

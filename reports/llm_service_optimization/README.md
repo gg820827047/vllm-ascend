@@ -7,6 +7,8 @@
 - [tasks.json](tasks.json)：阶段、证据、已有工作与任务的维护源。
 - [validation.json](validation.json)：文档与浏览器交互检查结果。
 
+2026-11-25新增[128k / 64并发准入诊断](index.html#scheduler-nov25)，归档四个DP的日志字段、两份token预算、约0.8秒的计算口径与`running=2`尾块拼批例子；补齐[MRV2与DSpark的token时序](index.html#mechanism-prefill-decode-dspark)、[P/D交接和客户端TTFT](index.html#mechanism-pd-ttft-handoff)。[选定日志字段与实验计划](scheduler_admission_evidence.json)明确全文日志缺失、128k精确口径及Runner核对边界；两组实验分别验证并发和token预算，不把降低负载或提前准入当成端到端优化收益。
+
 “网关排队 / KV传输”专题：F01/F02初始优先级为P2，分别挂到S0/S1与S5/S6。HTML和Markdown均列出四类观测边界：网关/API排队、引擎等待、P/D KV交接、Store读写；注明worker profiling能看到的范围、需要补采的数据和计时口径。当前共42项任务。
 
 2026-11-17新增“近期核对”入口，归档五项结论：A3目标层461.233ms与首层前Host准备的拆分、异步调度实际生效证据、官方0.32/CANN共有的共享专家多流互斥、A5 Prefill不能证明D侧static kernel配置，以及启动时静态二进制编译/FX图编译/ACLGraph capture的区别。新增B08共享专家多流验证、D08启动缓存排查，保留责任人、预期收益和验收口径。
