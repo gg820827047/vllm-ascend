@@ -33,7 +33,7 @@ def union(intervals):
     return sum(end - start for start, end in merged) / 1e6
 
 
-def audit(db, baseline):
+def audit(db, baseline, *, raw_root=RAW):
     conn = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
     strings = dict(conn.execute("SELECT id,value FROM STRING_IDS"))
     origin = int(conn.execute("SELECT * FROM SESSION_TIME_INFO").fetchone()[0])
@@ -349,7 +349,7 @@ def audit(db, baseline):
     selected = [r for r in rows if r["phase"]]
     unmapped = [r for r in rows if r["host_s"] is None and r["e"] > base and r["s"] < max(r["e"] for r in selected)]
     data = dict(
-        database_archive_member=str(db.relative_to(RAW)),
+        database_archive_member=str(db.relative_to(raw_root)) if db.is_relative_to(raw_root) else str(db),
         origin_ns=origin,
         worker_entry_epoch_ns=base,
         worker_entry_session_ms=(base - origin) / 1e6,
