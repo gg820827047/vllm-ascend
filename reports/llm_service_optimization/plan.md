@@ -87,7 +87,7 @@ P2P connector 负责 P/D 交接；Store 提供共享外部缓存。MultiConnecto
 
 2026-11-17归档。源码结论固定到官方0.32快照b12b6f7和CANN升级快照9a6a156；trace结论来自既有P.rar，不是新增性能实验。D侧启动日志、镜像中的npugraph_ex版本与约50个进度项的原文仍待补充。 2026-11-18补充DP2/TP2主线程/元数据/实际launch追踪，以及同名任务与时间零点复核；仍使用既有P.rar数据。 2026-11-19的多流阶段收尾与机制笔记见下方独立章节。 2026-11-20补充CPU验证方法、异步默认值/线程证据、真实与dummy逐轮区分，以及AG/A2A和MoE分块机制。
 
-[11月26日：A3 Prefill 性能阶段汇报（一页）](../dsv41_a3_a5_prefill/stage_brief.html)：先列Q-norm、元数据、KV写回及共享专家的算子/融合差异与投入优先级，再给时序线索和验收方法；明确现有profiling和单算子测试各能回答什么。
+[11月26日：A3裸模型执行全局视图与优化路线（简版）](../dsv41_a3_a5_prefill/stage_brief.html)：输入准备→40层目标模型→采样收尾→草稿→输出；标明已完成分析、当前阶段、M1～M5优化位置、成本与有假设的收益测算，以及A3验证顺序。
 [11月26日：Scheduler → Ascend → DeepSeekV4.1 代码地图](../llm_execution_code_walkthrough/report.html)：三张调用关系图、45处固定版本源码索引；区分启动绑定、跨进程提交、父类复用、目标模型与采样/草稿链。
 [11月26日：模型执行范围的 A3 / A5 精确拆分](../dsv41_a3_a5_prefill/execution_scope/report.html)：核对40层、收尾、采样与草稿的Host/Device边界，提供Stream/Task与调用栈；附成本账本及A3验证计划，不将非受控差额当硬件收益。
 [11月25日：128k / 64并发准入诊断与字段说明](index.html#mechanism-scheduler-admission)：包含四DP日志、0.8秒口径、两份预算、running=2与两组受控实验；未把估算写成TTFT实测。
