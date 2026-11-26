@@ -1,6 +1,6 @@
 # LLM 服务请求全局视图与性能任务台账
 
-更新：2026-11-25。以 A3 / DeepSeek / vLLM-CANN 为主要优化对象，A5用于机制对照。结合既有profiling、固定源码和用户提供的对方项目清单，整理可验证方向、版本差异、责任分工与收益口径；对方报告数字不作为本服务实测收益。 11月25日补充128k/64并发调度日志、预算门限与受控实验，以及MRV2/Prefill/Decode/DSpark和客户端TTFT边界；仍未新增性能收益实测。
+更新：2026-11-26。以 A3 / DeepSeek / vLLM-CANN 为主要优化对象，A5用于机制对照。结合既有profiling、固定源码和用户提供的对方项目清单，整理可验证方向、版本差异、责任分工与收益口径；对方报告数字不作为本服务实测收益。 11月25日补充128k/64并发调度日志、预算门限与受控实验，以及MRV2/Prefill/Decode/DSpark和客户端TTFT边界；仍未新增性能收益实测。
 
 ## 全局位置、四类主线与边界观测
 
@@ -87,6 +87,8 @@ P2P connector 负责 P/D 交接；Store 提供共享外部缓存。MultiConnecto
 
 2026-11-17归档。源码结论固定到官方0.32快照b12b6f7和CANN升级快照9a6a156；trace结论来自既有P.rar，不是新增性能实验。D侧启动日志、镜像中的npugraph_ex版本与约50个进度项的原文仍待补充。 2026-11-18补充DP2/TP2主线程/元数据/实际launch追踪，以及同名任务与时间零点复核；仍使用既有P.rar数据。 2026-11-19的多流阶段收尾与机制笔记见下方独立章节。 2026-11-20补充CPU验证方法、异步默认值/线程证据、真实与dummy逐轮区分，以及AG/A2A和MoE分块机制。
 
+[11月26日：Scheduler → Ascend → DeepSeekV4.1 代码地图](../llm_execution_code_walkthrough/report.html)：三张调用关系图、45处固定版本源码索引；区分启动绑定、跨进程提交、父类复用、目标模型与采样/草稿链。
+[11月26日：模型执行范围的 A3 / A5 精确拆分](../dsv41_a3_a5_prefill/execution_scope/report.html)：核对40层、收尾、采样与草稿的Host/Device边界，提供Stream/Task与调用栈；附成本账本及A3验证计划，不将非受控差额当硬件收益。
 [11月25日：128k / 64并发准入诊断与字段说明](index.html#mechanism-scheduler-admission)：包含四DP日志、0.8秒口径、两份预算、running=2与两组受控实验；未把估算写成TTFT实测。
 [打开A3 DP2/TP2主线程与多流时序报告](../dsv41_a3_a5_prefill/host_issue_dp2tp2/report.html)：包含Task15092/15140对照、SESSION/共同坐标切换，以及DecoderLayer为何出现在Prefill调用栈。
 [多流阶段结论与原理笔记](index.html#multistream-review)：展开metadata、Q/KV、通信、CSA2/CED、量化和并行切分对照；Host抖动保留为假设。

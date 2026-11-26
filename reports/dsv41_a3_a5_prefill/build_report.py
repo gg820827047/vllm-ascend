@@ -33,6 +33,8 @@ def main():
 
 <p class="lead">以 <strong>P.rar（A3）</strong> 与 <strong>vllm_profile_prefill-c192-bs12.zip（A5）</strong> 为主对照，旧的 0.30/0.32 ZIP 仅作 A3 历史参照。分析覆盖有效 execute_model 的输入准备、40 层主干、draft 调用及跨 rank 等待，回答哪些融合已发生、哪些差异来自部署，以及 A3 下一步应优化什么。</p>
 
+<div class="note"><strong>2026-11-26 执行范围审计：</strong><a href="execution_scope/report.html">查看模型执行内的精确边界、逐层任务与 A3 优化计划</a>。补充主干层后 collapse/norm、采样与草稿收尾，区分 AICPU 包络、HC 计算边界及前一轮设备积压；每个边界提供 Stream/Task ID 与采集调用栈。</div>
+
 <div class="cards"><div><b>A3：DP4×TP4</b><span>EP16 · INT8 routed weights · MRV2 · CANN 9.2.1</span></div><div><b>A5：DP8×TP1</b><span>EP8 · MXFP4 routed weights · MRV1 · CANN 9.3.0</span></div><div><b>40 次融合 / 前向</b><span>A5 RMSNorm + MX 动态量化，调用栈与硬件事件相互印证</span></div><div><b>1641 → 221</b><span>代表前向的输入准备硬件任务数量；不是同配置硬件 A/B</span></div></div>
 
 ## 核心结论
@@ -123,7 +125,7 @@ A5 DP5 的第一份完整前向，已经是其他 rank 的第 2 个共同轮次�
 
 A3 默认前向的输入准备粗窗口约 **223.59 ms**，A5 约 **44.68 ms**。A3 其中有 88.76 ms 的 Gloo，约 69.16 ms 与前轮 NPU 任务重叠，约 19.60 ms 未被这些任务覆盖；未覆盖也不自动等于可消除。A3 扣除 Gloo 作粗参照约 134.84 ms，A5 不含对应 Gloo。两个 Runner 的入口工作不同，不能直接将 178.91 ms 全归为融合收益。
 
-更明确的是实际下发工作：A3 前置阶段有 **1641 个计算类硬件任务**，A5 为 **221 个**；RepeatInterleave 为 42→0，Index / IndexCheck 为 176/176→7/0，Range 为 89→0。A5 仍有 Tile、FloorMod、FloorDiv 和专门的 ring table / metadata kernel，并非“不做输入准备”。
+更明确的是实际下发工作：A3 前置阶段有 **1641 个非 hcom 硬件任务**，A5 为 **221 个**；RepeatInterleave 为 42→2，Index / IndexCheck 为 176/176→7/0，Range 为 89→5。A5 的两次 RepeatInterleave 来自 block table / slot mapping，不能与 A3 逐层 SWA visible lens 的 42 次重复构造混为同一来源。A5 仍有 Tile、FloorMod、FloorDiv 和专门的 ring table / metadata kernel，并非“不做输入准备”。
 
 <div id="parent-stack"></div>
 
