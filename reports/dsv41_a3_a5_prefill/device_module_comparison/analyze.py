@@ -21,7 +21,8 @@ from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
 MODULES = (
-    "Embedding/Engram",
+    "Embedding",
+    "Engram",
     "Attn-Proj",
     "Attn-Core",
     "Indexer/DSA",
@@ -193,12 +194,10 @@ def trace_context(rows, db, evidence):
 def scope_owner(name):
     """Recognize a functional boundary; generic Linear wrappers are ignored."""
     function = name.rsplit(": ", 1)[-1]
-    if (
-        ("/engram/" in name and "/model_state.py" not in name and "/hash_state.py" not in name)
-        or "engram" in function
-        or "VocabParallelEmbedding" in name
-    ):
-        return "Embedding/Engram"
+    if "VocabParallelEmbedding" in name or function == "embed_input_ids":
+        return "Embedding"
+    if ("/engram/" in name and "/model_state.py" not in name and "/hash_state.py" not in name) or "engram" in function:
+        return "Engram"
     if function in ("hc_pre", "hc_post", "hc_collapse"):
         return "MHC/HC"
     if "/shared_experts.py" in name or "SharedExperts" in name:
@@ -277,7 +276,7 @@ def classify(row):
     owners = [(scope_owner(p), p) for p in reversed(parents)]
     owners = [(m, p) for m, p in owners if m]
     if row["phase"] == "worker_prepare":
-        if owners and owners[0][0] == "Embedding/Engram":
+        if owners and owners[0][0] in ("Embedding", "Engram"):
             return owners[0][0], "captured_scope", owners[0][1]
         return "Device-Metadata", "device_prepare_phase", row["phase"]
     if owners:

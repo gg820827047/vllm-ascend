@@ -14,10 +14,15 @@ from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
 FEATURES = {
-    "Embedding/Engram": (
-        "Token embedding、Engram查表/门控及其通信。",
-        "A3有独立Engram与TP恢复；A5窗口只观察到词表Gather/Cast。特性配置或执行范围仍需核对，不能写成融合收益。",
-        ["embedding", "embed_tp", "engram_tp", "engram_gate"],
+    "Embedding": (
+        "Token ID查词表参数，生成本轮输入隐藏向量；含词表分片的TP恢复。",
+        "两边均有token embedding。独立词表查表与其TP通信计本行，不包含Engram。",
+        ["token_embedding_entry", "embed_tp"],
+    ),
+    "Engram": (
+        "n-gram参数查表、投影、门控及其通信；在指定模型层注入信息。",
+        "这是额外模型分支。未观察到该分支的Device任务不等于没有基础Embedding，原因需核对模型和开关。",
+        ["embedding", "engram_tp", "engram_layer", "engram_gate"],
     ),
     "Attn-Proj": (
         "Attention Q_a/Q_b/KV线性投影和输出投影；不含Indexer自己的投影。",
@@ -137,12 +142,8 @@ def difference_note(module, data, scope):
     for label, sample in data["samples"].items():
         value = sample["summary"][scope]["modules"][module]
         types = {v["type"]: v["count"] for v in value["types"]}
-        if module == "Embedding/Engram":
-            count = sum(
-                r["module"] == module and r["stage"] != "draft" and "engram" in r["basis"].lower()
-                for r in sample["tasks"]
-            )
-            descriptions.append(f"{label} 有 {count} 条独立Engram相关记录")
+        if module in ("Embedding", "Engram"):
+            descriptions.append(f"{label} 本统计范围有 {value['count']} 条独立{module}设备记录")
         elif module == "MHC/HC":
             descriptions.append(
                 f"{label} Pre {types.get('HcPre', 0)} / Post {types.get('HcPost', 0) + types.get('MhcPost', 0)} 次"
@@ -153,7 +154,9 @@ def difference_note(module, data, scope):
             descriptions.append(
                 f"{label} MegaMoe {types.get('MegaMoe', 0)} / DispatchFFNCombine {types.get('DispatchFFNCombine', 0)} 次"
             )
-    if module == "Embedding/Engram":
+    if module == "Embedding":
+        return "；".join(descriptions) + "。词表分片恢复通信随Embedding归属；Engram单列。"
+    if module == "Engram":
         return "；".join(descriptions) + "。未观察到不自动等于融合或功能关闭；需核对配置及范围。"
     if module == "MHC/HC":
         return "；".join(descriptions) + "。还含独立collapse任务；接口/shape仍需对齐。"
@@ -181,8 +184,8 @@ def communication_table(data):
         ("Attention输出投影", "Attn-Proj", "target_layers", "hcom_allReduce_", "oproj"),
         ("routed finalize结果恢复", "MoE-Boundary/TP", "target_layers", "hcom_allGather_", "routed_gather"),
         ("shared finalize结果恢复", "MoE-SharedExpert", "target_layers", "hcom_allGather_", "shared_gather"),
-        ("词表Embedding恢复", "Embedding/Engram", "primary", "hcom_allReduce_", "embed_tp"),
-        ("Engram输入gather", "Embedding/Engram", "primary", "hcom_allGather_", "engram_tp"),
+        ("词表Embedding恢复", "Embedding", "primary", "hcom_allReduce_", "embed_tp"),
+        ("Engram输入gather", "Engram", "primary", "hcom_allGather_", "engram_tp"),
     )
     out = (
         "<table><tr><th>实际功能路径 / 归属</th>"
@@ -349,6 +352,42 @@ def observed_timing(data):
     return out + "</table>"
 
 
+def embedding_engram_explanation(data):
+    rows = [
+        (
+            "作用",
+            "将本轮token ID查词表参数，转成模型输入hidden向量。",
+            "从相邻token的n-gram特征查额外参数表，经投影和门控把信息注入hidden。",
+        ),
+        (
+            "模型位置",
+            "目标模型输入阶段；草稿模型也可有自己的token embedding。",
+            "查表可前置准备；投影与门控在指定模型层中执行。",
+        ),
+        (
+            "实际节点",
+            "Gather、Cast、词表分片mask；TP下可能需要AllReduce恢复结果。",
+            "hash/查表与反量化、矩阵乘、门控等；本次A3还有输入AllGather。",
+        ),
+    ]
+    for label, sample in data["samples"].items():
+        cells = []
+        for module in ("Embedding", "Engram"):
+            value = sample["summary"]["primary"]["modules"][module]
+            cells.append(
+                f"{value['count']} 条设备记录；驻留Σ {value['resident_us'] / 1000:.3f} ms（其中hcom {value['hcom_us'] / 1000:.3f} ms）"
+                if value["count"]
+                else "本窗口未观察到独立Device任务；不记作零计算或融合收益。"
+            )
+        rows.append((f"{label} 目标段实际观察", *cells))
+    body = "".join("<tr>" + "".join(f"<td>{esc(c)}</td>" for c in row) + "</tr>" for row in rows)
+    return (
+        "<table><tr><th>比较项</th><th>Embedding（基础token词表）</th><th>Engram（额外模型分支）</th></tr>"
+        + body
+        + "</table>"
+    )
+
+
 def operator_table(data):
     labels = list(data["samples"])
     html_rows = []
@@ -466,7 +505,7 @@ def main():
 <style>
 :root{{font-family:system-ui,"Noto Sans CJK SC",sans-serif;color:#192d40;color-scheme:light}}*{{box-sizing:border-box}}body{{margin:0;background:#f1f5f9;line-height:1.6}}main{{max-width:1540px;margin:22px auto;background:white;padding:28px 34px;border:1px solid #dbe5ef;border-radius:12px}}h1{{font-size:28px;margin:12px 0}}h2{{font-size:20px;margin-top:30px}}h3{{font-size:17px}}a{{color:#1e5ca4}}nav,.note,small{{font-size:13px;color:#51677b}}p{{margin:8px 0}}.notice{{padding:12px 16px;background:#edf4ff;border-left:4px solid #3672b7}}.cards{{display:grid;grid-template-columns:repeat(2,1fr);gap:12px;margin:14px 0}}.card{{padding:12px 16px;border:1px solid #dbe5ef;border-radius:8px}}.scroll{{overflow:auto}}table{{width:100%;border-collapse:collapse;font-size:13px;margin:12px 0}}th,td{{text-align:left;vertical-align:top;border:1px solid #dbe5ef;padding:10px 12px}}th{{background:#f0f5fa}}.feature{{min-width:1140px;table-layout:fixed}}.feature th:first-child{{width:15%}}.feature th:last-child{{width:26%}}.feature th small{{display:block;font-weight:normal;margin-top:5px}}.types{{font-size:12px;margin-top:8px;overflow-wrap:anywhere}}.fused{{background:#fff8e8}}.sourcelinks{{margin-top:7px;font-size:12px}}code,pre{{font-family:ui-monospace,SFMono-Regular,monospace}}code{{overflow-wrap:anywhere}}pre{{padding:10px;background:#f5f8fb;white-space:pre-wrap;overflow-wrap:anywhere;font-size:12px}}details{{margin:8px 0}}summary{{cursor:pointer;color:#1b527e}}.legend{{padding:12px 16px;border:1px dashed #9eb9d2}}.numbers{{font-variant-numeric:tabular-nums}}li{{margin:5px 0}}@media(max-width:850px){{main{{margin:0;padding:18px 14px}}.cards{{grid-template-columns:1fr}}h1{{font-size:23px}}}}@media print{{nav{{display:none}}main{{border:0;margin:0;padding:0}}details[open]{{break-inside:avoid}}table{{font-size:9px}}th,td{{padding:5px}}.feature{{min-width:0}}}}@page{{size:A3 landscape;margin:12mm}}
 </style></head><body><main>
-<nav><a href="../../llm_service_optimization/index.html">优化总览</a> · <a href="../stage_brief.html">全局简版</a> · <a href="../execution_scope/report.html">旧执行边界审计</a> · 2026-11-26</nav>
+<nav><a href="../../llm_service_optimization/index.html">优化总览</a> · <a href="../stage_brief.html">全局简版</a> · <a href="../execution_scope/report.html">旧执行边界审计</a> · 2026-11-27</nav>
 <h1>DSv4.1 P侧：Device模块与算子差异</h1>
 <p class=notice><b>本轮打法：</b>沿模型功能归属设备任务，先列清“算了什么、用了什么算子、哪些已融合、TP通信落在哪里”。<b>不做Host耗时比较，不把当前A3/A5耗时差额当性能结论。</b>Runner作为实现背景保留；它仍可能影响Device准备和算子路径。</p>
 <div class=cards>{metadata}</div>
@@ -474,30 +513,34 @@ def main():
 <h2 id=timing>1. 当前一个有效step的真实观测时长</h2>
 {observed_timing(data)}
 <p class=note>第1行从Worker.execute_model入口计时，以本轮最后一个精确关联NPU任务完成为终点；不是Host函数返回时间，也不是完整128k请求TTFT。EngineCore完整step墙钟与最终CPU输出完成不在本包的完整捕获范围。Device跨度直接取实际首尾，并非模块累加；它包含空泡和融合内等待。{prior}，故第1行也不能直接比较净算术能力。</p>
-<h2 id=modules>2. 按模型功能归属：目标段及设备准备</h2>
-<div class=legend><b>主表范围：</b>本轮Device准备、Embedding/Engram、40层主干、目标收尾和目标采样；草稿另表。包含采样是为了把不同Runner中位置不同的同类输出头工作归在一起。<br><b>指标：</b>Σ为该模块所有已归属任务的驻留累计，包含显式hcom及通信辅助；“区间并集”消除该模块内部重叠。模块之间仍可重叠，<b>Σ或各模块并集都不能相加当step耗时</b>。MegaMoE内等待也属于驻留，不等于纯FFN计算。</div>
+<h2 id=embedding>2. Embedding 与 Engram：基础输入与额外分支</h2>
+{embedding_engram_explanation(data)}
+<p>Embedding与Engram查的都是模型学习得到的参数，作用不同；它们也不同于请求的Attention KV / prefix cache。A5存在基础Embedding，而本窗口没有观察到Engram的设备计算；不能合并解释成“A5没有Embedding”或“Engram已被融合”。</p>
+<p class=note>上述累计包含各自通信和等待，不是纯查表时间，也不能据此计算跨硬件倍率。源码：<a href="#src-token_embedding_entry">token入口</a>、<a href="#src-embed_tp">词表分片与TP恢复</a>、<a href="#src-engram_tp">Engram查表与gather</a>、<a href="#src-engram_layer">Engram投影/门控</a>。相同名字的Gather/MatMul按实际调用归属，不按算子类型混在一起。</p>
+<h2 id=modules>3. 按模型功能归属：目标段及设备准备</h2>
+<div class=legend><b>主表范围：</b>本轮Device准备、Embedding、Engram、40层主干、目标收尾和目标采样；草稿另表。包含采样是为了把不同Runner中位置不同的同类输出头工作归在一起。<br><b>指标：</b>Σ为该模块所有已归属任务的驻留累计，包含显式hcom及通信辅助；“区间并集”消除该模块内部重叠。模块之间仍可重叠，<b>Σ或各模块并集都不能相加当step耗时</b>。MegaMoE内等待也属于驻留，不等于纯FFN计算。</div>
 {primary}
 <p class=note>{esc(coverage)}。每条设备记录只计一个模块，hcom聚合事件与辅助kernel分别列示；融合不能拆成虚构的shared/routed/communication耗时。Layout/Boundary保留结构性未细分项，归属覆盖不代表每个小任务的语义都已细拆。</p>
 <h3>跨融合边界的组合视图</h3>
 <p>仅对比两边的MegaMoE还不够：A5含共享专家，A3有独立共享分支。下表将Gate、Shared、Routed、Dispatch/Combine、Fused及MoE外围重新组合，保留整体功能成本；独立Norm/Quant仍按主表定义排除。当前仍不计算速度差，后续受控数据应先看组合，再看子项。</p>
 {moe_composite(data)}
 <details><summary>仅看40层主干：排除设备准备、Embedding前置、收尾与采样</summary>{core}</details>
-<h2 id=communication>3. A3的TP通信具体算到哪里</h2>
+<h2 id=communication>4. A3的TP通信具体算到哪里</h2>
 {communication_table(data)}
 <p class=note>A5 TP1没有上述显式TP恢复任务；EP8的专家交换仍在MegaMoE内，不能写成“A5无通信”。共享专家行的A3通信已计入，不能再在MoE-Boundary重复统计。</p>
-<h2 id=draft>4. 草稿模型单列：相同规则，不混入40层</h2>
+<h2 id=draft>5. 草稿模型单列：相同规则，不混入40层</h2>
 <p>草稿准备、3层与草稿头/候选整理独立归属。A3的DispatchFFNCombine保留完整融合边界；A5有可独立观察的GMM与dispatch/combine。query、量化和负载不同，目前不能用36.82 ms与1.00 ms的差额宣称收益。</p>
 <details><summary>展开草稿Device模块表</summary>{draft}</details>
-<h2 id=types>5. 模块内算子类型、shape与dtype对照</h2>
+<h2 id=types>6. 模块内算子类型、shape与dtype对照</h2>
 <p>同名不自动等于同规格，DSL长名字仅在展示时使用别名；原始名称、shape、dtype、时间和任务ID全部保留在CSV。Norm/Quant按独立物理节点统一计数；压缩epilogue等跨功能融合保留KV/RoPE归属。</p>
 {operators}
-<h2 id=attribution>6. 归属方法与可在Insight核对的任务</h2>
+<h2 id=attribution>7. 归属方法与可在Insight核对的任务</h2>
 <ol><li>沿PYTORCH_API.connectionId组 → CONNECTION_IDS原始Connection → TASK → 精确startNs匹配CSV，恢复任务的提交线程与操作。</li><li>在该线程同一操作时刻恢复捕获的Python/nn.Module祖先，识别Indexer、共享专家、输出投影等功能边界。MatMul不靠名字或最近时间猜归属。</li><li>HC、完整MoE融合、独立Norm/Quant和RoPE等采用明确物理边界规则；其余优先采用最内层可识别功能调用。结构性边界显式保留。</li><li>通信使用同一调用祖先归属；一个任务只计一次。源码用于解释功能与分支条件，运行路径以捕获栈和设备任务为准。</li></ol>
 {examples}
-<h2 id=source>7. 固定参考源码与采集源码的边界</h2>
+<h2 id=source>8. 固定参考源码与采集源码的边界</h2>
 <p class=notice>以下是CANN参考快照 <code>36b73a9c431d</code> 的真实源码片段与网页链接。A3采集函数路径与其对应，但采集镜像精确SHA未提供；A5来自 <code>/opt/vllm-ascend-dsnext</code>。用户说明A5为0.27版本背景；已检查的官方 <a href="https://github.com/vllm-project/vllm-ascend/tree/0ce124446a0f59c431da76e31ffcc53489622513">0.27.1rc快照</a> 没有采集中的dsa_v41.py，尚不能据版本号替代镜像源码。<b>A5列使用采集栈、输入/输出与融合接口证据；不把参考源码冒充A5镜像原文。</b>精确源码或分支明确后可补逐行差异。</p>
 {code}
-<h2 id=next>8. 下一批受控数据：沿同一台账继续比较</h2>
+<h2 id=next>9. 下一批受控数据：沿同一台账继续比较</h2>
 <table><tr><th>对齐项</th><th>必须记录的内容</th></tr><tr><td>输入工作量</td><td>相同query长度、历史KV长度、批内请求数；同层/同轮比较。KV容量与max-model-len不能代替实际上下文。</td></tr><tr><td>并行与路由</td><td>A3 TP1，记录DP/EP、总/本地专家数、top-k、每专家token分布；强制均衡用于受控基准，结果单独标记，不代表真实路由吞吐。</td></tr><tr><td>模型特性</td><td>Engram、SWA replay/尾窗、缓存命中与窗口、DSpark、KV dtype及原生量化。A3存在而A5未观察到的Engram路径必须核对。</td></tr><tr><td>采集与范围</td><td>同样排除启动/捕获/warmup；选真实Prefill；记录镜像、core/Ascend SHA、CANN、时间坐标，覆盖整组EP并保留前序工作情况。</td></tr></table>
 <p>先用受控数据建立模块成本差，再从Norm+Quant、KV epilogue、Indexer专门前处理、MoE融合边界中选择A3实际支持的实现。算子微基准固定shape/dtype/布局，完整MegaMoE用整组EP与固定专家负载；最终仍回到A3模型执行A/B。</p>
 <details><summary>重新生成：保留现在的统计方法，替换输入</summary><p>使用 <a href="new_inputs.template.json">新输入配置模板</a>，填入真实采集信息：</p><pre>python analyze.py --list-workers /path/to/ASCEND_PROFILER_OUTPUT/ascend_pytorch_profiler_0.db
